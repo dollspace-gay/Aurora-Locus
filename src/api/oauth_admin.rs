@@ -407,6 +407,7 @@ struct AdminLoginResponse {
 /// from the handler so the handler's own tests exercise the login logic directly.
 async fn password_login_gate(
     State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
     body: Json<AdminLoginRequest>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -417,7 +418,9 @@ async fn password_login_gate(
         )
             .into_response();
     }
-    match handle_password_login(State(ctx), body).await {
+    // Resolve the client IP for IP binding (#442) before consuming ctx.
+    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+    match handle_password_login(State(ctx), client_ip, body).await {
         Ok(json) => json.into_response(),
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -425,6 +428,7 @@ async fn password_login_gate(
 
 async fn handle_password_login(
     State(ctx): State<AppContext>,
+    client_ip: Option<std::net::IpAddr>,
     Json(req): Json<AdminLoginRequest>,
 ) -> Result<Json<AdminLoginResponse>, (StatusCode, String)> {
     // Verify the password and mint a session. `login` resolves the identifier to
@@ -466,25 +470,54 @@ async fn handle_password_login(
         ));
     };
 
+    // Per-account security config (TOTP + IP binding), fetched once.
+    let security_config = ctx
+        .admin_security_store
+        .get_config(&account.did)
+        .await
+        .ok()
+        .flatten();
+
     // TOTP 2FA (#442): if this admin has confirmed TOTP, require + verify a code
     // before releasing the session. `login` already minted the session, so on any
     // TOTP failure we revoke it and return the SAME generic 401 as a bad password
     // — otherwise a TOTP-specific error would confirm the password was correct
     // (a password oracle).
-    if let Some(cfg) = ctx
-        .admin_security_store
-        .get_config(&account.did)
-        .await
-        .ok()
-        .flatten()
-    {
+    if let Some(cfg) = security_config.as_ref() {
         if cfg.totp_confirmed_at.is_some()
-            && !verify_login_totp(&ctx, &cfg, req.totp_code.as_deref()).await
+            && !verify_login_totp(&ctx, cfg, req.totp_code.as_deref()).await
         {
             let _ = ctx.account_manager.delete_session(&session.id).await;
             tracing::debug!(did = %account.did, "admin password login rejected: TOTP failed");
             return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
         }
+    }
+
+    // IP binding (#442): bind the just-minted session to the login IP when the
+    // admin opted in. Enforced on every later request by
+    // validate_access_token_with_ip. Fail-closed: if the bind write fails we
+    // revoke the session rather than release an unbound one for a binding admin.
+    if security_config
+        .as_ref()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        if let Some(ip) = client_ip {
+            if let Err(e) = ctx
+                .account_manager
+                .bind_session_ip(&session.id, &ip.to_string())
+                .await
+            {
+                tracing::error!(did = %account.did, "failed to bind session IP: {}", e);
+                let _ = ctx.account_manager.delete_session(&session.id).await;
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to bind session".to_string(),
+                ));
+            }
+        }
+        // No client IP (e.g. trust_proxy off → no real IP): binding degrades to a
+        // no-op by design; the session is released unbound.
     }
 
     tracing::info!(
@@ -680,6 +713,7 @@ struct OAuthLoginResponse {
 async fn authorize_local_admin(
     ctx: &AppContext,
     did: &str,
+    current_ip: Option<std::net::IpAddr>,
 ) -> Result<(String, String, String), (StatusCode, String)> {
     // (1) Local-account gate — runs before the admin_roles lookup.
     if ctx.account_manager.get_account(did).await.is_err() {
@@ -743,6 +777,17 @@ async fn authorize_local_admin(
     }
     let lifetime_secs =
         sec::compute_admin_session_lifetime_secs(admin_role.role, security_config.as_ref());
+    // IP binding (#442): bind at creation when the admin opted in and a real
+    // client IP is available (trust_proxy on). None otherwise → unbound.
+    let bound_ip = if security_config
+        .as_ref()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        current_ip.map(|ip| ip.to_string())
+    } else {
+        None
+    };
     let session = ctx
         .account_manager
         .create_session_with(
@@ -750,7 +795,7 @@ async fn authorize_local_admin(
             None,
             chrono::Duration::seconds(lifetime_secs),
             chrono::Duration::seconds(lifetime_secs),
-            None,
+            bound_ip,
         )
         .await
         .map_err(|e| {
@@ -768,6 +813,7 @@ async fn authorize_local_admin(
 async fn handle_oauth_callback(
     State(ctx): State<AppContext>,
     axum::Extension(state_store): axum::Extension<OAuthStateStore>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<OAuthCallbackParams>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
@@ -863,7 +909,9 @@ async fn handle_oauth_callback(
     // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL
     // accounts. Resolve the login into a real account session (the tokens the
     // request-auth path validates), rejecting non-local DIDs and non-admins.
-    let (access_token, refresh_token, role) = authorize_local_admin(&ctx, &did).await?;
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let (access_token, refresh_token, role) =
+        authorize_local_admin(&ctx, &did, current_ip).await?;
 
     // Resolve the deployment-default theme's token CSS to inline into the
     // transition screen (chainlink #441), so it paints the right theme instantly
@@ -1070,6 +1118,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -1358,6 +1407,7 @@ mod tests {
         .await;
         let resp = handle_password_login(
             State(ctx.clone()),
+            None,
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "correct-horse-battery-staple".to_string(),
@@ -1390,6 +1440,7 @@ mod tests {
         .await;
         let err = handle_password_login(
             State(ctx),
+            None,
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "the-WRONG-password".to_string(),
@@ -1415,6 +1466,7 @@ mod tests {
         .await;
         let err = handle_password_login(
             State(ctx),
+            None,
             Json(AdminLoginRequest {
                 identifier: "bob.localhost".to_string(),
                 password: "bobs-password".to_string(),
@@ -1432,6 +1484,7 @@ mod tests {
         let ctx = create_test_context().await;
         let err = handle_password_login(
             State(ctx),
+            None,
             Json(AdminLoginRequest {
                 identifier: "ghost.localhost".to_string(),
                 password: "whatever".to_string(),
@@ -1453,6 +1506,7 @@ mod tests {
         let ctx = build_test_context(None, false, None).await;
         let resp = password_login_gate(
             State(ctx),
+            axum::http::HeaderMap::new(),
             Json(AdminLoginRequest {
                 identifier: "admin.localhost".to_string(),
                 password: "whatever".to_string(),
@@ -1475,6 +1529,7 @@ mod tests {
         let ctx = build_test_context(None, true, None).await;
         let resp = password_login_gate(
             State(ctx),
+            axum::http::HeaderMap::new(),
             Json(AdminLoginRequest {
                 identifier: "ghost.localhost".to_string(),
                 password: "whatever".to_string(),
@@ -1520,7 +1575,7 @@ mod tests {
             .grant_role(did, Role::SuperAdmin, "system", None)
             .await
             .unwrap();
-        let err = authorize_local_admin(&ctx, did)
+        let err = authorize_local_admin(&ctx, did, None)
             .await
             .expect_err("non-local DID must be refused");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
@@ -1541,7 +1596,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (access, refresh, role) = authorize_local_admin(&ctx, did)
+        let (access, refresh, role) = authorize_local_admin(&ctx, did, None)
             .await
             .expect("local admin must be authorized");
         assert_eq!(role, "superadmin");
@@ -1564,7 +1619,7 @@ mod tests {
         seed_local_account(&ctx, did, "bob.localhost").await;
         // Local account, but NO admin_roles entry — the existing "not an admin"
         // 403 must still fire (no regression).
-        let err = authorize_local_admin(&ctx, did)
+        let err = authorize_local_admin(&ctx, did, None)
             .await
             .expect_err("local non-admin must be refused");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
@@ -1624,6 +1679,7 @@ mod tests {
         // Correct password + correct code → success.
         let ok = handle_password_login(
             State(ctx.clone()),
+            None,
             Json(AdminLoginRequest {
                 identifier: "totp.localhost".to_string(),
                 password: "correct-horse".to_string(),
@@ -1637,6 +1693,7 @@ mod tests {
         // Correct password, MISSING code → 401 (fails closed).
         let err = handle_password_login(
             State(ctx.clone()),
+            None,
             Json(AdminLoginRequest {
                 identifier: "totp.localhost".to_string(),
                 password: "correct-horse".to_string(),
@@ -1652,6 +1709,7 @@ mod tests {
         let wrong = if live == "000000" { "111111" } else { "000000" };
         let err = handle_password_login(
             State(ctx.clone()),
+            None,
             Json(AdminLoginRequest {
                 identifier: "totp.localhost".to_string(),
                 password: "correct-horse".to_string(),
@@ -1672,13 +1730,61 @@ mod tests {
 
         // The OAuth callback path (authorize_local_admin) has no code-entry step,
         // so it must refuse rather than silently skip the second factor.
-        let err = authorize_local_admin(&ctx, did).await.unwrap_err();
+        let err = authorize_local_admin(&ctx, did, None).await.unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(
             err.1.contains("password login"),
             "message should redirect to password login, got: {}",
             err.1
         );
+    }
+
+    #[tokio::test]
+    async fn password_login_binds_session_to_client_ip_when_enabled() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:ipbindlogin00000000000000";
+        seed_password_admin(&ctx, did, "ipbind.localhost", "pw-correct", Some(Role::Admin)).await;
+        // Opt this admin into IP binding.
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        // Log in from a specific IP — the minted session is bound to it.
+        let login_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(login_ip),
+            Json(AdminLoginRequest {
+                identifier: "ipbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login succeeds and binds");
+        let token = resp.0.access_token;
+
+        // Usable from the bound IP; rejected from any other.
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(login_ip))
+            .await
+            .is_ok());
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(other))
+            .await
+            .is_err());
     }
 
     // Phase 4 (#442): admin session hardening — the security-config store + the
@@ -1727,7 +1833,7 @@ mod tests {
             .unwrap();
 
         let before = chrono::Utc::now();
-        let (access, refresh, role) = authorize_local_admin(&ctx, did).await.unwrap();
+        let (access, refresh, role) = authorize_local_admin(&ctx, did, None).await.unwrap();
         assert_eq!(role, "superadmin");
 
         // Both tokens share the superadmin 15m task-time lifetime — activity
@@ -1773,7 +1879,7 @@ mod tests {
             .unwrap();
 
         let before = chrono::Utc::now();
-        let (access, refresh, _role) = authorize_local_admin(&ctx, did).await.unwrap();
+        let (access, refresh, _role) = authorize_local_admin(&ctx, did, None).await.unwrap();
 
         let access_exp: String =
             sqlx::query_scalar("SELECT expires_at FROM session WHERE access_token = $1")
@@ -1906,6 +2012,7 @@ mod tests {
         let html = handle_oauth_callback(
             State(ctx.clone()),
             axum::Extension(state_store),
+            axum::http::HeaderMap::new(),
             axum::extract::Query(OAuthCallbackParams {
                 code: Some(code.to_string()),
                 state: Some(state.to_string()),

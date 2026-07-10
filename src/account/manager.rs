@@ -780,6 +780,20 @@ impl AccountManager {
         }
     }
 
+    /// Bind an existing session to a client IP (#442), by session id. Used by the
+    /// password-login path to bind an admin's just-minted session to the IP the
+    /// login came from (the OAuth path binds at creation via `create_session_with`).
+    /// Subsequent `validate_access_token_with_ip` calls then enforce it.
+    pub async fn bind_session_ip(&self, session_id: &str, bound_ip: &str) -> PdsResult<()> {
+        sqlx::query("UPDATE session SET bound_ip = $1 WHERE id = $2")
+            .bind(bound_ip)
+            .bind(session_id)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
     /// Get account by DID
     ///
     /// Joins actor and account tables to get complete actor information.
@@ -3575,6 +3589,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

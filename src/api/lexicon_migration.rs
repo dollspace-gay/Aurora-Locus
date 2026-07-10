@@ -203,7 +203,7 @@ mod tests {
             identity: IdentityConfig { did_plc_url: "https://plc.directory".to_string(), service_handle_domains: vec![".localhost".to_string()], did_cache_stale_ttl: 3600, did_cache_max_ttl: 86400, recovery_did_key: None },
             email: None,
             invites: InviteConfig { required: false, interval: 604800, epoch: "2024-01-01T00:00:00Z".to_string() },
-            rate_limit: RateLimitConfig { enabled: false, global_requests_per_minute: 3000, exempt_admin_assets: true, buckets_retention_days: 7 },
+            rate_limit: RateLimitConfig { enabled: false, global_requests_per_minute: 3000, exempt_admin_assets: true, buckets_retention_days: 7, trust_proxy: false },
             logging: LoggingConfig { level: "info".to_string() },
             federation: FederationConfig { enabled: false, relay_urls: vec![], appview_url: None, firehose_enabled: false, crawl_enabled: false, public_url: Some("http://localhost:2583".to_string()), peer_pds: vec![] },
             validation_mode: crate::validation::ValidationMode::Required,

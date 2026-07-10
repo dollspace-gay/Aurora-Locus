@@ -222,6 +222,41 @@ impl AdminSecurityStore {
         Ok(updated > 0)
     }
 
+    /// Set a DID's `ip_binding_enabled` flag (#442). Upserts, preserving the
+    /// other settings. Transaction-aware for atomic mutation + audit. The
+    /// trust_proxy precondition is enforced at the handler, not here.
+    pub async fn set_ip_binding_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        enabled: bool,
+    ) -> PdsResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE admin_security_config SET ip_binding_enabled = $1, updated_at = $2 WHERE did = $3",
+        )
+        .bind(enabled)
+        .bind(&now)
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?
+        .rows_affected();
+
+        if updated == 0 {
+            sqlx::query(
+                "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(did)
+            .bind(enabled)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+        }
+        Ok(())
+    }
+
     /// Clear a DID's TOTP entirely (#442): nulls both the secret and the
     /// confirmation. A no-op (0 rows) when TOTP was never set. Transaction-aware.
     pub async fn clear_totp_in_tx<'c>(

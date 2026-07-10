@@ -1136,6 +1136,13 @@ pub struct RateLimitConfig {
     /// operator-tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
     /// per V06 batch tail G7.2.
     pub buckets_retention_days: u32,
+    /// Trust `X-Forwarded-For` / `X-Real-IP` for the real client IP (#442),
+    /// from `PDS_TRUST_PROXY`. OFF by default — enable ONLY behind a trusted
+    /// reverse proxy, else a client can spoof its IP via the header. Consumed by
+    /// the rate limiter and by admin session IP-binding, which refuses to enable
+    /// while this is off (the client IP is otherwise a loopback placeholder).
+    #[serde(default)]
+    pub trust_proxy: bool,
 }
 
 /// Logging configuration
@@ -1847,6 +1854,16 @@ impl ServerConfig {
                 .parse()
                 .unwrap_or(7);
 
+        // PDS_TRUST_PROXY (#442): honor forwarded client-IP headers. OFF unless
+        // explicitly enabled — a spoofable header behind an untrusted hop.
+        let trust_proxy = env::var("PDS_TRUST_PROXY")
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+            .unwrap_or(false);
+        if trust_proxy {
+            tracing::info!("Proxy trust: ENABLED via PDS_TRUST_PROXY (forwarded client IP honored)");
+        }
+
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
         // Validation mode
@@ -2079,6 +2096,7 @@ impl ServerConfig {
                 global_requests_per_minute: rate_limit_requests,
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
                 buckets_retention_days: rate_limit_buckets_retention_days,
+                trust_proxy,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {

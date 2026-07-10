@@ -106,6 +106,7 @@ async fn build_test_ctx() -> (AppContext, Arc<MockIdentityResolver>) {
             global_requests_per_minute: 3000,
             exempt_admin_assets: true,
             buckets_retention_days: 7,
+            trust_proxy: false,
         },
         logging: LoggingConfig {
             level: "info".to_string(),

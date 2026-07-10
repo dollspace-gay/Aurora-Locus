@@ -1081,6 +1081,13 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(disable_totp),
             CapsBuilder::new(Family::Admin),
         )
+        // Phase 4 (#442) — self-service admin session IP binding (step-up gated,
+        // trust_proxy-gated at the handler).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.setIpBinding",
+            post(set_ip_binding),
+            CapsBuilder::new(Family::Admin),
+        )
         .build()
 }
 
@@ -2000,6 +2007,87 @@ async fn disable_totp(
 
     Ok(Json(TotpStatusOutput {
         success: true,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Request for `tools.aurora.admin.setIpBinding`.
+#[derive(Debug, Deserialize)]
+struct SetIpBindingRequest {
+    enabled: bool,
+}
+
+/// Output for `tools.aurora.admin.setIpBinding`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetIpBindingOutput {
+    success: bool,
+    enabled: bool,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.admin.setIpBinding` — turn IP binding on/off for the caller's
+/// OWN account (Phase 4 · #442). Self-service, step-up gated. Takes effect at the
+/// NEXT login: a session minted while enabled is bound to its origin IP and can
+/// only be used from there. Enabling REFUSES (400) when `PDS_TRUST_PROXY` is off,
+/// since the real client IP can't be determined behind the (untrusted) proxy and
+/// binding would be a silent no-op — a false sense of security. Disabling is
+/// always allowed (turning a protection off).
+async fn set_ip_binding(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetIpBindingRequest>,
+) -> Result<Json<SetIpBindingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    if req.enabled && !ctx.rate_limiter.trust_proxy {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "TrustProxyRequired",
+            "IP binding requires a trusted reverse proxy: set PDS_TRUST_PROXY=true. \
+             Without it the client IP can't be determined and binding is a no-op.",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::set_ip_binding_in_tx(
+        &mut tx,
+        &auth.did,
+        req.enabled,
+    )
+    .await
+    .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.ip_binding.set",
+            subject: Some(&subject),
+            rationale: if req.enabled {
+                "self-service IP binding enabled (enforced from next login)"
+            } else {
+                "self-service IP binding disabled"
+            },
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(SetIpBindingOutput {
+        success: true,
+        enabled: req.enabled,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -10127,6 +10215,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -10820,6 +10909,88 @@ mod tests {
         let err = enroll_totp(State(ctx), admin_auth(did, &sid, Role::Admin))
             .await
             .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+    }
+
+    // Phase 4 (#442): self-service admin session IP binding — setIpBinding.
+    #[tokio::test]
+    async fn set_ip_binding_refuses_enable_without_trust_proxy() {
+        // Default context has trust_proxy off → enabling is a no-op → refused.
+        let ctx = create_test_context().await;
+        let did = "did:plc:ipbindoff";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindoff.localhost").await;
+        let err = set_ip_binding(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "TrustProxyRequired");
+        // No row written.
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .is_none());
+        // Disabling is allowed even with trust_proxy off (turning a control off).
+        let out = set_ip_binding(
+            State(ctx),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: false }),
+        )
+        .await
+        .expect("disable allowed")
+        .0;
+        assert!(!out.enabled);
+    }
+
+    #[tokio::test]
+    async fn set_ip_binding_enables_with_trust_proxy() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:ipbindon";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindon.localhost").await;
+        let out = set_ip_binding(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .expect("enable")
+        .0;
+        assert!(out.enabled);
+        assert!(
+            ctx.admin_security_store
+                .get_config(did)
+                .await
+                .unwrap()
+                .unwrap()
+                .ip_binding_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn set_ip_binding_requires_step_up() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:ipbindstale";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindstale.localhost").await;
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let err = set_ip_binding(
+            State(ctx),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert_eq!(err.1 .0["error"], "StepUpRequired");
     }
@@ -12138,7 +12309,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (24 endpoints)
+            // tools.aurora.admin (25 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -12164,7 +12335,8 @@ mod tests {
             r#""revokeOperatorSessions","#,
             r#""enrollTotp","#,
             r#""confirmTotp","#,
-            r#""disableTotp""#,
+            r#""disableTotp","#,
+            r#""setIpBinding""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,

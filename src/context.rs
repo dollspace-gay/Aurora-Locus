@@ -953,23 +953,14 @@ impl AppContext {
         // the floor — config::RateLimitConfig held it but it never reached
         // the rate_limit::RateLimitConfig the enforcement layers consult.
         // PDS_TRUST_PROXY (#442): trust X-Forwarded-For / X-Real-IP for the real
-        // client IP. Read at the rate-limiter build site (its sole consumer, now
-        // joined by admin IP-binding via `ctx.rate_limiter.trust_proxy`) rather
-        // than threaded through config::RateLimitConfig, whose ~24 struct-literal
-        // sites aren't worth a bool. OFF by default: only enable behind a trusted
-        // reverse proxy, else a client could spoof its IP via the header.
-        let trust_proxy = std::env::var("PDS_TRUST_PROXY")
-            .ok()
-            .map(|v| matches!(v.trim(), "true" | "1"))
-            .unwrap_or(false);
-        if trust_proxy {
-            tracing::info!("Proxy trust: ENABLED via PDS_TRUST_PROXY (X-Forwarded-For honored)");
-        }
+        // client IP (consumed by the rate limiter + admin IP-binding via
+        // `ctx.rate_limiter.trust_proxy`). OFF by default: only enable behind a
+        // trusted reverse proxy, else a client could spoof its IP via the header.
         let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
             crate::rate_limit::RateLimitConfig {
                 enabled: config.rate_limit.enabled,
                 exempt_admin_assets: config.rate_limit.exempt_admin_assets,
-                trust_proxy,
+                trust_proxy: config.rate_limit.trust_proxy,
                 ..crate::rate_limit::RateLimitConfig::default()
             },
         ));

@@ -987,7 +987,7 @@ mod tests {
             },
             email: None,
             invites: InviteConfig { required: false, interval: 604800, epoch: "2024-01-01T00:00:00Z".to_string() },
-            rate_limit: RateLimitConfig { enabled: false, global_requests_per_minute: 3000, exempt_admin_assets: true, buckets_retention_days: 7 },
+            rate_limit: RateLimitConfig { enabled: false, global_requests_per_minute: 3000, exempt_admin_assets: true, buckets_retention_days: 7, trust_proxy: false },
             logging: LoggingConfig { level: "info".to_string() },
             federation: FederationConfig {
                 enabled: false,
