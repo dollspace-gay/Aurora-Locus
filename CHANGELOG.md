@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `create-account.sh` now uses `PDS_SERVICE_PUBLIC_URL` as the API endpoint when set (falling back to the internal `PDS_HOSTNAME:PDS_PORT`), adds connect/response timeouts to its curl calls so an unreachable server fails fast, and accepts the "make admin?" prompt case-insensitively (`yes`/`y` in any case)
 
+### Fixed
+
+- `install.sh` is now marked executable in git; the tracked file mode was non-executable, so a fresh clone could not `./install.sh` without a manual `chmod +x` first (the shebang was already `#!/usr/bin/env bash`)
+
 ## [0.9.0] - 2026-06-28
 
 ### Added
