@@ -23,8 +23,8 @@
   // access token and retry once — the operator never sees an interactive
   // re-auth unless the refresh itself fails (refresh token expired/revoked
   // or no refresh token present), in which case the 401 reaches handle()
-  // and bounces to login as before. Reactive-on-401 only; proactive
-  // near-expiry refresh is deferred (the 0.9.3 session-management pass).
+  // and bounces to login as before. Complemented by the proactive
+  // near-expiry refresh below (#442).
   let refreshInFlight = null;
 
   function storedRefreshToken() {
@@ -40,6 +40,8 @@
       localStorage.setItem('aurora-admin-token', data.access_token);
       if (data.refresh_token) localStorage.setItem('aurora-admin-refresh-token', data.refresh_token);
     }
+    // Re-arm the proactive timer against the fresh token's expiry (#442).
+    scheduleProactiveRefresh();
   }
 
   // Single-flight: concurrent 401s share one in-flight refresh so we never
@@ -181,6 +183,85 @@
     return await res.json();
   }
 
+  // ---- Proactive near-expiry refresh (#442, Phase 4 · Commit 5) ----
+  //
+  // The admin session uses a SINGLE short lifetime for both the access and
+  // refresh tokens (SuperAdmin 15m / Admin 30m / Moderator 1h), so reactive
+  // refresh-on-401 alone can't slide it: by the time the access token 401s the
+  // refresh token has expired too, and the operator is bounced to login at the
+  // hard window regardless of activity. To deliver "activity slides, idle
+  // kills", refresh PROACTIVELY shortly before expiry — but only when the
+  // operator interacted during this token's window; an idle session is left to
+  // lapse (its tokens expire together and the next request bounces to login).
+  const REFRESH_LEAD_FRACTION = 0.2; // refresh with ~20% of lifetime remaining
+  const MIN_LEAD_MS = 30 * 1000; //     ...but no later than 30s before expiry
+  let proactiveTimer = null;
+  let tokenArmedAt = 0;
+  let lastActivityAt = Date.now();
+
+  function markActivity() {
+    lastActivityAt = Date.now();
+  }
+
+  // A JWT's `exp` (seconds) as epoch-ms. null for an opaque/absent token — the
+  // reactive-on-401 path still covers those.
+  function decodeExpMs(token) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    try {
+      let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4) b64 += '=';
+      const payload = JSON.parse(atob(b64));
+      return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function currentToken() {
+    return global.AuroraSession
+      ? global.AuroraSession.token()
+      : localStorage.getItem('aurora-admin-token');
+  }
+
+  // (Re)arm the proactive timer against the current token's expiry. Called at
+  // load (picks up the post-login-redirect token) and after every refresh.
+  function scheduleProactiveRefresh() {
+    if (proactiveTimer) {
+      clearTimeout(proactiveTimer);
+      proactiveTimer = null;
+    }
+    const expMs = decodeExpMs(currentToken());
+    if (expMs == null) return;
+    const remaining = expMs - Date.now();
+    if (remaining <= 0) return;
+    const lead = Math.max(remaining * REFRESH_LEAD_FRACTION, MIN_LEAD_MS);
+    const fireIn = Math.max(remaining - lead, 0);
+    tokenArmedAt = Date.now();
+    proactiveTimer = setTimeout(function () {
+      proactiveTimer = null;
+      // Slide only if the operator was active at/after this token was armed;
+      // idle sessions (last activity strictly before arming) fall through to
+      // expiry. applyRefreshed() re-arms on success; on failure the
+      // reactive-on-401 path takes over at the next request.
+      if (lastActivityAt < tokenArmedAt) return;
+      refreshAccessToken();
+    }, fireIn);
+  }
+
+  // Track operator presence for the slide gate. Window-level, passive, capture
+  // so it sees interaction anywhere in the app without interfering.
+  if (global.addEventListener) {
+    ['mousedown', 'keydown', 'pointerdown', 'scroll', 'touchstart'].forEach(
+      function (evt) {
+        global.addEventListener(evt, markActivity, { passive: true, capture: true });
+      },
+    );
+  }
+  // Arm for whatever token is already present (e.g. right after login).
+  scheduleProactiveRefresh();
+
   global.AuroraClient = {
     get: get,
     post: post,
@@ -189,5 +270,9 @@
     // Canonical auth-header builder (#360). capabilities.js routes through
     // this instead of carrying its own copy — single token-read path.
     authHeaders: authHeaders,
+    // Proactive near-expiry refresh (#442). Exposed for the load-time re-arm
+    // and for tests.
+    scheduleProactiveRefresh: scheduleProactiveRefresh,
+    _proactive: { decodeExpMs: decodeExpMs, markActivity: markActivity },
   };
 })(window);
