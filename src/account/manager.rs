@@ -376,8 +376,9 @@ impl AccountManager {
     ) -> PdsResult<Session> {
         let session_id = Uuid::new_v4().to_string();
 
-        // Generate JWT tokens
-        let access_token = self.generate_access_token(did, &session_id)?;
+        // Generate JWT tokens. The access JWT's exp mirrors access_ttl so the
+        // exp claim matches the session row (and the UI's refresh scheduling).
+        let access_token = self.generate_access_token(did, &session_id, access_ttl)?;
         let refresh_token_str = self.generate_refresh_token(did, &session_id)?;
 
         let now = Utc::now();
@@ -721,9 +722,9 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Create new access token
+        // Create new access token (exp mirrors access_ttl, matching the row).
         let new_session_id = uuid::Uuid::new_v4().to_string();
-        let access_token = self.generate_access_token(&did, &new_session_id)?;
+        let access_token = self.generate_access_token(&did, &new_session_id, access_ttl)?;
         let access_expires = now + access_ttl;
 
         // Insert new session (carrying the bound IP + authenticated_at forward).
@@ -1497,7 +1498,12 @@ impl AccountManager {
     }
 
     /// Generate access JWT token
-    fn generate_access_token(&self, did: &str, session_id: &str) -> PdsResult<String> {
+    fn generate_access_token(
+        &self,
+        did: &str,
+        session_id: &str,
+        access_ttl: Duration,
+    ) -> PdsResult<String> {
         use jsonwebtoken::{encode, EncodingKey, Header};
         use serde::{Deserialize, Serialize};
 
@@ -1509,12 +1515,17 @@ impl AccountManager {
             exp: i64,
         }
 
+        // The JWT `exp` MUST match the session row's `expires_at` (both
+        // now + access_ttl). validate_access_token gates on the DB row, but the
+        // exp claim is what the admin UI reads to schedule its proactive refresh
+        // (#442) — a stale hardcoded 1h here (vs a 15m role lifetime) scheduled
+        // the refresh long past the real expiry, so the session never slid.
         let now = Utc::now().timestamp();
         let claims = Claims {
             sub: did.to_string(),
             sid: session_id.to_string(),
             iat: now,
-            exp: now + 3600, // 1 hour
+            exp: now + access_ttl.num_seconds(),
         };
 
         // Arc 12 §5.4 Step 0.6.2: include kid="aurora-local-v1"
@@ -4122,6 +4133,50 @@ mod tests {
             .validate_access_token(&unbound.access_token)
             .await
             .is_ok());
+    }
+
+    /// Phase 4 (#442) regression: the access JWT's `exp` claim must track the
+    /// access_ttl (not the old hardcoded 1h), so the admin UI's proactive-refresh
+    /// timer schedules against the real session lifetime rather than 48 min out.
+    #[tokio::test]
+    async fn access_token_exp_tracks_access_ttl() {
+        use base64::Engine as _;
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "expuser".to_string(),
+                Some("exp@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = Utc::now().timestamp();
+        // A 15-minute access lifetime (superadmin-like), NOT the legacy 1h.
+        let session = manager
+            .create_session_with(
+                &account.did,
+                None,
+                Duration::minutes(15),
+                Duration::minutes(15),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let payload_b64 = session.access_token.split('.').nth(1).expect("JWT payload");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .expect("base64url payload");
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let exp = claims["exp"].as_i64().expect("exp claim");
+        let ttl_secs = exp - before;
+        assert!(
+            (14 * 60..=16 * 60).contains(&ttl_secs),
+            "exp should track the 15m access_ttl, got {ttl_secs}s (regression: hardcoded 1h?)"
+        );
     }
 
     // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----

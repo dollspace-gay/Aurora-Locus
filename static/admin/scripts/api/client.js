@@ -233,19 +233,34 @@
       proactiveTimer = null;
     }
     const expMs = decodeExpMs(currentToken());
-    if (expMs == null) return;
+    if (expMs == null) {
+      if (global.console) {
+        global.console.info('[aurora] proactive refresh: token has no exp claim; relying on refresh-on-401');
+      }
+      return;
+    }
     const remaining = expMs - Date.now();
     if (remaining <= 0) return;
     const lead = Math.max(remaining * REFRESH_LEAD_FRACTION, MIN_LEAD_MS);
     const fireIn = Math.max(remaining - lead, 0);
     tokenArmedAt = Date.now();
+    if (global.console) {
+      global.console.info(
+        '[aurora] proactive refresh scheduled in ' + Math.round(fireIn / 1000) +
+        's (token expires in ' + Math.round(remaining / 1000) + 's)',
+      );
+    }
     proactiveTimer = setTimeout(function () {
       proactiveTimer = null;
       // Slide only if the operator was active at/after this token was armed;
       // idle sessions (last activity strictly before arming) fall through to
       // expiry. applyRefreshed() re-arms on success; on failure the
       // reactive-on-401 path takes over at the next request.
-      if (lastActivityAt < tokenArmedAt) return;
+      if (lastActivityAt < tokenArmedAt) {
+        if (global.console) global.console.info('[aurora] proactive refresh: idle, letting session expire');
+        return;
+      }
+      if (global.console) global.console.info('[aurora] proactive refresh: firing');
       refreshAccessToken();
     }, fireIn);
   }
