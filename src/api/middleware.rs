@@ -193,7 +193,13 @@ pub async fn authenticate(
     let headers = req.headers().clone();
 
     if let Some(token) = extract_bearer_token(&headers) {
-        match ctx.account_manager.validate_access_token(&token).await {
+        // Thread the client IP so a bound admin session is enforced here (#442).
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        match ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, current_ip)
+            .await
+        {
             Ok(session) => {
                 // Add session to request extensions
                 req.extensions_mut().insert(session);
@@ -230,7 +236,12 @@ pub async fn require_auth(
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
 
-    match ctx.account_manager.validate_access_token(&token).await {
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    match ctx
+        .account_manager
+        .validate_access_token_with_ip(&token, current_ip)
+        .await
+    {
         Ok(session) => {
             info!(
                 did = %session.did,
@@ -366,7 +377,12 @@ pub async fn check_account_moderation(
 
     // Only check moderation for authenticated requests
     if let Some(token) = extract_bearer_token(&headers) {
-        if let Ok(session) = ctx.account_manager.validate_access_token(&token).await {
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        if let Ok(session) = ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, current_ip)
+            .await
+        {
             // Check if this is an admin - admins bypass moderation checks
             let is_admin = ctx
                 .admin_role_manager
@@ -611,10 +627,11 @@ pub async fn service_auth(
 
     // Check if this is a service auth request
     if let Some(token) = extract_bearer_token(&headers) {
-        // Try local auth first
+        // Try local auth first (threading the client IP for bound sessions, #442)
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
         if ctx
             .account_manager
-            .validate_access_token(&token)
+            .validate_access_token_with_ip(&token, current_ip)
             .await
             .is_ok()
         {

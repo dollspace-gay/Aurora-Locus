@@ -431,14 +431,35 @@ impl AccountManager {
         })
     }
 
-    /// Validate access token and return session info
+    /// Validate access token and return session info. IP-binding-agnostic: use
+    /// this for internal/non-request contexts. Request-auth paths call
+    /// [`AccountManager::validate_access_token_with_ip`] so a bound admin session
+    /// is enforced against the request's client IP.
     pub async fn validate_access_token(
         &self,
         token: &str,
     ) -> PdsResult<crate::account::ValidatedSession> {
+        self.validate_access_token_with_ip(token, None).await
+    }
+
+    /// Validate an access token, additionally enforcing IP binding (#442). When
+    /// the session row carries a `bound_ip` (set at login for an admin who opted
+    /// into IP binding), the request's `current_ip` MUST match it or the token is
+    /// rejected as though invalid. UNBOUND sessions (`bound_ip = NULL`, the
+    /// common case) are unaffected regardless of `current_ip`. Enforcement is
+    /// fail-closed: a bound session with a non-matching or absent `current_ip`
+    /// (including `None`) is rejected, so a request path that fails to thread the
+    /// client IP can't slip a bound session through unchecked. Internal callers
+    /// pass `None` and only ever handle unbound sessions; every real request-auth
+    /// path threads the client IP.
+    pub async fn validate_access_token_with_ip(
+        &self,
+        token: &str,
+        current_ip: Option<std::net::IpAddr>,
+    ) -> PdsResult<crate::account::ValidatedSession> {
         // Find session by access token
         let row = sqlx::query(
-            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = $1",
+            "SELECT id, did, expires_at, app_password_name, bound_ip FROM session WHERE access_token = $1",
         )
         .bind(token)
         .fetch_optional(&self.db)
@@ -450,10 +471,24 @@ impl AccountManager {
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let app_password_name: Option<String> = row.get("app_password_name");
+        let bound_ip: Option<String> = row.get("bound_ip");
 
         // Check expiration
         if Utc::now() > expires_at {
             return Err(PdsError::Authentication("Session expired".to_string()));
+        }
+
+        // IP binding: a bound session may only be used from its bound IP. Fails
+        // closed — a request whose client IP can't be resolved to the bound value
+        // (including `current_ip == None` in a request path) is rejected. The
+        // error mirrors the invalid-token message so a mismatch isn't an oracle.
+        if let Some(bound) = bound_ip {
+            let matches = current_ip.map(|ip| ip.to_string()) == Some(bound);
+            if !matches {
+                return Err(PdsError::Authentication(
+                    "Invalid or expired session".to_string(),
+                ));
+            }
         }
 
         Ok(crate::account::ValidatedSession {
@@ -4008,6 +4043,70 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Phase 4 (#442): IP-binding enforcement in validate_access_token_with_ip.
+    #[tokio::test]
+    async fn validate_access_token_enforces_ip_binding() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "ipbinduser".to_string(),
+                Some("ipbind@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bound = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        // A session bound to `bound` may only be used from `bound`.
+        let session = manager
+            .create_session_with(
+                &account.did,
+                None,
+                Duration::hours(1),
+                Duration::hours(1),
+                Some(bound.to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, Some(bound))
+            .await
+            .is_ok());
+        // Wrong IP → rejected.
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, Some(other))
+            .await
+            .is_err());
+        // No IP context → rejected (fail-closed); the IP-agnostic wrapper too.
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, None)
+            .await
+            .is_err());
+        assert!(manager
+            .validate_access_token(&session.access_token)
+            .await
+            .is_err());
+
+        // An UNBOUND session validates from any IP (and with no IP).
+        let unbound = manager.create_session(&account.did, None).await.unwrap();
+        assert!(manager
+            .validate_access_token_with_ip(&unbound.access_token, Some(other))
+            .await
+            .is_ok());
+        assert!(manager
+            .validate_access_token_with_ip(&unbound.access_token, None)
+            .await
+            .is_ok());
+        assert!(manager
+            .validate_access_token(&unbound.access_token)
+            .await
+            .is_ok());
     }
 
     // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----

@@ -75,6 +75,17 @@ pub struct AuthContext {
     pub auth_method: AuthMethod,
 }
 
+/// The request's client IP for admin session IP-binding enforcement (#442).
+/// Honors X-Forwarded-For/X-Real-IP only when `trust_proxy` is on, else a
+/// loopback placeholder — so a client can't spoof its bound IP via the header
+/// unless the operator has opted into trusting the proxy.
+pub(crate) fn request_client_ip(
+    headers: &axum::http::HeaderMap,
+    ctx: &AppContext,
+) -> Option<std::net::IpAddr> {
+    crate::rate_limit::extract_client_ip(headers, ctx.rate_limiter.trust_proxy)
+}
+
 #[async_trait]
 impl FromRequestParts<AppContext> for AuthContext {
     type Rejection = PdsError;
@@ -116,8 +127,13 @@ impl FromRequestParts<AppContext> for AuthContext {
                 })
             }
             Err(_) => {
-                // Fallback to JWT validation for backward compatibility
-                let session = state.account_manager.validate_access_token(&token).await?;
+                // Fallback to JWT validation for backward compatibility. Thread
+                // the client IP so a bound admin session is enforced (#442).
+                let current_ip = request_client_ip(&parts.headers, state);
+                let session = state
+                    .account_manager
+                    .validate_access_token_with_ip(&token, current_ip)
+                    .await?;
 
                 let did = session.did.clone();
                 let duration = start.elapsed().as_secs_f64();
@@ -227,8 +243,14 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                     })
                 }
                 Err(_) => {
-                    // Fallback to JWT validation
-                    match state.account_manager.validate_access_token(&token).await {
+                    // Fallback to JWT validation. Thread the client IP so a bound
+                    // admin session is enforced here too (#442).
+                    let current_ip = request_client_ip(&parts.headers, state);
+                    match state
+                        .account_manager
+                        .validate_access_token_with_ip(&token, current_ip)
+                        .await
+                    {
                         Ok(session) => {
                             let did = session.did.clone();
                             let duration = start.elapsed().as_secs_f64();
@@ -279,7 +301,8 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
     ) -> Result<Self, Self::Rejection> {
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
-        admin_auth_from_token(state, &token).await
+        let current_ip = request_client_ip(&parts.headers, state);
+        admin_auth_from_token_with_ip(state, &token, current_ip).await
     }
 }
 
@@ -308,8 +331,24 @@ pub(crate) async fn admin_auth_from_token(
     state: &AppContext,
     token: &str,
 ) -> Result<AdminAuthContext, PdsError> {
+    // IP-binding-agnostic wrapper for internal/test callers (which only handle
+    // unbound sessions). The request extractor uses the `_with_ip` variant.
+    admin_auth_from_token_with_ip(state, token, None).await
+}
+
+/// [`admin_auth_from_token`] threading the request's client IP through layer 1
+/// so a bound admin session is enforced against it (#442).
+pub(crate) async fn admin_auth_from_token_with_ip(
+    state: &AppContext,
+    token: &str,
+    current_ip: Option<std::net::IpAddr>,
+) -> Result<AdminAuthContext, PdsError> {
     // Layer 1: local session
-    match state.account_manager.validate_access_token(token).await {
+    match state
+        .account_manager
+        .validate_access_token_with_ip(token, current_ip)
+        .await
+    {
         Ok(session) => {
             let did = session.did.clone();
             return finalize_admin_role(state, did, session).await;
@@ -1273,6 +1312,12 @@ async fn route_local_verify(
     ctx: &AppContext,
     token: &str,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
+    // IP binding (#442): this is the service-auth / forwarded-JWT dispatch, not
+    // the admin-UI path (AdminAuthContext threads the client IP). It has no
+    // request headers, so it validates without an IP — which is fail-closed for a
+    // bound session (rejected here, never slipped through), not a bypass. Admin
+    // sessions are enforced on their real path; a bound token routed here is
+    // simply refused.
     match ctx.account_manager.validate_access_token(token).await {
         Ok(session) => {
             tracing::info!(
