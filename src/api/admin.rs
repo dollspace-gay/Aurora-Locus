@@ -793,6 +793,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Phase 4 admin session hardening (#442): set/clear an admin's
+        // per-account session-lifetime override. SuperAdmin-only + step-up
+        // gated at the handler.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.setSessionLifetime",
+            post(set_session_lifetime),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 Federation runtime-mutability arc §3.4 (#393) — revert-to-default:
         // delete a runtime row (and, for restart-required keys, queue the restart
         // marker(s) atomically). §3.8 (#396) — read the queued restart markers for
@@ -1550,6 +1558,178 @@ async fn grant_role(
         did: req.did,
         role: req.role,
         admin_role,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Step-up auth gate (Phase 4 · #442): a hardening endpoint requires the caller
+/// to have interactively authenticated within `STEP_UP_MAX_AGE_SECS`. Freshness
+/// is read from the session's `authenticated_at` (login time, preserved across
+/// refreshes), so a silent refresh never satisfies it — only a real re-login.
+/// Fails closed: a session whose freshness cannot be resolved (no row — e.g. a
+/// synthetic/HS256 admin session id) is treated as stale.
+async fn require_step_up(
+    ctx: &AppContext,
+    auth: &AdminAuthContext,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let authenticated_at = ctx
+        .account_manager
+        .session_authenticated_at(&auth.session.session_id)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
+    let fresh = match authenticated_at {
+        Some(ts) => {
+            (chrono::Utc::now() - ts).num_seconds()
+                <= crate::admin::security_config::STEP_UP_MAX_AGE_SECS
+        }
+        None => false,
+    };
+    if !fresh {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "StepUpRequired",
+            "this operation requires a recent login; re-authenticate and retry",
+        ));
+    }
+    Ok(())
+}
+
+/// Request for `tools.aurora.superadmin.setSessionLifetime`. A null (omitted)
+/// `sessionLifetimeSecs` reverts the target to their role default.
+#[derive(Debug, Deserialize)]
+struct SetSessionLifetimeRequest {
+    did: String,
+    #[serde(default)]
+    session_lifetime_secs: Option<i64>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// Output for `tools.aurora.superadmin.setSessionLifetime`. `auditEntryId` is a
+/// string per the action-ID contract (dodges JS number precision).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSessionLifetimeOutput {
+    success: bool,
+    did: String,
+    session_lifetime_secs: Option<i64>,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.setSessionLifetime` — set (or clear) an admin's
+/// per-account session-lifetime override (Phase 4 · #442). SuperAdmin-only and
+/// step-up-gated: it reshapes another operator's session security, so the caller
+/// must have logged in within the step-up window. `sessionLifetimeSecs` null
+/// reverts the target to their role default; a value is bounds-checked
+/// (60s..30d). The override + its audit-chain entry are written atomically.
+async fn set_session_lifetime(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetSessionLifetimeRequest>,
+) -> Result<Json<SetSessionLifetimeOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "setSessionLifetime requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+
+    // Reshaping session security is a hardening operation — require a recent
+    // interactive login, not merely a live (silently-refreshed) session.
+    require_step_up(&ctx, &auth).await?;
+
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
+
+    // Bounds-check up front so an invalid value is a clean 400 before any tx.
+    crate::admin::security_config::validate_session_lifetime(req.session_lifetime_secs)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
+
+    // Target must be a local admin: the config row FKs to actor, and setting a
+    // lifetime for a non-admin is meaningless. 404 rather than a raw FK error.
+    let target_role = ctx.admin_role_manager.get_role(&req.did).await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    if target_role.is_none() {
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "target DID is not an admin on this PDS",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let chain_rationale = match req.session_lifetime_secs {
+        Some(s) => format!("{} (session_lifetime_secs={})", rationale, s),
+        None => format!("{} (session_lifetime_secs=role-default)", rationale),
+    };
+
+    // LB-1 / #122: override + chain in one transaction so a crash between the
+    // two leaves neither, not a config change without an audit breadcrumb.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    crate::admin::security_config::AdminSecurityStore::set_session_lifetime_in_tx(
+        &mut tx,
+        &req.did,
+        req.session_lifetime_secs,
+    )
+    .await
+    .map_err(|e| match e {
+        PdsError::Validation(msg) => {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", msg)
+        }
+        other => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            other.to_string(),
+        ),
+    })?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.session_lifetime.set",
+            subject: Some(&subject),
+            rationale: &chain_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(SetSessionLifetimeOutput {
+        success: true,
+        did: req.did,
+        session_lifetime_secs: req.session_lifetime_secs,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -9960,6 +10140,216 @@ mod tests {
         assert_eq!(again.revoked, 0);
     }
 
+    // Phase 4 (#442): setSessionLifetime — SuperAdmin-only, step-up-gated,
+    // audited. A fresh real session is needed to pass the step-up gate, so the
+    // caller's `session_id` must point at a live `session` row.
+    fn super_auth(did: &str, session_id: &str) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: session_id.to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
+    fn set_lifetime_req(
+        did: &str,
+        secs: Option<i64>,
+        rationale: Option<&str>,
+    ) -> Json<SetSessionLifetimeRequest> {
+        Json(SetSessionLifetimeRequest {
+            did: did.to_string(),
+            session_lifetime_secs: secs,
+            rationale: rationale.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_superadmin_fresh_session_sets_and_audits() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:superlifecaller";
+        let target = "did:plc:targetadminlife";
+        seed_test_account(&ctx, caller, "superlifecaller.localhost", None).await;
+        seed_test_account(&ctx, target, "targetadminlife.localhost", None).await;
+        ctx.admin_role_manager
+            .grant_role(target, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        // Fresh interactive login → step-up passes.
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let auth = super_auth(caller, &session.id);
+
+        let out = set_session_lifetime(
+            State(ctx.clone()),
+            auth,
+            set_lifetime_req(target, Some(7200), Some("tighten for offboarding")),
+        )
+        .await
+        .expect("superadmin sets lifetime")
+        .0;
+        assert!(out.success);
+        assert_eq!(out.session_lifetime_secs, Some(7200));
+        assert!(!out.audit_entry_id.is_empty());
+
+        // Persisted on the target's config.
+        let cfg = ctx
+            .admin_security_store
+            .get_config(target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.session_lifetime_secs, Some(7200));
+
+        // Null reverts to the role default (clears the override).
+        let reverted = set_session_lifetime(
+            State(ctx.clone()),
+            super_auth(caller, &session.id),
+            set_lifetime_req(target, None, Some("revert to default")),
+        )
+        .await
+        .expect("null reverts")
+        .0;
+        assert_eq!(reverted.session_lifetime_secs, None);
+        assert_eq!(
+            ctx.admin_security_store
+                .get_config(target)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_lifetime_secs,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        // Admin role → 403 at the role gate, before step-up (no session needed).
+        let auth = AdminAuthContext {
+            did: "did:plc:adm".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:adm".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+        let err = set_session_lifetime(
+            State(ctx),
+            auth,
+            set_lifetime_req("did:plc:t", None, Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_stale_session_requires_step_up() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:stalecaller";
+        let target = "did:plc:targetstale";
+        seed_test_account(&ctx, caller, "stalecaller.localhost", None).await;
+        ctx.admin_role_manager
+            .grant_role(target, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        // Age the interactive-auth time past the step-up window.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&session.id)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        let err = set_session_lifetime(
+            State(ctx.clone()),
+            super_auth(caller, &session.id),
+            set_lifetime_req(target, Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+        // The override was NOT written.
+        assert!(ctx
+            .admin_security_store
+            .get_config(target)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_synthetic_session_fails_step_up_closed() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:synthcaller";
+        // No real session row for this id → freshness unresolvable → fail closed.
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, "jwt-no-such-session"),
+            set_lifetime_req("did:plc:t", Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_requires_rationale() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:rationalecaller";
+        seed_test_account(&ctx, caller, "rationalecaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:t", Some(3600), None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_rejects_out_of_bounds() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:boundscaller";
+        seed_test_account(&ctx, caller, "boundscaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:t", Some(1), Some("too short")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_unknown_target_is_404() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:targetcaller";
+        seed_test_account(&ctx, caller, "targetcaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:nobody", Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn test_get_resource_usage() {
         let ctx = create_test_context().await;
@@ -11367,10 +11757,11 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (33 endpoints)
+            // tools.aurora.superadmin (34 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
+            r#""setSessionLifetime","#,
             r#""deleteRuntimeSetting","#,
             r#""listPendingRestartActions","#,
             r#""triggerRestart","#,
@@ -11825,6 +12216,7 @@ mod tests {
             superadmin.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(names.contains(&"grantRole"), "grantRole missing");
         assert!(names.contains(&"revokeRole"), "revokeRole missing");
+        assert!(names.contains(&"setSessionLifetime"), "setSessionLifetime missing");
         assert!(names.contains(&"preRebuildCheck"), "preRebuildCheck missing");
         assert!(names.contains(&"rebuildRepo"), "rebuildRepo missing");
         assert!(names.contains(&"getRebuildProgress"), "getRebuildProgress missing");

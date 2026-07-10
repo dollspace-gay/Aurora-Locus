@@ -358,8 +358,11 @@ impl AccountManager {
 
     /// Create a session with explicit access- and refresh-token lifetimes and an
     /// optional bound IP. [`AccountManager::create_session`] is the
-    /// regular-default wrapper; admin sessions (Phase 4 · #442) pass a short 15m
-    /// access lifetime + a role-based refresh (idle-timeout) lifetime.
+    /// regular-default wrapper; admin sessions (Phase 4 · #442) pass a single
+    /// role-based (task-time) lifetime for both tokens.
+    ///
+    /// This is an interactive login, so `authenticated_at` is stamped to now —
+    /// the step-up freshness clock. It is preserved (not reset) across refreshes.
     ///
     /// `bound_ip` is persisted on the `session` row for the IP-binding commit; it
     /// is NOT enforced here (enforcement lands with the trust_proxy-gated check).
@@ -380,10 +383,11 @@ impl AccountManager {
         let now = Utc::now();
         let expires_at = now + access_ttl;
 
-        // Insert session
+        // Insert session. authenticated_at == created_at here: a fresh login is,
+        // by definition, a fresh authentication.
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip, authenticated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         )
         .bind(&session_id)
         .bind(did)
@@ -393,6 +397,7 @@ impl AccountManager {
         .bind(expires_at.to_rfc3339())
         .bind(&app_password_name)
         .bind(&bound_ip)
+        .bind(now.to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -569,11 +574,12 @@ impl AccountManager {
     }
 
     /// Rotate a session's tokens with explicit access-/refresh-token lifetimes
-    /// (Phase 4 · #442). Admin refresh passes a 15m access lifetime + the
-    /// role-based refresh (idle-timeout) lifetime, so activity within the window
-    /// slides the session and idle beyond it expires. The rotated session carries
-    /// the previous session's `bound_ip` forward, so an IP-bound session stays
-    /// bound across refreshes.
+    /// (Phase 4 · #442). Admin refresh passes a single role-based (task-time)
+    /// lifetime for both tokens, so activity within the window slides the session
+    /// and idle beyond it expires. The rotated session carries the previous
+    /// session's `bound_ip` AND `authenticated_at` forward: an IP-bound session
+    /// stays bound, and — crucially — a refresh does NOT reset the step-up
+    /// freshness clock, so only a real re-login counts as recent authentication.
     pub async fn refresh_session_with(
         &self,
         refresh_token: &str,
@@ -627,17 +633,23 @@ impl AccountManager {
             ));
         }
 
-        // Carry the previous session's bound IP forward so an IP-bound admin
-        // session stays bound across refreshes (Phase 4 · #442). The old session
-        // still exists (its access token is valid until expiry) and still points
-        // at the token being refreshed.
-        let bound_ip: Option<String> =
-            sqlx::query_scalar("SELECT bound_ip FROM session WHERE refresh_token = $1")
-                .bind(refresh_token)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(PdsError::Database)?
-                .flatten();
+        // Carry the previous session's bound IP + authenticated_at forward
+        // (Phase 4 · #442): an IP-bound session stays bound, and the step-up
+        // freshness clock is preserved so a refresh never counts as a fresh
+        // authentication. The old session still exists (its access token is valid
+        // until expiry) and still points at the token being refreshed.
+        let carried: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT bound_ip, authenticated_at FROM session WHERE refresh_token = $1",
+        )
+        .bind(refresh_token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        let (bound_ip, carried_authenticated_at) = carried.unwrap_or((None, None));
+        // Fall back to now if the previous row predates the authenticated_at
+        // column (NULL) — the worst case is treating an old session as freshly
+        // authenticated, and such sessions age out within the short admin window.
+        let authenticated_at = carried_authenticated_at.unwrap_or_else(|| now.to_rfc3339());
 
         // Create new refresh token
         let new_token_id = uuid::Uuid::new_v4().to_string();
@@ -679,10 +691,12 @@ impl AccountManager {
         let access_token = self.generate_access_token(&did, &new_session_id)?;
         let access_expires = now + access_ttl;
 
-        // Insert new session (carrying the bound IP forward)
+        // Insert new session (carrying the bound IP + authenticated_at forward).
+        // created_at is now (this row is new); authenticated_at is the original
+        // login time, so the step-up clock does not reset on refresh.
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip)
-             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip, authenticated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)"
         )
         .bind(&new_session_id)
         .bind(&did)
@@ -691,6 +705,7 @@ impl AccountManager {
         .bind(now.to_rfc3339())
         .bind(access_expires.to_rfc3339())
         .bind(&bound_ip)
+        .bind(&authenticated_at)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -704,6 +719,30 @@ impl AccountManager {
             expires_at: access_expires,
             app_password_name: None,
         })
+    }
+
+    /// The interactive-authentication time of a session, by session id — the
+    /// step-up freshness clock (Phase 4 · #442). Distinct from `created_at`,
+    /// which the sliding-refresh rotation resets; `authenticated_at` is stamped
+    /// at login and carried across refreshes. COALESCEs to `created_at` for
+    /// sessions that predate the column. Returns `None` when no such session row
+    /// exists (e.g. a synthetic/HS256 admin session id), which step-up callers
+    /// treat as "cannot verify freshness" and fail closed.
+    pub async fn session_authenticated_at(
+        &self,
+        session_id: &str,
+    ) -> PdsResult<Option<DateTime<Utc>>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT COALESCE(authenticated_at, created_at) FROM session WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        match row {
+            Some((ts,)) => Ok(Some(parse_timestamp(&ts)?)),
+            None => Ok(None),
+        }
     }
 
     /// Get account by DID
@@ -3906,6 +3945,68 @@ mod tests {
         // The not-found path still fail-closes through the helper.
         let missing = manager.refresh_session("no-such-token").await;
         assert!(matches!(missing, Err(PdsError::Authentication(_))));
+    }
+
+    /// Phase 4 (#442) wiring tripwire: `authenticated_at` is stamped at login and
+    /// PRESERVED across a refresh (not reset to the rotation time). This is what
+    /// makes the step-up freshness gate correct — a silent refresh must not count
+    /// as a fresh authentication.
+    #[tokio::test]
+    async fn authenticated_at_is_stamped_at_login_and_preserved_across_refresh() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "stepupuser".to_string(),
+                Some("stepup@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // Login stamps authenticated_at ≈ now.
+        let login_auth = manager
+            .session_authenticated_at(&session.id)
+            .await
+            .unwrap()
+            .expect("login session has authenticated_at");
+        assert!(
+            (Utc::now() - login_auth).num_seconds().abs() <= 5,
+            "authenticated_at should be ~now at login"
+        );
+
+        // Backdate it, then refresh: the new session must carry the SAME
+        // (backdated) authenticated_at, proving a refresh does not reset it.
+        let backdated = (Utc::now() - Duration::minutes(20)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&backdated)
+            .bind(&session.id)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        let refreshed = manager
+            .refresh_session(&session.refresh_token)
+            .await
+            .unwrap();
+        let refreshed_auth = manager
+            .session_authenticated_at(&refreshed.id)
+            .await
+            .unwrap()
+            .expect("refreshed session has authenticated_at");
+        assert!(
+            (Utc::now() - refreshed_auth).num_seconds() >= 19 * 60,
+            "refresh must preserve the original (backdated) authenticated_at, got {refreshed_auth}"
+        );
+
+        // An unknown session id resolves to None (step-up fails closed).
+        assert!(manager
+            .session_authenticated_at("no-such-session")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----

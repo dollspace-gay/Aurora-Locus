@@ -24,6 +24,12 @@ pub const MIN_SESSION_LIFETIME_SECS: i64 = 60;
 /// Maximum accepted session-lifetime override — 30 days.
 pub const MAX_SESSION_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// Step-up freshness window: a hardening endpoint requires the caller to have
+/// interactively authenticated within this many seconds. Measured from the
+/// session's `authenticated_at` (login time, preserved across refreshes), so a
+/// silent refresh does not satisfy it — only a real re-login does.
+pub const STEP_UP_MAX_AGE_SECS: i64 = 5 * 60;
+
 /// A DID's admin security settings. Callers treat a `None` from
 /// [`AdminSecurityStore::get_config`] as "all defaults"; this struct is only
 /// materialised for a DID that has a row.
@@ -82,14 +88,7 @@ impl AdminSecurityStore {
     /// creates the row (other settings at their defaults) if absent, otherwise
     /// updates just the lifetime + `updated_at`, preserving IP-binding/TOTP.
     pub async fn set_session_lifetime(&self, did: &str, secs: Option<i64>) -> PdsResult<()> {
-        if let Some(s) = secs {
-            if !(MIN_SESSION_LIFETIME_SECS..=MAX_SESSION_LIFETIME_SECS).contains(&s) {
-                return Err(PdsError::Validation(format!(
-                    "session lifetime must be between {MIN_SESSION_LIFETIME_SECS} and \
-                     {MAX_SESSION_LIFETIME_SECS} seconds"
-                )));
-            }
-        }
+        validate_session_lifetime(secs)?;
         let now = Utc::now().to_rfc3339();
 
         // UPDATE-then-INSERT-if-absent: avoids a dual-dialect ON CONFLICT and a
@@ -121,6 +120,60 @@ impl AdminSecurityStore {
         }
         Ok(())
     }
+
+    /// Transaction-aware [`set_session_lifetime`], so a mutating XRPC can write
+    /// the override and its audit-chain entry atomically (LB-1, chainlink #122):
+    /// a crash between the two leaves neither, not a config change without a
+    /// breadcrumb. Same UPDATE-then-INSERT upsert, on the caller's transaction.
+    pub async fn set_session_lifetime_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        secs: Option<i64>,
+    ) -> PdsResult<()> {
+        validate_session_lifetime(secs)?;
+        let now = Utc::now().to_rfc3339();
+
+        let updated = sqlx::query(
+            "UPDATE admin_security_config SET session_lifetime_secs = $1, updated_at = $2 WHERE did = $3",
+        )
+        .bind(secs)
+        .bind(&now)
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?
+        .rows_affected();
+
+        if updated == 0 {
+            sqlx::query(
+                "INSERT INTO admin_security_config (did, ip_binding_enabled, session_lifetime_secs, updated_at) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(did)
+            .bind(false)
+            .bind(secs)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await
+            .map_err(PdsError::Database)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate a session-lifetime override is within `[MIN, MAX]`. `None` (revert
+/// to the role default) is always valid. Callers surface a rejection as a
+/// client error (400), not a server fault.
+pub fn validate_session_lifetime(secs: Option<i64>) -> PdsResult<()> {
+    if let Some(s) = secs {
+        if !(MIN_SESSION_LIFETIME_SECS..=MAX_SESSION_LIFETIME_SECS).contains(&s) {
+            return Err(PdsError::Validation(format!(
+                "session lifetime must be between {MIN_SESSION_LIFETIME_SECS} and \
+                 {MAX_SESSION_LIFETIME_SECS} seconds"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Role-based session lifetime (both tokens, idle-timeout), before any
