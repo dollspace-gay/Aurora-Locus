@@ -185,7 +185,12 @@ impl FromRequestParts<AppContext> for AuthContextForwarded {
         if let Some(eid) = entryway_did_owned.as_deref() {
             allowlist.push(eid);
         }
-        let auth = ctx.verify_jwt_with_allowlist(&token, &allowlist).await?;
+        // #442: thread the client IP so a bound admin session is enforced on this
+        // forwarded path (getSession routes here), not fail-closed.
+        let current_ip = request_client_ip(&parts.headers, ctx);
+        let auth = ctx
+            .verify_jwt_with_allowlist(&token, &allowlist, current_ip)
+            .await?;
         Ok(Self {
             did: auth.did().to_string(),
         })
@@ -311,7 +316,7 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
 /// JWTs, gated by a four-case pre-check (§5.3.1) so non-ES256K
 /// tokens never trigger the resolver. The full layering is:
 ///
-/// 1. Local session (`account_manager.validate_access_token`).
+/// 1. Local session (`account_manager.validate_access_token_with_ip`).
 /// 2. HS256 admin JWT (`verify_jwt_token`, scope=admin).
 /// 3. ES256K pre-check (`pre_check_es256k`) — four explicit
 ///    fall-through cases, NO `?` propagation.
@@ -1214,6 +1219,7 @@ pub async fn verify_jwt_with_allowlist_impl(
     ctx: &AppContext,
     token: &str,
     audience_allowlist: &[&str],
+    current_ip: Option<std::net::IpAddr>,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1244,7 +1250,9 @@ pub async fn verify_jwt_with_allowlist_impl(
     let iss = decode_jwt_iss_only(parts[1]).unwrap_or(None);
 
     match (alg.as_str(), kid.as_deref()) {
-        ("HS256", Some("aurora-local-v1") | None) => route_local_verify(ctx, token).await,
+        ("HS256", Some("aurora-local-v1") | None) => {
+            route_local_verify(ctx, token, current_ip).await
+        }
         ("HS256", Some(unknown_kid)) => {
             tracing::warn!(
                 kid = %unknown_kid,
@@ -1311,14 +1319,22 @@ async fn route_opaque_oauth(
 async fn route_local_verify(
     ctx: &AppContext,
     token: &str,
+    current_ip: Option<std::net::IpAddr>,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
-    // IP binding (#442): this is the service-auth / forwarded-JWT dispatch, not
-    // the admin-UI path (AdminAuthContext threads the client IP). It has no
-    // request headers, so it validates without an IP — which is fail-closed for a
-    // bound session (rejected here, never slipped through), not a bypass. Admin
-    // sessions are enforced on their real path; a bound token routed here is
-    // simply refused.
-    match ctx.account_manager.validate_access_token(token).await {
+    // IP binding (#442): this local-session dispatch backs BOTH the non-forwarded
+    // (`require_auth_unified`) and forwarded (`require_auth_forwarded`,
+    // `AuthContextForwarded`) admin-facing auth paths — getSession routes here —
+    // so it must enforce IP binding against the real request IP. `current_ip` is
+    // threaded from the caller (via `verify_jwt_with_allowlist`); a request path
+    // that reaches here always supplies it, so a bound session is checked, not
+    // fail-closed, and an unbound one is unaffected. Only the internal `None`
+    // callers (service-to-service, which never carry a bound local session) pass
+    // no IP.
+    match ctx
+        .account_manager
+        .validate_access_token_with_ip(token, current_ip)
+        .await
+    {
         Ok(session) => {
             tracing::info!(
                 did = %session.did,

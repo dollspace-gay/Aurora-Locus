@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Admin IP binding could be bypassed two ways: (1) the standard `com.atproto.server.createSession` login endpoint minted sessions without binding them (unlike the admin OAuth and password-login paths), so an admin who opted into IP binding but authenticated there received an unbound session; and (2) the shared JWT-verify path behind `getSession` and the other forwarded/non-forwarded auth routes validated tokens without the request's client IP, so it neither enforced binding against the real IP nor accepted a genuinely-bound session (it fail-closed one). The client IP is now threaded through the shared verify path, and `createSession` binds the session it mints like the other login paths do
 - `install.sh` is now marked executable in git; the tracked file mode was non-executable, so a fresh clone could not `./install.sh` without a manual `chmod +x` first (the shebang was already `#!/usr/bin/env bash`)
 
 ## [0.9.0] - 2026-06-28

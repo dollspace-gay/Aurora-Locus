@@ -1501,8 +1501,10 @@ impl AppContext {
         &self,
         token: &str,
         audience_allowlist: &[&str],
+        current_ip: Option<std::net::IpAddr>,
     ) -> PdsResult<crate::api::middleware::UnifiedAuthContext> {
-        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist).await
+        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist, current_ip)
+            .await
     }
 
     /// Arc 12 §5.4 Step 2.1 — build the `Authorization: Bearer <jwt>`

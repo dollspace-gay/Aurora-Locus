@@ -336,17 +336,18 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> PdsResult<Json<SessionResponse>> {
+    // #442: resolve the client IP once — reused for identifier+IP rate limiting
+    // and, after the session is minted, IP-binding enforcement.
+    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+
     // Identifier+IP rate limiting for login attempts (30 per 5min per identifier+IP)
     // Prevents brute-force attacks on specific accounts from specific IPs
-    if let Some(client_ip) =
-        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
-    {
+    if let Some(ip) = client_ip {
         tracing::debug!(
             "create_session: Checking identifier+IP rate limit for {}",
             req.identifier
         );
-        ctx.rate_limiter
-            .check_identifier_ip(&req.identifier, &client_ip)?;
+        ctx.rate_limiter.check_identifier_ip(&req.identifier, &ip)?;
     }
 
     // Try regular password authentication first. If that returns a
@@ -380,6 +381,37 @@ async fn create_session(
                 .map(|(account, session, _name)| (account, session))?
         }
     };
+
+    // #442: IP binding must hold no matter which endpoint mints the session. The
+    // admin OAuth callback and the password-login handler both bind; this standard
+    // `com.atproto.server.createSession` path did not, leaving a bypass — an admin
+    // who enabled binding but authenticated here (e.g. a direct XRPC call) got an
+    // unbound session. Bind the just-minted session to the login IP when the
+    // account opted in. Non-admins have no security config → no-op. Fail-closed: a
+    // bind-write failure revokes the session rather than releasing it unbound.
+    if ctx
+        .admin_security_store
+        .get_config(&account.did)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        if let Some(ip) = client_ip {
+            if let Err(e) = ctx
+                .account_manager
+                .bind_session_ip(&session.id, &ip.to_string())
+                .await
+            {
+                tracing::error!(did = %account.did, "failed to bind session IP: {}", e);
+                let _ = ctx.account_manager.delete_session(&session.id).await;
+                return Err(e);
+            }
+        }
+        // No resolvable client IP (e.g. trust_proxy off): binding degrades to a
+        // no-op by design, matching the password-login handler.
+    }
 
     Ok(Json(SessionResponse {
         did: account.did,
@@ -2062,5 +2094,124 @@ mod describe_server_federation_tests {
         assert_eq!(v["enabled"], true);
         assert_eq!(v["firehoseEnabled"], true);
         assert_eq!(v["crawlEnabled"], false);
+    }
+}
+
+#[cfg(test)]
+mod create_session_ip_binding_tests {
+    use super::*;
+    use crate::api::federation_peers::test_support::create_test_context_with;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::Json;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    async fn seed_password_account(ctx: &AppContext, did: &str, handle: &str, password: &str) {
+        let hash = crate::auth::PasswordHasher::hash(password).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after) \
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES (?1, ?2, ?3, NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("acct@example.test"))
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    // #442 Gate 1 regression: the standard `com.atproto.server.createSession` login
+    // endpoint bypassed IP binding — an admin who opted in but authenticated here
+    // (e.g. a direct XRPC call rather than the admin OAuth/password-login flow) got
+    // an UNBOUND session. It must now bind the minted session to the login IP.
+    #[tokio::test]
+    async fn create_session_binds_to_client_ip_when_enabled() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:createsessbind0000000000";
+        seed_password_account(&ctx, did, "createbind.localhost", "pw-correct").await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.44".parse().unwrap());
+        let resp = create_session(
+            State(ctx.clone()),
+            headers,
+            Json(CreateSessionRequest {
+                identifier: "createbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+            }),
+        )
+        .await
+        .expect("login succeeds and binds");
+        let token = resp.0.access_jwt.clone();
+
+        // Usable only from the bound (X-Forwarded-For) IP.
+        let bound = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(bound))
+            .await
+            .is_ok());
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(other))
+            .await
+            .is_err());
+    }
+
+    // No regression for a normal (non-binding) account: createSession still mints
+    // an unbound session usable from any IP.
+    #[tokio::test]
+    async fn create_session_leaves_non_binding_account_unbound() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:createsessunbound00000000";
+        seed_password_account(&ctx, did, "createunbound.localhost", "pw-correct").await;
+        // No admin_security_config row → binding off.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.45".parse().unwrap());
+        let resp = create_session(
+            State(ctx.clone()),
+            headers,
+            Json(CreateSessionRequest {
+                identifier: "createunbound.localhost".to_string(),
+                password: "pw-correct".to_string(),
+            }),
+        )
+        .await
+        .expect("login succeeds");
+        let token = resp.0.access_jwt.clone();
+        // Usable from an unrelated IP and with no IP — unbound.
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))))
+            .await
+            .is_ok());
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, None)
+            .await
+            .is_ok());
     }
 }

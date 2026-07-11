@@ -334,7 +334,10 @@ pub async fn require_auth_unified(
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
     let service_did = ctx.service_did().to_string();
-    ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()])
+    // #442: thread the client IP so a bound admin session is enforced (or, for an
+    // unbound session, unaffected) on this non-forwarded path.
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()], current_ip)
         .await
 }
 
@@ -360,7 +363,12 @@ pub async fn require_auth_forwarded(
     if let Some(eid) = entryway_did.as_deref() {
         allowlist.push(eid);
     }
-    ctx.verify_jwt_with_allowlist(&token, &allowlist).await
+    // #442: thread the client IP so getSession (and the other forwarded mint-
+    // pattern handlers) enforce a bound admin session against the real request IP
+    // instead of fail-closing it.
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    ctx.verify_jwt_with_allowlist(&token, &allowlist, current_ip)
+        .await
 }
 
 /// Moderation enforcement middleware

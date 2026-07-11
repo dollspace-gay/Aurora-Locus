@@ -432,10 +432,14 @@ impl AccountManager {
         })
     }
 
-    /// Validate access token and return session info. IP-binding-agnostic: use
-    /// this for internal/non-request contexts. Request-auth paths call
-    /// [`AccountManager::validate_access_token_with_ip`] so a bound admin session
-    /// is enforced against the request's client IP.
+    /// Validate access token and return session info. IP-binding-agnostic
+    /// convenience wrapper for tests; every runtime request-auth path (including
+    /// the forwarded/local-verify dispatch) calls
+    /// [`AccountManager::validate_access_token_with_ip`] with the request's client
+    /// IP so a bound admin session is enforced. Test-only: gating it on
+    /// `cfg(test)` keeps the bin build (which has no non-test caller) free of the
+    /// lib/bin dead-code warning.
+    #[cfg(test)]
     pub async fn validate_access_token(
         &self,
         token: &str,

@@ -393,8 +393,8 @@ struct AdminLoginResponse {
 /// deactivation/takedown checks) then a v0.10 local-account admin-role gate —
 /// and returns `account_manager.create_session` tokens as JSON. The admin UI
 /// stores them in localStorage and sends `Authorization: Bearer`, validated by
-/// the same `route_local_verify` → `validate_access_token` path as every other
-/// admin request.
+/// the same `route_local_verify` → `validate_access_token_with_ip` path as every
+/// other admin request.
 ///
 /// No cookie is set and no CSRF token is required: the response carries the
 /// Bearer token in the JSON body (not an ambient cookie credential), so this
@@ -694,7 +694,7 @@ struct OAuthLoginResponse {
 /// are restricted to LOCAL accounts — DIDs with a row in this PDS's `account`
 /// table. Returns `(access_token, refresh_token, role)` from a real account
 /// session, i.e. the tokens `route_local_verify` (`account_manager
-/// ::validate_access_token`) accepts on every subsequent request.
+/// ::validate_access_token_with_ip`) accepts on every subsequent request.
 ///
 /// Two rejections, both 403, in this order:
 ///  1. **Non-local DID** — the DID authenticated as a valid ATProto identity
@@ -1785,6 +1785,109 @@ mod tests {
             .validate_access_token_with_ip(&token, Some(other))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_verify_path_enforces_ip_binding() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // #442 Gate 1 regression: getSession — and every `verify_jwt_with_allowlist`
+        // caller (`require_auth_unified` / `require_auth_forwarded` /
+        // `AuthContextForwarded`) — routes a local session token through
+        // `route_local_verify`. Before the fix that path validated with NO client
+        // IP, so it both failed to enforce binding against the real IP AND
+        // fail-closed a genuinely-bound session. It must now enforce: a bound
+        // session is usable only from its bound IP.
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:fwdverifyipbind0000000000";
+        seed_password_admin(&ctx, did, "fwdbind.localhost", "pw-correct", Some(Role::Admin)).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        let login_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(login_ip),
+            Json(AdminLoginRequest {
+                identifier: "fwdbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login binds");
+        let token = resp.0.access_token;
+
+        let service_did = ctx.service_did().to_string();
+        let allow = [service_did.as_str()];
+
+        // Accepted from the bound IP.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(login_ip))
+            .await
+            .is_ok());
+        // Rejected from another IP — enforcement, not a bypass.
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(other))
+            .await
+            .is_err());
+        // Rejected when no IP is threaded — fail-closed guard so this path can
+        // never silently drop binding again.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_verify_path_unaffected_for_unbound_session() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // The common case: an UNBOUND session must stay usable on the verify path
+        // regardless of request IP — threading the IP must not break normal auth.
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:fwdverifyunbound000000000";
+        seed_password_admin(
+            &ctx,
+            did,
+            "fwdunbound.localhost",
+            "pw-correct",
+            Some(Role::Admin),
+        )
+        .await;
+        // No admin_security_config row → binding off → unbound session.
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            Json(AdminLoginRequest {
+                identifier: "fwdunbound.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login succeeds");
+        let token = resp.0.access_token;
+
+        let service_did = ctx.service_did().to_string();
+        let allow = [service_did.as_str()];
+        // Accepted from an unrelated IP and with no IP.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))))
+            .await
+            .is_ok());
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, None)
+            .await
+            .is_ok());
     }
 
     // Phase 4 (#442): admin session hardening — the security-config store + the
