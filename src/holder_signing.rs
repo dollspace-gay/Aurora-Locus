@@ -1,10 +1,18 @@
 //! Holder-mediated signing channel (v0.10 Arc 2 Phase δ / LOCKED §5).
 //!
-//! did:web accounts publish a public key but the substrate never holds the
-//! private key (pre-decision 1). Any operation that must sign *as the holder*
-//! — repo commits (Phase γ) and the getServiceAuth / entryway-auth JWTs
-//! (Phase δ) — therefore cannot sign in-process; it must reach out to wherever
-//! the holder's `#atproto` key lives and get a signature back.
+//! v0.10 status (chainlink #448): did:web accounts hold their `#atproto` signing
+//! key ON THE PDS, identical to did:plc — so getServiceAuth / entryway-auth /
+//! repo commits sign in-process, and this channel is the FALLBACK consulted only
+//! when an account has no PDS-held key. In v0.10 no such account is reachable
+//! (there is no did:web creation route), so the default channel below returns an
+//! honest "not yet wired" 4xx if it is ever hit.
+//!
+//! v0.11 (Phase γ / did:web sovereignty, chainlink #447): a *sovereign* did:web
+//! account publishes a public key the substrate does not hold. Any operation
+//! that must sign *as the holder* then cannot sign in-process; it must reach out
+//! over this channel to wherever the holder's `#atproto` key lives — replacing
+//! the placeholder below with a real channel consuming the (pending) async
+//! signer trait.
 //!
 //! [`HolderSigningChannel`] is that seam. Phase δ ships the seam, its two
 //! JWT-signing dispatch sites (getServiceAuth + entryway-auth), and
@@ -25,8 +33,10 @@ use axum::async_trait;
 use crate::error::PdsError;
 
 /// Delegates cryptographic signing to the account holder rather than the
-/// substrate. Every signature originates from the holder; the substrate never
-/// holds the `#atproto` private key (pre-decision 1).
+/// substrate — the v0.11 sovereignty path, where the substrate does not hold the
+/// `#atproto` private key. In v0.10 did:web accounts hold their key on the PDS
+/// (parity with did:plc), so this seam is the fallback for keyless accounts;
+/// the real channel lands in v0.11 (Phase γ, chainlink #447 / #448).
 ///
 /// [`sign_service_auth`](HolderSigningChannel::sign_service_auth) returns the
 /// **64-byte compact `R‖S` ES256K signature** — the shape `RepoSigner::sign`

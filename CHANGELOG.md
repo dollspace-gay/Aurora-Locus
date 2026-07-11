@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- did:web signing substrate — a did:web account whose atproto key the PDS holds signs repo commits, getServiceAuth, and entryway-auth JWTs in-process, identically to did:plc; app passwords are available on the same terms. Signing routes by key presence (PDS-held key → in-process; keyless → the holder channel). The did:web account-creation route lands in v0.11 alongside did:web sovereignty (holder-mediated signing) via Phase γ
 - `test/install-sh-smoke/` — containerized preflight smoke for `install.sh` on Rocky Linux, AlmaLinux, and Arch, asserting each distro takes the correct package-manager branch (`dnf` for Rocky/Alma, `pacman` for Arch) and installs a working C toolchain. Run with `test/install-sh-smoke/run-smoke.sh`
 
 ### Changed

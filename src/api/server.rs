@@ -1252,37 +1252,50 @@ async fn get_service_auth(
     // one layer up. Same key surface used by genesis-commit signing
     // (Arc 15, api/account_emit.rs::create_account_emit_sequence)
     // and Arc 18's record-write fix.
-    // Generate the service-auth JWT. did:plc signs in-process with the
-    // per-account key; did:web mediates the signature through the holder
-    // channel (Arc 2 Phase δ, LOCKED §5, SD-A4 (a)).
-    let token = if crate::identity::did_method::is_web(&auth.did) {
-        mint_service_jwt_via_holder(
-            ctx.holder_signing_channel.as_ref(),
-            &auth.did,
-            &req.aud,
-            exp_duration,
-            req.lxm.as_deref(),
-        )
-        .await?
-    } else {
-        let signing_key_bytes = ctx
-            .account_manager
-            .get_atproto_signing_key_bytes(&auth.did)
-            .await?;
-
-        if signing_key_bytes.len() != 32 {
-            return Err(PdsError::Internal(
-                "Signing key must be exactly 32 bytes".to_string(),
-            ));
+    // Generate the service-auth JWT. Routing is KEY-PRESENCE-based (#448): when
+    // the PDS holds the account's per-account key it signs in-process — did:plc
+    // and, as of v0.10, did:web accounts with a PDS-held key (parity). When no
+    // key is stored — a sovereign did:web whose holder keeps the private key —
+    // the signature is mediated through the holder channel (v0.11 / Phase γ; the
+    // default `UnavailableHolderSigningChannel` returns a clean "not yet wired"
+    // 4xx today). See chainlink #447 (async signer) / #448 (this parity work).
+    let token = match ctx
+        .account_manager
+        .get_atproto_signing_key_bytes(&auth.did)
+        .await
+    {
+        Ok(signing_key_bytes) => {
+            if signing_key_bytes.len() != 32 {
+                return Err(PdsError::Internal(
+                    "Signing key must be exactly 32 bytes".to_string(),
+                ));
+            }
+            service_auth::create_service_jwt(
+                &auth.did,          // Issuer DID (authenticated user)
+                &req.aud,           // Audience DID (target service)
+                exp_duration,       // Expiration duration in seconds
+                req.lxm.as_deref(), // Optional lexicon method
+                &signing_key_bytes, // Per-account signing key (chainlink #143)
+            )?
         }
-
-        service_auth::create_service_jwt(
-            &auth.did,          // Issuer DID (authenticated user)
-            &req.aud,           // Audience DID (target service)
-            exp_duration,       // Expiration duration in seconds
-            req.lxm.as_deref(), // Optional lexicon method
-            &signing_key_bytes, // Per-account signing key (chainlink #143)
-        )?
+        Err(PdsError::NotFound(nf)) => {
+            // No PDS-held key. A did:web account is sovereign — mediate through
+            // the holder channel. Any other DID with no key is simply unknown;
+            // surface that as-is rather than misroute it to the holder path.
+            if crate::identity::did_method::is_web(&auth.did) {
+                mint_service_jwt_via_holder(
+                    ctx.holder_signing_channel.as_ref(),
+                    &auth.did,
+                    &req.aud,
+                    exp_duration,
+                    req.lxm.as_deref(),
+                )
+                .await?
+            } else {
+                return Err(PdsError::NotFound(nf));
+            }
+        }
+        Err(e) => return Err(e),
     };
 
     tracing::info!(
@@ -1296,20 +1309,21 @@ async fn get_service_auth(
     Ok(Json(GetServiceAuthResponse { token }))
 }
 
-/// The did:web branch of getServiceAuth minting (Arc 2 Phase δ, LOCKED §5,
-/// SD-A4 (a)). Structurally parallel to [`service_auth::create_service_jwt`]'s
-/// in-process signing, but the signature comes from the account holder over
-/// the [`crate::holder_signing::HolderSigningChannel`] — the substrate never
-/// holds the did:web `#atproto` key (pre-decision 1).
+/// The holder-mediated (keyless-account) branch of getServiceAuth minting.
+/// Reached only when the PDS holds no per-account key — a sovereign did:web
+/// account (v0.11 / Phase γ; chainlink #447 / #448). In v0.10 did:web accounts
+/// hold their key on the PDS, so this branch is not reached by any reachable
+/// account. Structurally parallel to [`service_auth::create_service_jwt`]'s
+/// in-process signing, but the signature comes from the account holder over the
+/// [`crate::holder_signing::HolderSigningChannel`].
 ///
 /// The header + claims + signing input are built by the SAME
-/// `service_auth::service_jwt_signing_input` the did:plc path uses, so the two
+/// `service_auth::service_jwt_signing_input` the in-process path uses, so the two
 /// emit an identical JWT format; the holder's 64-byte compact ES256K signature
 /// is re-encoded to DER for the JWT wire form (`verify_service_jwt` decodes
 /// DER). Until Phase γ installs the real channel, the default
 /// `UnavailableHolderSigningChannel` makes this return a clean 4xx
-/// (`HolderSigningError::ChannelNotAvailable` → `PdsError::Validation`) — the
-/// honest successor to the pre-δ "not yet supported for did:web" rejection.
+/// (`HolderSigningError::ChannelNotAvailable` → `PdsError::Validation`).
 async fn mint_service_jwt_via_holder(
     channel: &dyn crate::holder_signing::HolderSigningChannel,
     did: &str,

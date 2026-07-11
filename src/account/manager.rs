@@ -818,6 +818,7 @@ impl AccountManager {
         })
     }
 
+
     /// Generate a fresh per-account atproto signing keypair for rotation
     /// (key-rotation arc #372 / B1 §4.2.1 Path A). Pure: no DB, no PLC — side
     /// effects (PLC publish, `plc_keys` write, empty-commit) come in B3. Mirrors
@@ -2563,27 +2564,19 @@ impl AccountManager {
 
     /// Create an app password for third-party applications.
     ///
-    /// did:web accounts are not offered app passwords (Arc 2 Phase β.5, SD-A5 =
-    /// (b)). App passwords are a legacy did:plc credential; a did:web holder
-    /// authenticates to third-party apps through the atproto-OAuth provider
-    /// (login-α + the `/oauth/atproto/*` flow), never via a server-held
-    /// password. The substrate never holds the did:web signing key, so issuing
-    /// it a password-shaped credential would be a category error.
+    /// v0.10 (#448): available for did:web accounts on the same terms as did:plc.
+    /// The prior SD-A5=(b) rejection was justified by "the substrate never holds
+    /// the did:web signing key"; v0.10 did:web accounts hold their key on the PDS
+    /// (parity), so an app-password credential is no longer a category error.
+    /// v0.11 (Phase γ / did:web sovereignty) revisits this alongside
+    /// holder-mediated signing — a sovereign holder authenticates third-party
+    /// apps through the atproto-OAuth provider, not a server-held password.
     pub async fn create_app_password(
         &self,
         did: &str,
         name: &str,
         privileged: bool,
     ) -> PdsResult<String> {
-        // did:web accounts use OAuth, not app passwords (SD-A5 = (b)).
-        if crate::identity::did_method::is_web(did) {
-            return Err(PdsError::Validation(
-                "app passwords are not available for did:web accounts; \
-                 use the OAuth authorization flow instead"
-                    .to_string(),
-            ));
-        }
-
         // Validate name
         if name.is_empty() {
             return Err(PdsError::Validation(
@@ -4457,19 +4450,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_app_password_rejects_did_web() {
+    async fn create_app_password_works_for_did_web() {
         let manager = setup_test_db().await;
-        // did:web accounts are not offered app passwords (SD-A5 = (b)). The
-        // guard short-circuits before any DB lookup, so no account row is
-        // needed — a syntactic did:web is enough to trip it.
-        let err = manager
-            .create_app_password("did:web:alice.example.com", "Test App", false)
+        let did = "did:web:alice.example.com";
+        // v0.10 (#448): did:web accounts hold a PDS-held key (parity with
+        // did:plc), so the prior SD-A5=(b) app-password rejection is lifted.
+        // app_password FKs to actor(did), so seed the actor row.
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind("alice.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&manager.db)
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, PdsError::Validation(ref m) if m.contains("did:web")),
-            "expected a did:web Validation rejection, got {err:?}"
-        );
+            .expect("seed did:web actor");
+
+        let pw = manager
+            .create_app_password(did, "Test App", false)
+            .await
+            .expect("did:web app password now succeeds (v0.10 parity)");
+        assert_eq!(pw.len(), 39);
+        let list = manager.list_app_passwords(did).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Test App");
     }
 
     #[tokio::test]
@@ -5328,6 +5330,51 @@ mod tests {
              K256Keypair::from_private_key(plc_keys.atproto_signing_key for alice). \
              A mismatch means the helper is not reading the published per-account key."
         );
+    }
+
+    /// v0.10 did:web parity (#448): a did:web account holding a PDS-side key
+    /// resolves and signs through the SAME key-presence path as did:plc — the key
+    /// round-trips and `create_actor_signer` yields a working repo signer. The
+    /// key is seeded directly here; a did:web account-creation route (which would
+    /// provision the key) lands in v0.11 alongside sovereignty.
+    #[tokio::test]
+    async fn did_web_account_with_pds_held_key_signs_like_did_plc() {
+        let manager = setup_test_db().await;
+        let did = "did:web:alice.example.com";
+
+        // A did:web account with a PDS-held atproto key: seed the actor row, then
+        // a plc_keys row (last_operation_cid NULL — no PLC operation for did:web).
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind("alice.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&manager.db)
+            .await
+            .expect("seed did:web actor");
+        sqlx::query(
+            "INSERT INTO plc_keys (did, last_operation_cid, atproto_signing_key) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(did)
+        .bind(Option::<String>::None)
+        .bind("77".repeat(32))
+        .execute(&manager.db)
+        .await
+        .expect("seed did:web plc_keys");
+
+        // The key resolves via the same accessor the repo/service-auth paths use.
+        let key = manager
+            .get_atproto_signing_key_bytes(did)
+            .await
+            .expect("did:web key resolves like did:plc");
+        assert_eq!(key.len(), 32);
+
+        // And a repo signer signs in-process — commit-signing parity.
+        let signer = crate::api::repo::create_actor_signer(&manager, did)
+            .await
+            .expect("did:web repo signer");
+        let sig = signer.sign(b"did-web-parity-check").expect("did:web signs");
+        assert!(!sig.is_empty());
     }
 
     // ============================================================

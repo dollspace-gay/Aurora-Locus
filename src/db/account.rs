@@ -76,10 +76,12 @@ pub struct ActorAccount {
 /// v0.10 Arc 1 (#414) — a did:web account's public-key-only sovereign identity.
 ///
 /// Mirrors the `did_web_account` table (migration 0027 sqlite / 0028 postgres).
-/// `identity_public_key` is the holder's `#atproto` verification method
-/// (multibase / did:key); there is deliberately NO private-key field — the
-/// substrate never holds the did:web signing key (LOCKED design §4 / §6 Layer 2
-/// under SD-1 (A)). `slug` is the stable minted DID segment (AD-3) and the
+/// `identity_public_key` is the holder's identity/login verification method
+/// (multibase / did:key); this table deliberately has NO private-key field.
+/// v0.10 (chainlink #448): the account's atproto SIGNING key is held on the PDS
+/// in `plc_keys`, identical to did:plc (parity), so signing is in-process; v0.11
+/// (Phase γ / did:web sovereignty) moves signing to a holder-held key over the
+/// [`crate::holder_signing::HolderSigningChannel`]. `slug` is the stable minted DID segment (AD-3) and the
 /// serve-route reverse-lookup key. `created_at` is RFC3339 text, matching the
 /// column (not parsed to a `DateTime` — the serve path doesn't arithmetic on it).
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

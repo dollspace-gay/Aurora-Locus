@@ -57,47 +57,32 @@ pub const AURORA_LOCAL_KID: &str = "aurora-local-v1";
 /// Per §5.3.5: TTL is fixed at 60s, JWT is never cached, and the
 /// caller re-mints per forward.
 /// Read the per-account atproto signing key (hex) for an entryway-auth JWT —
-/// the **did:plc** path (v0.10 Arc 1 Phase A — R1 D-1 inline-SQL migration /
-/// R2 F-3). Reads `plc_keys.atproto_signing_key`.
-///
-/// As of Arc 2 Phase δ, `entryway_auth_headers` guards `is_web` and routes
-/// did:web through the holder signing channel *before* calling this accessor,
-/// so the callable path here is did:plc only. The `DidMethod::Web` arm is
-/// retained as a defensive reject for any direct/future caller (a public-key-
-/// only did:web account has no substrate-held key — holder-mediation, not an
-/// in-process read, is the answer). A malformed DID is rejected rather than
-/// read as an empty key.
+/// the PDS-held-key path. Reads `plc_keys.atproto_signing_key`, method-agnostic
+/// (#448): did:plc and, as of v0.10, did:web accounts whose key the PDS holds
+/// both resolve here. A missing row → `PdsError::NotFound`, which the caller
+/// treats as "sovereign did:web, sign via the holder channel." A malformed DID
+/// is rejected rather than read as an empty key.
 async fn entryway_signing_key_hex(db: &AnyPool, user_did: &str) -> PdsResult<String> {
-    use crate::identity::did_method::{parse_did, DidMethod};
-    match parse_did(user_did).map(|p| p.method()) {
-        Ok(DidMethod::Plc) => {
-            let row: Option<(String,)> =
-                sqlx::query_as("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
-                    .bind(user_did)
-                    .fetch_optional(db)
-                    .await
-                    .map_err(PdsError::Database)?;
-            match row {
-                Some((key,)) if !key.is_empty() => Ok(key),
-                Some(_) => Err(PdsError::Authentication(format!(
-                    "KeyNotFound: plc_keys.atproto_signing_key is empty for {} \
-                     (legacy row pending Arc 13 v4.1 §6.3.2 forward-population)",
-                    user_did
-                ))),
-                None => Err(PdsError::NotFound(format!(
-                    "UnknownAccount: no plc_keys row for {}",
-                    user_did
-                ))),
-            }
-        }
-        Ok(DidMethod::Web) => Err(PdsError::Validation(format!(
-            "entryway-auth JWT is not available for did:web account {}: the substrate \
-             holds no signing key (holder-mediated signing is forthcoming in Arc 2)",
+    use crate::identity::did_method::parse_did;
+    // Reject a malformed DID rather than reading an empty key for it.
+    parse_did(user_did)
+        .map_err(|e| PdsError::Validation(format!("unparseable DID {}: {}", user_did, e)))?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT atproto_signing_key FROM plc_keys WHERE did = $1")
+            .bind(user_did)
+            .fetch_optional(db)
+            .await
+            .map_err(PdsError::Database)?;
+    match row {
+        Some((key,)) if !key.is_empty() => Ok(key),
+        Some(_) => Err(PdsError::Authentication(format!(
+            "KeyNotFound: plc_keys.atproto_signing_key is empty for {} \
+             (legacy row pending Arc 13 v4.1 §6.3.2 forward-population)",
             user_did
         ))),
-        Err(e) => Err(PdsError::Validation(format!(
-            "unparseable DID {}: {}",
-            user_did, e
+        None => Err(PdsError::NotFound(format!(
+            "UnknownAccount: no plc_keys row for {}",
+            user_did
         ))),
     }
 }
@@ -132,32 +117,43 @@ pub async fn entryway_auth_headers(
     let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
     let signing_input = format!("{}.{}", header_b64, claims_b64);
 
-    // did:plc signs in-process with the per-account key; did:web mediates the
-    // signature through the holder channel — the substrate holds no did:web
-    // signing key (Arc 2 Phase δ, LOCKED §5, SD-A4 (a): entryway-auth rides the
-    // same holder channel as getServiceAuth + commits). The holder returns a
-    // 64-byte compact ES256K signature; re-encode to DER for the JWT wire form.
-    let sig_der: Vec<u8> = if crate::identity::did_method::is_web(user_did) {
-        let compact = channel
-            .sign_service_auth(user_did, signing_input.as_bytes())
-            .await?;
-        crate::service_auth::compact_es256k_to_der(&compact)?
-    } else {
-        let signing_key_hex = entryway_signing_key_hex(db, user_did).await?;
-        let key_bytes = hex::decode(&signing_key_hex).map_err(|e| {
-            PdsError::Internal(format!(
-                "plc_keys.atproto_signing_key for {} is not valid hex: {}",
-                user_did, e
-            ))
-        })?;
-        let signing_key = SigningKey::from_slice(&key_bytes).map_err(|e| {
-            PdsError::Internal(format!(
-                "plc_keys.atproto_signing_key for {} is not a valid k256 private key: {}",
-                user_did, e
-            ))
-        })?;
-        let signature: Signature = signing_key.sign(signing_input.as_bytes());
-        signature.to_der().as_bytes().to_vec()
+    // KEY-PRESENCE routing (#448): when the PDS holds the per-account key it
+    // signs in-process — did:plc and, as of v0.10, did:web accounts with a
+    // PDS-held key (parity). A sovereign did:web with no stored key
+    // (`NotFound`) mediates the signature through the holder channel (v0.11 /
+    // Phase γ; the default channel returns a clean 4xx today). The holder
+    // returns a 64-byte compact ES256K signature; re-encode to DER for the wire.
+    let sig_der: Vec<u8> = match entryway_signing_key_hex(db, user_did).await {
+        Ok(signing_key_hex) => {
+            let key_bytes = hex::decode(&signing_key_hex).map_err(|e| {
+                PdsError::Internal(format!(
+                    "plc_keys.atproto_signing_key for {} is not valid hex: {}",
+                    user_did, e
+                ))
+            })?;
+            let signing_key = SigningKey::from_slice(&key_bytes).map_err(|e| {
+                PdsError::Internal(format!(
+                    "plc_keys.atproto_signing_key for {} is not a valid k256 private key: {}",
+                    user_did, e
+                ))
+            })?;
+            let signature: Signature = signing_key.sign(signing_input.as_bytes());
+            signature.to_der().as_bytes().to_vec()
+        }
+        Err(PdsError::NotFound(nf)) => {
+            // No PDS-held key. A did:web account is sovereign — mediate through
+            // the holder channel. Any other DID with no key is simply unknown;
+            // surface the NotFound rather than misroute it to the holder path.
+            if crate::identity::did_method::is_web(user_did) {
+                let compact = channel
+                    .sign_service_auth(user_did, signing_input.as_bytes())
+                    .await?;
+                crate::service_auth::compact_es256k_to_der(&compact)?
+            } else {
+                return Err(PdsError::NotFound(nf));
+            }
+        }
+        Err(e) => return Err(e),
     };
 
     let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_der);
@@ -390,6 +386,36 @@ mod tests {
     }
 
     // ---------- did:web holder-mediation (Arc 2 Phase δ, LOCKED §5) ----------
+
+    #[tokio::test]
+    async fn entryway_auth_did_web_with_pds_held_key_signs_in_process() {
+        // v0.10 parity (#448): a did:web account whose key the PDS holds signs
+        // the entryway-auth JWT in-process, exactly like did:plc. The holder
+        // channel is NOT consulted — ch() is Unavailable, so had this routed
+        // through it the mint would have failed with a 4xx.
+        let db = fresh_db().await;
+        let user_did = "did:web:aurora.localhost";
+        seed_plc_keys(&db, user_did, &"66".repeat(32), &"77".repeat(32)).await;
+
+        let headers =
+            entryway_auth_headers(&db, &ch(), user_did, "did:web:entryway.test", "com.atproto.server.getSession")
+                .await
+                .expect("did:web with a PDS-held key signs in-process");
+        let auth = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .expect("auth header present")
+            .to_str()
+            .unwrap();
+        assert!(auth.starts_with("Bearer "));
+        let jwt = auth.trim_start_matches("Bearer ");
+        assert_eq!(jwt.split('.').count(), 3, "JWT must be 3 segments");
+        // Header carries the local kid — the in-process signer, not a holder sig.
+        let header_bytes =
+            URL_SAFE_NO_PAD.decode(jwt.split('.').next().unwrap()).expect("header b64");
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("header json");
+        assert_eq!(header_json["kid"], AURORA_LOCAL_KID);
+    }
 
     #[tokio::test]
     async fn entryway_auth_did_web_unavailable_channel_is_client_error() {
