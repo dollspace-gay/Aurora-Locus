@@ -488,8 +488,20 @@ impl AccountManager {
         // (including `current_ip == None` in a request path) is rejected. The
         // error mirrors the invalid-token message so a mismatch isn't an oracle.
         if let Some(bound) = bound_ip {
-            let matches = current_ip.map(|ip| ip.to_string()) == Some(bound);
-            if !matches {
+            let current_str = current_ip.map(|ip| ip.to_string());
+            if current_str.as_deref() != Some(bound.as_str()) {
+                // #442 diagnostic: a bound session is rejected because the request
+                // IP doesn't match the IP stamped at login. Behind a CDN/reverse
+                // proxy these can legitimately differ (edge-node variance /
+                // XFF-chain position) — the reason enablement is gated off until
+                // v0.11. Logged at debug so the per-request enforcement work can
+                // compare the two resolutions; the client sees only the generic
+                // message above (no IP-mismatch oracle).
+                tracing::debug!(
+                    bound_ip = %bound,
+                    current_ip = ?current_str,
+                    "ip_binding_rejected: bound IP != request IP (#442)"
+                );
                 return Err(PdsError::Authentication(
                     "Invalid or expired session".to_string(),
                 ));

@@ -2040,12 +2040,25 @@ async fn set_ip_binding(
 ) -> Result<Json<SetIpBindingOutput>, (StatusCode, Json<serde_json::Value>)> {
     require_step_up(&ctx, &auth).await?;
 
-    if req.enabled && !ctx.rate_limiter.trust_proxy {
+    // #442: IP-binding ENFORCEMENT is deferred to v0.11 — the enable path is gated
+    // off to prevent operator lockout. Live testing behind a CDN/reverse proxy
+    // showed the client IP resolved at login can differ from the IP resolved on
+    // later requests (proxy edge-node variance / XFF-chain position), so a bound
+    // session rejects the operator's own legitimate requests and locks them out.
+    // The bind-at-login + enforcement substrate ships in v0.10, but reliable
+    // enablement needs a single per-request enforcement layer with a stable
+    // client-IP resolution, which lands in v0.11. Disabling is always allowed so an
+    // operator who enabled binding out-of-band (e.g. directly in the DB) can
+    // recover. See chainlink #442.
+    if req.enabled {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
-            "TrustProxyRequired",
-            "IP binding requires a trusted reverse proxy: set PDS_TRUST_PROXY=true. \
-             Without it the client IP can't be determined and binding is a no-op.",
+            "IpBindingDeferred",
+            "IP binding enforcement is deferred to v0.11: behind a reverse proxy or \
+             CDN the resolved client IP can vary between login and later requests, \
+             which rejects legitimate sessions and locks operators out. Enabling is \
+             disabled to prevent lockout; disabling remains available. Tracking: \
+             chainlink #442.",
         ));
     }
 
@@ -10914,9 +10927,13 @@ mod tests {
     }
 
     // Phase 4 (#442): self-service admin session IP binding — setIpBinding.
+    // ENFORCEMENT deferred to v0.11: the enable path is gated off to prevent
+    // operator lockout (live CDN testing showed the resolved client IP can vary
+    // between login and later requests). Disabling stays available for recovery.
     #[tokio::test]
-    async fn set_ip_binding_refuses_enable_without_trust_proxy() {
-        // Default context has trust_proxy off → enabling is a no-op → refused.
+    async fn set_ip_binding_enable_gated_off_pending_v11() {
+        // trust_proxy OFF: enable is refused (deferral gate, not the old
+        // trust-proxy gate) and no row is written; disable is still allowed.
         let ctx = create_test_context().await;
         let did = "did:plc:ipbindoff";
         let sid = seed_admin_with_session(&ctx, did, "ipbindoff.localhost").await;
@@ -10928,15 +10945,14 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1 .0["error"], "TrustProxyRequired");
-        // No row written.
+        assert_eq!(err.1 .0["error"], "IpBindingDeferred");
         assert!(ctx
             .admin_security_store
             .get_config(did)
             .await
             .unwrap()
             .is_none());
-        // Disabling is allowed even with trust_proxy off (turning a control off).
+        // Disabling is allowed (recovery path for an out-of-band enable).
         let out = set_ip_binding(
             State(ctx),
             admin_auth(did, &sid, Role::Admin),
@@ -10949,27 +10965,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_ip_binding_enables_with_trust_proxy() {
+    async fn set_ip_binding_enable_refused_even_with_trust_proxy() {
+        // trust_proxy ON no longer permits enabling — the deferral gate is
+        // unconditional in v0.10, so no bound session can be created via the API.
         let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
         let did = "did:plc:ipbindon";
         let sid = seed_admin_with_session(&ctx, did, "ipbindon.localhost").await;
-        let out = set_ip_binding(
+        let err = set_ip_binding(
             State(ctx.clone()),
             admin_auth(did, &sid, Role::Admin),
             Json(SetIpBindingRequest { enabled: true }),
         )
         .await
-        .expect("enable")
-        .0;
-        assert!(out.enabled);
-        assert!(
-            ctx.admin_security_store
-                .get_config(did)
-                .await
-                .unwrap()
-                .unwrap()
-                .ip_binding_enabled
-        );
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "IpBindingDeferred");
+        // No row written → no session will be bound at login.
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
