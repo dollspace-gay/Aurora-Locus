@@ -1554,6 +1554,7 @@ mod admin_auth_third_path_tests {
                 jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),

@@ -83,15 +83,29 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         .ok()
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    // Password login is a fallback, OFF by default (#442). When disabled, the
+    // fallback page 302-redirects to the OAuth login landing rather than
+    // rendering. Read once here from the cached config (a Copy bool captured into
+    // the per-request closure), so it is not re-read per request.
+    let password_login_enabled = ctx.config.authentication.password_login_enabled;
     let admin_static = Router::new()
         .nest_service("/admin", ServeDir::new("static/admin"))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
-            // Capture into the async closure by value — bool is Copy
+            // Capture into the async closure by value — bools are Copy
             // so this is a zero-cost copy per request.
-            let enabled = debug_pages_enabled;
+            let debug_enabled = debug_pages_enabled;
+            let pw_login = password_login_enabled;
             async move {
-                if !enabled && req.uri().path() == "/admin/debug.html" {
+                let path = req.uri().path();
+                if !debug_enabled && path == "/admin/debug.html" {
                     return (StatusCode::NOT_FOUND, "Not found").into_response();
+                }
+                if !pw_login && path == "/admin/password-login.html" {
+                    return (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/admin/")],
+                    )
+                        .into_response();
                 }
                 no_store(next.run(req).await)
             }

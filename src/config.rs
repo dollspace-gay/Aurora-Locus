@@ -1034,6 +1034,14 @@ pub struct AuthConfig {
     /// URL to OAuth migration guide for developers
     #[serde(default = "default_migration_guide_url")]
     pub oauth_migration_guide_url: String,
+    /// Password-login fallback toggle (#442). When `false` (the default), the
+    /// `/admin-oauth/password-login` endpoint and the `/admin/password-login.html`
+    /// page both 302-redirect to `/admin/` — OAuth is the default admin auth and
+    /// password login is off unless an operator opts in per-deployment. A
+    /// boot-time env decision (`PDS_ADMIN_PASSWORD_LOGIN_ENABLED=true`), cached
+    /// here at startup; not a runtime toggle.
+    #[serde(default)]
+    pub password_login_enabled: bool,
 }
 
 fn default_jwt_sunset_date() -> String {
@@ -1717,6 +1725,20 @@ impl ServerConfig {
         let oauth_pds_url =
             env::var("PDS_OAUTH_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
 
+        // Password-login fallback toggle (#442): OAuth is the default admin auth;
+        // password login is off unless the operator opts in per-deployment. Read
+        // once here and cached in the config; the value is logged at boot for
+        // observability.
+        let password_login_enabled = env::var("PDS_ADMIN_PASSWORD_LOGIN_ENABLED")
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+            .unwrap_or(false);
+        if password_login_enabled {
+            tracing::info!("Password login: ENABLED via PDS_ADMIN_PASSWORD_LOGIN_ENABLED=true");
+        } else {
+            tracing::info!("Password login: DISABLED (default)");
+        }
+
         let did_plc_url =
             env::var("PDS_DID_PLC_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let service_handle_domains = env::var("PDS_SERVICE_HANDLE_DOMAINS")
@@ -2001,6 +2023,7 @@ impl ServerConfig {
                     .unwrap_or_else(|_| default_jwt_sunset_date()),
                 oauth_migration_guide_url: env::var("PDS_OAUTH_MIGRATION_GUIDE_URL")
                     .unwrap_or_else(|_| default_migration_guide_url()),
+                password_login_enabled,
             },
             identity: IdentityConfig {
                 did_plc_url,

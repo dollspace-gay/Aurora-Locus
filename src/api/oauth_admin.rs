@@ -85,7 +85,7 @@ pub struct OAuthStateData {
 pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     let oauth_router = Router::new()
         .route("/admin-oauth/login", get(initiate_oauth))
-        .route("/admin-oauth/password-login", post(handle_password_login))
+        .route("/admin-oauth/password-login", post(password_login_gate))
         .route("/admin-oauth/callback", get(handle_oauth_callback))
         .route("/admin-oauth/refresh", post(handle_refresh))
         .layer(axum::Extension(state_store));
@@ -360,6 +360,30 @@ struct AdminLoginResponse {
 /// No cookie is set and no CSRF token is required: the response carries the
 /// Bearer token in the JSON body (not an ambient cookie credential), so this
 /// login is not a CSRF sink — the same posture as the OAuth callback.
+/// Toggle gate in front of [`handle_password_login`] (#442). Password login is a
+/// fallback, OFF by default; when disabled it 302-redirects to the OAuth login
+/// landing (`/admin/`) — the friendly UX for a stale bookmark / muscle memory —
+/// rather than exposing the credential endpoint. Enabled per-deployment via
+/// `PDS_ADMIN_PASSWORD_LOGIN_ENABLED` (cached in config at boot). Kept separate
+/// from the handler so the handler's own tests exercise the login logic directly.
+async fn password_login_gate(
+    State(ctx): State<AppContext>,
+    body: Json<AdminLoginRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if !ctx.config.authentication.password_login_enabled {
+        return (
+            StatusCode::FOUND,
+            [(axum::http::header::LOCATION, "/admin/")],
+        )
+            .into_response();
+    }
+    match handle_password_login(State(ctx), body).await {
+        Ok(json) => json.into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
 async fn handle_password_login(
     State(ctx): State<AppContext>,
     Json(req): Json<AdminLoginRequest>,
@@ -847,8 +871,9 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 mod tests {
     use super::{
         authorize_local_admin, generate_pkce, handle_oauth_callback, handle_password_login,
-        handle_refresh, initiate_oauth, mint_admin_access_jwt, AdminLoginRequest,
-        OAuthCallbackParams, OAuthInitParams, OAuthStateData, OAuthStateStore, RefreshRequest,
+        handle_refresh, initiate_oauth, mint_admin_access_jwt, password_login_gate,
+        AdminLoginRequest, OAuthCallbackParams, OAuthInitParams, OAuthStateData, OAuthStateStore,
+        RefreshRequest,
     };
     use crate::admin::roles::Role;
     use crate::config::*;
@@ -863,12 +888,15 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-key-aurora-admin-test-32xx";
 
     async fn create_test_context() -> AppContext {
-        build_test_context(None).await
+        build_test_context(None, true).await
     }
 
     /// As `create_test_context`, but with an explicit `service.public_url` — used
     /// by the loopback test to point the admin OAuth client at an in-process AS.
-    async fn build_test_context(public_url: Option<String>) -> AppContext {
+    async fn build_test_context(
+        public_url: Option<String>,
+        password_login_enabled: bool,
+    ) -> AppContext {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
         let config = ServerConfig {
@@ -909,6 +937,7 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
+                password_login_enabled,
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -1298,6 +1327,45 @@ mod tests {
         assert_eq!(err.1, "Invalid credentials");
     }
 
+    // #442: password login is a fallback, OFF by default. The gate 302s to
+    // /admin/ when disabled and delegates to the handler when enabled.
+
+    #[tokio::test]
+    async fn password_login_gate_redirects_to_admin_when_disabled() {
+        use axum::http::header;
+        let ctx = build_test_context(None, false).await;
+        let resp = password_login_gate(
+            State(ctx),
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "whatever".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+            "/admin/",
+            "disabled password login must 302 to the OAuth login landing, not expose the endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_login_gate_delegates_when_enabled() {
+        // Enabled: the gate passes through to the handler, which rejects an
+        // unknown identifier with 401 (not a 302) — proving delegation.
+        let ctx = build_test_context(None, true).await;
+        let resp = password_login_gate(
+            State(ctx),
+            Json(AdminLoginRequest {
+                identifier: "ghost.localhost".to_string(),
+                password: "whatever".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     // Fix 1 (#432): admin OAuth is constrained to local accounts.
 
     #[tokio::test]
@@ -1417,7 +1485,7 @@ mod tests {
         // A context whose public URL IS that in-process AS (Aurora talks to its
         // own AS); both the admin client and the AS handlers derive their URLs
         // from this, so their DPoP htu values line up.
-        let ctx = build_test_context(Some(as_url.clone())).await;
+        let ctx = build_test_context(Some(as_url.clone()), true).await;
 
         // Serve Aurora's real AS routes on the same ctx (shared account_db).
         let app = crate::oauth::atproto::routes().with_state(ctx.clone());
