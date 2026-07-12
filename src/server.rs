@@ -27,6 +27,29 @@ use tower_http::{
 };
 use tracing::info;
 
+/// Force `Cache-Control: no-store` on EVERY admin static response, regardless of
+/// content-type.
+///
+/// This closes a class, not one file. The admin surface is low-traffic and
+/// operator-only, so re-fetching a few KB per visit is negligible next to the
+/// failure mode it prevents: a browser or edge serving ANY stale admin asset
+/// after a fix has shipped — login.html (an old form missing `method="POST"` →
+/// credentials in the URL, #436), login.js (the submit handler never runs, so the
+/// form POSTs to login.html instead of the real endpoint → 405), client.js (auth
+/// broken), login.css (silent layout regression). `ServeDir` sets no
+/// `Cache-Control` and only `Last-Modified`/`ETag`, so without this admin assets
+/// cache by heuristic freshness and a shipped fix may never reach the client.
+/// Applied ONLY to the `static/admin` tree (see `admin_static`), so responses
+/// from outside it are unaffected; the small re-fetch cost is a deliberate
+/// tradeoff for an always-fresh admin surface.
+fn no_store(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
 /// Build the main application router.
 ///
 /// `api_router` is the pre-built `Router<AppContext>` returned by
@@ -70,7 +93,7 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
                 if !enabled && req.uri().path() == "/admin/debug.html" {
                     return (StatusCode::NOT_FOUND, "Not found").into_response();
                 }
-                next.run(req).await
+                no_store(next.run(req).await)
             }
         }));
 
@@ -302,6 +325,61 @@ mod shutdown_wiring_tests {
         assert!(
             res.is_ok(),
             "watchdog should complete within the drain deadline after a signal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_header_tests {
+    //! #436: EVERY admin static response is served `no-store` so a stale cached
+    //! asset — login.html, login.js, login.css, client.js — can't keep running
+    //! after a fix has shipped. `no_store` is applied ONLY to the `static/admin`
+    //! tree (see `build_router`'s `admin_static` layer), so responses from
+    //! outside it are unaffected — the layer's scope, not the helper, provides
+    //! that boundary.
+    use super::no_store;
+    use axum::http::{header, StatusCode};
+    use axum::response::{IntoResponse, Response};
+
+    fn resp_with_content_type(ct: &'static str) -> Response {
+        (StatusCode::OK, [(header::CONTENT_TYPE, ct)], "body").into_response()
+    }
+
+    #[test]
+    fn every_admin_asset_type_is_marked_no_store() {
+        // The whole class — HTML shells AND the JS/CSS/SVG/JSON that carry
+        // critical regressions — must be no-store, not just text/html.
+        for ct in [
+            "text/html; charset=utf-8",
+            "application/javascript",
+            "text/css",
+            "image/svg+xml",
+            "application/json",
+        ] {
+            let resp = no_store(resp_with_content_type(ct));
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{ct} must be served no-store"
+            );
+        }
+    }
+
+    #[test]
+    fn no_store_is_content_type_agnostic_and_overriding() {
+        // Guarantee must not depend on a content-type being present, and it
+        // overrides any Cache-Control ServeDir might set.
+        let mut resp = (StatusCode::OK, "body").into_response();
+        resp.headers_mut().remove(header::CONTENT_TYPE);
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("max-age=31536000"),
+        );
+        let resp = no_store(resp);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "no_store must override a pre-existing Cache-Control and not need a content-type"
         );
     }
 }

@@ -94,7 +94,7 @@ if (authError) {
 
 async function handleOAuthCallback(code, state) {
     try {
-        setLoading(true);
+        setLoading(true, 'oauth-login-btn');
 
         // The backend will exchange the code for tokens
         // The callback endpoint is already handling this
@@ -130,7 +130,7 @@ async function handleOAuthCallback(code, state) {
     } catch (error) {
         console.error('OAuth callback error:', error);
         showError(error.message || 'Authentication failed');
-        setLoading(false);
+        setLoading(false, 'oauth-login-btn');
 
         // Clear URL parameters on error
         window.history.replaceState({}, document.title, '/admin/login.html');
@@ -196,32 +196,35 @@ async function handlePasswordLogin(event) {
     }
 }
 
-async function handleLogin(event) {
+// OAuth admin sign-in. Reads the SAME identifier field as the password form
+// (admin logins are local-only per Fix 1, so one field serves both). This is a
+// type="button", so it never submits the form — preventDefault is defensive.
+async function handleOAuthLogin(event) {
     event.preventDefault();
 
-    const handle = document.getElementById('handle').value.trim();
+    const identifier = document.getElementById('admin-login-identifier').value.trim();
 
-    // Clear previous errors
     hideError();
 
-    // Show loading state
-    setLoading(true);
+    if (!identifier) {
+        showError('Enter your handle or DID to continue.');
+        return;
+    }
+
+    setLoading(true, 'oauth-login-btn');
 
     try {
-        // Build OAuth initiation URL
-        const oauthUrl = `/admin-oauth/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`;
-
-        // Redirect to OAuth flow
-        window.location.href = oauthUrl;
+        window.location.href = `/admin-oauth/login?handle=${encodeURIComponent(identifier)}`;
     } catch (error) {
         console.error('OAuth initiation error:', error);
-        showError(error.message || 'Failed to start OAuth flow');
-        setLoading(false);
+        showError('Failed to start OAuth flow');
+        setLoading(false, 'oauth-login-btn');
     }
 }
 
 function setLoading(isLoading, btnId) {
-    const btn = document.getElementById(btnId || 'login-btn');
+    const btn = document.getElementById(btnId || 'password-login-btn');
+    if (!btn) return; // null-safe: never throw if the target button is absent
     const btnText = btn.querySelector('.btn-text');
     const btnSpinner = btn.querySelector('.btn-spinner');
 
@@ -247,10 +250,24 @@ function hideError() {
     errorElement.style.display = 'none';
 }
 
-// Handle Enter key in form
-document.getElementById('login-form').addEventListener('submit', handleLogin);
+// Wire the form + OAuth button. The password "Sign in" is the form's submit
+// (handlePasswordLogin, which preventDefault()s and does the real JSON POST);
+// "Sign in with OAuth" is a type=button sharing the identifier field. Wired via
+// addEventListener rather than inline onsubmit so the binding is robust, and
+// guarded on readyState so it runs whether or not DOMContentLoaded has fired.
+function wireAdminLogin() {
+    const form = document.getElementById('admin-login-form');
+    if (form) form.addEventListener('submit', handlePasswordLogin);
 
-// Focus on handle field on page load
-document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('handle').focus();
-});
+    const oauthBtn = document.getElementById('oauth-login-btn');
+    if (oauthBtn) oauthBtn.addEventListener('click', handleOAuthLogin);
+
+    const idField = document.getElementById('admin-login-identifier');
+    if (idField) idField.focus();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireAdminLogin);
+} else {
+    wireAdminLogin();
+}

@@ -232,25 +232,10 @@ body {
     transform: none;
 }
 
-/* "or" divider between the password form and the OAuth button. */
-.login-divider {
-    display: flex;
-    align-items: center;
-    text-align: center;
-    color: var(--color-text-tertiary);
-    font-size: 0.85rem;
-    margin: 1.25rem 0;
-}
-
-.login-divider::before,
-.login-divider::after {
-    content: "";
-    flex: 1;
-    border-bottom: 1px solid var(--color-surface-tertiary);
-}
-
-.login-divider span {
-    padding: 0 0.75rem;
+/* The OAuth sign-in stacks under the primary password sign-in inside the same
+   form; space it off from the primary button. */
+#oauth-login-btn {
+    margin-top: 0.75rem;
 }
 
 .login-footer {
