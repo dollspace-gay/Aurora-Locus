@@ -1,17 +1,20 @@
 //! OAuth-based admin authentication endpoints.
 //!
-//! Wraps proto-blue's OAuth client to authenticate operators via their
-//! atproto identity. The flow:
+//! Drives the admin login ceremony against Aurora's OWN authorization server
+//! with the Aurora-owned [`AdminOAuthClient`] (chainlink #439) — no
+//! proto-blue-oauth in the loop, so the flow does not inherit that client's
+//! DPoP-`exp` non-compliance (RFC 9449 §4.2). The flow:
 //!
-//! 1. `/admin-oauth/login` — discover the user's AS, build a PAR/PKCE
-//!    authorization URL, stash the `AuthState` + server metadata under
-//!    the `state` parameter, redirect.
-//! 2. `/admin-oauth/callback` — look up the stash, exchange the code
-//!    for a token, verify the resulting DID is on the admin list, mint
-//!    PDS access/refresh tokens, render a small HTML page that stows
-//!    them in localStorage.
-//! 3. `/oauth/client-metadata.json` — public client-metadata document
-//!    consumed by the AS during discovery.
+//! 1. `/admin-oauth/login` — build the client, generate PKCE + state, push a
+//!    PAR to our own AS, stash the PKCE verifier under the `state` parameter,
+//!    redirect the browser to the authorize URL.
+//! 2. `/admin-oauth/callback` — look up the stash, exchange the code for a
+//!    (throwaway) DPoP-bound token, resolve the authenticated DID from that
+//!    token via the loopback validation path, verify the DID is a local admin,
+//!    mint a real PDS account session, render a small HTML page that stows the
+//!    session tokens in localStorage.
+//! 3. `/oauth/client-metadata.json` — public client-metadata document the AS
+//!    fetches to resolve + trust the client during PAR.
 use crate::AppContext;
 use axum::{
     extract::{Query, State},
@@ -20,10 +23,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use proto_blue::oauth::{
-    types::{AuthState, OAuthClientMetadata, OAuthServerMetadata},
-    OAuthClient,
-};
+use crate::oauth_client::admin::AdminOAuthClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,13 +64,18 @@ impl OAuthStateStore {
 }
 
 /// Per-flow data we need to remember between `/login` and `/callback`.
+///
+/// The DPoP key is deliberately NOT carried across the round-trip: Aurora's AS
+/// does not bind the PAR proof's key to the issued token (only the
+/// token-exchange proof's key is bound), and the admin flow discards the OAuth
+/// token immediately after resolving the DID — so a fresh ephemeral key at the
+/// callback is sufficient and correct.
 #[derive(Clone)]
 pub struct OAuthStateData {
-    /// PKCE verifier + DPoP key + issuer, produced by `OAuthClient::authorize`.
-    pub auth_state: AuthState,
-    /// AS metadata fetched during discovery — the callback needs it again to
-    /// drive token exchange (token_endpoint, iss-parameter support, etc.).
-    pub server_metadata: OAuthServerMetadata,
+    /// PKCE verifier — replayed at the callback to complete the code exchange.
+    pub code_verifier: String,
+    /// The redirect_uri bound to this flow; must match at the token exchange.
+    pub redirect_uri: String,
     /// Optional handle hint, retained only for tracing.
     #[allow(dead_code)]
     pub handle: Option<String>,
@@ -411,26 +416,32 @@ async fn handle_password_login(
     }))
 }
 
-/// Build a fresh `OAuthClient` configured for this PDS's admin flow.
-fn build_oauth_client(ctx: &AppContext) -> OAuthClient {
-    let metadata = OAuthClientMetadata {
-        client_id: ctx.config.authentication.oauth.client_id.clone(),
-        redirect_uris: vec![ctx.config.authentication.oauth.redirect_uri.clone()],
-        response_types: Some(vec!["code".to_string()]),
-        grant_types: Some(vec![
-            "authorization_code".to_string(),
-            "refresh_token".to_string(),
-        ]),
-        scope: Some("atproto transition:generic".to_string()),
-        token_endpoint_auth_method: Some("none".to_string()),
-        token_endpoint_auth_signing_alg: None,
-        application_type: Some("web".to_string()),
-        dpop_bound_access_tokens: Some(true),
-        client_name: Some("Aurora Locus Admin".to_string()),
-        client_uri: None,
-        logo_uri: None,
-    };
-    OAuthClient::new(metadata)
+/// Generate a PKCE `(code_verifier, S256 code_challenge)` pair (RFC 7636). The
+/// verifier is 43 URL-safe chars (base64url of 32 random bytes), well within the
+/// 43–128 range, and the challenge is `base64url(SHA-256(verifier))` — exactly
+/// what the AS recomputes in `oauth::atproto::token`'s PKCE check.
+fn generate_pkce() -> (String, String) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let verifier = URL_SAFE_NO_PAD.encode(seed);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// Generate an opaque, high-entropy `state` parameter (CSRF/flow binding).
+fn generate_state() -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Query parameters for OAuth initiation
@@ -467,59 +478,56 @@ async fn initiate_oauth(
         }
     }
 
-    let oauth_client = build_oauth_client(&ctx);
-
     // #432 Fix 2: admins are local accounts (see `authorize_local_admin`), so
-    // the authorization server is always THIS PDS. Discover against our own
-    // issuer — `ctx.service_url()` == `service.effective_public_url()`, the same
-    // value the AS metadata publishes as `issuer` and did.json as
-    // `serviceEndpoint` — rather than the legacy external `oauth.pds_url`
-    // (bsky.social), where a local handle is unknown. proto-blue then routes the
-    // browser to `{issuer}/oauth/atproto/authorize` (PAR-based, per our AS
-    // metadata) and the callback lands back at `/admin-oauth/callback`.
-    let pds_url = ctx.service_url();
-    let server_metadata = oauth_client.discover_server(&pds_url).await.map_err(|e| {
-        tracing::error!("Failed to discover server metadata: {}", e);
+    // the authorization server is always THIS PDS. `AdminOAuthClient::from_config`
+    // targets `service.effective_public_url()` — the same value the AS metadata
+    // publishes as `issuer` and did.json as `serviceEndpoint` — and generates a
+    // fresh ephemeral DPoP key for this ceremony. The browser is then routed to
+    // `{issuer}/oauth/atproto/authorize` (PAR-based) and lands back at
+    // `/admin-oauth/callback`.
+    let mut oauth_client = AdminOAuthClient::from_config(&ctx.config).map_err(|e| {
+        tracing::error!("Failed to build admin OAuth client: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to discover OAuth server: {}", e),
+            format!("Failed to build OAuth client: {}", e),
         )
     })?;
 
-    // Build authorization URL — proto-blue generates PKCE + DPoP keys + state internally.
-    let (auth_url, auth_state) = oauth_client
-        .authorize(&server_metadata)
+    // Generate PKCE + state locally (the Aurora-owned client does not hide these
+    // the way proto-blue did), push the authorization request to our own AS, and
+    // build the authorize URL from the returned request_uri.
+    let (code_verifier, code_challenge) = generate_pkce();
+    let state = generate_state();
+    let redirect_uri = ctx.config.authentication.oauth.redirect_uri.clone();
+
+    let par = oauth_client
+        .pushed_authorization_request(&state, &code_challenge, &redirect_uri)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to build authorization URL: {}", e);
+            tracing::error!("Failed to push authorization request: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build authorization URL: {}", e),
+                format!("Failed to push authorization request: {}", e),
             )
         })?;
 
-    // The state we'll receive back on the callback is `app_state` on AuthState.
-    let state_key = auth_state.app_state.clone().ok_or_else(|| {
-        tracing::error!("OAuth client returned AuthState without app_state");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "OAuth client returned no state parameter".to_string(),
-        )
-    })?;
+    let auth_url = oauth_client.build_authorize_url(&par.request_uri);
 
+    // Stash the PKCE verifier + redirect_uri under the state the AS will echo
+    // back on the callback.
     state_store
         .store(
-            state_key,
+            state,
             OAuthStateData {
-                auth_state,
-                server_metadata,
+                code_verifier,
+                redirect_uri,
                 handle: params.handle.clone(),
             },
         )
         .await;
 
-    tracing::info!("Redirecting to authorization URL: {}", auth_url);
-    Ok(Redirect::to(auth_url.as_str()))
+    tracing::info!("Redirecting to authorization URL");
+    Ok(Redirect::to(&auth_url))
 }
 
 /// OAuth callback parameters
@@ -664,17 +672,34 @@ async fn handle_oauth_callback(
         )
     })?;
 
-    let oauth_client = build_oauth_client(&ctx);
+    // RFC 9207 (defense in depth): the admin flow only ever targets our own AS,
+    // but if the AS echoed an `iss`, it must match the issuer we push to. A
+    // mismatch signals a mix-up attempt.
+    let expected_iss = ctx.service_url();
+    if let Some(iss) = params.iss.as_deref() {
+        if iss != expected_iss {
+            tracing::warn!(got = %iss, expected = %expected_iss, "OAuth callback iss mismatch");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "OAuth issuer mismatch".to_string(),
+            ));
+        }
+    }
 
-    // RFC 9207: when the AS supports it, verify the `iss` we got back matches
-    // the one we stored before exchanging the code.
-    let token_set = oauth_client
-        .callback_with_iss(
-            &code,
-            params.iss.as_deref(),
-            &state_data.auth_state,
-            &state_data.server_metadata,
+    // Exchange the code with the Aurora-owned client (fresh ephemeral DPoP key).
+    // The AS binds the issued token to that key, but the admin flow uses the
+    // token only to learn the authenticated DID and then discards it, so the
+    // key need not survive beyond this call.
+    let mut oauth_client = AdminOAuthClient::from_config(&ctx.config).map_err(|e| {
+        tracing::error!("Failed to build admin OAuth client: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to build OAuth client: {}", e),
         )
+    })?;
+
+    let tokens = oauth_client
+        .exchange_code_for_tokens(&code, &state_data.code_verifier, &state_data.redirect_uri)
         .await
         .map_err(|e| {
             tracing::error!("Failed to exchange code: {}", e);
@@ -684,7 +709,20 @@ async fn handle_oauth_callback(
             )
         })?;
 
-    let did = token_set.sub.clone();
+    // Loopback DID resolution: Aurora's AS token response carries no `sub`, but
+    // the token it just minted lives in this PDS's own `token` table, so we
+    // validate it locally to learn the authenticated DID — the loopback
+    // equivalent of the userinfo call an external client would make.
+    let did = crate::auth::validate_oauth_token(&ctx, &tokens.access_token)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to resolve DID from the issued token: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve authenticated identity".to_string(),
+            )
+        })?
+        .did;
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
     // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL
@@ -792,8 +830,9 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_local_admin, handle_password_login, handle_refresh, initiate_oauth,
-        mint_admin_access_jwt, AdminLoginRequest, OAuthInitParams, OAuthStateStore, RefreshRequest,
+        authorize_local_admin, generate_pkce, handle_oauth_callback, handle_password_login,
+        handle_refresh, initiate_oauth, mint_admin_access_jwt, AdminLoginRequest,
+        OAuthCallbackParams, OAuthInitParams, OAuthStateData, OAuthStateStore, RefreshRequest,
     };
     use crate::admin::roles::Role;
     use crate::config::*;
@@ -808,6 +847,12 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-key-aurora-admin-test-32xx";
 
     async fn create_test_context() -> AppContext {
+        build_test_context(None).await
+    }
+
+    /// As `create_test_context`, but with an explicit `service.public_url` — used
+    /// by the loopback test to point the admin OAuth client at an in-process AS.
+    async fn build_test_context(public_url: Option<String>) -> AppContext {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
         let config = ServerConfig {
@@ -817,7 +862,7 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
-                public_url: None,
+                public_url,
                 max_blob_fetch_size: 50_000_000,
                 blob_fetch_timeout_seconds: 30,
                 blob_fetch_max_retries: 3,
@@ -1325,5 +1370,131 @@ mod tests {
             "expected not-an-admin message, got: {}",
             err.1
         );
+    }
+
+    // Phase 3 (#439): full loopback — the callback exchanges a real code against
+    // Aurora's own in-process AS with an Aurora-built DPoP proof, resolves the
+    // DID from the issued token, and mints a validatable admin session.
+
+    /// Pull a `localStorage.setItem('<key>', "<json>")` value out of the success
+    /// HTML the callback renders.
+    fn extract_localstorage_value(html: &str, key: &str) -> String {
+        let needle = format!("localStorage.setItem('{key}', ");
+        let start = html.find(&needle).expect("localStorage key present") + needle.len();
+        let rest = &html[start..];
+        let end = rest.find(");").expect("setItem statement terminator");
+        serde_json::from_str::<String>(rest[..end].trim()).expect("value is a JSON string")
+    }
+
+    #[tokio::test]
+    async fn callback_completes_loopback_exchange_and_mints_validatable_session() {
+        use crate::oauth::atproto::request_store::{self, AtprotoAuthorizationRequest};
+
+        // Bind the in-process AS first so we know its port before building ctx.
+        // Address it as `localhost` (not `127.0.0.1`) so the WebAuthn RP config
+        // derived from the public URL is valid — a bare IP is rejected — while
+        // still resolving to this loopback listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let as_url = format!("http://localhost:{port}");
+
+        // A context whose public URL IS that in-process AS (Aurora talks to its
+        // own AS); both the admin client and the AS handlers derive their URLs
+        // from this, so their DPoP htu values line up.
+        let ctx = build_test_context(Some(as_url.clone())).await;
+
+        // Serve Aurora's real AS routes on the same ctx (shared account_db).
+        let app = crate::oauth::atproto::routes().with_state(ctx.clone());
+        let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .ok();
+        });
+
+        // Seed a local superadmin + a redeemable authorization code bound to it
+        // (as consent would have, but seeded directly so the test needn't drive
+        // the browser-session authorize step).
+        let did = "did:plc:loopadmin0000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+
+        let code = "loopback-authorization-code";
+        let (verifier, challenge) = generate_pkce();
+        let redirect_uri = ctx.config.authentication.oauth.redirect_uri.clone();
+        let now = chrono::Utc::now();
+        request_store::insert(
+            &ctx.account_db,
+            &AtprotoAuthorizationRequest {
+                request_id: "loop-req".to_string(),
+                request_uri: None,
+                client_id: ctx.config.authentication.oauth.client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                scope: "atproto transition:generic".to_string(),
+                state: None,
+                code_challenge: challenge,
+                code_challenge_method: "S256".to_string(),
+                did: Some(did.to_string()),
+                code_hash: Some(crate::oauth::access_token_hash(code)),
+                code_used_at: None,
+                denied_at: None,
+                created_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Pre-store the flow state exactly as `initiate_oauth` would.
+        let state_store = OAuthStateStore::new();
+        let state = "loopback-state";
+        state_store
+            .store(
+                state.to_string(),
+                OAuthStateData {
+                    code_verifier: verifier,
+                    redirect_uri,
+                    handle: None,
+                },
+            )
+            .await;
+
+        // Drive the callback: it exchanges the code over HTTP against the
+        // in-process AS (Aurora-built DPoP proof, incl. the exp claim upstream
+        // omits), resolves the DID via the loopback validation path, and mints a
+        // real account session.
+        let html = handle_oauth_callback(
+            State(ctx.clone()),
+            axum::Extension(state_store),
+            axum::extract::Query(OAuthCallbackParams {
+                code: Some(code.to_string()),
+                state: Some(state.to_string()),
+                iss: None,
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await
+        .expect("loopback callback must succeed")
+        .0;
+
+        // The HTML stows a session token that validates via the exact path
+        // route_local_verify uses.
+        let token = extract_localstorage_value(&html, "aurora-admin-token");
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&token)
+            .await
+            .expect("minted session token must validate");
+        assert_eq!(validated.did, did);
+        assert!(html.contains("superadmin"));
+
+        let _ = shutdown.send(());
     }
 }

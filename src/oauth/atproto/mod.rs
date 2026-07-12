@@ -26,6 +26,7 @@ pub mod par;
 pub mod params;
 pub mod request_store;
 pub mod scope;
+pub mod signin;
 pub mod token;
 
 use axum::http::{header, StatusCode};
@@ -55,6 +56,13 @@ pub fn routes() -> Router<AppContext> {
             get(login::challenge).post(login::verify),
         )
         .route("/oauth/atproto/logout", post(login::logout))
+        // Browser-interactive sign-in for LOCAL accounts (password → browser
+        // session), the authorize flow's login step for did:plc admins that
+        // login-α (machine, did:web) cannot serve. chainlink #439.
+        .route(
+            "/oauth/atproto/signin",
+            get(signin::signin_page).post(signin::submit_signin),
+        )
         // whoami — resolves the current session (exercises the validation
         // extractor; reused by β.3's authorize/consent handlers).
         .route("/oauth/atproto/session", get(login::whoami))

@@ -128,6 +128,25 @@ async fn authorize_inner(
         }
     };
 
+    // 6a. First-party admin auto-approve. When the requesting client is Aurora's
+    //     own admin client AND the authenticated resource owner holds an admin
+    //     role on this PDS, skip the consent screen — an admin authorizing the
+    //     admin panel on their own PDS is not the third-party-app scenario consent
+    //     exists for (chainlink #439). Safety holds without the consent CSRF
+    //     token: the code lands only at the first-party client's pre-registered
+    //     redirect_uri, and redemption still requires the PKCE verifier the admin
+    //     client holds server-side, so a cross-site-triggered authorize cannot be
+    //     completed by anyone but the admin's own callback.
+    if is_first_party_admin(ctx, &resolved.client_id, &session.did).await {
+        return Ok(auto_approve(
+            ctx,
+            &request_id,
+            &resolved.redirect_uri,
+            resolved.state.as_deref(),
+        )
+        .await);
+    }
+
     // 6. Render the consent screen. The CSRF token is the SESSION's token
     //    (β.2's browser_session.csrf_token) — the request_id is a correlation
     //    key, never a trust token (F-3.2).
@@ -196,8 +215,13 @@ async fn resolve_session(ctx: &AppContext, headers: &HeaderMap) -> Option<Browse
         .flatten()
 }
 
-/// 302 to the login endpoint, preserving the authorize URL as `return_to` so
-/// the login-α handshake can bounce the holder back here afterward.
+/// 302 to the browser sign-in page, preserving the authorize URL as `return_to`
+/// so a successful sign-in bounces the resource owner back here afterward.
+///
+/// Targets `/oauth/atproto/signin` (browser password login for local accounts),
+/// NOT `/oauth/atproto/login` (login-α: machine, key-signing, did:web-only) —
+/// the latter cannot serve a did:plc admin authenticating with a password in a
+/// browser, which was the live-VPS failure this addresses (chainlink #439).
 fn login_redirect(ctx: &AppContext, raw_query: Option<&str>) -> Response {
     let authorize_url = match raw_query {
         Some(q) if !q.is_empty() => {
@@ -208,7 +232,7 @@ fn login_redirect(ctx: &AppContext, raw_query: Option<&str>) -> Response {
     let return_to: String =
         url::form_urlencoded::byte_serialize(authorize_url.as_bytes()).collect();
     let location = format!(
-        "{}/oauth/atproto/login?return_to={}",
+        "{}/oauth/atproto/signin?return_to={}",
         ctx.service_url(),
         return_to
     );
@@ -217,6 +241,39 @@ fn login_redirect(ctx: &AppContext, raw_query: Option<&str>) -> Response {
         [(header::LOCATION, location)],
     )
         .into_response()
+}
+
+/// Whether this authorization request should skip consent: Aurora's own admin
+/// client requesting authorization from a resource owner who holds an admin role
+/// on this PDS. Both conditions are required — a non-Aurora client, or a
+/// non-admin holder, still sees the consent screen.
+async fn is_first_party_admin(ctx: &AppContext, client_id: &str, did: &str) -> bool {
+    if client_id != ctx.config.authentication.oauth.client_id {
+        return false;
+    }
+    matches!(ctx.admin_role_manager.get_role(did).await, Ok(Some(_)))
+}
+
+/// Mint the authorization code and 302 to the client — the auto-approve
+/// counterpart to [`super::consent::approve`], minus the consent form + CSRF
+/// (there is no form; approval is implicit for the first-party admin case). The
+/// code's hash is persisted; the raw code travels only in the redirect.
+async fn auto_approve(
+    ctx: &AppContext,
+    request_id: &str,
+    redirect_uri: &str,
+    state: Option<&str>,
+) -> Response {
+    let code = super::opaque_token();
+    let code_hash = super::token_hash(&code);
+    if let Err(e) = request_store::set_code_hash(&ctx.account_db, request_id, &code_hash).await {
+        return internal_error_page(e);
+    }
+    let mut pairs: Vec<(&str, &str)> = vec![("code", &code)];
+    if let Some(s) = state {
+        pairs.push(("state", s));
+    }
+    super::consent::redirect_to_client(redirect_uri, &pairs)
 }
 
 /// Render the HTML consent screen. Every interpolated value is HTML-escaped.
@@ -391,7 +448,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(location.contains("/oauth/atproto/login?return_to="));
+        assert!(location.contains("/oauth/atproto/signin?return_to="));
         // The return_to round-trips the authorize URL (percent-encoded).
         assert!(location.contains("authorize"));
     }
@@ -434,5 +491,110 @@ mod tests {
         assert!(html.contains("Cool &lt;App&gt;"));
         assert!(html.contains("<code>atproto</code>"));
         assert!(html.contains("<code>transition:generic</code>"));
+    }
+
+    // ---- First-party admin auto-approve (chainlink #439) ----
+
+    /// Spawn a one-shot client-metadata server; returns (client_id, join).
+    async fn spawn_metadata(redirect_uri: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_id = format!("http://127.0.0.1:{port}/client-metadata.json");
+        let body = format!(
+            r#"{{"client_id":"{client_id}","redirect_uris":["{redirect_uri}"]}}"#
+        );
+        let join = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        (client_id, join)
+    }
+
+    async fn ctx_with_admin_client(client_id: String) -> AppContext {
+        crate::api::federation_peers::test_support::create_test_context_with(move |cfg| {
+            cfg.authentication.oauth.client_id = client_id;
+        })
+        .await
+    }
+
+    fn session_cookie(session_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}={}", browser_session::SESSION_COOKIE, session_id)
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn first_party_admin_auto_approves_without_consent() {
+        use crate::admin::roles::Role;
+        let did = "did:web:admin.example.com";
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx_with_admin_client(client_id.clone()).await;
+
+        // The operator holds an admin role AND has an authenticated session.
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+        let session = browser_session::create_session(&ctx.account_db, did, None, None)
+            .await
+            .unwrap();
+
+        let resp = authorize(
+            State(ctx.clone()),
+            session_cookie(&session.id),
+            RawQuery(None),
+            Query(query(&client_id, redirect_uri)),
+        )
+        .await;
+        server.await.unwrap();
+
+        // Auto-approved: 302 straight to the client with a code, no consent screen.
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert!(loc.starts_with("https://app.example.com/cb?"), "loc: {loc}");
+        assert!(loc.contains("code="));
+        assert!(loc.contains("state=st"));
+    }
+
+    #[tokio::test]
+    async fn first_party_non_admin_still_sees_consent() {
+        let did = "did:web:notadmin.example.com";
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx_with_admin_client(client_id.clone()).await;
+
+        // Same first-party client, but the session holder has NO admin role.
+        let session = browser_session::create_session(&ctx.account_db, did, None, None)
+            .await
+            .unwrap();
+
+        let resp = authorize(
+            State(ctx.clone()),
+            session_cookie(&session.id),
+            RawQuery(None),
+            Query(query(&client_id, redirect_uri)),
+        )
+        .await;
+        server.await.unwrap();
+
+        // Not auto-approved: the consent screen renders (200 HTML with Approve).
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_string(resp).await;
+        assert!(html.contains("Authorize"));
+        assert!(html.contains("Approve"));
     }
 }

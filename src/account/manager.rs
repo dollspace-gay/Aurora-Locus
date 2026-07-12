@@ -275,50 +275,61 @@ impl AccountManager {
         identifier: &str,
         password: &str,
     ) -> PdsResult<(ActorAccount, Session)> {
-        // Start timing for attack mitigation
+        // Verify the credential (timing-attack-mitigated), then mint a session.
+        let account = self.verify_password(identifier, password).await?;
+        let session = self.create_session(&account.did, None).await?;
+        Ok((account, session))
+    }
+
+    /// Verify a local account's password WITHOUT minting a session.
+    ///
+    /// The credential-checking half of [`AccountManager::login`]: resolve the
+    /// identifier, reject deactivated/taken-down accounts, and verify the argon2
+    /// hash — all under a fixed 350ms floor so response time cannot distinguish
+    /// an unknown identifier from a wrong password (username-oracle resistance).
+    /// Used by the AS browser sign-in (chainlink #439), which needs the password
+    /// check but mints a *browser* session rather than an account session.
+    pub async fn verify_password(
+        &self,
+        identifier: &str,
+        password: &str,
+    ) -> PdsResult<ActorAccount> {
+        // Start timing for attack mitigation.
         let start = std::time::Instant::now();
 
-        // Perform login logic - wrap in a scope so we can handle timing in finally block
         let result = async {
-            // Find account by handle or email
+            // Find account by handle or email.
             let account = self.get_account_by_identifier(identifier).await?;
 
-            // Check if account is deactivated or taken down
+            // Reject deactivated or taken-down accounts.
             if account.deactivated_at.is_some() {
                 return Err(PdsError::Authorization(
                     "Account is deactivated".to_string(),
                 ));
             }
-
             if account.takedown_ref.is_some() {
                 return Err(PdsError::Authorization(
                     "Account has been taken down".to_string(),
                 ));
             }
 
-            // Verify password exists (must have local account)
+            // Verify password exists (must have local account).
             let password_hash = account.password_hash.as_ref().ok_or_else(|| {
                 PdsError::Authentication("No local account credentials".to_string())
             })?;
 
-            // Verify password
             let valid = crate::auth::PasswordHasher::verify(password, password_hash)
                 .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
-
             if !valid {
                 return Err(PdsError::Authentication("Invalid credentials".to_string()));
             }
 
-            // Create session
-            let session = self.create_session(&account.did, None).await?;
-
-            Ok((account, session))
+            Ok(account)
         }
         .await;
 
-        // Mitigate timing attacks by ensuring minimum execution time
-        // This prevents attackers from distinguishing valid vs invalid usernames
-        // based on response time differences
+        // Mitigate timing attacks by ensuring a minimum execution time, so an
+        // attacker cannot distinguish valid vs invalid identifiers by latency.
         let elapsed = start.elapsed().as_millis() as i64;
         let wait_time = 350 - elapsed;
         if wait_time > 0 {

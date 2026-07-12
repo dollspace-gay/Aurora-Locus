@@ -129,7 +129,10 @@ async fn precheck(
 
 /// 302 to the client's redirect URI with the given query pairs appended,
 /// preserving any query already present on the registered redirect URI.
-fn redirect_to_client(redirect_uri: &str, pairs: &[(&str, &str)]) -> Response {
+///
+/// `pub(super)` so the authorize handler's first-party admin auto-approve
+/// (chainlink #439) issues its code through the exact same redirect path.
+pub(super) fn redirect_to_client(redirect_uri: &str, pairs: &[(&str, &str)]) -> Response {
     let location = match url::Url::parse(redirect_uri) {
         Ok(mut url) => {
             url.query_pairs_mut().extend_pairs(pairs.iter().copied());

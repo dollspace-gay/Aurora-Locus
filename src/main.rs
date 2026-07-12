@@ -36,6 +36,7 @@ mod kryphocron_rotation;
 mod mailer;
 mod metrics;
 mod oauth;
+mod oauth_client;
 mod rate_limit;
 mod read_after_write;
 mod rebuild;
