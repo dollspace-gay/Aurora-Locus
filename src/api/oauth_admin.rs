@@ -80,6 +80,7 @@ pub struct OAuthStateData {
 pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     let oauth_router = Router::new()
         .route("/admin-oauth/login", get(initiate_oauth))
+        .route("/admin-oauth/password-login", post(handle_password_login))
         .route("/admin-oauth/callback", get(handle_oauth_callback))
         .route("/admin-oauth/refresh", post(handle_refresh))
         .layer(axum::Extension(state_store));
@@ -317,6 +318,97 @@ async fn handle_refresh(
             ))
         }
     }
+}
+
+/// Request body for `POST /admin-oauth/password-login`.
+#[derive(Deserialize)]
+struct AdminLoginRequest {
+    /// Handle or email of the local admin account.
+    identifier: String,
+    password: String,
+}
+
+/// Response from `POST /admin-oauth/password-login`. Mirrors the token shape the
+/// OAuth callback stows in localStorage, so the admin UI consumes both paths
+/// identically (Bearer in `Authorization`).
+#[derive(Serialize, Debug)]
+struct AdminLoginResponse {
+    access_token: String,
+    refresh_token: String,
+    did: String,
+    role: String,
+}
+
+/// `POST /admin-oauth/password-login` — password-based admin login (chainlink
+/// #434).
+///
+/// A Bearer-token alternative to the OAuth admin flow, which is blocked upstream
+/// by a proto-blue-oauth DPoP-`exp` compliance bug (RFC 9449 §4.2). It reuses
+/// the exact session mechanism the OAuth callback + holder OAuth use —
+/// `account_manager.login` (timing-attack-mitigated password verification +
+/// deactivation/takedown checks) then a v0.10 local-account admin-role gate —
+/// and returns `account_manager.create_session` tokens as JSON. The admin UI
+/// stores them in localStorage and sends `Authorization: Bearer`, validated by
+/// the same `route_local_verify` → `validate_access_token` path as every other
+/// admin request.
+///
+/// No cookie is set and no CSRF token is required: the response carries the
+/// Bearer token in the JSON body (not an ambient cookie credential), so this
+/// login is not a CSRF sink — the same posture as the OAuth callback.
+async fn handle_password_login(
+    State(ctx): State<AppContext>,
+    Json(req): Json<AdminLoginRequest>,
+) -> Result<Json<AdminLoginResponse>, (StatusCode, String)> {
+    // Verify the password and mint a session. `login` resolves the identifier to
+    // a LOCAL account, rejects deactivated/taken-down accounts, verifies the
+    // argon2 hash, and applies timing-attack mitigation. A generic 401 avoids
+    // leaking whether the identifier or the password was wrong.
+    let (account, session) = ctx
+        .account_manager
+        .login(&req.identifier, &req.password)
+        .await
+        .map_err(|e| {
+            tracing::debug!("admin password login failed: {}", e);
+            (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())
+        })?;
+
+    // v0.10 constitutional claim: admin/superadmin roles are restricted to local
+    // accounts (`login` guarantees local). Require an admin_roles entry; a local
+    // account without one is refused. Authority is the admin_role table, live per
+    // request (#267).
+    let admin_role = ctx
+        .admin_role_manager
+        .get_role(&account.did)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to query admin role: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check admin status".to_string(),
+            )
+        })?;
+    let Some(admin_role) = admin_role else {
+        tracing::warn!(
+            did = %account.did,
+            "Password admin login rejected: account has no admin role on this PDS"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Account has no admin role on this PDS".to_string(),
+        ));
+    };
+
+    tracing::info!(
+        did = %account.did,
+        role = %admin_role.role.as_str(),
+        "Admin logged in via password"
+    );
+    Ok(Json(AdminLoginResponse {
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        did: account.did,
+        role: admin_role.role.as_str().to_string(),
+    }))
 }
 
 /// Build a fresh `OAuthClient` configured for this PDS's admin flow.
@@ -700,8 +792,8 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_local_admin, handle_refresh, initiate_oauth, mint_admin_access_jwt,
-        OAuthInitParams, OAuthStateStore, RefreshRequest,
+        authorize_local_admin, handle_password_login, handle_refresh, initiate_oauth,
+        mint_admin_access_jwt, AdminLoginRequest, OAuthInitParams, OAuthStateStore, RefreshRequest,
     };
     use crate::admin::roles::Role;
     use crate::config::*;
@@ -1007,6 +1099,142 @@ mod tests {
         .execute(&ctx.account_db)
         .await
         .unwrap();
+    }
+
+    /// Seed a local account with a REAL argon2 password hash (so `login` can
+    /// verify it) and optionally an admin role.
+    async fn seed_password_admin(
+        ctx: &AppContext,
+        did: &str,
+        handle: &str,
+        password: &str,
+        role: Option<Role>,
+    ) {
+        let hash = crate::auth::PasswordHasher::hash(password).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, ?3, NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("admin@example.test"))
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        if let Some(role) = role {
+            ctx.admin_role_manager
+                .grant_role(did, role, "system", None)
+                .await
+                .unwrap();
+        }
+    }
+
+    // Fix 1 (#434): password-based admin login (Bearer).
+
+    #[tokio::test]
+    async fn password_login_happy_path_mints_validatable_admin_session() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwadmin000000000000000000",
+            "admin.localhost",
+            "correct-horse-battery-staple",
+            Some(Role::SuperAdmin),
+        )
+        .await;
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "correct-horse-battery-staple".to_string(),
+            }),
+        )
+        .await
+        .expect("valid admin login must succeed");
+        assert_eq!(resp.0.role, "superadmin");
+        assert_eq!(resp.0.did, "did:plc:pwadmin000000000000000000");
+        // Token validates via the same path route_local_verify uses.
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&resp.0.access_token)
+            .await
+            .expect("minted access token must validate");
+        assert_eq!(validated.did, "did:plc:pwadmin000000000000000000");
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_wrong_password() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwadmin000000000000000000",
+            "admin.localhost",
+            "the-right-password",
+            Some(Role::SuperAdmin),
+        )
+        .await;
+        let err = handle_password_login(
+            State(ctx),
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "the-WRONG-password".to_string(),
+            }),
+        )
+        .await
+        .expect_err("wrong password must be refused");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "Invalid credentials");
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_local_account_without_admin_role() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwnonadmin0000000000000000",
+            "bob.localhost",
+            "bobs-password",
+            None, // local account, no admin role
+        )
+        .await;
+        let err = handle_password_login(
+            State(ctx),
+            Json(AdminLoginRequest {
+                identifier: "bob.localhost".to_string(),
+                password: "bobs-password".to_string(),
+            }),
+        )
+        .await
+        .expect_err("non-admin must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("no admin role"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_unknown_identifier() {
+        let ctx = create_test_context().await;
+        let err = handle_password_login(
+            State(ctx),
+            Json(AdminLoginRequest {
+                identifier: "ghost.localhost".to_string(),
+                password: "whatever".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown identifier must be refused");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "Invalid credentials");
     }
 
     // Fix 1 (#432): admin OAuth is constrained to local accounts.

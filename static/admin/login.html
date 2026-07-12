@@ -29,6 +29,49 @@
             </div>
 
             <div class="login-form-container">
+                <!-- Shared error banner (used by both the password and OAuth forms). -->
+                <div id="error-message" class="error-message" style="display: none;"></div>
+
+                <!-- Password sign-in (primary). Calls /admin-oauth/password-login
+                     and stows the returned Bearer tokens the same way the OAuth
+                     callback does. -->
+                <form id="password-login-form" onsubmit="handlePasswordLogin(event)">
+                    <div class="form-group">
+                        <label for="admin-login-identifier">Handle or DID</label>
+                        <input
+                            type="text"
+                            id="admin-login-identifier"
+                            name="identifier"
+                            placeholder="you.example.com"
+                            autocomplete="username"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="admin-login-password">Password</label>
+                        <input
+                            type="password"
+                            id="admin-login-password"
+                            name="password"
+                            autocomplete="current-password"
+                            required
+                        >
+                    </div>
+
+                    <button type="submit" class="btn-primary" id="password-login-btn">
+                        <span class="btn-text">Sign in</span>
+                        <span class="btn-spinner" style="display: none;">
+                            <svg class="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <circle cx="12" cy="12" r="10" stroke-width="4" stroke-opacity="0.25"/>
+                                <path d="M12 2a10 10 0 0 1 10 10" stroke-width="4"/>
+                            </svg>
+                        </span>
+                    </button>
+                </form>
+
+                <div class="login-divider"><span>or</span></div>
+
                 <form id="login-form" onsubmit="handleLogin(event)">
                     <div class="form-group">
                         <label for="handle">Your Handle (Optional)</label>
@@ -44,9 +87,7 @@
                         </small>
                     </div>
 
-                    <div id="error-message" class="error-message" style="display: none;"></div>
-
-                    <button type="submit" class="btn-primary" id="login-btn">
+                    <button type="submit" class="btn-secondary" id="login-btn">
                         <span class="btn-text">Sign in with OAuth</span>
                         <span class="btn-spinner" style="display: none;">
                             <svg class="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
