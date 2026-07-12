@@ -793,6 +793,14 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(revoke_role),
             CapsBuilder::new(Family::SuperAdmin),
         )
+        // Phase 4 admin session hardening (#442): set/clear an admin's
+        // per-account session-lifetime override. SuperAdmin-only + step-up
+        // gated at the handler.
+        .route_with_caps(
+            "/xrpc/tools.aurora.superadmin.setSessionLifetime",
+            post(set_session_lifetime),
+            CapsBuilder::new(Family::SuperAdmin),
+        )
         // v0.9 Federation runtime-mutability arc §3.4 (#393) — revert-to-default:
         // delete a runtime row (and, for restart-required keys, queue the restart
         // marker(s) atomically). §3.8 (#396) — read the queued restart markers for
@@ -1054,6 +1062,30 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
         .route_with_caps(
             "/xrpc/tools.aurora.admin.revokeOperatorSessions",
             post(revoke_operator_sessions),
+            CapsBuilder::new(Family::Admin),
+        )
+        // Phase 4 (#442) — self-service admin TOTP 2FA. Every operator manages
+        // their OWN enrollment (keyed on auth.did); all three are step-up gated.
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.enrollTotp",
+            post(enroll_totp),
+            CapsBuilder::new(Family::Admin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.confirmTotp",
+            post(confirm_totp),
+            CapsBuilder::new(Family::Admin),
+        )
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.disableTotp",
+            post(disable_totp),
+            CapsBuilder::new(Family::Admin),
+        )
+        // Phase 4 (#442) — self-service admin session IP binding (step-up gated,
+        // trust_proxy-gated at the handler).
+        .route_with_caps(
+            "/xrpc/tools.aurora.admin.setIpBinding",
+            post(set_ip_binding),
             CapsBuilder::new(Family::Admin),
         )
         .build()
@@ -1550,6 +1582,525 @@ async fn grant_role(
         did: req.did,
         role: req.role,
         admin_role,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Step-up auth gate (Phase 4 · #442): a hardening endpoint requires the caller
+/// to have interactively authenticated within `STEP_UP_MAX_AGE_SECS`. Freshness
+/// is read from the session's `authenticated_at` (login time, preserved across
+/// refreshes), so a silent refresh never satisfies it — only a real re-login.
+/// Fails closed: a session whose freshness cannot be resolved (no row — e.g. a
+/// synthetic/HS256 admin session id) is treated as stale.
+async fn require_step_up(
+    ctx: &AppContext,
+    auth: &AdminAuthContext,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let authenticated_at = ctx
+        .account_manager
+        .session_authenticated_at(&auth.session.session_id)
+        .await
+        .map_err(|e| {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+        })?;
+    let fresh = match authenticated_at {
+        Some(ts) => {
+            (chrono::Utc::now() - ts).num_seconds()
+                <= crate::admin::security_config::STEP_UP_MAX_AGE_SECS
+        }
+        None => false,
+    };
+    if !fresh {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "StepUpRequired",
+            "this operation requires a recent login; re-authenticate and retry",
+        ));
+    }
+    Ok(())
+}
+
+/// Request for `tools.aurora.superadmin.setSessionLifetime`. A null (omitted)
+/// `sessionLifetimeSecs` reverts the target to their role default.
+#[derive(Debug, Deserialize)]
+struct SetSessionLifetimeRequest {
+    did: String,
+    #[serde(default)]
+    session_lifetime_secs: Option<i64>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+/// Output for `tools.aurora.superadmin.setSessionLifetime`. `auditEntryId` is a
+/// string per the action-ID contract (dodges JS number precision).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSessionLifetimeOutput {
+    success: bool,
+    did: String,
+    session_lifetime_secs: Option<i64>,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.superadmin.setSessionLifetime` — set (or clear) an admin's
+/// per-account session-lifetime override (Phase 4 · #442). SuperAdmin-only and
+/// step-up-gated: it reshapes another operator's session security, so the caller
+/// must have logged in within the step-up window. `sessionLifetimeSecs` null
+/// reverts the target to their role default; a value is bounds-checked
+/// (60s..30d). The override + its audit-chain entry are written atomically.
+async fn set_session_lifetime(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetSessionLifetimeRequest>,
+) -> Result<Json<SetSessionLifetimeOutput>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::admin::roles::Role;
+
+    if !auth.role.can_act_as(Role::SuperAdmin) {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            format!(
+                "setSessionLifetime requires SuperAdmin role; have {}",
+                auth.role.as_str()
+            ),
+        ));
+    }
+
+    // Reshaping session security is a hardening operation — require a recent
+    // interactive login, not merely a live (silently-refreshed) session.
+    require_step_up(&ctx, &auth).await?;
+
+    let rationale = req
+        .rationale
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", "rationale-required")
+        })?;
+
+    // Bounds-check up front so an invalid value is a clean 400 before any tx.
+    crate::admin::security_config::validate_session_lifetime(req.session_lifetime_secs)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()))?;
+
+    // Target must be a local admin: the config row FKs to actor, and setting a
+    // lifetime for a non-admin is meaningless. 404 rather than a raw FK error.
+    let target_role = ctx.admin_role_manager.get_role(&req.did).await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    if target_role.is_none() {
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "target DID is not an admin on this PDS",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: req.did.clone(),
+    };
+    let chain_rationale = match req.session_lifetime_secs {
+        Some(s) => format!("{} (session_lifetime_secs={})", rationale, s),
+        None => format!("{} (session_lifetime_secs=role-default)", rationale),
+    };
+
+    // LB-1 / #122: override + chain in one transaction so a crash between the
+    // two leaves neither, not a config change without an audit breadcrumb.
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    crate::admin::security_config::AdminSecurityStore::set_session_lifetime_in_tx(
+        &mut tx,
+        &req.did,
+        req.session_lifetime_secs,
+    )
+    .await
+    .map_err(|e| match e {
+        PdsError::Validation(msg) => {
+            json_error(StatusCode::BAD_REQUEST, "InvalidRequest", msg)
+        }
+        other => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            other.to_string(),
+        ),
+    })?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.session_lifetime.set",
+            subject: Some(&subject),
+            rationale: &chain_rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+    tx.commit().await.map_err(|e| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
+    })?;
+
+    Ok(Json(SetSessionLifetimeOutput {
+        success: true,
+        did: req.did,
+        session_lifetime_secs: req.session_lifetime_secs,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Map any `Display` error to a generic 500 JSON body. Trims the boilerplate
+/// from the multi-step hardening handlers below.
+fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<serde_json::Value>) {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        e.to_string(),
+    )
+}
+
+/// Request for `tools.aurora.admin.confirmTotp`.
+#[derive(Debug, Deserialize)]
+struct ConfirmTotpRequest {
+    code: String,
+}
+
+/// Output for `tools.aurora.admin.enrollTotp`: the secret to add to an
+/// authenticator app (base32 + otpauth URI). TOTP is NOT enforced at login until
+/// the caller confirms a code via `confirmTotp`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrollTotpOutput {
+    secret: String,
+    provisioning_uri: String,
+    audit_entry_id: String,
+}
+
+/// Output for `confirmTotp` / `disableTotp`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TotpStatusOutput {
+    success: bool,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.admin.enrollTotp` — begin TOTP 2FA enrollment for the caller's
+/// OWN account (Phase 4 · #442). Self-service (keyed on `auth.did`), step-up
+/// gated. Generates a secret, stores it encrypted-at-rest (pending, unconfirmed),
+/// and returns the base32 secret + otpauth URI. Refuses (503) when no encryption
+/// key is configured — a secret is never persisted in plaintext. 409 if TOTP is
+/// already enabled (disable first), so a fresh secret can't silently replace a
+/// confirmed one.
+async fn enroll_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<EnrollTotpOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let cipher = ctx.admin_totp_cipher.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TotpUnavailable",
+            "TOTP is unavailable: set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX to enable enrollment",
+        )
+    })?;
+
+    if let Some(cfg) = ctx
+        .admin_security_store
+        .get_config(&auth.did)
+        .await
+        .map_err(internal_error)?
+    {
+        if cfg.totp_confirmed_at.is_some() {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "AlreadyEnabled",
+                "TOTP is already enabled; disable it before re-enrolling",
+            ));
+        }
+    }
+
+    let enrollment =
+        crate::admin::totp::generate_enrollment(&auth.did).map_err(internal_error)?;
+    let encrypted = cipher.encrypt(&enrollment.secret_bytes).map_err(internal_error)?;
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::set_totp_pending_in_tx(
+        &mut tx,
+        &auth.did,
+        &encrypted,
+    )
+    .await
+    .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.enroll",
+            subject: Some(&subject),
+            rationale: "self-service TOTP enrollment (pending confirmation)",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(EnrollTotpOutput {
+        secret: enrollment.secret_base32,
+        provisioning_uri: enrollment.provisioning_uri,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// `tools.aurora.admin.confirmTotp` — confirm a pending enrollment by proving a
+/// current code (Phase 4 · #442). Self-service, step-up gated. On success sets
+/// `totp_confirmed_at`, after which login enforces TOTP. 400 if there is no
+/// pending enrollment or it is already confirmed; 401 on a wrong code.
+async fn confirm_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<ConfirmTotpRequest>,
+) -> Result<Json<TotpStatusOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let cipher = ctx.admin_totp_cipher.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TotpUnavailable",
+            "TOTP is unavailable: set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX",
+        )
+    })?;
+
+    let cfg = ctx
+        .admin_security_store
+        .get_config(&auth.did)
+        .await
+        .map_err(internal_error)?
+        .filter(|c| c.totp_secret_encrypted.is_some())
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "NoPendingEnrollment",
+                "no pending TOTP enrollment to confirm; call enrollTotp first",
+            )
+        })?;
+    if cfg.totp_confirmed_at.is_some() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "AlreadyConfirmed",
+            "TOTP is already confirmed",
+        ));
+    }
+
+    let secret_enc = cfg
+        .totp_secret_encrypted
+        .as_deref()
+        .expect("totp_secret_encrypted is Some by the filter above");
+    let secret = cipher.decrypt(secret_enc).map_err(internal_error)?;
+    if !crate::admin::totp::verify_code(secret, req.code.trim()).map_err(internal_error)? {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "InvalidCode",
+            "invalid TOTP code",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let confirmed =
+        crate::admin::security_config::AdminSecurityStore::confirm_totp_in_tx(&mut tx, &auth.did)
+            .await
+            .map_err(internal_error)?;
+    if !confirmed {
+        // Raced with a disable between the read and the write.
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "NoPendingEnrollment",
+            "no pending TOTP enrollment to confirm",
+        ));
+    }
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.confirm",
+            subject: Some(&subject),
+            rationale: "self-service TOTP confirmation (2FA now enforced at login)",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(TotpStatusOutput {
+        success: true,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// `tools.aurora.admin.disableTotp` — turn off TOTP for the caller's OWN account
+/// (Phase 4 · #442). Self-service, step-up gated. Idempotent: clearing when TOTP
+/// was never set is a no-op success.
+async fn disable_totp(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+) -> Result<Json<TotpStatusOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::clear_totp_in_tx(&mut tx, &auth.did)
+        .await
+        .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.totp.disable",
+            subject: Some(&subject),
+            rationale: "self-service TOTP disabled",
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(TotpStatusOutput {
+        success: true,
+        audit_entry_id: audit_entry_id.to_string(),
+    }))
+}
+
+/// Request for `tools.aurora.admin.setIpBinding`.
+#[derive(Debug, Deserialize)]
+struct SetIpBindingRequest {
+    enabled: bool,
+}
+
+/// Output for `tools.aurora.admin.setIpBinding`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetIpBindingOutput {
+    success: bool,
+    enabled: bool,
+    audit_entry_id: String,
+}
+
+/// `tools.aurora.admin.setIpBinding` — turn IP binding on/off for the caller's
+/// OWN account (Phase 4 · #442). Self-service, step-up gated. Takes effect at the
+/// NEXT login: a session minted while enabled is bound to its origin IP and can
+/// only be used from there. Enabling REFUSES (400) when `PDS_TRUST_PROXY` is off,
+/// since the real client IP can't be determined behind the (untrusted) proxy and
+/// binding would be a silent no-op — a false sense of security. Disabling is
+/// always allowed (turning a protection off).
+async fn set_ip_binding(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<SetIpBindingRequest>,
+) -> Result<Json<SetIpBindingOutput>, (StatusCode, Json<serde_json::Value>)> {
+    require_step_up(&ctx, &auth).await?;
+
+    // #442: IP-binding ENFORCEMENT is deferred to v0.11 — the enable path is gated
+    // off to prevent operator lockout. Live testing behind a CDN/reverse proxy
+    // showed the client IP resolved at login can differ from the IP resolved on
+    // later requests (proxy edge-node variance / XFF-chain position), so a bound
+    // session rejects the operator's own legitimate requests and locks them out.
+    // The bind-at-login + enforcement substrate ships in v0.10, but reliable
+    // enablement needs a single per-request enforcement layer with a stable
+    // client-IP resolution, which lands in v0.11. Disabling is always allowed so an
+    // operator who enabled binding out-of-band (e.g. directly in the DB) can
+    // recover. See chainlink #442.
+    if req.enabled {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "IpBindingDeferred",
+            "IP binding enforcement is deferred to v0.11: behind a reverse proxy or \
+             CDN the resolved client IP can vary between login and later requests, \
+             which rejects legitimate sessions and locks operators out. Enabling is \
+             disabled to prevent lockout; disabling remains available. Tracking: \
+             chainlink #442.",
+        ));
+    }
+
+    let subject = Subject::Repo {
+        did: auth.did.clone(),
+    };
+    let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
+    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    crate::admin::security_config::AdminSecurityStore::set_ip_binding_in_tx(
+        &mut tx,
+        &auth.did,
+        req.enabled,
+    )
+    .await
+    .map_err(internal_error)?;
+    let audit_entry_id = audit_chain::insert_chain_entry(
+        &mut tx,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "admin.ip_binding.set",
+            subject: Some(&subject),
+            rationale: if req.enabled {
+                "self-service IP binding enabled (enforced from next login)"
+            } else {
+                "self-service IP binding disabled"
+            },
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(Json(SetIpBindingOutput {
+        success: true,
+        enabled: req.enabled,
         audit_entry_id: audit_entry_id.to_string(),
     }))
 }
@@ -3863,6 +4414,12 @@ struct UpdateAccountHandleRequest {
 }
 
 /// Update account handle
+///
+/// v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): the `did:` check below is
+/// a generic shape guard, not a method guard — it correctly admits did:web. A
+/// did:web handle change writes `actor.handle` (the served `alsoKnownAs`
+/// recomposes from it at the Phase D serve route) with **no PLC republish**;
+/// did:plc continues to republish. Method discrimination stays absent by design.
 async fn update_account_handle(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -4190,7 +4747,7 @@ pub(crate) async fn update_account_signing_key(
             .into_response()
     }
 
-    if !req.did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&req.did) {
         return Err(plain_err(
             StatusCode::BAD_REQUEST,
             "did must be a did:plc identifier",
@@ -9636,6 +10193,8 @@ mod tests {
                 // tests that exercise PLC code paths.
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -9644,7 +10203,6 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 // Non-routable fail-fast URL: unit tests must not dial the real
@@ -9670,6 +10228,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -9952,6 +10511,505 @@ mod tests {
         .expect("idempotent success")
         .0;
         assert_eq!(again.revoked, 0);
+    }
+
+    // Phase 4 (#442): setSessionLifetime — SuperAdmin-only, step-up-gated,
+    // audited. A fresh real session is needed to pass the step-up gate, so the
+    // caller's `session_id` must point at a live `session` row.
+    fn super_auth(did: &str, session_id: &str) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: session_id.to_string(),
+                is_app_password: false,
+            },
+            role: Role::SuperAdmin,
+        }
+    }
+
+    fn set_lifetime_req(
+        did: &str,
+        secs: Option<i64>,
+        rationale: Option<&str>,
+    ) -> Json<SetSessionLifetimeRequest> {
+        Json(SetSessionLifetimeRequest {
+            did: did.to_string(),
+            session_lifetime_secs: secs,
+            rationale: rationale.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_superadmin_fresh_session_sets_and_audits() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:superlifecaller";
+        let target = "did:plc:targetadminlife";
+        seed_test_account(&ctx, caller, "superlifecaller.localhost", None).await;
+        seed_test_account(&ctx, target, "targetadminlife.localhost", None).await;
+        ctx.admin_role_manager
+            .grant_role(target, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        // Fresh interactive login → step-up passes.
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let auth = super_auth(caller, &session.id);
+
+        let out = set_session_lifetime(
+            State(ctx.clone()),
+            auth,
+            set_lifetime_req(target, Some(7200), Some("tighten for offboarding")),
+        )
+        .await
+        .expect("superadmin sets lifetime")
+        .0;
+        assert!(out.success);
+        assert_eq!(out.session_lifetime_secs, Some(7200));
+        assert!(!out.audit_entry_id.is_empty());
+
+        // Persisted on the target's config.
+        let cfg = ctx
+            .admin_security_store
+            .get_config(target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.session_lifetime_secs, Some(7200));
+
+        // Null reverts to the role default (clears the override).
+        let reverted = set_session_lifetime(
+            State(ctx.clone()),
+            super_auth(caller, &session.id),
+            set_lifetime_req(target, None, Some("revert to default")),
+        )
+        .await
+        .expect("null reverts")
+        .0;
+        assert_eq!(reverted.session_lifetime_secs, None);
+        assert_eq!(
+            ctx.admin_security_store
+                .get_config(target)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_lifetime_secs,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_rejects_non_superadmin() {
+        let ctx = create_test_context().await;
+        // Admin role → 403 at the role gate, before step-up (no session needed).
+        let auth = AdminAuthContext {
+            did: "did:plc:adm".to_string(),
+            session: ValidatedSession {
+                did: "did:plc:adm".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role: Role::Admin,
+        };
+        let err = set_session_lifetime(
+            State(ctx),
+            auth,
+            set_lifetime_req("did:plc:t", None, Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "Forbidden");
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_stale_session_requires_step_up() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:stalecaller";
+        let target = "did:plc:targetstale";
+        seed_test_account(&ctx, caller, "stalecaller.localhost", None).await;
+        ctx.admin_role_manager
+            .grant_role(target, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        // Age the interactive-auth time past the step-up window.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&session.id)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        let err = set_session_lifetime(
+            State(ctx.clone()),
+            super_auth(caller, &session.id),
+            set_lifetime_req(target, Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+        // The override was NOT written.
+        assert!(ctx
+            .admin_security_store
+            .get_config(target)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_synthetic_session_fails_step_up_closed() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:synthcaller";
+        // No real session row for this id → freshness unresolvable → fail closed.
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, "jwt-no-such-session"),
+            set_lifetime_req("did:plc:t", Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_requires_rationale() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:rationalecaller";
+        seed_test_account(&ctx, caller, "rationalecaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:t", Some(3600), None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_rejects_out_of_bounds() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:boundscaller";
+        seed_test_account(&ctx, caller, "boundscaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:t", Some(1), Some("too short")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_session_lifetime_unknown_target_is_404() {
+        let ctx = create_test_context().await;
+        let caller = "did:plc:targetcaller";
+        seed_test_account(&ctx, caller, "targetcaller.localhost", None).await;
+        let session = ctx.account_manager.create_session(caller, None).await.unwrap();
+        let err = set_session_lifetime(
+            State(ctx),
+            super_auth(caller, &session.id),
+            set_lifetime_req("did:plc:nobody", Some(3600), Some("x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // Phase 4 (#442): self-service admin TOTP 2FA — enroll / confirm / disable.
+    const TOTP_TEST_KEY_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    async fn totp_test_context() -> AppContext {
+        create_test_context_with(|c| {
+            c.authentication.admin_totp_encryption_key_hex = Some(TOTP_TEST_KEY_HEX.to_string());
+        })
+        .await
+    }
+
+    fn admin_auth(did: &str, session_id: &str, role: Role) -> AdminAuthContext {
+        AdminAuthContext {
+            did: did.to_string(),
+            session: ValidatedSession {
+                did: did.to_string(),
+                session_id: session_id.to_string(),
+                is_app_password: false,
+            },
+            role,
+        }
+    }
+
+    /// Seed a self-service admin with a fresh (step-up-passing) session; returns
+    /// its session id.
+    async fn seed_admin_with_session(ctx: &AppContext, did: &str, handle: &str) -> String {
+        seed_test_account(ctx, did, handle, None).await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::Admin, "system", None)
+            .await
+            .unwrap();
+        ctx.account_manager
+            .create_session(did, None)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Compute the current TOTP code for a DID's stored (encrypted) secret.
+    async fn current_totp_code(ctx: &AppContext, did: &str) -> String {
+        let enc = ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_secret_encrypted
+            .unwrap();
+        let secret = ctx.admin_totp_cipher.as_ref().unwrap().decrypt(&enc).unwrap();
+        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret)
+            .unwrap()
+            .generate_current()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_confirm_disable_round_trip() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpround";
+        let sid = seed_admin_with_session(&ctx, did, "totpround.localhost").await;
+
+        // Enroll → pending secret + provisioning URI, not yet confirmed.
+        let out = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .expect("enroll")
+            .0;
+        assert!(!out.secret.is_empty());
+        assert!(out.provisioning_uri.starts_with("otpauth://totp/"));
+        let cfg = ctx.admin_security_store.get_config(did).await.unwrap().unwrap();
+        assert!(cfg.totp_secret_encrypted.is_some(), "secret stored");
+        assert!(cfg.totp_confirmed_at.is_none(), "not yet confirmed");
+        // Stored form is not the base32 secret in the clear (it's encrypted).
+        assert_ne!(cfg.totp_secret_encrypted.as_deref().unwrap(), out.secret);
+
+        // Confirm with the live code → enforced from now on.
+        let code = current_totp_code(&ctx, did).await;
+        let confirmed = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest { code }),
+        )
+        .await
+        .expect("confirm")
+        .0;
+        assert!(confirmed.success);
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_confirmed_at
+            .is_some());
+
+        // Disable → fully cleared.
+        let _ = disable_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .expect("disable");
+        let cfg = ctx.admin_security_store.get_config(did).await.unwrap().unwrap();
+        assert!(cfg.totp_secret_encrypted.is_none());
+        assert!(cfg.totp_confirmed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_refuses_without_encryption_key() {
+        // A context WITHOUT the key → cipher absent → 503 (never plaintext).
+        let ctx = create_test_context().await;
+        let did = "did:plc:totpnokey";
+        let sid = seed_admin_with_session(&ctx, did, "totpnokey.localhost").await;
+        let err = enroll_totp(State(ctx), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1 .0["error"], "TotpUnavailable");
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_conflicts_when_already_enabled() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpdup";
+        let sid = seed_admin_with_session(&ctx, did, "totpdup.localhost").await;
+        let _ = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap();
+        let code = current_totp_code(&ctx, did).await;
+        let _ = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest { code }),
+        )
+        .await
+        .unwrap();
+        // Re-enroll while confirmed → 409.
+        let err = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn totp_confirm_rejects_wrong_code_and_missing_pending() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpwrong";
+        let sid = seed_admin_with_session(&ctx, did, "totpwrong.localhost").await;
+
+        // No pending enrollment → 400.
+        let err = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest {
+                code: "000000".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Enroll, then confirm with a deliberately wrong code → 401, unconfirmed.
+        let _ = enroll_totp(State(ctx.clone()), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap();
+        let live = current_totp_code(&ctx, did).await;
+        let wrong = if live == "000000" { "111111" } else { "000000" };
+        let err = confirm_totp(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(ConfirmTotpRequest {
+                code: wrong.to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .unwrap()
+            .totp_confirmed_at
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn totp_enroll_requires_step_up() {
+        let ctx = totp_test_context().await;
+        let did = "did:plc:totpstale";
+        let sid = seed_admin_with_session(&ctx, did, "totpstale.localhost").await;
+        // Age the session past the step-up window.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let err = enroll_totp(State(ctx), admin_auth(did, &sid, Role::Admin))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
+    }
+
+    // Phase 4 (#442): self-service admin session IP binding — setIpBinding.
+    // ENFORCEMENT deferred to v0.11: the enable path is gated off to prevent
+    // operator lockout (live CDN testing showed the resolved client IP can vary
+    // between login and later requests). Disabling stays available for recovery.
+    #[tokio::test]
+    async fn set_ip_binding_enable_gated_off_pending_v11() {
+        // trust_proxy OFF: enable is refused (deferral gate, not the old
+        // trust-proxy gate) and no row is written; disable is still allowed.
+        let ctx = create_test_context().await;
+        let did = "did:plc:ipbindoff";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindoff.localhost").await;
+        let err = set_ip_binding(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "IpBindingDeferred");
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .is_none());
+        // Disabling is allowed (recovery path for an out-of-band enable).
+        let out = set_ip_binding(
+            State(ctx),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: false }),
+        )
+        .await
+        .expect("disable allowed")
+        .0;
+        assert!(!out.enabled);
+    }
+
+    #[tokio::test]
+    async fn set_ip_binding_enable_refused_even_with_trust_proxy() {
+        // trust_proxy ON no longer permits enabling — the deferral gate is
+        // unconditional in v0.10, so no bound session can be created via the API.
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:ipbindon";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindon.localhost").await;
+        let err = set_ip_binding(
+            State(ctx.clone()),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["error"], "IpBindingDeferred");
+        // No row written → no session will be bound at login.
+        assert!(ctx
+            .admin_security_store
+            .get_config(did)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn set_ip_binding_requires_step_up() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:ipbindstale";
+        let sid = seed_admin_with_session(&ctx, did, "ipbindstale.localhost").await;
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&stale)
+            .bind(&sid)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let err = set_ip_binding(
+            State(ctx),
+            admin_auth(did, &sid, Role::Admin),
+            Json(SetIpBindingRequest { enabled: true }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0["error"], "StepUpRequired");
     }
 
     #[tokio::test]
@@ -11268,7 +12326,7 @@ mod tests {
             r#"],"#,
             // ---- families: 4 namespaces, alphabetical keys ----
             r#""families":{"#,
-            // tools.aurora.admin (21 endpoints)
+            // tools.aurora.admin (25 endpoints)
             r#""tools.aurora.admin":["#,
             r#""emitEvent","#,
             r#""batchTakedownAccounts","#,
@@ -11291,7 +12349,11 @@ mod tests {
             r#""listInstalled","#,
             r#""listSessions","#,
             r#""revokeSession","#,
-            r#""revokeOperatorSessions""#,
+            r#""revokeOperatorSessions","#,
+            r#""enrollTotp","#,
+            r#""confirmTotp","#,
+            r#""disableTotp","#,
+            r#""setIpBinding""#,
             r#"],"#,
             // tools.aurora.moderator (7 endpoints)
             r#""tools.aurora.moderator":["#,
@@ -11361,10 +12423,11 @@ mod tests {
             r#""getAccountOverrides","#,
             r#""setAccountOverride""#,
             r#"],"#,
-            // tools.aurora.superadmin (33 endpoints)
+            // tools.aurora.superadmin (34 endpoints)
             r#""tools.aurora.superadmin":["#,
             r#""grantRole","#,
             r#""revokeRole","#,
+            r#""setSessionLifetime","#,
             r#""deleteRuntimeSetting","#,
             r#""listPendingRestartActions","#,
             r#""triggerRestart","#,
@@ -11408,7 +12471,7 @@ mod tests {
             r#"},"#,
             // ---- implementation, version (literals) ----
             r#""implementation":"aurora-locus","#,
-            r#""version":"0.9.0""#,
+            r#""version":"0.10.0""#,
             r#"}"#,
         );
         assert_eq!(
@@ -11612,7 +12675,7 @@ mod tests {
         // version comes from CARGO_PKG_VERSION; pinned to the
         // current cycle release per CR-4 / chainlink #117. Bump in
         // lockstep with Cargo.toml when the cycle increments.
-        assert_eq!(resp.version, "0.9.0");
+        assert_eq!(resp.version, "0.10.0");
 
         // Families object must include the four Aurora namespaces, each
         // a JSON array (possibly empty for namespaces that haven't
@@ -11819,6 +12882,7 @@ mod tests {
             superadmin.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(names.contains(&"grantRole"), "grantRole missing");
         assert!(names.contains(&"revokeRole"), "revokeRole missing");
+        assert!(names.contains(&"setSessionLifetime"), "setSessionLifetime missing");
         assert!(names.contains(&"preRebuildCheck"), "preRebuildCheck missing");
         assert!(names.contains(&"rebuildRepo"), "rebuildRepo missing");
         assert!(names.contains(&"getRebuildProgress"), "getRebuildProgress missing");

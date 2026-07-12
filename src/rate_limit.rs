@@ -989,7 +989,10 @@ pub fn is_admin_asset_exempt(path: &str, method: &Method) -> bool {
 
     matches!(
         path,
-        "/admin/index.html" | "/admin/login.html" | "/admin/debug.html"
+        "/admin/index.html"
+            | "/admin/login.html"
+            | "/admin/password-login.html"
+            | "/admin/debug.html"
     ) || path.starts_with("/admin/scripts/")
         || path.starts_with("/admin/styles/")
         || path.starts_with("/admin/i18n/")

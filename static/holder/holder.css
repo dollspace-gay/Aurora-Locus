@@ -1,0 +1,113 @@
+/* Holder self-service UI — structural styles (Holder UI Phase 1, chainlink #424).
+ *
+ * Colour + typography come from the active theme's CSS custom properties
+ * (loaded via /theme/active.css before this file), so the holder pages inherit
+ * whichever theme the operator/holder selected. This file only lays out
+ * structure — spacing, forms, tables — with theme-var fallbacks so the page is
+ * legible even if a theme fails to load. */
+
+:root {
+  --holder-gap: 1rem;
+  --holder-radius: 8px;
+  --holder-max-width: 34rem;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family-sans, system-ui, -apple-system, "Segoe UI", sans-serif);
+  background: var(--color-surface-primary, #ffffff);
+  color: var(--color-text-primary, #111111);
+  line-height: 1.5;
+}
+
+.holder-shell {
+  max-width: var(--holder-max-width);
+  margin: 3rem auto;
+  padding: 0 1.25rem;
+}
+
+.holder-shell h1 {
+  font-family: var(--font-family-display, inherit);
+  margin-bottom: var(--holder-gap);
+}
+
+.holder-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  background: var(--color-surface-secondary, #f6f6f6);
+  border: 1px solid var(--color-border-primary, #dddddd);
+  border-radius: var(--holder-radius);
+  padding: 1.25rem;
+}
+
+.holder-form label {
+  font-weight: 600;
+  color: var(--color-text-secondary, #333333);
+}
+
+.holder-form input {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--color-border-primary, #cccccc);
+  border-radius: 6px;
+  background: var(--color-surface-primary, #ffffff);
+  color: var(--color-text-primary, #111111);
+  font: inherit;
+}
+
+.holder-form input:focus {
+  outline: 2px solid var(--color-border-focus, var(--color-accent-primary, #3b6ef6));
+  outline-offset: 1px;
+}
+
+.holder-form button,
+.holder-actions button {
+  margin-top: 0.5rem;
+  padding: 0.6rem 1rem;
+  border: none;
+  border-radius: 6px;
+  background: var(--color-accent-primary, #3b6ef6);
+  color: var(--color-text-inverted, #ffffff);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.holder-form button:hover,
+.holder-actions button:hover {
+  background: var(--color-accent-primary-hover, #2f5ad0);
+}
+
+.holder-error {
+  background: var(--color-surface-tertiary, #fde8e8);
+  border: 1px solid var(--color-border-primary, #f5b5b5);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: var(--holder-gap);
+}
+
+.holder-note {
+  color: var(--color-text-tertiary, #666666);
+  font-size: 0.9rem;
+  margin-top: var(--holder-gap);
+}
+
+.holder-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: var(--holder-gap) 0;
+}
+
+.holder-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: var(--holder-gap) 0;
+}
+
+.holder-table th,
+.holder-table td {
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--color-border-secondary, #eeeeee);
+}

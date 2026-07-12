@@ -23,6 +23,7 @@ pub mod db;
 pub mod distributed;
 pub mod error;
 pub mod federation;
+pub mod holder_signing;
 pub mod identity;
 pub mod jobs;
 pub mod kryphocron;
@@ -36,6 +37,7 @@ pub mod kryphocron_rotation;
 pub mod mailer;
 pub mod metrics;
 pub mod oauth;
+pub mod oauth_client;
 pub mod rate_limit;
 pub mod read_after_write; // Must come before actor_store (actor_store uses its types)
 pub mod rebuild;

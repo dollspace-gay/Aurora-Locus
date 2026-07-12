@@ -1034,13 +1034,29 @@ pub struct AuthConfig {
     /// URL to OAuth migration guide for developers
     #[serde(default = "default_migration_guide_url")]
     pub oauth_migration_guide_url: String,
-    /// OAuth feature flags for production deployment
+    /// Password-login fallback toggle (#442). When `false` (the default), the
+    /// `/admin-oauth/password-login` endpoint and the `/admin/password-login.html`
+    /// page both 302-redirect to `/admin/` — OAuth is the default admin auth and
+    /// password login is off unless an operator opts in per-deployment. A
+    /// boot-time env decision (`PDS_ADMIN_PASSWORD_LOGIN_ENABLED=true`), cached
+    /// here at startup; not a runtime toggle.
     #[serde(default)]
-    pub oauth_features: OAuthFeatureFlags,
+    pub password_login_enabled: bool,
+    /// AES-256 key (hex, 64 chars) for encrypting admin TOTP secrets at rest
+    /// (#442), from `PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX`. `None` when unset — TOTP
+    /// enrollment then refuses rather than persisting a plaintext secret. Read
+    /// once at boot; decoded to key bytes at cipher-construction time.
+    #[serde(default)]
+    pub admin_totp_encryption_key_hex: Option<String>,
 }
 
 fn default_jwt_sunset_date() -> String {
-    // Default to 90 days from now
+    // Fallback only: a rolling 90-days-from-boot window used when
+    // `PDS_JWT_SUNSET_DATE` is unset. Because it recomputes on each boot it
+    // never actually arrives — operators pinning a real deprecation deadline
+    // MUST set `PDS_JWT_SUNSET_DATE` (housekeeping #421 §5: the env override was
+    // added so the field is tunable like every other; the rolling default is
+    // documented, not silent).
     use chrono::{Duration, Utc};
     let sunset = Utc::now() + Duration::days(90);
     sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
@@ -1059,105 +1075,6 @@ pub struct OAuthConfig {
     pub redirect_uri: String,
     /// PDS URL for OAuth (e.g., https://bsky.social)
     pub pds_url: String,
-}
-
-/// OAuth feature flags for controlled production deployment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthFeatureFlags {
-    /// Enable OAuth 2.1 authorization endpoints
-    #[serde(default = "default_oauth_enabled")]
-    pub enabled: bool,
-
-    /// Percentage of users to roll out OAuth to (0-100)
-    /// Allows gradual rollout based on DID hash
-    #[serde(default = "default_rollout_percentage")]
-    pub rollout_percentage: u8,
-
-    /// Require DPoP token binding (enforces security in production)
-    /// When false, DPoP is optional (development mode)
-    #[serde(default = "default_require_dpop")]
-    pub require_dpop: bool,
-
-    /// Enable authorization endpoint (/oauth/authorize)
-    #[serde(default = "default_oauth_enabled")]
-    pub enable_authorize: bool,
-
-    /// Enable token endpoint (/oauth/token)
-    #[serde(default = "default_oauth_enabled")]
-    pub enable_token: bool,
-
-    /// Enable device management endpoints
-    #[serde(default)]
-    pub enable_device_management: bool,
-
-    /// Allow JWT fallback during transition period
-    /// When false, reject all JWT tokens
-    #[serde(default = "default_allow_jwt_fallback")]
-    pub allow_jwt_fallback: bool,
-}
-
-impl Default for OAuthFeatureFlags {
-    fn default() -> Self {
-        Self {
-            enabled: default_oauth_enabled(),
-            rollout_percentage: default_rollout_percentage(),
-            require_dpop: default_require_dpop(),
-            enable_authorize: default_oauth_enabled(),
-            enable_token: default_oauth_enabled(),
-            enable_device_management: false,
-            allow_jwt_fallback: default_allow_jwt_fallback(),
-        }
-    }
-}
-
-fn default_oauth_enabled() -> bool {
-    false // Disabled by default for safety
-}
-
-fn default_rollout_percentage() -> u8 {
-    0 // Start with 0% rollout
-}
-
-fn default_require_dpop() -> bool {
-    false // Optional in development
-}
-
-fn default_allow_jwt_fallback() -> bool {
-    true // Allow JWT during transition
-}
-
-/// Load OAuth feature flags from environment variables
-fn load_oauth_features_from_env() -> OAuthFeatureFlags {
-    OAuthFeatureFlags {
-        enabled: env::var("OAUTH_ENABLED")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        rollout_percentage: env::var("OAUTH_ROLLOUT_PERCENTAGE")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0),
-        require_dpop: env::var("OAUTH_REQUIRE_DPOP")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_authorize: env::var("OAUTH_ENABLE_AUTHORIZE")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_token: env::var("OAUTH_ENABLE_TOKEN")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        enable_device_management: env::var("OAUTH_ENABLE_DEVICE_MANAGEMENT")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse()
-            .unwrap_or(false),
-        allow_jwt_fallback: env::var("OAUTH_ALLOW_JWT_FALLBACK")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true),
-    }
 }
 
 /// Identity configuration
@@ -1194,6 +1111,10 @@ pub struct EmailConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteConfig {
     pub required: bool,
+    // NOTE (housekeeping #421 §5): `interval`/`epoch` have zero runtime readers
+    // (dead fields). Removal is deferred — it fans out to ~8 test-construction
+    // sites; batch it with the `blob_metadata`/`stage_ttl_seconds` removal (same
+    // fan-out) in a focused config-field-removal commit.
     pub interval: u64,
     pub epoch: String,
 }
@@ -1215,6 +1136,13 @@ pub struct RateLimitConfig {
     /// operator-tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
     /// per V06 batch tail G7.2.
     pub buckets_retention_days: u32,
+    /// Trust `X-Forwarded-For` / `X-Real-IP` for the real client IP (#442),
+    /// from `PDS_TRUST_PROXY`. OFF by default — enable ONLY behind a trusted
+    /// reverse proxy, else a client can spoof its IP via the header. Consumed by
+    /// the rate limiter and by admin session IP-binding, which refuses to enable
+    /// while this is off (the client IP is otherwise a loopback placeholder).
+    #[serde(default)]
+    pub trust_proxy: bool,
 }
 
 /// Logging configuration
@@ -1735,7 +1663,7 @@ impl EntrywayConfig {
 impl ServerConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> PdsResult<Self> {
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         let hostname = env::var("PDS_HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let port = env::var("PDS_PORT")
@@ -1810,6 +1738,49 @@ impl ServerConfig {
         let oauth_pds_url =
             env::var("PDS_OAUTH_PDS_URL").unwrap_or_else(|_| "https://bsky.social".to_string());
 
+        // Password-login fallback toggle (#442): OAuth is the default admin auth;
+        // password login is off unless the operator opts in per-deployment. Read
+        // once here and cached in the config; the value is logged at boot for
+        // observability.
+        let password_login_enabled = env::var("PDS_ADMIN_PASSWORD_LOGIN_ENABLED")
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+            .unwrap_or(false);
+        if password_login_enabled {
+            tracing::info!("Password login: ENABLED via PDS_ADMIN_PASSWORD_LOGIN_ENABLED=true");
+        } else {
+            tracing::info!("Password login: DISABLED (default)");
+        }
+
+        // Admin TOTP secret-encryption key (#442). Validated eagerly at boot so a
+        // malformed key fails startup rather than the first enrollment. Absent =
+        // TOTP enrollment unavailable (refuses rather than storing plaintext).
+        let admin_totp_encryption_key_hex = env::var("PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        match admin_totp_encryption_key_hex.as_deref() {
+            Some(hex_key) => {
+                let decoded = hex::decode(hex_key.trim()).map_err(|_| {
+                    PdsError::Validation(
+                        "PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX is not valid hex".to_string(),
+                    )
+                })?;
+                if decoded.len() != 32 {
+                    return Err(PdsError::Validation(
+                        "PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX must be 32 bytes (64 hex chars)"
+                            .to_string(),
+                    ));
+                }
+                tracing::info!("Admin TOTP: encryption key configured (2FA enrollment available)");
+            }
+            None => {
+                tracing::info!(
+                    "Admin TOTP: no encryption key set — 2FA enrollment unavailable \
+                     (set PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX to enable)"
+                );
+            }
+        }
+
         let did_plc_url =
             env::var("PDS_DID_PLC_URL").unwrap_or_else(|_| "https://plc.directory".to_string());
         let service_handle_domains = env::var("PDS_SERVICE_HANDLE_DOMAINS")
@@ -1882,6 +1853,16 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "7".to_string())
                 .parse()
                 .unwrap_or(7);
+
+        // PDS_TRUST_PROXY (#442): honor forwarded client-IP headers. OFF unless
+        // explicitly enabled — a spoofable header behind an untrusted hop.
+        let trust_proxy = env::var("PDS_TRUST_PROXY")
+            .ok()
+            .map(|v| matches!(v.trim(), "true" | "1"))
+            .unwrap_or(false);
+        if trust_proxy {
+            tracing::info!("Proxy trust: ENABLED via PDS_TRUST_PROXY (forwarded client IP honored)");
+        }
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
@@ -2090,9 +2071,12 @@ impl ServerConfig {
                     redirect_uri: oauth_redirect_uri,
                     pds_url: oauth_pds_url,
                 },
-                jwt_sunset_date: default_jwt_sunset_date(),
-                oauth_migration_guide_url: default_migration_guide_url(),
-                oauth_features: load_oauth_features_from_env(),
+                jwt_sunset_date: env::var("PDS_JWT_SUNSET_DATE")
+                    .unwrap_or_else(|_| default_jwt_sunset_date()),
+                oauth_migration_guide_url: env::var("PDS_OAUTH_MIGRATION_GUIDE_URL")
+                    .unwrap_or_else(|_| default_migration_guide_url()),
+                password_login_enabled,
+                admin_totp_encryption_key_hex,
             },
             identity: IdentityConfig {
                 did_plc_url,
@@ -2112,6 +2096,7 @@ impl ServerConfig {
                 global_requests_per_minute: rate_limit_requests,
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
                 buckets_retention_days: rate_limit_buckets_retention_days,
+                trust_proxy,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {
@@ -2882,7 +2867,7 @@ mod env_example_lint_tests {
     //! in `.env.example`. Operators routinely export only
     //! `PDS_DATA_DIRECTORY` for per-instance overlays (e.g., Phase B
     //! pds-a / pds-b); committed `.env.example` entries are copied into
-    //! the operator's local `.env`, dotenv populates them at process
+    //! the operator's local `.env`, dotenvy populates them at process
     //! start (since the operator's shell didn't export them), and the
     //! derivation-from-data-directory path is silently bypassed —
     //! stranding components at the .env-set path instead of following
@@ -2918,7 +2903,7 @@ mod env_example_lint_tests {
                  PDS_DATA_DIRECTORY; committing them as active values \
                  creates a precedence trap where operator-shell-exported \
                  PDS_DATA_DIRECTORY no longer moves the component (the \
-                 dotenv-loaded .env value wins because the operator's \
+                 dotenvy-loaded .env value wins because the operator's \
                  shell didn't export this specific key). Comment the \
                  entry out — operators who genuinely want a non-default \
                  component path can uncomment. See chainlink #94.",

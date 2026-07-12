@@ -519,7 +519,6 @@ fn reject_cascade_write(
     ))
 }
 
-#[allow(dead_code)] // reached at arc 2 step 5 and onward
 pub async fn bind_pipeline(
     write_op: &crate::actor_store::repository::WriteOp,
     shared_tx: &mut sqlx::Transaction<'_, sqlx::Any>,

@@ -1,27 +1,49 @@
-#!/bin/bash
-
-# Aurora Locus PDS Installation Script
-# Interactive setup for a production-ready ATProto Personal Data Server
+#!/usr/bin/env bash
 #
-# This script will:
-# - Collect configuration information
-# - Generate cryptographic keys
-# - Create OAuth keyset
-# - Configure environment variables
-# - Set up systemd service (optional)
-# - Configure nginx reverse proxy (optional)
+# Aurora Locus — installer.
+#
+# Composes a working `.env` for a fresh PDS deployment by DERIVING it from
+# `.env.example` (the single source of truth). The installer never carries its
+# own parallel list of config variables: it copies `.env.example` line-for-line,
+# substituting values only for keys that already exist there. That structural
+# choice is deliberate — it makes the whole class of "phantom env var" drift
+# (vars the script wrote that the app never reads) impossible, and means a new
+# field landing in `.env.example` is picked up here automatically with no edit.
+#
+# Value substitution follows three rules, all encoded in `.env.example` itself:
+#   1. A `# Generate with:  <cmd>` comment above one or more KEY= lines marks
+#      those as generated secrets — the installer runs <cmd> (an `openssl …`
+#      invocation) and writes the output. This covers PDS_JWT_SECRET and the two
+#      _K256_PRIVATE_KEY_HEX signing keys (raw 32-byte hex — the format
+#      `PlcSigner` decodes; the previous installer emitted DER and never booted).
+#   2. A small fixed set of deployment-identity keys is derived from the one
+#      value the operator must supply, their public domain (PDS_HOSTNAME,
+#      AURORA_DOMAIN, PDS_SERVICE_DID, PDS_SERVICE_PUBLIC_URL, PDS_SERVICE_HANDLE_DOMAINS).
+#   3. Everything else is copied verbatim (working defaults + all documentation).
+#
+# Beyond the .env, the installer brings the NATIVE deploy path up to parity with
+# the docker-compose path by handling the two prerequisites operators otherwise
+# solve by hand:
+#   - the Rust toolchain (bootstraps rustup if absent; the pinned toolchain then
+#     auto-selects from rust-toolchain.toml on the first cargo invocation), and
+#   - TLS termination (detects an installed reverse proxy — Caddy / nginx /
+#     Apache — and writes a site config for the operator's domain, or offers to
+#     install Caddy on a fresh host for automatic Let's Encrypt).
+#
+# Admin access is NOT an env var (the old `PDS_ADMIN_DIDS` never had a consumer).
+# It is granted per-DID from the `admin_roles` table via the offline
+# `grant-admin` subcommand; the installer prints that as a post-boot step.
 
-set -e
+set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ---- presentation -----------------------------------------------------------
 
-# Print functions
-print_header() {
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+info()    { echo -e "${BLUE}ℹ${NC} $1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; }
+warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
+err()     { echo -e "${RED}✗${NC} $1" >&2; }
+header() {
     echo -e "${BLUE}"
     echo "═══════════════════════════════════════════════════════════"
     echo "  $1"
@@ -29,1124 +51,835 @@ print_header() {
     echo -e "${NC}"
 }
 
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
+# ---- privilege / platform helpers ------------------------------------------
 
-print_error() {
-    echo -e "${RED}✗ $1${NC}"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠ $1${NC}"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-# Check if running as root
-check_root() {
-    if [[ $EUID -eq 0 ]]; then
-        print_error "This script should NOT be run as root"
-        print_info "Run as a regular user. It will prompt for sudo when needed."
-        exit 1
-    fi
-}
-
-# Check dependencies
-check_dependencies() {
-    print_header "Checking Dependencies"
-
-    local missing_deps=()
-
-    for cmd in openssl jq xxd cargo sqlite3 curl; do
-        if ! command -v $cmd &> /dev/null; then
-            missing_deps+=("$cmd")
-            print_error "Missing: $cmd"
-        else
-            print_success "Found: $cmd"
-        fi
-    done
-
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        echo ""
-        print_error "Missing required dependencies: ${missing_deps[*]}"
-        echo ""
-        print_info "Install them with:"
-        echo "  Ubuntu/Debian: sudo apt-get install openssl jq xxd build-essential sqlite3 curl"
-        echo "  Fedora/RHEL:   sudo dnf install openssl jq vim-common gcc sqlite curl"
-        echo "  macOS:         brew install openssl jq xxd sqlite curl"
-        echo ""
-        print_info "Install Rust from: https://rustup.rs/"
-        exit 1
-    fi
-
-    echo ""
-    print_success "All dependencies found!"
-    echo ""
-}
-
-# Prompt for user input with default value
-prompt() {
-    local var_name=$1
-    local prompt_text=$2
-    local default_value=$3
-    local secret=$4
-
-    if [ -n "$default_value" ]; then
-        prompt_text="$prompt_text [$default_value]"
-    fi
-
-    if [ "$secret" = "secret" ]; then
-        read -s -p "$prompt_text: " value
-        echo ""
+# Run a command as root: directly if already root, via sudo if available,
+# otherwise fail with a clear message. Used for package installs and writes
+# under /etc.
+run_root() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
     else
-        read -p "$prompt_text: " value
-    fi
-
-    if [ -z "$value" ] && [ -n "$default_value" ]; then
-        value=$default_value
-    fi
-
-    eval $var_name="'$value'"
-}
-
-# Generate random string
-generate_random() {
-    local length=$1
-    openssl rand -base64 $length | tr -d "=+/\n" | tr -d '\n' | cut -c1-$length
-}
-
-# Validate domain name
-validate_domain() {
-    local domain=$1
-    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
-        return 0
-    else
+        err "This step needs root privileges (or sudo), which are not available."
         return 1
     fi
 }
 
-# Validate email
-validate_email() {
-    local email=$1
-    if [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        return 0
-    else
-        return 1
-    fi
+# Echo the distro family: debian | rhel | arch | unknown.
+detect_distro() {
+    if [[ -f /etc/debian_version ]]; then echo debian
+    elif [[ -f /etc/redhat-release ]]; then echo rhel
+    elif [[ -f /etc/arch-release ]]; then echo arch
+    else echo unknown; fi
 }
 
-# Generate repository signing key (secp256k1)
-generate_repo_key() {
-    print_info "Generating repository signing key (secp256k1)..."
-
-    openssl ecparam -name secp256k1 -genkey -noout -out repo_key.pem
-    openssl ec -in repo_key.pem -outform DER 2>/dev/null | xxd -p -c 256 > repo_key.hex
-
-    REPO_KEY=$(cat repo_key.hex)
-    rm repo_key.pem repo_key.hex
-
-    print_success "Repository signing key generated"
+# True if systemd reports the given unit active.
+svc_active() {
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null
 }
 
-# Generate PLC rotation key (secp256k1)
-generate_plc_key() {
-    print_info "Generating PLC rotation key (secp256k1)..."
+# ---- reverse-proxy config renderers ----------------------------------------
+#
+# Pure functions: each echoes the site config it would write, with the
+# operator's domain substituted, and touches nothing. `--emit-proxy-config`
+# exposes them for preview/testing. The proxy's own runtime variables ($host,
+# $scheme, …) are protected by a quoted heredoc and survive the substitution —
+# only the __AURORA_DOMAIN__ token is replaced.
 
-    openssl ecparam -name secp256k1 -genkey -noout -out plc_key.pem
-    openssl ec -in plc_key.pem -outform DER 2>/dev/null | xxd -p -c 256 > plc_key.hex
-
-    PLC_KEY=$(cat plc_key.hex)
-    rm plc_key.pem plc_key.hex
-
-    print_success "PLC rotation key generated"
+render_caddy_block() {
+    cat <<CADDY
+${DOMAIN} {
+    reverse_proxy localhost:2583
+}
+CADDY
 }
 
-# Generate OAuth keyset (P-256 for ES256)
-generate_oauth_keyset() {
-    print_info "Generating OAuth keyset (P-256/ES256)..."
+render_nginx_conf() {
+    sed "s/__AURORA_DOMAIN__/${DOMAIN}/g" <<'NGINX'
+server {
+    listen 443 ssl http2;
+    server_name __AURORA_DOMAIN__;
 
-    # Generate P-256 key pair
-    openssl ecparam -name prime256v1 -genkey -noout -out private-legacy.pem
-    openssl pkcs8 -topk8 -nocrypt -in private-legacy.pem -out private-pkcs8.pem
-    openssl ec -in private-legacy.pem -pubout -out public.pem 2>/dev/null
+    # certbot-managed certs (adjust path if your certs live elsewhere)
+    ssl_certificate     /etc/letsencrypt/live/__AURORA_DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__AURORA_DOMAIN__/privkey.pem;
 
-    # Read PEM files
-    PRIVATE_KEY_PEM=$(cat private-pkcs8.pem)
-    PUBLIC_KEY_PEM=$(cat public.pem)
-
-    # Extract key components
-    KEY_COMPONENTS_HEX=$(openssl ec -in private-legacy.pem -text -noout 2>/dev/null)
-
-    PRIV_HEX=$(echo "$KEY_COMPONENTS_HEX" | grep priv -A 3 | tail -n +2 | tr -d ' \n:')
-    PUB_HEX=$(echo "$KEY_COMPONENTS_HEX" | grep pub -A 5 | tail -n +2 | tr -d ' \n:')
-    X_HEX=$(echo "$PUB_HEX" | cut -c 3-66)
-    Y_HEX=$(echo "$PUB_HEX" | cut -c 67-130)
-
-    # Convert to base64url
-    D_B64URL=$(echo -n "$PRIV_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
-    X_B64URL=$(echo -n "$X_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
-    Y_B64URL=$(echo -n "$Y_HEX" | xxd -r -p | base64 | tr '/+' '_-' | tr -d '=')
-
-    # Generate Key ID
-    KID="$(date +%s)-$(openssl rand -hex 4)"
-
-    # Create oauth-keyset.json
-    jq -n \
-      --arg kid "$KID" \
-      --arg pkpem "$PRIVATE_KEY_PEM" \
-      --arg pubpem "$PUBLIC_KEY_PEM" \
-      --arg d "$D_B64URL" \
-      --arg x "$X_B64URL" \
-      --arg y "$Y_B64URL" \
-      '{
-        kid: $kid,
-        privateKeyPem: $pkpem,
-        publicKeyPem: $pubpem,
-        jwk: {
-          kid: $kid,
-          kty: "EC",
-          crv: "P-256",
-          alg: "ES256",
-          use: "sig",
-          d: $d,
-          x: $x,
-          y: $y
-        }
-      }' > oauth-keyset.json
-
-    # Cleanup
-    rm private-legacy.pem private-pkcs8.pem public.pem
-
-    print_success "OAuth keyset generated: oauth-keyset.json"
+    location / {
+        proxy_pass http://127.0.0.1:2583;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+    }
 }
-
-# Create .env file
-create_env_file() {
-    print_info "Creating .env configuration file..."
-
-    cat > .env << EOF
-# Aurora Locus PDS Configuration
-# Generated on $(date)
-
-# ============================================================================
-# Server Configuration
-# ============================================================================
-PDS_HOSTNAME=$HOSTNAME
-PDS_PORT=$PORT
-PDS_SERVICE_DID=did:web:$HOSTNAME
-
-# ============================================================================
-# Security
-# ============================================================================
-PDS_JWT_SECRET=$JWT_SECRET
-
-# ============================================================================
-# Cryptographic Keys
-# ============================================================================
-# Repository signing key (secp256k1) - DO NOT SHARE
-PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=$REPO_KEY
-
-# PLC rotation key (secp256k1) - DO NOT SHARE
-PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$PLC_KEY
-
-# ============================================================================
-# OAuth Configuration
-# ============================================================================
-# OAuth keyset for admin authentication (P-256/ES256)
-OAUTH_KEYSET_FILE=./oauth-keyset.json
-OAUTH_CLIENT_ID=http://$HOSTNAME/oauth/client
-
-# Admin DIDs allowed to use OAuth admin authentication
-# Add your DID here after creating an account to get admin access
-# Multiple DIDs can be comma-separated: did:plc:abc123,did:plc:def456
-PDS_ADMIN_DIDS=$ADMIN_DID
-
-# ============================================================================
-# Storage
-# ============================================================================
-PDS_DATA_DIRECTORY=./data
-PDS_ACTOR_STORE_DIRECTORY=./data/actors
-
-# Blob storage configuration
-# Options: disk or s3
-PDS_BLOBSTORE_PROVIDER=disk
-PDS_BLOBSTORE_DISK_LOCATION=./data/blobs
-PDS_BLOBSTORE_DISK_TMP_LOCATION=./data/tmp
-
-# S3 Configuration (uncomment and configure if using S3)
-# PDS_BLOBSTORE_PROVIDER=s3
-# PDS_BLOBSTORE_S3_BUCKET=my-pds-blobs
-# PDS_BLOBSTORE_S3_REGION=us-east-1
-# PDS_BLOBSTORE_S3_ACCESS_KEY_ID=
-# PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=
-# PDS_BLOBSTORE_S3_ENDPOINT=  # Optional: for S3-compatible services
-
-# ============================================================================
-# Database
-# ============================================================================
-PDS_ACCOUNT_DB_LOCATION=./data/account.sqlite
-
-# ============================================================================
-# Email Configuration (Optional)
-# ============================================================================
-EMAIL_SMTP_URL=
-EMAIL_FROM_ADDRESS=noreply@$HOSTNAME
-
-# ============================================================================
-# Identity & Federation
-# ============================================================================
-# DID PLC Directory URL
-DID_PLC_URL=https://plc.directory
-
-# Federation settings
-PDS_FEDERATION_ENABLED=$FEDERATION_ENABLED
-PDS_FEDERATION_RELAY_URLS=$RELAY_URL
-PDS_FEDERATION_FIREHOSE_ENABLED=true
-PDS_FEDERATION_CRAWL_ENABLED=true
-PDS_PUBLIC_URL=$PDS_PUBLIC_URL
-
-# ============================================================================
-# Rate Limiting
-# ============================================================================
-RATE_LIMIT_ENABLED=true
-RATE_LIMIT_GLOBAL_HOURLY=3000
-RATE_LIMIT_GLOBAL_DAILY=10000
-RATE_LIMIT_CREATE_SESSION_HOURLY=30
-RATE_LIMIT_CREATE_SESSION_DAILY=300
-
-# ============================================================================
-# Invite Codes
-# ============================================================================
-INVITE_REQUIRED=$INVITE_REQUIRED
-INVITE_INTERVAL=604800  # 1 week in seconds
-
-# ============================================================================
-# Logging
-# ============================================================================
-RUST_LOG=info,aurora_locus=debug
-
-EOF
-
-    print_success ".env file created"
-}
-
-# Create systemd service
-create_systemd_service() {
-    print_info "Creating systemd service file..."
-
-    local service_file="/tmp/aurora-locus.service"
-
-    cat > $service_file << EOF
-[Unit]
-Description=Aurora Locus ATProto PDS
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/target/release/aurora-locus
-Restart=always
-RestartSec=10
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$INSTALL_DIR/data
-
-# Environment
-Environment=RUST_LOG=info,aurora_locus=debug
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    print_success "Systemd service file created: $service_file"
-    echo ""
-    print_info "To install the service, run:"
-    echo "  sudo cp $service_file /etc/systemd/system/"
-    echo "  sudo systemctl daemon-reload"
-    echo "  sudo systemctl enable aurora-locus"
-    echo "  sudo systemctl start aurora-locus"
-    echo ""
-}
-
-# Create nginx configuration
-create_nginx_config() {
-    print_info "Creating nginx reverse proxy configuration..."
-
-    local nginx_file="/tmp/aurora-locus-nginx.conf"
-
-    cat > $nginx_file << EOF
-# Aurora Locus PDS - Nginx Configuration
-# Place this file in /etc/nginx/sites-available/aurora-locus
-# Then: sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/
 
 server {
     listen 80;
-    server_name $HOSTNAME;
-
-    # Redirect HTTP to HTTPS
-    return 301 https://\$host\$request_uri;
+    server_name __AURORA_DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+NGINX
 }
 
-server {
-    listen 443 ssl http2;
-    server_name $HOSTNAME;
+render_apache_conf() {
+    sed "s/__AURORA_DOMAIN__/${DOMAIN}/g" <<'APACHE'
+<VirtualHost *:443>
+    ServerName __AURORA_DOMAIN__
 
-    # SSL Configuration (update paths to your certificates)
-    ssl_certificate /etc/letsencrypt/live/$HOSTNAME/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$HOSTNAME/privkey.pem;
+    SSLEngine on
+    SSLCertificateFile      /etc/letsencrypt/live/__AURORA_DOMAIN__/fullchain.pem
+    SSLCertificateKeyFile   /etc/letsencrypt/live/__AURORA_DOMAIN__/privkey.pem
 
-    # SSL Security Settings
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ProxyPass        / http://127.0.0.1:2583/
+    ProxyPassReverse / http://127.0.0.1:2583/
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+</VirtualHost>
 
-    # Proxy settings
-    location / {
-        proxy_pass http://127.0.0.1:$PORT;
-        proxy_http_version 1.1;
-
-        # WebSocket support (for firehose)
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        # Headers
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        # Timeouts
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }
-
-    # Security headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-    # Logging
-    access_log /var/log/nginx/aurora-locus-access.log;
-    error_log /var/log/nginx/aurora-locus-error.log;
+<VirtualHost *:80>
+    ServerName __AURORA_DOMAIN__
+    Redirect permanent / https://__AURORA_DOMAIN__/
+</VirtualHost>
+APACHE
 }
+
+# ---- rustup bootstrap -------------------------------------------------------
+
+# Echo the pinned channel from rust-toolchain.toml (e.g. "1.91"), or nothing if
+# the file/line is absent. Tolerates single/double quotes, surrounding
+# whitespace, trailing comments, and a missing or comment-only file.
+read_pinned_channel() {
+    local f="$REPO_ROOT/rust-toolchain.toml" line
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    line="$(grep -E '^[[:space:]]*channel[[:space:]]*=' "$f" 2>/dev/null | head -1)"
+    [[ -n "$line" ]] || { echo ""; return 0; }
+    line="${line#*=}"        # drop up to the '='
+    line="${line%%#*}"       # drop a trailing comment
+    line="${line//\"/}"      # drop double quotes
+    line="${line//\'/}"      # drop single quotes
+    line="$(echo "$line" | tr -d '[:space:]')"
+    echo "$line"
+}
+
+# Bug 1 fix: rustup-init ran with --default-toolchain none, so nothing was
+# installed and no default is set — a later `cargo` in the workspace would only
+# auto-install if cwd happens to be the workspace. Explicitly install the pinned
+# channel and set it as the default so cargo works from any directory.
+ensure_pinned_toolchain() {
+    local ch; ch="$(read_pinned_channel)"
+    if [[ -z "$ch" ]]; then
+        warn "No pinned channel found in rust-toolchain.toml — leaving toolchain"
+        warn "selection to rustup's on-demand install in the workspace."
+        return 0
+    fi
+    info "Installing the pinned Rust toolchain ($ch) …"
+    rustup toolchain install "$ch"
+    rustup default "$ch"
+    success "Active toolchain: $(rustup show active-toolchain 2>/dev/null || echo "$ch")"
+}
+
+# Bug 2 fix: rustup-init was run with --no-modify-path (no rc edits without
+# consent), so ~/.cargo/bin is on install.sh's PATH (we source it) but NOT the
+# operator's parent shell — the banner's `cargo` next-step would resolve to an
+# older system cargo, or nothing. Offer to persist it (opt-in; auto-yes under
+# --non-interactive). New shells then get cargo; the banner still prints how to
+# fix the CURRENT shell.
+offer_shell_rc_append() {
+    local rc="$HOME/.bashrc"
+    if [[ -f "$rc" ]] && grep -qF '.cargo/env' "$rc"; then
+        info "~/.bashrc already sources ~/.cargo/env — new shells get cargo automatically."
+        return 0
+    fi
+    local do_it=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_it=true
+    else
+        info "cargo is installed under ~/.cargo/bin, which is not yet on your shell's PATH."
+        read -r -p "Add cargo to your PATH permanently? (appends to ~/.bashrc) [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_it=true
+    fi
+    if [[ "$do_it" == true ]]; then
+        printf '\n# Added by aurora-locus install.sh — put rustup/cargo on PATH\n. "$HOME/.cargo/env"\n' >> "$rc"
+        success "Appended cargo env to $rc (effective in new shells)."
+    else
+        info "Left ~/.bashrc unchanged."
+    fi
+}
+
+bootstrap_rustup() {
+    if command -v rustup >/dev/null 2>&1; then
+        success "rustup found — toolchain resolves from rust-toolchain.toml"
+        return 0
+    fi
+    if [[ "$SKIP_RUSTUP" == true ]]; then
+        warn "rustup not found and --skip-rustup set — provide a Rust toolchain yourself before building."
+        return 0
+    fi
+
+    local do_install=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_install=true
+    else
+        warn "rustup is not installed. Distro 'rust' packages are often too old to"
+        warn "parse this workspace's lockfile; rustup is the supported toolchain."
+        read -r -p "Install rustup now? [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_install=true
+    fi
+
+    if [[ "$do_install" != true ]]; then
+        warn "Skipping rustup install — install a Rust toolchain before 'cargo run'."
+        return 0
+    fi
+
+    info "Installing rustup (no rc edits yet; the pinned toolchain is installed next) …"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
+    # Put rustup + cargo on install.sh's own PATH for the rest of this run.
+    # shellcheck disable=SC1091
+    [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+    if ! command -v rustup >/dev/null 2>&1; then
+        err "rustup-init ran but rustup is not on PATH."
+        err "Open a new shell (or 'source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+
+    ensure_pinned_toolchain   # bug 1
+    offer_shell_rc_append     # bug 2
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        err "rustup installed but cargo is not on PATH."
+        err "Open a new shell (or 'source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+    RUSTUP_INSTALLED_THIS_RUN=true
+    success "rustup + pinned toolchain installed — cargo available"
+}
+
+# ---- system C toolchain preflight -------------------------------------------
+
+# Rust crates with C dependencies (openssl-sys, libc, ring, …) need a C compiler
+# and the openssl development headers to build; without them the first
+# `cargo run` dies with "linker `cc` not found" or an openssl-sys build error.
+# Run this BEFORE bootstrap_rustup so rustup-init doesn't first emit its own
+# "no default linker (cc) was found" warning. Idempotent: a present toolchain is
+# detected and skipped.
+ensure_c_toolchain() {
+    local missing=()
+    command -v cc         >/dev/null 2>&1 || missing+=("C compiler (cc)")
+    if command -v pkg-config >/dev/null 2>&1; then
+        pkg-config --exists openssl 2>/dev/null || missing+=("openssl development headers")
+    else
+        missing+=("pkg-config")
+        missing+=("openssl development headers")   # can't probe without pkg-config
+    fi
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        success "C build toolchain found (cc, pkg-config, openssl headers)"
+        return 0
+    fi
+
+    warn "System C toolchain is incomplete — missing: ${missing[*]}."
+    warn "Rust crates like libc and openssl-sys need a C compiler and openssl dev headers."
+
+    local do_install=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        do_install=true
+    else
+        read -r -p "Install the C build toolchain + openssl dev headers now? [Y/n]: " ans
+        [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]] && do_install=true
+    fi
+    if [[ "$do_install" != true ]]; then
+        err "Cannot build Aurora without a C compiler and openssl development headers."
+        err "Install them for your distro and re-run install.sh."
+        exit 1
+    fi
+
+    local distro; distro="$(detect_distro)"
+    info "Installing the C build toolchain ($distro) …"
+    case "$distro" in
+        debian) run_root bash -c "apt-get update && apt-get install -y build-essential pkg-config libssl-dev" ;;
+        rhel)   run_root dnf install -y gcc gcc-c++ make openssl-devel pkgconf-pkg-config ;;
+        arch)   run_root pacman -S --needed --noconfirm base-devel openssl pkgconf ;;
+        *)
+            err "Automatic C-toolchain install is not supported on this distro."
+            err "Install a C compiler, pkg-config, and the openssl development headers"
+            err "(e.g. build-essential + pkg-config + libssl-dev on Debian/Ubuntu), then re-run."
+            exit 1 ;;
+    esac
+
+    hash -r 2>/dev/null || true   # forget stale command lookups after the install
+    if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 \
+       && pkg-config --exists openssl 2>/dev/null; then
+        success "C build toolchain installed"
+    else
+        err "The C-toolchain install did not satisfy all prerequisites (cc / pkg-config / openssl headers)."
+        err "Install them manually for your distro and re-run install.sh."
+        exit 1
+    fi
+}
+
+# ---- proto-blue-codegen preflight -------------------------------------------
+
+# kryphocron-lexicons' build.rs invokes the proto-blue-codegen binary as a
+# subprocess (§5.2 fallback integration path); without it on PATH the workspace
+# build fails inside that crate. Install it once cargo is available. The ~0.3.1
+# constraint is the one that crate's build.rs error message prescribes.
+# Idempotent: a present binary is detected and skipped.
+ensure_proto_blue_codegen() {
+    if command -v proto-blue-codegen >/dev/null 2>&1; then
+        success "proto-blue-codegen found"
+        return 0
+    fi
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "cargo is not available — skipping proto-blue-codegen."
+        warn "After you have a Rust toolchain, run: cargo install proto-blue-codegen --version '~0.3.1'"
+        return 0
+    fi
+    info "Installing proto-blue-codegen (required by kryphocron-lexicons build.rs) …"
+    cargo install proto-blue-codegen --version '~0.3.1'
+    hash -r 2>/dev/null || true   # forget stale command lookups after the install
+    if ! command -v proto-blue-codegen >/dev/null 2>&1; then
+        err "proto-blue-codegen installed but the binary is not on PATH."
+        err "Ensure ~/.cargo/bin is on PATH ('source \$HOME/.cargo/env') and re-run install.sh."
+        exit 1
+    fi
+    success "proto-blue-codegen installed ($(proto-blue-codegen --version 2>/dev/null || echo 'version unknown'))"
+}
+
+# ---- Caddy install ----------------------------------------------------------
+
+install_caddy() {
+    local distro; distro="$(detect_distro)"
+    info "Installing Caddy ($distro) …"
+    case "$distro" in
+        debian)
+            run_root bash -c "
+                apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg &&
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg &&
+                curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list &&
+                apt-get update &&
+                apt-get install -y caddy
+            " ;;
+        rhel)
+            run_root bash -c "
+                dnf install -y 'dnf-command(copr)' &&
+                dnf copr enable -y @caddy/caddy &&
+                dnf install -y caddy
+            " ;;
+        arch)
+            run_root pacman -Sy --noconfirm caddy ;;
+        *)
+            err "Automatic Caddy install is not supported on this distro."
+            err "Install Caddy manually (https://caddyserver.com/docs/install), then"
+            err "re-run with --reverse-proxy=caddy."
+            return 1 ;;
+    esac
+}
+
+# ---- reverse-proxy detection + configuration --------------------------------
+
+# Echo which proxy to configure: an active one wins; else the sole installed
+# one; else "none" (nothing installed) or "multi:<list>" (several, none active).
+detect_reverse_proxy() {
+    if svc_active caddy;  then echo caddy;  return; fi
+    if svc_active nginx;  then echo nginx;  return; fi
+    if svc_active apache2 || svc_active httpd; then echo apache; return; fi
+
+    local installed=()
+    command -v caddy >/dev/null 2>&1 && installed+=(caddy)
+    command -v nginx >/dev/null 2>&1 && installed+=(nginx)
+    { command -v apache2 >/dev/null 2>&1 || command -v httpd >/dev/null 2>&1; } && installed+=(apache)
+
+    case "${#installed[@]}" in
+        0) echo none ;;
+        1) echo "${installed[0]}" ;;
+        *) echo "multi:${installed[*]}" ;;
+    esac
+}
+
+configure_caddy() {
+    if ! command -v caddy >/dev/null 2>&1; then
+        install_caddy || { err "Caddy install failed."; exit 1; }
+    fi
+    local cf=/etc/caddy/Caddyfile block ts=""
+    block="$(render_caddy_block)"
+
+    if run_root test -s "$cf"; then
+        if run_root grep -qF "${DOMAIN} {" "$cf" 2>/dev/null; then
+            warn "Caddyfile already has a block for $DOMAIN — leaving it untouched."
+            RP_SUMMARY="Caddy (existing $DOMAIN block kept)"
+            return 0
+        fi
+        ts="$(date +%Y%m%d%H%M%S)"
+        run_root cp "$cf" "$cf.bak.$ts"
+        warn "Existing Caddyfile backed up to $cf.bak.$ts"
+        printf '\n%s\n' "$block" | run_root tee -a "$cf" >/dev/null
+    else
+        run_root mkdir -p /etc/caddy
+        printf '%s\n' "$block" | run_root tee "$cf" >/dev/null
+    fi
+
+    if ! run_root caddy validate --config "$cf" 2>/dev/null; then
+        err "caddy validate failed for $cf."
+        if [[ -n "$ts" ]]; then
+            run_root cp "$cf.bak.$ts" "$cf"
+            err "Restored the previous Caddyfile from backup."
+        fi
+        exit 1
+    fi
+
+    run_root systemctl daemon-reload || true
+    run_root systemctl enable caddy || true
+    run_root systemctl reload caddy || run_root systemctl restart caddy || true
+    success "Caddy configured for $DOMAIN (automatic Let's Encrypt TLS)."
+    RP_SUMMARY="Caddy (automatic Let's Encrypt)"
+}
+
+configure_nginx() {
+    command -v nginx >/dev/null 2>&1 || { err "nginx not found on PATH."; exit 1; }
+    local conf link=""
+    if [[ -d /etc/nginx/sites-available ]]; then
+        conf=/etc/nginx/sites-available/aurora-locus.conf
+        link=/etc/nginx/sites-enabled/aurora-locus.conf
+    else
+        conf=/etc/nginx/conf.d/aurora-locus.conf
+    fi
+
+    render_nginx_conf | run_root tee "$conf" >/dev/null
+    [[ -n "$link" ]] && run_root ln -sf "$conf" "$link"
+
+    if ! run_root nginx -t 2>/dev/null; then
+        err "nginx -t failed — removing the site config."
+        run_root rm -f "$conf"
+        [[ -n "$link" ]] && run_root rm -f "$link"
+        exit 1
+    fi
+    run_root systemctl reload nginx || true
+    success "nginx site written: $conf"
+    RP_SUMMARY="nginx"
+    run_root test -d "/etc/letsencrypt/live/$DOMAIN" || RP_CERTBOT_HINT=true
+}
+
+configure_apache() {
+    local conf reload_svc
+    if command -v apache2 >/dev/null 2>&1 || [[ "$(detect_distro)" == debian ]]; then
+        conf=/etc/apache2/sites-available/aurora-locus.conf
+        reload_svc=apache2
+        local m
+        for m in proxy proxy_http ssl headers; do run_root a2enmod "$m" >/dev/null 2>&1 || true; done
+        render_apache_conf | run_root tee "$conf" >/dev/null
+        run_root a2ensite aurora-locus.conf >/dev/null 2>&1 || true
+        if ! run_root apache2ctl configtest 2>/dev/null; then
+            err "apache2ctl configtest failed — removing the site config."
+            run_root rm -f "$conf"; exit 1
+        fi
+    else
+        conf=/etc/httpd/conf.d/aurora-locus.conf
+        reload_svc=httpd
+        render_apache_conf | run_root tee "$conf" >/dev/null
+        if ! run_root httpd -t 2>/dev/null; then
+            err "httpd -t failed — removing the site config."
+            run_root rm -f "$conf"; exit 1
+        fi
+    fi
+    run_root systemctl reload "$reload_svc" || true
+    success "Apache site written: $conf"
+    RP_SUMMARY="Apache"
+    run_root test -d "/etc/letsencrypt/live/$DOMAIN" || RP_CERTBOT_HINT=true
+}
+
+# Orchestrate reverse-proxy setup based on RP_MODE + detection.
+setup_reverse_proxy() {
+    if [[ "$RP_MODE" == none ]]; then
+        RP_SUMMARY="not configured (--reverse-proxy=none)"
+        info "Skipping reverse-proxy setup — Aurora will listen on localhost:2583."
+        info "Point your own proxy (Traefik, HAProxy, cloud LB, …) at that address."
+        return 0
+    fi
+    if [[ "$DOMAIN" == localhost ]]; then
+        RP_SUMMARY="not configured (localhost dev)"
+        info "Localhost install — skipping reverse-proxy / TLS setup."
+        return 0
+    fi
+
+    local choice="$RP_MODE"
+    if [[ "$choice" == auto ]]; then
+        choice="$(detect_reverse_proxy)"
+        if [[ "$choice" == multi:* ]]; then
+            local list="${choice#multi:}"
+            warn "Multiple reverse proxies installed ($list) and none is active."
+            if [[ "$NON_INTERACTIVE" == true ]]; then
+                choice="${list%% *}"
+                info "Non-interactive: choosing $choice."
+            else
+                read -r -p "Which should I configure? [caddy/nginx/apache]: " choice
+            fi
+        fi
+    fi
+
+    case "$choice" in
+        caddy)  configure_caddy ;;
+        nginx)  configure_nginx ;;
+        apache) configure_apache ;;
+        none)
+            info "No reverse proxy detected. Caddy gives you automatic Let's Encrypt TLS on a fresh host."
+            local do_it=false
+            if [[ "$NON_INTERACTIVE" == true ]]; then
+                do_it=true
+            else
+                read -r -p "Install and configure Caddy now? [Y/n]: " a
+                [[ -z "$a" || "${a,,}" == "y" || "${a,,}" == "yes" ]] && do_it=true
+            fi
+            if [[ "$do_it" == true ]]; then
+                configure_caddy
+            else
+                RP_SUMMARY="not configured"
+                warn "No reverse proxy configured — Aurora will listen on localhost:2583 only."
+            fi ;;
+        *)
+            err "Unknown reverse-proxy choice: '$choice' (expected caddy|nginx|apache|none)."
+            exit 1 ;;
+    esac
+}
+
+# ---- locate the repo --------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+ENV_EXAMPLE="$REPO_ROOT/.env.example"
+ENV_OUT="$REPO_ROOT/.env"
+SETUP_DB="$REPO_ROOT/scripts/setup-database.sh"
+SYSTEMD_UNIT="packaging/systemd/aurora-locus.service"
+
+# ---- arguments --------------------------------------------------------------
+
+DOMAIN=""
+DATA_DIR=""          # empty = "not set"; prompted (interactive) or defaults to ./data
+NON_INTERACTIVE=false
+FORCE=false
+ADMIN_DID=""
+COMPOSE_ENV=true     # set false when the operator declines to overwrite an existing .env
+RP_MODE="auto"       # auto | caddy | nginx | apache | none
+SKIP_RUSTUP=false
+EMIT_PROXY=""        # internal: render a proxy config to stdout and exit
+
+# reverse-proxy result state (for the banner)
+RP_SUMMARY="not configured"
+RP_CERTBOT_HINT=false
+
+# true once install.sh has installed rustup this run (drives the current-shell
+# PATH hint in the banner)
+RUSTUP_INSTALLED_THIS_RUN=false
+
+usage() {
+    cat <<EOF
+Aurora Locus installer — composes .env from .env.example and brings up the
+native deploy path (Rust toolchain + reverse-proxy TLS) to Docker parity.
+
+Usage: ./install.sh [options]
+
+  --domain DOMAIN         Public domain for this PDS (e.g. pds.example.com).
+                          Derives the identity keys and drives reverse-proxy
+                          config. Omit for a localhost dev install (no TLS).
+  --data-dir PATH         Data directory (default: ./data).
+  --admin-did DID         DID to print grant-admin bootstrap instructions for.
+  --reverse-proxy MODE    auto (default) | caddy | nginx | apache | none.
+                          auto detects an installed/active proxy, or offers to
+                          install Caddy on a fresh host. none skips TLS setup.
+  --no-caddy              Alias for --reverse-proxy=none.
+  --skip-rustup           Do not offer to install rustup if it is missing.
+  --non-interactive       Never prompt; accept installs, use defaults / flags.
+                          Requires --force to overwrite an existing .env.
+  --force                 Overwrite an existing .env (backs it up to .env.bak).
+  --emit-proxy-config T   Print the reverse-proxy config (T = caddy|nginx|apache)
+                          for --domain to stdout and exit (preview; no changes).
+  -h, --help              Show this help.
 EOF
-
-    print_success "Nginx configuration created: $nginx_file"
-    echo ""
-    print_info "To install the nginx config:"
-    echo "  1. Get SSL certificates: sudo certbot --nginx -d $HOSTNAME"
-    echo "  2. Copy config: sudo cp $nginx_file /etc/nginx/sites-available/aurora-locus"
-    echo "  3. Enable site: sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/"
-    echo "  4. Test config: sudo nginx -t"
-    echo "  5. Reload nginx: sudo systemctl reload nginx"
-    echo ""
 }
 
-# Main installation flow
-main() {
-    clear
-    print_header "Aurora Locus PDS Installation"
-    echo ""
-    echo "This script will guide you through setting up a production-ready"
-    echo "ATProto Personal Data Server (PDS) for the Bluesky network."
-    echo ""
-    read -p "Press Enter to continue..."
-    echo ""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --domain)              DOMAIN="${2:?--domain needs a value}"; shift 2 ;;
+        --data-dir)            DATA_DIR="${2:?--data-dir needs a value}"; shift 2 ;;
+        --admin-did)           ADMIN_DID="${2:?--admin-did needs a value}"; shift 2 ;;
+        --reverse-proxy)       RP_MODE="${2:?--reverse-proxy needs a value}"; shift 2 ;;
+        --reverse-proxy=*)     RP_MODE="${1#*=}"; shift ;;
+        --no-caddy)            RP_MODE="none"; shift ;;
+        --skip-rustup)         SKIP_RUSTUP=true; shift ;;
+        --non-interactive)     NON_INTERACTIVE=true; shift ;;
+        --force)               FORCE=true; shift ;;
+        --emit-proxy-config)   EMIT_PROXY="${2:?--emit-proxy-config needs a value}"; shift 2 ;;
+        --emit-proxy-config=*) EMIT_PROXY="${1#*=}"; shift ;;
+        -h|--help)             usage; exit 0 ;;
+        *) err "Unknown option: $1"; echo; usage; exit 1 ;;
+    esac
+done
 
-    # Check prerequisites
-    check_root
-    check_dependencies
+case "$RP_MODE" in
+    auto|caddy|nginx|apache|none) : ;;
+    *) err "Invalid --reverse-proxy '$RP_MODE' (expected auto|caddy|nginx|apache|none)."; exit 1 ;;
+esac
 
-    # Get installation directory
-    print_header "Installation Directory"
-    INSTALL_DIR=$(pwd)
-    echo "Current directory: $INSTALL_DIR"
-    prompt INSTALL_DIR "Install in this directory?" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-    echo ""
+# ---- preview short-circuit --------------------------------------------------
+# `--emit-proxy-config` renders a config and exits before any prereqs or writes.
 
-    # Collect configuration
-    print_header "Server Configuration"
+if [[ -n "$EMIT_PROXY" ]]; then
+    [[ -z "$DOMAIN" ]] && DOMAIN="example.com"
+    case "$EMIT_PROXY" in
+        caddy)  render_caddy_block ;;
+        nginx)  render_nginx_conf ;;
+        apache) render_apache_conf ;;
+        *) err "Unknown --emit-proxy-config type '$EMIT_PROXY' (expected caddy|nginx|apache)."; exit 1 ;;
+    esac
+    exit 0
+fi
 
-    while true; do
-        prompt HOSTNAME "PDS hostname (e.g., pds.example.com)" ""
-        if validate_domain "$HOSTNAME"; then
-            break
-        else
-            print_error "Invalid domain name. Please try again."
-        fi
-    done
+# ---- prerequisites ----------------------------------------------------------
 
-    prompt PORT "Server port" "3000"
-    echo ""
+header "Aurora Locus — Install"
 
-    # Admin DID configuration
-    print_header "Admin DID Configuration"
+if [[ ! -f "$ENV_EXAMPLE" ]]; then
+    err ".env.example not found at $ENV_EXAMPLE"
+    err "Run this script from a checkout of the Aurora Locus repository."
+    exit 1
+fi
 
-    echo "Aurora Locus uses OAuth 2.0 with DID-based admin authentication."
-    echo ""
-    print_info "You can either:"
-    echo "  1. Enter an admin DID now (if you already have an account DID)"
-    echo "  2. Leave blank and add it later to .env after creating your account"
-    echo ""
+if ! command -v openssl >/dev/null 2>&1; then
+    err "openssl is required (used to generate secrets and signing keys) but was not found."
+    exit 1
+fi
+success "openssl found"
 
-    prompt ADMIN_DID "Admin DID (leave blank to set later)" ""
+# System C toolchain (cc + pkg-config + openssl headers): needed to build crates
+# with C dependencies. Done BEFORE rustup so rustup-init doesn't emit its own
+# "no default linker (cc) was found" warning the operator would have to ignore.
+ensure_c_toolchain
 
-    if [ -z "$ADMIN_DID" ]; then
-        print_warning "No admin DID provided - you'll need to update PDS_ADMIN_DIDS in .env later"
-        ADMIN_DID="__PLACEHOLDER_ADMIN_DID__"
+# Rust toolchain: bootstrap rustup if missing (unless --skip-rustup). The pinned
+# toolchain in rust-toolchain.toml is fetched on the first cargo invocation.
+bootstrap_rustup
+
+# proto-blue-codegen: build-time codegen binary kryphocron-lexicons' build.rs
+# invokes; install once cargo is available so the first `cargo build` succeeds.
+ensure_proto_blue_codegen
+
+if command -v docker >/dev/null 2>&1; then
+    info "docker also present — the docker-compose path is available as an alternative."
+fi
+
+# ---- gather operator input --------------------------------------------------
+
+if [[ -z "$DOMAIN" && "$NON_INTERACTIVE" == false ]]; then
+    echo
+    info "Public domain for this PDS (leave blank for a localhost dev install)."
+    info "Must be a domain you control with an A/AAAA record pointing here, so"
+    info "did:web + federation + TLS can resolve it."
+    read -r -p "Domain [localhost]: " DOMAIN
+fi
+
+if [[ -z "$DOMAIN" ]]; then
+    DOMAIN="localhost"
+    info "No domain supplied — configuring for localhost (development)."
+else
+    info "Configuring for domain: $DOMAIN"
+fi
+
+# Data directory: prompt when interactive and not supplied via --data-dir; empty
+# defaults to ./data. Mirrors the domain-prompt pattern.
+if [[ -z "$DATA_DIR" && "$NON_INTERACTIVE" == false ]]; then
+    echo
+    info "Data directory for databases, blobs and the actor store."
+    read -r -p "Data directory [./data]: " DATA_DIR
+fi
+if [[ -z "$DATA_DIR" ]]; then
+    DATA_DIR="./data"
+fi
+info "Data directory: $DATA_DIR"
+
+# ---- guard an existing .env -------------------------------------------------
+
+if [[ -f "$ENV_OUT" ]]; then
+    if [[ "$FORCE" == true ]]; then
+        cp "$ENV_OUT" "$ENV_OUT.bak"
+        warn "Existing .env backed up to .env.bak"
+    elif [[ "$NON_INTERACTIVE" == true ]]; then
+        err ".env already exists. Re-run with --force to overwrite (backs up to .env.bak)."
+        exit 1
     else
-        # Basic validation - should start with did:
-        if [[ ! $ADMIN_DID =~ ^did: ]]; then
-            print_error "Invalid DID format. Should start with 'did:'"
-            print_info "Example: did:plc:abc123xyz..."
-            exit 1
-        fi
-        print_success "Admin DID will be configured: $ADMIN_DID"
-    fi
-    echo ""
-
-    # Federation settings
-    print_header "Federation Configuration"
-
-    prompt FEDERATION_ENABLED "Enable federation with Bluesky network? (true/false)" "true"
-
-    if [ "$FEDERATION_ENABLED" = "true" ]; then
-        prompt RELAY_URL "Relay server URL" "https://bsky.network"
-
-        # Set PDS_PUBLIC_URL based on hostname and port
-        if [ -n "$HOSTNAME" ]; then
-            if [ "$PORT" = "443" ]; then
-                DEFAULT_PUBLIC_URL="https://$HOSTNAME"
-            else
-                DEFAULT_PUBLIC_URL="https://$HOSTNAME"
+        read -r -p ".env already exists. Overwrite? (backs up to .env.bak) [y/N]: " ans
+        if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+            COMPOSE_ENV=false
+            info "Keeping existing .env — skipping .env composition step."
+            # Prefer the existing .env's data directory so the rest of the
+            # install (dir prep, final banner) reflects what the server will use.
+            existing_dd="$(grep -E '^PDS_DATA_DIRECTORY=' "$ENV_OUT" | tail -1 | cut -d= -f2- || true)"
+            if [[ -n "$existing_dd" ]]; then
+                DATA_DIR="$existing_dd"
+                info "Using PDS_DATA_DIRECTORY from the existing .env: $DATA_DIR"
             fi
         else
-            DEFAULT_PUBLIC_URL=""
+            cp "$ENV_OUT" "$ENV_OUT.bak"
+            warn "Existing .env backed up to .env.bak"
         fi
-
-        prompt PDS_PUBLIC_URL "Public URL for this PDS (must be accessible from internet)" "$DEFAULT_PUBLIC_URL"
-    else
-        RELAY_URL=""
-        PDS_PUBLIC_URL=""
     fi
-    echo ""
+fi
 
-    # Invite codes
-    print_header "Invite Code Configuration"
+# ---- compose .env (skipped when keeping an existing .env) -------------------
 
-    prompt INVITE_REQUIRED "Require invite codes for registration? (true/false)" "false"
-    echo ""
+if [[ "$COMPOSE_ENV" == true ]]; then
 
-    # Generate cryptographic keys
-    print_header "Generating Cryptographic Keys"
+# ---- deployment-identity overrides (rule 2) --------------------------------
+#
+# The single unavoidable piece of domain knowledge: how one operator-supplied
+# domain maps onto the identity-bearing config keys. Only used when a non-
+# localhost domain is given; a localhost dev install keeps .env.example's
+# defaults untouched. Every key here already exists in .env.example.
 
-    print_info "Generating JWT secret..."
-    JWT_SECRET=$(generate_random 64)
-    print_success "JWT secret generated"
+declare -A OVERRIDE=()
 
-    generate_repo_key
-    generate_plc_key
-    generate_oauth_keyset
-    echo ""
+# The data directory is independent of the domain: always pin it so the .env
+# and the directory setup-database.sh prepares agree (default ./data matches the
+# template, so this is a no-op there).
+OVERRIDE[PDS_DATA_DIRECTORY]="$DATA_DIR"
 
-    # Create configuration files
-    print_header "Creating Configuration Files"
+if [[ "$DOMAIN" != "localhost" ]]; then
+    OVERRIDE[PDS_HOSTNAME]="$DOMAIN"
+    OVERRIDE[AURORA_DOMAIN]="$DOMAIN"
+    OVERRIDE[PDS_SERVICE_DID]="did:web:$DOMAIN"
+    OVERRIDE[PDS_SERVICE_PUBLIC_URL]="https://$DOMAIN"
+    OVERRIDE[PDS_SERVICE_HANDLE_DOMAINS]=".$DOMAIN"
+fi
 
-    # Backup existing .env if it exists
-    if [ -f .env ]; then
-        print_warning "Existing .env file found - backing up to .env.backup"
-        mv .env .env.backup
+# ---- derive .env from .env.example (rules 1 & 3) ----------------------------
+
+info "Composing .env from .env.example …"
+
+gen_cmd=""          # pending `# Generate with:` command; applies to the
+                    # consecutive KEY= lines that follow, reset by a blank
+                    # line or a non-hint comment.
+tmp_env="$(mktemp)"
+generated_count=0
+overridden_count=0
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Generator-hint comment → arm the generator for the following KEY= lines.
+    if [[ "$line" =~ ^#[[:space:]]*Generate[[:space:]]with:[[:space:]]*(.+)$ ]]; then
+        gen_cmd="${BASH_REMATCH[1]}"
+        printf '%s\n' "$line" >>"$tmp_env"
+        continue
     fi
 
-    create_env_file
-
-    # Verify .env was created successfully
-    if [ ! -f .env ]; then
-        print_error ".env file was not created!"
-        exit 1
+    # Any other comment or a blank line ends the current generator run.
+    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line//[[:space:]]/}" ]]; then
+        gen_cmd=""
+        printf '%s\n' "$line" >>"$tmp_env"
+        continue
     fi
 
-    if ! grep -q "PDS_JWT_SECRET" .env; then
-        print_error ".env file is missing PDS_JWT_SECRET"
-        exit 1
-    fi
+    # Uncommented KEY=value line?
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
 
-    print_success ".env file created and verified"
-    echo ""
-
-    # Build the project
-    print_header "Building Aurora Locus"
-
-    print_info "This may take several minutes..."
-    if cargo build --release 2>&1 | tee build.log | grep -q "Finished"; then
-        print_success "Build completed successfully!"
-        rm build.log
-    else
-        print_error "Build failed. Check build.log for details."
-        exit 1
-    fi
-    echo ""
-
-    # Create data directories
-    print_header "Setting Up Data Directories"
-
-    # Clean existing databases for fresh install
-    if [ -d "data" ]; then
-        if [ -f "data/account.sqlite" ] || [ -f "data/sequencer.sqlite" ] || [ -f "data/did_cache.sqlite" ]; then
-            print_warning "Existing database files found"
-            prompt CLEAN_DB "Delete existing databases for fresh install? (yes/no)" "yes"
-            if [ "$CLEAN_DB" = "yes" ]; then
-                rm -f data/*.sqlite data/*.sqlite-*
-                print_success "Existing databases deleted"
+        if [[ -n "${OVERRIDE[$key]+x}" ]]; then
+            val="${OVERRIDE[$key]}"
+            overridden_count=$((overridden_count + 1))
+        elif [[ -n "$gen_cmd" ]]; then
+            # Only run recognised generators from the trusted template.
+            if [[ "$gen_cmd" =~ ^openssl[[:space:]] ]]; then
+                val="$(eval "$gen_cmd")"
+                generated_count=$((generated_count + 1))
             else
-                print_warning "Keeping existing databases - may cause migration conflicts!"
+                warn "Unrecognised generator '$gen_cmd' for $key — leaving blank."
+                val=""
             fi
         fi
+
+        printf '%s=%s\n' "$key" "$val" >>"$tmp_env"
+        continue
     fi
 
-    mkdir -p data/actors data/blobs data/tmp
-    print_success "Data directories created"
-    echo ""
-    mkdir -p data/actors data/blobs data/tmp
-    print_success "Data directories created"
-    echo ""
+    # Anything else (shouldn't happen) — copy verbatim.
+    printf '%s\n' "$line" >>"$tmp_env"
+done <"$ENV_EXAMPLE"
 
-    # Initialize database with inline SQL
-    print_header "Initializing Database"
+mv "$tmp_env" "$ENV_OUT"
+chmod 600 "$ENV_OUT"
+success ".env written ($generated_count secrets generated, $overridden_count identity fields set for $DOMAIN)"
 
-    if [ ! -f "data/account.sqlite" ]; then
-        print_info "Creating database with core tables..."
-        sqlite3 data/account.sqlite << 'EOSQL'
--- Core account table
-CREATE TABLE IF NOT EXISTS account (
-    did TEXT PRIMARY KEY NOT NULL,
-    handle TEXT UNIQUE NOT NULL,
-    email TEXT UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    email_confirmed BOOLEAN NOT NULL DEFAULT 0,
-    email_confirmed_at DATETIME,
-    deactivated_at DATETIME,
-    takedown_ref TEXT,
-    status TEXT NOT NULL DEFAULT 'active'
-);
-CREATE INDEX IF NOT EXISTS account_handle_idx ON account(handle);
-CREATE INDEX IF NOT EXISTS account_email_idx ON account(email) WHERE email IS NOT NULL;
-CREATE INDEX IF NOT EXISTS account_status_idx ON account(status);
+else
+    info "Existing .env left in place (composition skipped)."
+fi
 
--- Actor table (for handle/DID mapping)
-CREATE TABLE IF NOT EXISTS actor (
-    did TEXT PRIMARY KEY NOT NULL,
-    handle TEXT UNIQUE NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    takedown_ref TEXT,
-    FOREIGN KEY (did) REFERENCES account(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS actor_handle_idx ON actor(handle);
+# ---- data directory + schema ------------------------------------------------
 
--- Session table
-CREATE TABLE IF NOT EXISTS session (
-    id TEXT PRIMARY KEY NOT NULL,
-    did TEXT NOT NULL,
-    access_token TEXT UNIQUE NOT NULL,
-    refresh_token TEXT UNIQUE NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    expires_at DATETIME NOT NULL,
-    app_password_name TEXT,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS session_did_idx ON session(did);
-CREATE INDEX IF NOT EXISTS session_access_token_idx ON session(access_token);
-CREATE INDEX IF NOT EXISTS session_refresh_token_idx ON session(refresh_token);
-CREATE INDEX IF NOT EXISTS session_expires_at_idx ON session(expires_at);
+echo
+if [[ -x "$SETUP_DB" ]]; then
+    info "Preparing the data directory via scripts/setup-database.sh …"
+    "$SETUP_DB" --data-dir "$DATA_DIR" --non-interactive
+else
+    warn "scripts/setup-database.sh not found or not executable — creating $DATA_DIR directly."
+    mkdir -p "$DATA_DIR"
+fi
 
--- Refresh token table
-CREATE TABLE IF NOT EXISTS refresh_token (
-    id TEXT PRIMARY KEY NOT NULL,
-    did TEXT NOT NULL,
-    token TEXT UNIQUE NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    expires_at DATETIME NOT NULL,
-    used BOOLEAN NOT NULL DEFAULT 0,
-    used_at DATETIME,
-    next_id TEXT,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS refresh_token_did_idx ON refresh_token(did);
-CREATE INDEX IF NOT EXISTS refresh_token_token_idx ON refresh_token(token);
-CREATE INDEX IF NOT EXISTS refresh_token_expires_at_idx ON refresh_token(expires_at);
-CREATE INDEX IF NOT EXISTS refresh_token_used_idx ON refresh_token(used);
+# ---- reverse proxy / TLS ----------------------------------------------------
 
--- Email token table
-CREATE TABLE IF NOT EXISTS email_token (
-    token TEXT PRIMARY KEY NOT NULL,
-    did TEXT NOT NULL,
-    purpose TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    expires_at DATETIME NOT NULL,
-    used BOOLEAN NOT NULL DEFAULT 0,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS email_token_did_idx ON email_token(did);
-CREATE INDEX IF NOT EXISTS email_token_purpose_idx ON email_token(purpose);
-CREATE INDEX IF NOT EXISTS email_token_expires_at_idx ON email_token(expires_at);
-CREATE INDEX IF NOT EXISTS email_token_used_idx ON email_token(used);
+echo
+setup_reverse_proxy
 
--- App password table
-CREATE TABLE IF NOT EXISTS app_password (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL,
-    name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    last_used_at DATETIME,
-    privileged BOOLEAN NOT NULL DEFAULT 0,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE,
-    UNIQUE(did, name)
-);
-CREATE INDEX IF NOT EXISTS app_password_did_idx ON app_password(did);
-CREATE INDEX IF NOT EXISTS app_password_last_used_idx ON app_password(last_used_at);
+# ---- final instructions -----------------------------------------------------
 
--- Repository root table
-CREATE TABLE IF NOT EXISTS repo_root (
-    did TEXT PRIMARY KEY NOT NULL,
-    cid TEXT NOT NULL,
-    rev TEXT NOT NULL,
-    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS repo_root_cid_idx ON repo_root(cid);
-CREATE INDEX IF NOT EXISTS repo_root_indexed_at_idx ON repo_root(indexed_at);
+header "Install complete"
 
--- Record table
-CREATE TABLE IF NOT EXISTS record (
-    uri TEXT PRIMARY KEY NOT NULL,
-    cid TEXT NOT NULL,
-    collection TEXT NOT NULL,
-    rkey TEXT NOT NULL,
-    repo_rev TEXT NOT NULL,
-    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    takedown_ref TEXT,
-    FOREIGN KEY (uri) REFERENCES record(uri) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS record_collection_idx ON record(collection);
-CREATE INDEX IF NOT EXISTS record_rkey_idx ON record(rkey);
-CREATE INDEX IF NOT EXISTS record_cid_idx ON record(cid);
-CREATE INDEX IF NOT EXISTS record_indexed_at_idx ON record(indexed_at);
-CREATE INDEX IF NOT EXISTS record_takedown_idx ON record(takedown_ref) WHERE takedown_ref IS NOT NULL;
-
--- Record-blob association table (tracks which blobs are referenced by which records)
-CREATE TABLE IF NOT EXISTS record_blob (
-    blob_cid TEXT NOT NULL,
-    record_uri TEXT NOT NULL,
-    indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (blob_cid, record_uri)
-);
-CREATE INDEX IF NOT EXISTS record_blob_cid_idx ON record_blob(blob_cid);
-CREATE INDEX IF NOT EXISTS record_blob_uri_idx ON record_blob(record_uri);
-CREATE INDEX IF NOT EXISTS record_blob_indexed_at_idx ON record_blob(indexed_at);
-
--- Repo block table
-CREATE TABLE IF NOT EXISTS repo_block (
-    cid TEXT PRIMARY KEY NOT NULL,
-    content BLOB NOT NULL,
-    indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS repo_block_indexed_at_idx ON repo_block(indexed_at);
-
--- Repo sequence table
-CREATE TABLE IF NOT EXISTS repo_seq (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    event TEXT NOT NULL,
-    invalidated BOOLEAN NOT NULL DEFAULT 0,
-    sequenced_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS repo_seq_did_idx ON repo_seq(did);
-CREATE INDEX IF NOT EXISTS repo_seq_event_type_idx ON repo_seq(event_type);
-CREATE INDEX IF NOT EXISTS repo_seq_sequenced_at_idx ON repo_seq(sequenced_at);
-CREATE INDEX IF NOT EXISTS repo_seq_invalidated_idx ON repo_seq(invalidated);
-
--- Blob metadata table
-CREATE TABLE IF NOT EXISTS blob_metadata (
-    cid TEXT PRIMARY KEY NOT NULL,
-    mime_type TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    creator_did TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    width INTEGER,
-    height INTEGER,
-    thumbnail_cid TEXT,
-    FOREIGN KEY (creator_did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS blob_metadata_creator_did_idx ON blob_metadata(creator_did);
-CREATE INDEX IF NOT EXISTS blob_metadata_mime_type_idx ON blob_metadata(mime_type);
-CREATE INDEX IF NOT EXISTS blob_metadata_created_at_idx ON blob_metadata(created_at);
-
--- Temporary blob metadata table
-CREATE TABLE IF NOT EXISTS temp_blob_metadata (
-    cid TEXT PRIMARY KEY NOT NULL,
-    mime_type TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    creator_did TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    width INTEGER,
-    height INTEGER,
-    FOREIGN KEY (creator_did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS temp_blob_metadata_creator_did_idx ON temp_blob_metadata(creator_did);
-CREATE INDEX IF NOT EXISTS temp_blob_metadata_created_at_idx ON temp_blob_metadata(created_at);
-
--- Account moderation table
-CREATE TABLE IF NOT EXISTS account_moderation (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL,
-    action TEXT NOT NULL,
-    moderated_by TEXT NOT NULL,
-    moderated_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    expires_at DATETIME,
-    reason TEXT,
-    notes TEXT,
-    reversed BOOLEAN NOT NULL DEFAULT 0,
-    reversed_at DATETIME,
-    reversed_by TEXT,
-    reversal_reason TEXT,
-    report_id INTEGER,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS account_moderation_did_idx ON account_moderation(did);
-CREATE INDEX IF NOT EXISTS account_moderation_action_idx ON account_moderation(action);
-CREATE INDEX IF NOT EXISTS account_moderation_moderated_at_idx ON account_moderation(moderated_at);
-CREATE INDEX IF NOT EXISTS account_moderation_expires_at_idx ON account_moderation(expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS account_moderation_reversed_idx ON account_moderation(reversed);
-
--- Label table
-CREATE TABLE IF NOT EXISTS label (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uri TEXT NOT NULL,
-    cid TEXT,
-    val TEXT NOT NULL,
-    neg BOOLEAN NOT NULL DEFAULT 0,
-    src TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    created_by TEXT,
-    expires_at DATETIME
-);
-CREATE INDEX IF NOT EXISTS label_uri_idx ON label(uri);
-CREATE INDEX IF NOT EXISTS label_cid_idx ON label(cid) WHERE cid IS NOT NULL;
-CREATE INDEX IF NOT EXISTS label_val_idx ON label(val);
-CREATE INDEX IF NOT EXISTS label_src_idx ON label(src);
-CREATE INDEX IF NOT EXISTS label_created_at_idx ON label(created_at);
-CREATE INDEX IF NOT EXISTS label_expires_at_idx ON label(expires_at) WHERE expires_at IS NOT NULL;
-
--- Report table
-CREATE TABLE IF NOT EXISTS report (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject_did TEXT,
-    subject_uri TEXT,
-    subject_cid TEXT,
-    reason_type TEXT NOT NULL,
-    reason TEXT,
-    reported_by TEXT NOT NULL,
-    reported_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    status TEXT NOT NULL DEFAULT 'open',
-    resolved_by TEXT,
-    resolved_at DATETIME,
-    resolution_notes TEXT
-);
-CREATE INDEX IF NOT EXISTS report_subject_did_idx ON report(subject_did) WHERE subject_did IS NOT NULL;
-CREATE INDEX IF NOT EXISTS report_subject_uri_idx ON report(subject_uri) WHERE subject_uri IS NOT NULL;
-CREATE INDEX IF NOT EXISTS report_reason_type_idx ON report(reason_type);
-CREATE INDEX IF NOT EXISTS report_reported_by_idx ON report(reported_by);
-CREATE INDEX IF NOT EXISTS report_reported_at_idx ON report(reported_at);
-CREATE INDEX IF NOT EXISTS report_status_idx ON report(status);
-
--- Admin roles table
-CREATE TABLE IF NOT EXISTS admin_roles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    did TEXT NOT NULL,
-    role TEXT NOT NULL,
-    granted_by TEXT NOT NULL,
-    granted_at DATETIME NOT NULL,
-    revoked BOOLEAN NOT NULL DEFAULT 0,
-    revoked_at DATETIME,
-    revoked_by TEXT,
-    notes TEXT,
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE,
-    UNIQUE(did, role)
-);
-CREATE INDEX IF NOT EXISTS admin_roles_did_idx ON admin_roles(did);
-CREATE INDEX IF NOT EXISTS admin_roles_role_idx ON admin_roles(role);
-CREATE INDEX IF NOT EXISTS admin_roles_revoked_idx ON admin_roles(revoked);
-
--- Admin audit log table
-CREATE TABLE IF NOT EXISTS admin_audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_did TEXT NOT NULL,
-    action TEXT NOT NULL,
-    subject_did TEXT,
-    subject_uri TEXT,
-    details TEXT,
-    timestamp DATETIME NOT NULL DEFAULT (datetime('now')),
-    ip_address TEXT,
-    FOREIGN KEY (admin_did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS admin_audit_log_admin_did_idx ON admin_audit_log(admin_did);
-CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx ON admin_audit_log(action);
-CREATE INDEX IF NOT EXISTS admin_audit_log_timestamp_idx ON admin_audit_log(timestamp);
-CREATE INDEX IF NOT EXISTS admin_audit_log_subject_did_idx ON admin_audit_log(subject_did) WHERE subject_did IS NOT NULL;
-
--- Lexicon failure table
-CREATE TABLE IF NOT EXISTS lexicon_failure (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection TEXT NOT NULL,
-    record_uri TEXT NOT NULL,
-    validation_errors TEXT NOT NULL,
-    detected_at DATETIME NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS lexicon_failure_collection_idx ON lexicon_failure(collection);
-CREATE INDEX IF NOT EXISTS lexicon_failure_record_uri_idx ON lexicon_failure(record_uri);
-CREATE INDEX IF NOT EXISTS lexicon_failure_detected_at_idx ON lexicon_failure(detected_at);
-
--- Invite code table
-CREATE TABLE IF NOT EXISTS invite_code (
-    code TEXT PRIMARY KEY NOT NULL,
-    available_uses INTEGER NOT NULL DEFAULT 1,
-    disabled BOOLEAN NOT NULL DEFAULT 0,
-    for_account TEXT,
-    created_by TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    expires_at DATETIME
-);
-CREATE INDEX IF NOT EXISTS invite_code_disabled_idx ON invite_code(disabled);
-CREATE INDEX IF NOT EXISTS invite_code_for_account_idx ON invite_code(for_account) WHERE for_account IS NOT NULL;
-
--- Invite code use table
-CREATE TABLE IF NOT EXISTS invite_code_use (
-    code TEXT NOT NULL,
-    used_by TEXT NOT NULL,
-    used_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (code) REFERENCES invite_code(code) ON DELETE CASCADE,
-    PRIMARY KEY (code, used_by)
-);
-CREATE INDEX IF NOT EXISTS invite_code_use_code_idx ON invite_code_use(code);
-CREATE INDEX IF NOT EXISTS invite_code_use_used_by_idx ON invite_code_use(used_by);
-CREATE UNIQUE INDEX IF NOT EXISTS invite_code_use_unique_idx ON invite_code_use(code, used_by);
-
--- Sequencer config table
-CREATE TABLE IF NOT EXISTS sequencer_config (
-    key TEXT PRIMARY KEY NOT NULL,
-    value TEXT NOT NULL,
-    updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
-);
-
--- PLC keys table
-CREATE TABLE IF NOT EXISTS plc_keys (
-    did TEXT PRIMARY KEY NOT NULL,
-    rotation_key_public TEXT NOT NULL,
-    rotation_key_type TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (did) REFERENCES actor(did) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS plc_keys_did_idx ON plc_keys(did);
-
--- NOTE: All tables created. sqlx will handle remaining migrations automatically.
-EOSQL
-
-        if [ "$ADMIN_DID" != "__PLACEHOLDER_ADMIN_DID__" ] && [ -n "$ADMIN_DID" ]; then
-            # Use RFC3339 format for timestamp (e.g., 2025-10-24T18:41:11+00:00)
-            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
-            sqlite3 data/account.sqlite "INSERT INTO admin_roles (did, role, granted_by, granted_at, revoked) VALUES ('$ADMIN_DID', 'superadmin', 'installer', '$TIMESTAMP', 0);"
-            print_success "Database initialized - Admin DID $ADMIN_DID added as superadmin"
-        else
-            print_success "Database initialized with core tables"
-        fi
-        print_info "OAuth tables (device, authorization_request, token, etc.) will be created automatically on first startup"
-    else
-        print_info "Database already exists - OAuth tables will be added automatically if missing"
-    fi
-
-    # Initialize DID cache database
-    if [ ! -f "data/did_cache.sqlite" ]; then
-        print_info "Creating DID cache database..."
-        sqlite3 data/did_cache.sqlite << 'EOSQL'
--- DID document cache
-CREATE TABLE IF NOT EXISTS did_doc (
-    did TEXT PRIMARY KEY,
-    doc TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    cached_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_did_doc_updated_at ON did_doc(updated_at);
-
--- Handle to DID mapping cache
-CREATE TABLE IF NOT EXISTS did_handle (
-    handle TEXT PRIMARY KEY,
-    did TEXT NOT NULL,
-    declared_at TEXT,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_did_handle_did ON did_handle(did);
-CREATE INDEX IF NOT EXISTS idx_did_handle_updated_at ON did_handle(updated_at);
-
--- Migration tracking for DID cache database
-CREATE TABLE IF NOT EXISTS _sqlx_migrations (
-    version BIGINT PRIMARY KEY NOT NULL,
-    description TEXT NOT NULL,
-    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    success BOOLEAN NOT NULL,
-    checksum BLOB NOT NULL,
-    execution_time BIGINT NOT NULL
-);
-INSERT OR IGNORE INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
-VALUES (20251122000000, 'did_cache_tables', CURRENT_TIMESTAMP, 1, X'00', 0);
-EOSQL
-        print_success "DID cache database initialized"
-    else
-        print_info "DID cache database already exists"
-    fi
-
-    echo ""
-
-    print_header "Configuration Complete"
-    print_success "All configuration files have been generated!"
-    print_success "Database has been initialized"
-    echo ""
-    # Optional: systemd service
-    print_header "System Integration (Optional)"
-
-    prompt SETUP_SYSTEMD "Create systemd service file? (yes/no)" "yes"
-    if [ "$SETUP_SYSTEMD" = "yes" ]; then
-        create_systemd_service
-    fi
-
-    prompt SETUP_NGINX "Create nginx configuration? (yes/no)" "yes"
-    if [ "$SETUP_NGINX" = "yes" ]; then
-        create_nginx_config
-    fi
-
-    # Installation complete
-    print_header "Installation Complete!"
-
-    echo ""
-    print_success "🎉 Aurora Locus PDS has been installed successfully!"
-    echo ""
-
-    print_header "Next Steps"
-    echo ""
-
-    print_info "STEP 1: Start the server"
-    echo "  ./target/release/aurora-locus"
-    echo ""
-    print_info "  Or run in background:"
-    echo "  nohup ./target/release/aurora-locus > pds.log 2>&1 &"
-    echo ""
-
-    print_info "STEP 2: Create your first account"
-    echo "  curl -X POST http://localhost:$PORT/xrpc/com.atproto.server.createAccount \\"
-    echo "    -H 'Content-Type: application/json' \\"
-    echo "    -d '{\"handle\":\"you.$HOSTNAME\",\"email\":\"you@example.com\",\"password\":\"secure-password\"}'"
-    echo ""
-    print_warning "  SAVE THE DID from the response!"
-    echo "  Example response: {\"did\": \"did:plc:abc123xyz...\", ...}"
-    echo ""
-
-    if [ "$ADMIN_DID" = "__PLACEHOLDER_ADMIN_DID__" ]; then
-        print_info "STEP 3: Configure admin DID"
-        echo "  Edit .env and replace:"
-        echo "    PDS_ADMIN_DIDS=__PLACEHOLDER_ADMIN_DID__"
-        echo "  With your actual DID:"
-        echo "    PDS_ADMIN_DIDS=did:plc:abc123xyz..."
-        echo ""
-        print_warning "  Restart the server after updating .env!"
-        echo ""
-    else
-        print_info "STEP 3: Admin DID already configured"
-        echo "  Admin DID: $ADMIN_DID"
-        echo "  ✓ Already set in .env"
-        echo ""
-    fi
-
-    print_info "STEP 4: Grant admin role (optional - for database admin)"
-    echo "  sqlite3 data/accounts.db"
-    echo "  INSERT INTO admin_role (did, role, granted_by, granted_at, revoked)"
-    echo "    VALUES ('YOUR_DID', 'superadmin', 'system', datetime('now'), 0);"
-    echo "  .exit"
-    echo ""
-    print_info "  Note: If your DID is in PDS_ADMIN_DIDS, you automatically get admin"
-    echo "  access via OAuth without needing a database role."
-    echo ""
-
-    print_info "STEP 5: Access OAuth admin panel"
-    echo "  Visit: http://localhost:$PORT/oauth/authorize"
-    echo "  Login with your handle and password"
-    echo ""
-
-    print_header "Testing Your PDS"
-    echo ""
-    print_info "Health check:"
-    echo "  curl http://localhost:$PORT/health"
-    echo ""
-    print_info "Server info:"
-    echo "  curl http://localhost:$PORT/xrpc/com.atproto.server.describeServer"
-    echo ""
-
-    if [ "$SETUP_SYSTEMD" = "yes" ]; then
-        echo ""
-        print_info "OPTIONAL: Install systemd service"
-        echo "  sudo cp /tmp/aurora-locus.service /etc/systemd/system/"
-        echo "  sudo systemctl daemon-reload"
-        echo "  sudo systemctl enable aurora-locus"
-        echo "  sudo systemctl start aurora-locus"
-    fi
-
-    if [ "$SETUP_NGINX" = "yes" ]; then
-        echo ""
-        print_info "OPTIONAL: Configure nginx reverse proxy"
-        echo "  1. Get SSL certificate:"
-        echo "     sudo certbot --nginx -d $HOSTNAME"
-        echo "  2. Install config:"
-        echo "     sudo cp /tmp/aurora-locus-nginx.conf /etc/nginx/sites-available/aurora-locus"
-        echo "     sudo ln -s /etc/nginx/sites-available/aurora-locus /etc/nginx/sites-enabled/"
-        echo "  3. Reload nginx:"
-        echo "     sudo nginx -t && sudo systemctl reload nginx"
-    fi
-
-    echo ""
-    print_header "Security Reminder"
-    print_warning "Keep these files SECRET - they contain cryptographic keys:"
-    echo "  - .env (JWT secret, signing keys)"
-    echo "  - oauth-keyset.json (OAuth private key)"
-    echo ""
-    print_info "Generated files:"
-    echo "  📄 .env                    - Configuration"
-    echo "  🔐 oauth-keyset.json       - OAuth P-256 keyset"
-    echo "  📁 data/                   - Data directory"
-    echo "  🚀 target/release/aurora-locus - Server binary"
-    echo ""
-
-    print_success "Installation complete! 🎉"
-    echo ""
-    print_info "Your admin account will be: $FULL_HANDLE"
-    print_info "Installation directory: $INSTALL_DIR"
-    echo ""
-}
-
-# Run main installation
-main
+echo "Configuration:"
+if [[ "$COMPOSE_ENV" == true ]]; then
+    echo "  .env           $ENV_OUT   (chmod 600)"
+else
+    echo "  .env           $ENV_OUT   (kept existing — not modified)"
+fi
+echo "  data directory $DATA_DIR"
+echo "  domain         $DOMAIN"
+echo "  reverse proxy  $RP_SUMMARY"
+echo
+if [[ "$RUSTUP_INSTALLED_THIS_RUN" == true ]]; then
+    info "cargo was just installed. To use it in THIS shell, run:"
+    echo "  source \"\$HOME/.cargo/env\""
+    info "(new shells pick it up automatically if you let install.sh update ~/.bashrc.)"
+    echo
+fi
+info "Verify the configuration before first boot:"
+echo "  cargo run --release -- validate-config"
+echo
+info "Start the server (schema migrations run automatically on first boot):"
+echo "  cargo run --release"
+echo
+info "Or run it as a systemd service (recommended for production):"
+echo "  sudo cp $SYSTEMD_UNIT /etc/systemd/system/"
+echo "  sudo systemctl daemon-reload"
+echo "  sudo systemctl enable --now aurora-locus"
+echo "  # (review the unit's User / WorkingDirectory / paths first)"
+echo
+if [[ "$RP_CERTBOT_HINT" == true ]]; then
+    info "Provision a TLS certificate (nginx/Apache don't do it automatically):"
+    echo "  sudo certbot --nginx -d $DOMAIN     # or --apache"
+    echo
+fi
+info "Grant your first admin (admin is table-based, not an env var):"
+echo "  1. Create an account:  ./create-account.sh   (or the createAccount XRPC)"
+if [[ -n "$ADMIN_DID" ]]; then
+    echo "  2. Grant the role:     cargo run --release -- grant-admin $ADMIN_DID superadmin"
+else
+    echo "  2. Grant the role:     cargo run --release -- grant-admin <DID> superadmin"
+fi
+info "(grant-admin is offline and runs migrations itself, so it works before the"
+info " first server boot; the DID must be an account that already exists.)"
+echo
+if [[ "$RP_SUMMARY" == "not configured"* && "$DOMAIN" != "localhost" ]]; then
+    warn "No reverse proxy was configured. Aurora listens on localhost:2583 —"
+    warn "terminate TLS and forward to that address with your proxy of choice."
+fi

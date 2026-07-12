@@ -56,7 +56,6 @@ const LOCK_HELD_MESSAGE: &str =
 /// - **SQLite**: drops the held [`File`] handle; the kernel releases
 ///   the `flock(2)` immediately. (Process death also releases via the
 ///   same kernel path — no manual cleanup on crash.)
-#[allow(dead_code)] // Public API; CLI offline-check arrives in Step 4
 pub enum LivenessLock {
     /// Postgres backend — keepalive task owns the dedicated
     /// connection. Aborting the task drops the connection; the

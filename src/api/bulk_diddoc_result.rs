@@ -17,6 +17,7 @@ use crate::admin::defs::Subject;
 use crate::context::AppContext;
 use crate::crypto::plc::PlcSigner;
 use crate::error::PdsResult;
+use crate::identity::did_method::{parse_did, DidMethod};
 
 /// v0.9 Federation runtime-mutability arc §2.2/§3.6 (#398) — write one `pending`
 /// row per account for a bulk did:plc update run, into the caller's transaction
@@ -186,19 +187,75 @@ pub async fn run_bulk_diddoc_update(
         started_at,
         audit_action: "BulkServiceUrlUpdate",
     };
-    let (mut aligned, mut failed) = (0usize, 0usize);
+    let (mut aligned, mut failed, mut skipped) = (0usize, 0usize, 0usize);
     for did in &dids {
-        match run_per_account_diddoc_update(ctx, did, &run).await {
-            Ok(()) => aligned += 1,
-            Err(e) => {
-                failed += 1;
-                if let Err(e2) =
-                    upsert_result_row(&ctx.account_db, did, run_id, started_at, "failed", Some(&e.to_string()))
+        // v0.10 Arc 1 Phase 0 (#414): only did:plc accounts have an external PLC
+        // document to republish. did:web identities are served locally (Arc 1) and
+        // have no PLC doc — record `skipped_did_web` and continue. A malformed
+        // `actor.did` (should never occur) is recorded `failed` rather than
+        // crashing the run.
+        match parse_did(did) {
+            Ok(parsed) if parsed.method() == DidMethod::Plc => {
+                match run_per_account_diddoc_update(ctx, did, &run).await {
+                    Ok(()) => aligned += 1,
+                    Err(e) => {
+                        failed += 1;
+                        if let Err(e2) = upsert_result_row(
+                            &ctx.account_db,
+                            did,
+                            run_id,
+                            started_at,
+                            "failed",
+                            Some(&e.to_string()),
+                        )
                         .await
+                        {
+                            tracing::error!(did, error = %e2, "bulk-diddoc: failed to record failure row");
+                        }
+                        tracing::warn!(did, error = %e, "bulk-diddoc: account update failed (surface-and-triage)");
+                    }
+                }
+            }
+            Ok(parsed) => {
+                // Non-Plc method (did:web): no PLC republish applicable.
+                skipped += 1;
+                tracing::debug!(
+                    did = %parsed.raw,
+                    domain = parsed.domain.as_deref().unwrap_or("?"),
+                    segment = parsed.segment.as_deref().unwrap_or("-"),
+                    "bulk-diddoc: skipping non-did:plc account (no PLC document to republish)"
+                );
+                if let Err(e2) = upsert_result_row(
+                    &ctx.account_db,
+                    did,
+                    run_id,
+                    started_at,
+                    "skipped_did_web",
+                    Some("did:web account; PLC republish not applicable"),
+                )
+                .await
+                {
+                    tracing::error!(did, error = %e2, "bulk-diddoc: failed to record skipped_did_web row");
+                }
+            }
+            Err(e) => {
+                // Defensive: actor.did should always parse. If it doesn't, record
+                // `failed` rather than crash the run. `skipped_did_web` is reserved
+                // for did:web specifically, so an unparseable DID is not skipped.
+                failed += 1;
+                if let Err(e2) = upsert_result_row(
+                    &ctx.account_db,
+                    did,
+                    run_id,
+                    started_at,
+                    "failed",
+                    Some(&format!("unparseable DID: {e}")),
+                )
+                .await
                 {
                     tracing::error!(did, error = %e2, "bulk-diddoc: failed to record failure row");
                 }
-                tracing::warn!(did, error = %e, "bulk-diddoc: account update failed (surface-and-triage)");
+                tracing::warn!(did, error = %e, "bulk-diddoc: unparseable actor.did (surface-and-triage)");
             }
         }
     }
@@ -210,7 +267,7 @@ pub async fn run_bulk_diddoc_update(
         crate::api::pending_restart::ACTION_BULK_DIDDOC_UPDATE,
     )
     .await?;
-    tracing::info!(run_id, total = dids.len(), aligned, failed, "bulk did:plc service-url update complete");
+    tracing::info!(run_id, total = dids.len(), aligned, failed, skipped, "bulk did:plc service-url update complete");
     Ok(())
 }
 
@@ -410,5 +467,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(markers, 0, "marker cleared on completion");
+    }
+
+    // v0.10 Arc 1 Phase 0 (#414) — the bulk run skips non-did:plc accounts and
+    // writes the reserved `skipped_did_web` status (the producer #408 was missing).
+
+    #[tokio::test]
+    async fn bulk_update_skips_did_web_accounts() {
+        use crate::crypto::plc_client::MockPlcClient;
+        let mut ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+
+        // One did:plc account (republished) and one did:web account (skipped).
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind("did:plc:a")
+            .bind("a.test")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind("did:web:example.com:user:alice")
+            .bind("alice.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        // The mock is only configured for the did:plc account; the did:web DID must
+        // never reach the PLC client (it's filtered before run_per_account_*).
+        let mock = Arc::new(MockPlcClient::new().with_current_signing_key("did:plc:a", "zKEY"));
+        ctx.plc_client = mock.clone();
+
+        let expected = ctx.config.service.effective_public_url();
+        run_bulk_diddoc_update(&ctx, "run-1", "2026-06-27T00:00:00Z").await.unwrap();
+
+        // did:plc account republished; did:web account never published.
+        assert_eq!(
+            mock.published_service_endpoint("did:plc:a").as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(
+            mock.published_service_endpoint("did:web:example.com:user:alice").is_none(),
+            "did:web account must not have a PLC publish attempted"
+        );
+
+        // The did:web account has exactly one `skipped_did_web` row; the did:plc
+        // account is `aligned`.
+        let web_status: String = sqlx::query_scalar(
+            "SELECT status FROM bulk_diddoc_update_result WHERE did = 'did:web:example.com:user:alice'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(web_status, "skipped_did_web");
+        let plc_status: String = sqlx::query_scalar(
+            "SELECT status FROM bulk_diddoc_update_result WHERE did = 'did:plc:a'",
+        )
+        .fetch_one(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(plc_status, "aligned");
     }
 }

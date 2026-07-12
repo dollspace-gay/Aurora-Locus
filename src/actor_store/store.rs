@@ -722,7 +722,7 @@ impl ActorStore {
     /// the same enumeration shape is the natural seed for the proto-blue
     /// migration tool that will walk existing repos and re-emit signed
     /// commits.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // consumed by rebuild.rs (bin-invisible; not on the default runtime path)
     pub async fn list_all_records(&self, did: &str) -> PdsResult<Vec<Record>> {
         let pool = self.open_db(did).await?;
 

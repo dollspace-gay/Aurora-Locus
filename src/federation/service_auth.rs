@@ -113,7 +113,7 @@ impl ServiceAuthenticator {
         // Cluster 2 Member 2.2 (#144): propagate typed
         // PdsError::DidTombstoned unchanged so IntoResponse maps it to
         // HTTP 400 `{"error": "DidTombstoned", ...}` per
-        // src/error.rs:620-624. Pre-#144 the .map_err destroyed the
+        // src/error.rs:863-865. Pre-#144 the .map_err destroyed the
         // typed variant by stringifying into PdsError::Authentication
         // → HTTP 401 opaque. The PLC-410 → DidTombstoned mapping in
         // src/identity/resolver.rs::fetch_plc_document (#134 / Arc

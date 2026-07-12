@@ -292,13 +292,25 @@
 }
 .theme-row-action {
   flex-shrink: 0;
+  /* Stack the personal "Use this theme" action and the superadmin
+   * "Set as deployment default" action, stretched to a shared width so the
+   * buttons and the state indicators form one consistent column (#441). */
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1);
+  /* Fixed footprint across ALL cards (#441): otherwise each column sizes to its
+   * own widest child, so the active card (indicators: "Active Theme" /
+   * "Deployment default") comes out narrower than button cards ("Set as
+   * deployment default"). Sized to accommodate that longest button at .btn-sm
+   * metrics, so every card's actions line up. */
+  min-width: 13rem;
 }
-/* Small annotation pills on a theme row. Mode is a muted neutral chip; AAA is
- * an accent chip surfaced only on the high-contrast themes; Active marks the
- * current deployment default. */
+/* Small annotation pills on a theme row — Mode is a muted neutral chip; AAA is
+ * an accent chip surfaced only on the high-contrast themes. (The Active-Theme /
+ * Deployment-default indicators are NOT these tiny chips; see below.) */
 .theme-mode-pill,
-.theme-aaa-pill,
-.theme-active-pill {
+.theme-aaa-pill {
   display: inline-block;
   padding: 0.0625rem 0.4375rem;
   border-radius: var(--radius-full);
@@ -314,9 +326,29 @@
   background: color-mix(in srgb, var(--color-accent-primary) 18%, transparent);
   color: var(--color-accent-primary);
 }
+/* The "Active Theme" / "Deployment default" state indicators share the .btn-sm
+ * chrome (padding, radius, font size) so they line up with the interactive
+ * buttons in the action column; a muted fill + bold text — not a different
+ * shape — marks them as non-interactive status rather than a call to action
+ * (#441). */
+.theme-active-pill,
+.theme-default-pill {
+  display: inline-block;
+  box-sizing: border-box;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  font-weight: var(--font-weight-bold);
+  text-align: center;
+  cursor: default;
+  background: var(--color-surface-tertiary);
+}
 .theme-active-pill {
-  background: var(--color-accent-primary);
-  color: var(--color-text-inverted);
+  color: var(--color-text-primary);
+}
+.theme-default-pill {
+  color: var(--color-text-secondary);
 }
 /* Divider + heading for the Installed Themes section folded into UI & modes
  * (#322) — sits below the personal-preference controls. */

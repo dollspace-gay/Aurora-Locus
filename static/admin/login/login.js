@@ -94,7 +94,7 @@ if (authError) {
 
 async function handleOAuthCallback(code, state) {
     try {
-        setLoading(true);
+        setLoading(true, 'oauth-login-btn');
 
         // The backend will exchange the code for tokens
         // The callback endpoint is already handling this
@@ -130,39 +130,70 @@ async function handleOAuthCallback(code, state) {
     } catch (error) {
         console.error('OAuth callback error:', error);
         showError(error.message || 'Authentication failed');
-        setLoading(false);
+        setLoading(false, 'oauth-login-btn');
 
         // Clear URL parameters on error
         window.history.replaceState({}, document.title, '/admin/login.html');
     }
 }
 
-async function handleLogin(event) {
+// OAuth admin sign-in — Aurora's default admin login, run as a single-page
+// interaction so the operator never sees the AS signin page. On submit we:
+//  1. POST the credentials to the AS signin endpoint via fetch. Accept:
+//     application/json → the endpoint sets the HttpOnly browser-session cookie
+//     (Path=/oauth) and returns 204 with no redirect. JS can't read that cookie,
+//     but the browser stores it and sends it on the navigation below.
+//  2. Navigate into the normal OAuth redirect flow. Authorize now finds the
+//     session and auto-approves (first-party admin), so no signin page is shown;
+//     the callback stows the session tokens and lands on the admin UI.
+async function handleOAuthLogin(event) {
     event.preventDefault();
 
-    const handle = document.getElementById('handle').value.trim();
+    const identifier = document.getElementById('admin-login-identifier').value.trim();
+    const password = document.getElementById('admin-login-password').value;
 
-    // Clear previous errors
     hideError();
 
-    // Show loading state
-    setLoading(true);
+    if (!identifier || !password) {
+        showError('Enter your handle/DID and password.');
+        return;
+    }
+
+    setLoading(true, 'oauth-login-btn');
 
     try {
-        // Build OAuth initiation URL
-        const oauthUrl = `/admin-oauth/login${handle ? `?handle=${encodeURIComponent(handle)}` : ''}`;
+        // 1. Establish the AS browser session (sets the HttpOnly session cookie).
+        const resp = await fetch('/oauth/atproto/signin', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+            },
+            credentials: 'same-origin',
+            body: new URLSearchParams({ identifier, password }),
+        });
 
-        // Redirect to OAuth flow
-        window.location.href = oauthUrl;
+        if (!resp.ok) {
+            // 401 (bad credentials) or any non-2xx. Generic message — no
+            // enumeration between wrong identifier and wrong password.
+            console.debug('admin signin failed:', resp.status);
+            showError('Login failed. Check your credentials or admin role.');
+            setLoading(false, 'oauth-login-btn');
+            return;
+        }
+
+        // 2. Drive the OAuth flow; the stored session cookie carries the login.
+        window.location.href = `/admin-oauth/login?handle=${encodeURIComponent(identifier)}`;
     } catch (error) {
-        console.error('OAuth initiation error:', error);
-        showError(error.message || 'Failed to start OAuth flow');
-        setLoading(false);
+        console.error('admin sign-in error:', error);
+        showError('Login failed. Check your credentials or admin role.');
+        setLoading(false, 'oauth-login-btn');
     }
 }
 
-function setLoading(isLoading) {
-    const btn = document.getElementById('login-btn');
+function setLoading(isLoading, btnId) {
+    const btn = document.getElementById(btnId || 'oauth-login-btn');
+    if (!btn) return; // null-safe: never throw if the target button is absent
     const btnText = btn.querySelector('.btn-text');
     const btnSpinner = btn.querySelector('.btn-spinner');
 
@@ -188,10 +219,21 @@ function hideError() {
     errorElement.style.display = 'none';
 }
 
-// Handle Enter key in form
-document.getElementById('login-form').addEventListener('submit', handleLogin);
+// Wire the form. The single "Sign in" button is the form's submit; its handler
+// (handleOAuthLogin) preventDefault()s the native GET and initiates the OAuth
+// flow with a spinner. Wired via addEventListener rather than inline onsubmit so
+// the binding is robust, and guarded on readyState so it runs whether or not
+// DOMContentLoaded has fired.
+function wireAdminLogin() {
+    const form = document.getElementById('admin-login-form');
+    if (form) form.addEventListener('submit', handleOAuthLogin);
 
-// Focus on handle field on page load
-document.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('handle').focus();
-});
+    const idField = document.getElementById('admin-login-identifier');
+    if (idField) idField.focus();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireAdminLogin);
+} else {
+    wireAdminLogin();
+}

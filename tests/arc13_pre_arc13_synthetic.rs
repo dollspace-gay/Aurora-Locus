@@ -61,7 +61,7 @@ fn synthetic_op_carries_did_field_and_hex_sig_per_pre_arc13_shape() {
     // (Arc 13 changes to SHA-256 of canonical CBOR of unsigned
     // op; the synthetic utility deliberately uses the wrong
     // derivation).
-    assert!(did.starts_with("did:plc:"));
+    assert!(aurora_locus::identity::did_method::is_plc(&did));
     assert_eq!(did.len(), "did:plc:".len() + 24);
 }
 

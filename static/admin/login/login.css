@@ -198,6 +198,46 @@ body {
     to { transform: rotate(360deg); }
 }
 
+/* Secondary button — the OAuth sign-in, visually distinct from the primary
+   password sign-in (and currently the fallback path while OAuth is blocked
+   upstream by the proto-blue-oauth DPoP issue, #434). */
+.btn-secondary {
+    width: 100%;
+    padding: 0.875rem 1.5rem;
+    background: transparent;
+    color: var(--color-accent-primary);
+    border: 1px solid var(--color-accent-primary);
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+    overflow: hidden;
+}
+
+.btn-secondary:hover {
+    background: var(--color-surface-tertiary);
+    transform: translateY(-1px);
+}
+
+.btn-secondary:active {
+    transform: translateY(0);
+}
+
+.btn-secondary:disabled {
+    color: var(--color-text-tertiary);
+    border-color: var(--color-surface-tertiary);
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* The OAuth sign-in stacks under the primary password sign-in inside the same
+   form; space it off from the primary button. */
+#oauth-login-btn {
+    margin-top: 0.75rem;
+}
+
 .login-footer {
     text-align: center;
     padding-top: 1.5rem;

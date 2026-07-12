@@ -1,0 +1,13 @@
+-- Phase 4 admin session hardening (chainlink #442): step-up auth freshness.
+--
+-- `authenticated_at` records when the operator last interactively authenticated
+-- (logged in), as distinct from `created_at`, which the sliding-refresh model
+-- resets on every token rotation. Step-up-gated endpoints measure freshness
+-- from this column, so a silent refresh does NOT reset the step-up clock — only
+-- a fresh login does. Set at session creation (login) and carried forward
+-- across refreshes (like `bound_ip`).
+--
+-- Nullable + additive: sessions created before this migration read back NULL,
+-- and the step-up read COALESCEs to `created_at` for them (they age out within
+-- the short admin session window regardless).
+ALTER TABLE session ADD COLUMN authenticated_at TEXT;

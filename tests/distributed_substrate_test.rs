@@ -28,11 +28,20 @@ use std::time::Duration;
 use aurora_locus::distributed::{
     DistributedError, DistributedStore, Lease, PostgresCasStore,
 };
-use aurora_locus::oauth::flow_state_adapter::{
-    decode_request, encode_request_data, OAuthFlowStateAdapter,
-};
-use aurora_locus::oauth::models::AuthorizationRequestData;
+use aurora_locus::oauth::flow_state_adapter::OAuthFlowStateAdapter;
+use aurora_locus::oauth::models::{AuthorizationRequest, AuthorizationRequestData};
 use sqlx::any::AnyPoolOptions;
+
+// Phase ζ retired the adapter's `encode_request_data`/`decode_request`
+// convenience helpers (they had no runtime caller once the legacy `/oauth/*`
+// provider was cut). These tests serialize the same way the adapter does
+// internally; local shims keep the test bodies unchanged.
+fn encode_request_data(data: &AuthorizationRequestData) -> Vec<u8> {
+    serde_json::to_vec(data).unwrap()
+}
+fn decode_request(bytes: &[u8]) -> Result<AuthorizationRequest, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
 use sqlx::AnyPool;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;

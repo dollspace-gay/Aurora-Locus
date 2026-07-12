@@ -60,6 +60,8 @@ async fn create_test_manager() -> AccountManager {
             jwt_secret: "test-secret-key-for-testing-only".to_string(),
             repo_signing_key: "test-key".to_string(),
             plc_rotation_key: "b".repeat(64),
+            password_login_enabled: false,
+            admin_totp_encryption_key_hex: None,
             oauth: OAuthConfig {
                 client_id: "test-client".to_string(),
                 redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -67,7 +69,6 @@ async fn create_test_manager() -> AccountManager {
             },
             jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
             oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-            oauth_features: Default::default(),
         },
         identity: IdentityConfig {
             did_plc_url: "https://plc.directory".to_string(),
@@ -87,6 +88,7 @@ async fn create_test_manager() -> AccountManager {
             global_requests_per_minute: 3000,
             exempt_admin_assets: true,
             buckets_retention_days: 7,
+            trust_proxy: false,
         },
         logging: LoggingConfig {
             level: "info".to_string(),

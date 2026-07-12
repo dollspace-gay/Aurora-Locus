@@ -3,8 +3,8 @@ use crate::{
     account::AccountManager,
     actor_store::{ActorStore, ActorStoreConfig},
     admin::{
-        AdminRoleManager, InviteCodeManager, LabelManager, ModerationManager,
-        OperatorSessionStore, ReportManager,
+        security_config::AdminSecurityStore, totp::AdminTotpCipher, AdminRoleManager,
+        InviteCodeManager, LabelManager, ModerationManager, OperatorSessionStore, ReportManager,
     },
     blob_store::{BlobBackendType, BlobStorageConfig, BlobStore, BlobStoreConfig},
     config::{BlobstoreConfig, DatabaseConfig, DistributedStateMode, ServerConfig},
@@ -20,7 +20,6 @@ use crate::{
     },
     identity::{DidCache, IdentityResolver, IdentityResolverApi, IdentityResolverConfig},
     mailer::Mailer,
-    oauth::{ClientManager, DeviceManager},
     rate_limit::RateLimiter,
     read_after_write::LocalRecordsCache,
     sequencer::{Sequencer, SequencerConfig},
@@ -74,6 +73,13 @@ pub struct AppContext {
     pub plc_client: Arc<dyn crate::crypto::plc_client::PlcClientApi>,
     // Admin & Moderation
     pub admin_role_manager: Arc<AdminRoleManager>,
+    /// Per-DID admin security settings (Phase 4 · #442): IP binding, session
+    /// lifetime override, TOTP enrollment state. Over `account_db`.
+    pub admin_security_store: Arc<AdminSecurityStore>,
+    /// AES-256-GCM cipher for admin TOTP secrets at rest (Phase 4 · #442).
+    /// `None` when `PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX` is unset — TOTP
+    /// enrollment then refuses rather than persisting a plaintext secret.
+    pub admin_totp_cipher: Option<Arc<AdminTotpCipher>>,
     /// Per-operator session store (§8.1.7 / #271): backs admin session
     /// listing, force-logout, and refresh rotation. Keyed by the `sid`
     /// claim carried in admin access/refresh tokens.
@@ -85,11 +91,8 @@ pub struct AppContext {
     /// v0.9 Arc B (§11) — installed-theme registry, enumerated + validated
     /// at startup; serves the active theme's resolved token CSS to the UI.
     pub theme_registry: Arc<crate::themes::ThemeRegistry>,
-    // OAuth server components (for third-party app authorization)
-    #[allow(dead_code)] // Future OAuth client management
-    pub oauth_client_manager: Arc<ClientManager>,
-    #[allow(dead_code)] // Future OAuth device flow
-    pub oauth_device_manager: Arc<DeviceManager>,
+    // (legacy OAuth ClientManager/DeviceManager retired in Phase ζ — the atproto
+    // provider ships its own client-metadata fetcher + device registry.)
     // Sequencer for event streaming
     pub sequencer: Arc<Sequencer>,
     // Relay client for federation
@@ -127,6 +130,59 @@ pub struct AppContext {
     /// JTI replay set is shared with the federation §8 challenge
     /// store when federation is enabled (see field above).
     pub dpop_verifier: Arc<DPopVerifier>,
+    /// Phase β.2 (#420): single-use nonce store backing the atproto-OAuth
+    /// AS-login challenge-response (login-α). A general-purpose
+    /// `DPopNonceStore` in its own keyspace — `generate_nonce` issues the
+    /// challenge, `check_and_consume_nonce` enforces single use. Always
+    /// present (login is not federation-gated). The server-nonce half is
+    /// in-memory; a distributed login-challenge story is a follow-up,
+    /// mirroring the DPoP server-nonce posture.
+    pub browser_login_nonces: Arc<DPopNonceStore>,
+    /// Phase β.4 (#420): URL-based atproto-OAuth client-metadata fetcher
+    /// (on-demand `client-metadata.json` resolution + cache). Consumed by the
+    /// β.3 authorize flow to resolve a `client_id` URL and verify its redirect
+    /// URIs. (The legacy static `ClientManager` this replaced was retired in
+    /// Phase ζ.)
+    pub client_metadata_fetcher: Arc<crate::oauth::atproto::client_metadata::ClientMetadataFetcher>,
+    /// v0.10 Arc 2 Phase δ (LOCKED §5) — holder-mediated signing seam. did:web
+    /// accounts sign *as the holder* (pre-decision 1: the substrate never holds
+    /// their `#atproto` key), so getServiceAuth / entryway-auth JWTs and (Phase
+    /// γ) repo commits for a did:web holder route through this channel instead
+    /// of an in-process key read. Constructed as
+    /// [`crate::holder_signing::UnavailableHolderSigningChannel`] by default
+    /// (returns a clean "channel not yet available" 4xx); Phase γ installs the
+    /// real channel here.
+    pub holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel>,
+    /// v0.10 Arc 2 Phase ε (#422) — the atproto-OAuth device registry. Backs the
+    /// `/oauth/atproto/device/*` management endpoints and the ε.3 general-XRPC
+    /// bearer gate (a bearer's DPoP proof key must match a registered device row
+    /// for its DID). Did-keyed, browser-session-aligned. (The legacy
+    /// `oauth_device_manager` this superseded was retired in Phase ζ.)
+    pub atproto_device_manager:
+        Arc<crate::oauth::atproto::device_manager::AtprotoDeviceManager>,
+    /// Holder UI Phase 1 (#424) — the holder auth-method registry (SD-A5 =
+    /// flexible). Backs the holder self-service login + auth-method management;
+    /// password verification for did:web holders. Did-keyed, over `account_db`.
+    pub holder_auth_methods:
+        Arc<crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager>,
+    /// Holder UI — whether login-α (the `#atproto`-key challenge method) is
+    /// usable at the web-UI layer. Default `true` since Phase 2.a (#425): the
+    /// in-browser secp256k1 signer (`static/holder/noble-secp256k1.js`) is
+    /// vendored, so the holder login page offers key sign-in. An operator
+    /// disables it with `PDS_HOLDER_LOGIN_ALPHA_ENABLED=false`. (β.2's machine
+    /// AS-login endpoint is unaffected — it verifies server-side.)
+    pub holder_login_alpha_enabled: bool,
+    /// Holder UI Phase 1 (#424) — per-holder display preferences (theme). The
+    /// first per-account preferences store; over `account_db`.
+    pub holder_preferences:
+        Arc<crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager>,
+    /// Holder UI Phase 2.b (#427) — the WebAuthn relying-party context for the
+    /// holder-UI passkey ceremonies. RP id = service hostname, RP origin =
+    /// effective public URL. Arc-backed internally (cheap to clone).
+    pub passkey_webauthn: crate::oauth::atproto::holder::passkey::WebauthnCtx,
+    /// Holder UI Phase 2.b (#427) — in-memory store of in-flight passkey
+    /// ceremonies (registration challenge state), keyed by opaque challenge_id.
+    pub passkey_challenges: Arc<crate::oauth::atproto::holder::passkey::PasskeyChallengeStore>,
     // Rate limiter (governor-backed, per-instance).
     pub rate_limiter: Arc<RateLimiter>,
     // Cross-instance rate-limit primitive (Arc 7 Step 3).
@@ -337,13 +393,16 @@ impl std::fmt::Debug for AppContext {
             .field("blob_store", &"<BlobStore>")
             .field("identity_resolver", &"<dyn IdentityResolverApi>")
             .field("admin_role_manager", &"<AdminRoleManager>")
+            .field("admin_security_store", &"<AdminSecurityStore>")
+            .field(
+                "admin_totp_cipher",
+                &self.admin_totp_cipher.as_ref().map(|_| "<AdminTotpCipher>"),
+            )
             .field("operator_session_store", &"<OperatorSessionStore>")
             .field("moderation_manager", &"<ModerationManager>")
             .field("label_manager", &"<LabelManager>")
             .field("invite_manager", &"<InviteCodeManager>")
             .field("report_manager", &"<ReportManager>")
-            .field("oauth_client_manager", &"<ClientManager>")
-            .field("oauth_device_manager", &"<DeviceManager>")
             .field("sequencer", &"<Sequencer>")
             .field(
                 "relay_client",
@@ -595,6 +654,14 @@ impl AppContext {
 
         // Initialize admin & moderation managers
         let admin_role_manager = Arc::new(AdminRoleManager::new(account_db.clone()));
+        let admin_security_store = Arc::new(AdminSecurityStore::new(account_db.clone()));
+        // Admin TOTP cipher (#442): present only when a key is configured. The
+        // key was already validated at config load, so this decode succeeds; a
+        // belt-and-braces `?` still surfaces any drift rather than panicking.
+        let admin_totp_cipher = AdminTotpCipher::from_config(
+            config.authentication.admin_totp_encryption_key_hex.as_deref(),
+        )?
+        .map(Arc::new);
         let operator_session_store = Arc::new(OperatorSessionStore::new(account_db.clone()));
         // v0.9 Arc H §7.4.3 (#291) — bulk repository-repair scan substrate.
         let scan_findings_store =
@@ -613,13 +680,6 @@ impl AppContext {
         ));
         let invite_manager = Arc::new(InviteCodeManager::new(account_db.clone()));
         let report_manager = Arc::new(ReportManager::new(account_db.clone()));
-
-        // Initialize OAuth server managers
-        // For now, initialize with empty client list. In production, load from config.
-        // TODO: Add OAuth client configuration to ServerConfig
-        tracing::info!("Initializing OAuth server managers (ClientManager, DeviceManager)");
-        let oauth_client_manager = Arc::new(ClientManager::new(account_db.clone(), vec![]));
-        let oauth_device_manager = Arc::new(DeviceManager::new(account_db.clone()));
 
         // v0.9 Federation runtime-mutability arc §2.1 (#397) — resolve the master
         // federation gate from the runtime override (federation.enabled row →
@@ -769,6 +829,48 @@ impl AppContext {
             };
             Arc::new(DPopVerifier::new(store_for_verifier))
         };
+        // Phase β.2 (#420): the AS-login challenge store. Its own keyspace,
+        // always present (login is not federation-gated).
+        let browser_login_nonces = Arc::new(make_dpop_store());
+        // Phase β.4 (#420): the URL-based client-metadata fetcher.
+        let client_metadata_fetcher =
+            Arc::new(crate::oauth::atproto::client_metadata::ClientMetadataFetcher::new());
+        // Phase δ (Arc 2 §5): holder-signing seam. Default = unavailable; Phase
+        // γ swaps in the real channel at this construction site.
+        let holder_signing_channel: Arc<dyn crate::holder_signing::HolderSigningChannel> =
+            Arc::new(crate::holder_signing::UnavailableHolderSigningChannel);
+        // Phase ε (Arc 2 #422): the atproto device registry.
+        let atproto_device_manager = Arc::new(
+            crate::oauth::atproto::device_manager::AtprotoDeviceManager::new(account_db.clone()),
+        );
+        // Holder UI Phase 1 (#424): the holder auth-method registry.
+        let holder_auth_methods = Arc::new(
+            crate::oauth::atproto::holder::auth_method_manager::HolderAuthMethodManager::new(
+                account_db.clone(),
+            ),
+        );
+        // Holder UI Phase 2.a (#425): login-α web-UI gate. Default ON now that
+        // the in-browser secp256k1 signer (static/holder/noble-secp256k1.js) is
+        // vendored. An operator disables it with
+        // `PDS_HOLDER_LOGIN_ALPHA_ENABLED=false`.
+        let holder_login_alpha_enabled = std::env::var("PDS_HOLDER_LOGIN_ALPHA_ENABLED")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+        // Holder UI Phase 1 (#424): per-holder display preferences.
+        let holder_preferences = Arc::new(
+            crate::oauth::atproto::holder::preferences_manager::AtprotoHolderPreferencesManager::new(
+                account_db.clone(),
+            ),
+        );
+        // Holder UI Phase 2.b (#427): the WebAuthn RP context + passkey ceremony
+        // challenge store.
+        let passkey_webauthn = crate::oauth::atproto::holder::passkey::WebauthnCtx::new(
+            &config.service.hostname,
+            &config.service.effective_public_url(),
+        )?;
+        let passkey_challenges =
+            Arc::new(crate::oauth::atproto::holder::passkey::PasskeyChallengeStore::new());
 
         // Initialize sequencer with relay client (using account_db for now, could be separate database).
         // Arc 14 §7.3.3 / §7.4 Step 3: env override for the backfill
@@ -850,10 +952,15 @@ impl AppContext {
         // `enabled` value loaded from PDS_RATE_LIMITS_ENABLED was dropped on
         // the floor — config::RateLimitConfig held it but it never reached
         // the rate_limit::RateLimitConfig the enforcement layers consult.
+        // PDS_TRUST_PROXY (#442): trust X-Forwarded-For / X-Real-IP for the real
+        // client IP (consumed by the rate limiter + admin IP-binding via
+        // `ctx.rate_limiter.trust_proxy`). OFF by default: only enable behind a
+        // trusted reverse proxy, else a client could spoof its IP via the header.
         let rate_limiter = Arc::new(RateLimiter::with_bluesky_defaults(
             crate::rate_limit::RateLimitConfig {
                 enabled: config.rate_limit.enabled,
                 exempt_admin_assets: config.rate_limit.exempt_admin_assets,
+                trust_proxy: config.rate_limit.trust_proxy,
                 ..crate::rate_limit::RateLimitConfig::default()
             },
         ));
@@ -1237,14 +1344,14 @@ impl AppContext {
             blob_store,
             identity_resolver,
             admin_role_manager,
+            admin_security_store,
+            admin_totp_cipher,
             operator_session_store,
             moderation_manager,
             label_manager,
             invite_manager,
             report_manager,
             theme_registry,
-            oauth_client_manager,
-            oauth_device_manager,
             sequencer,
             relay_client,
             federation_auth,
@@ -1253,6 +1360,15 @@ impl AppContext {
             nonce_store,
             dpop_nonce_store,
             dpop_verifier,
+            browser_login_nonces,
+            client_metadata_fetcher,
+            holder_signing_channel,
+            atproto_device_manager,
+            holder_auth_methods,
+            holder_login_alpha_enabled,
+            holder_preferences,
+            passkey_webauthn,
+            passkey_challenges,
             rate_limiter,
             distributed_rate_limiter,
             mailer,
@@ -1385,8 +1501,10 @@ impl AppContext {
         &self,
         token: &str,
         audience_allowlist: &[&str],
+        current_ip: Option<std::net::IpAddr>,
     ) -> PdsResult<crate::api::middleware::UnifiedAuthContext> {
-        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist).await
+        crate::auth::verify_jwt_with_allowlist_impl(self, token, audience_allowlist, current_ip)
+            .await
     }
 
     /// Arc 12 §5.4 Step 2.1 — build the `Authorization: Bearer <jwt>`
@@ -1410,8 +1528,14 @@ impl AppContext {
                     .to_string(),
             )
         })?;
-        crate::federation::entryway_auth_headers(&self.account_db, user_did, entryway_did, lxm)
-            .await
+        crate::federation::entryway_auth_headers(
+            &self.account_db,
+            self.holder_signing_channel.as_ref(),
+            user_did,
+            entryway_did,
+            lxm,
+        )
+        .await
     }
 }
 

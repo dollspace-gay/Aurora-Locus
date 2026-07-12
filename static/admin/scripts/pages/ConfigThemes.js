@@ -22,6 +22,7 @@
   let currentDefault = 'aurora-classic';
   let listEl = null;
   let superFlag = false;
+  let themesCache = [];
 
   // Mode + AAA are theme-intrinsic but not carried on the listInstalledThemes
   // wire shape, so they are derived here for the bundled cohort. An
@@ -64,9 +65,17 @@
       global.AuroraSettings.setInstalledThemesCache(themes);
       global.AuroraSettings.setDeploymentDefaultCache(currentDefault);
     }
-    if (!themes.length) { listEl.innerHTML = '<p>No themes installed.</p>'; return; }
-    listEl.innerHTML = themes.map((t) => row(t, superFlag)).join('');
-    wire(themes, superFlag);
+    themesCache = themes;
+    render();
+  }
+
+  // Render the cached theme rows. Split from load() so a personal theme change
+  // re-renders (the "In use" marker moves) without re-fetching from the server.
+  function render() {
+    if (!listEl) return;
+    if (!themesCache.length) { listEl.innerHTML = '<p>No themes installed.</p>'; return; }
+    listEl.innerHTML = themesCache.map((t) => row(t, superFlag)).join('');
+    wire(themesCache, superFlag);
   }
 
   function row(t, isSuper) {
@@ -80,12 +89,24 @@
     let action;
     if (!t.valid) {
       action = '<button type="button" class="btn-secondary btn-sm" data-errors="' + esc(id) + '">View validation errors</button>';
-    } else if (isDefault) {
-      action = '<span class="theme-active-pill">Active</span>';
-    } else if (isSuper) {
-      action = '<button type="button" class="btn-primary btn-sm" data-setdefault="' + esc(id) + '">Set as deployment default</button>';
     } else {
-      action = '<span class="settings-help">SuperAdmin sets the default</span>';
+      // Personal selection (every operator): apply this theme in THIS browser
+      // (localStorage), or mark the one currently in use. Replaces the former
+      // Theme dropdown (#441).
+      const isCurrent = !!(global.AuroraSettings && global.AuroraSettings.resolvedThemeId() === id);
+      const personal = isCurrent
+        ? '<span class="theme-active-pill">Active Theme</span>'
+        : '<button type="button" class="btn-primary btn-sm" data-usetheme="' + esc(id) + '">Use this theme</button>';
+      // Deployment default (superadmin only): the server-wide default for
+      // operators without a personal preference — a second action beneath the
+      // personal one.
+      let deployment = '';
+      if (isSuper) {
+        deployment = isDefault
+          ? '<span class="theme-default-pill">Deployment default</span>'
+          : '<button type="button" class="btn-secondary btn-sm" data-setdefault="' + esc(id) + '">Set as deployment default</button>';
+      }
+      action = personal + deployment;
     }
 
     // §11.7.3 discovery — only when a theme actually declares extension points
@@ -132,10 +153,24 @@
         });
       });
     });
+    // Personal "Use this theme" — every operator, so wired before the
+    // superadmin-only gate below.
+    listEl.querySelectorAll('[data-usetheme]').forEach((btn) => {
+      btn.addEventListener('click', () => usePersonalTheme(btn.dataset.usetheme));
+    });
     if (!isSuper) return;
     listEl.querySelectorAll('[data-setdefault]').forEach((btn) => {
       btn.addEventListener('click', () => setDefault(btn.dataset.setdefault, isSuper));
     });
+  }
+
+  // Personal theme selection (all roles): pin this theme in the operator's own
+  // browser (localStorage; AuroraSettings.setTheme applies it live by
+  // re-pointing the theme <link>s). Re-render so the "In use" marker moves to
+  // the chosen card. This is the former Theme dropdown's action, now per-card.
+  function usePersonalTheme(themeId) {
+    if (global.AuroraSettings) global.AuroraSettings.setTheme(themeId);
+    render();
   }
 
   async function setDefault(themeId, isSuper) {

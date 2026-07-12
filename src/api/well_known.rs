@@ -1,4 +1,4 @@
-use crate::identity::did_document::{DidDocument, Service, VerificationMethod};
+use crate::identity::did_document::{build_did_document, DidDocument};
 /// Well-known endpoints
 /// Handles /.well-known/* endpoints for DID resolution and other standards
 use crate::{context::AppContext, crypto::plc::PlcSigner, error::PdsResult};
@@ -100,48 +100,19 @@ pub async fn did_document(State(ctx): State<AppContext>) -> PdsResult<Json<DidDo
 /// - Verification methods (signing keys)
 /// - Also known as (handles)
 async fn generate_did_document(ctx: &AppContext, did: &str) -> PdsResult<DidDocument> {
-    // Build service endpoint
-    let service_url = ctx.service_url();
-    let service = Service {
-        id: format!("{}#atproto_pds", did),
-        service_type: "AtprotoPersonalDataServer".to_string(),
-        service_endpoint: service_url,
-    };
-
-    // Build verification method from repo signing key
-    let verification_method = generate_verification_method(ctx, did)?;
-
-    // Build DID document
-    let doc = DidDocument {
-        context: Some(serde_json::json!([
-            "https://www.w3.org/ns/did/v1",
-            "https://w3id.org/security/multikey/v1",
-            "https://w3id.org/security/suites/secp256k1-2019/v1"
-        ])),
-        id: did.to_string(),
-        also_known_as: vec![], // Could be populated with service handle
-        service: vec![service],
-        verification_method: vec![verification_method],
-    };
-
-    Ok(doc)
-}
-
-/// Generate verification method from repository signing key
-fn generate_verification_method(ctx: &AppContext, did: &str) -> PdsResult<VerificationMethod> {
-    // Load repo signing key from config
-    let repo_key_hex = &ctx.config.authentication.repo_signing_key;
-    let signer = PlcSigner::from_hex(repo_key_hex)?;
-
-    // Get public key in multibase format
+    // v0.10 Arc 1 Phase D (#414 / R1 F-6): the server-own doc is now built by the
+    // shared `build_did_document` builder (the same one the per-account did:web
+    // serve route uses), supplying the server's own repo signing key as the
+    // `#atproto` verification method and no `alsoKnownAs`. Byte-equivalence with
+    // the prior hand-built doc is not required (R2 Focus #3).
+    let signer = PlcSigner::from_hex(&ctx.config.authentication.repo_signing_key)?;
     let public_key_multibase = generate_multibase_key(&signer)?;
-
-    Ok(VerificationMethod {
-        id: format!("{}#atproto", did),
-        key_type: "Multikey".to_string(),
-        controller: did.to_string(),
-        public_key_multibase: Some(public_key_multibase),
-    })
+    Ok(build_did_document(
+        did,
+        &public_key_multibase,
+        ctx.service_url(),
+        None,
+    ))
 }
 
 /// Generate multibase-encoded public key from signer
@@ -169,6 +140,9 @@ fn generate_multibase_key(signer: &PlcSigner) -> PdsResult<String> {
 mod tests {
     use super::*;
     use crate::config::*;
+    // Service/VerificationMethod are no longer constructed in module code (the
+    // shared build_did_document owns that); the tests still build them directly.
+    use crate::identity::did_document::{Service, VerificationMethod};
     use std::path::PathBuf;
 
     #[test]
@@ -208,6 +182,8 @@ mod tests {
                 jwt_secret: "test_secret_key_that_is_32_chars".to_string(),
                 repo_signing_key: "a".repeat(64), // Valid hex key
                 plc_rotation_key: "b".repeat(64), // Valid hex key
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -215,7 +191,6 @@ mod tests {
                 },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -235,6 +210,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

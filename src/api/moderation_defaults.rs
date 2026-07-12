@@ -506,6 +506,8 @@ mod tests {
                 jwt_secret: "test-secret-key-aurora-mod-defaults-32x".to_string(),
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -514,7 +516,6 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -534,6 +535,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

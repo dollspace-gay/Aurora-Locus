@@ -83,12 +83,15 @@
   }
 
   function applyTheme(pref) {
-    const tokensLink = document.getElementById('theme-tokens');
-    const effectsLink = document.getElementById('theme-effects');
-    const extensionsLink = document.getElementById('theme-extensions');
-    if (tokensLink) tokensLink.setAttribute('href', themeHref('/theme/active.css', pref));
-    if (effectsLink) effectsLink.setAttribute('href', themeHref('/theme/active-effects.css', pref));
-    if (extensionsLink) extensionsLink.setAttribute('href', themeHref('/theme/active-extensions.css', pref));
+    // Swap each theme stylesheet gap-free (#441 live-swap FOUC): re-pointing the
+    // existing <link>'s href drops the old rules while the new href refetches
+    // (and under no-store there is no cache to serve it instantly), so the theme
+    // falls back to the base tokens.css defaults for a frame — the aurora-classic
+    // flash on "Use this theme". Instead, load the new stylesheet on a fresh
+    // <link> and only remove the old once the new has applied (swapThemeLink).
+    swapThemeLink('theme-tokens', themeHref('/theme/active.css', pref));
+    swapThemeLink('theme-effects', themeHref('/theme/active-effects.css', pref));
+    swapThemeLink('theme-extensions', themeHref('/theme/active-extensions.css', pref));
     // data-theme carries the resolved id for any [data-theme="…"]-scoped hooks.
     document.documentElement.setAttribute('data-theme', resolvedThemeId());
     // Refresh the extension-point runtime cache to match the now-active theme
@@ -96,6 +99,30 @@
     if (global.AuroraThemeRuntime) {
       try { global.AuroraThemeRuntime.reload(pref); } catch (e) { /* non-fatal */ }
     }
+  }
+
+  // Point the theme stylesheet with id `id` at `href` without a swap-gap: insert
+  // a fresh <link> right after the current one and, only once it has loaded and
+  // applied, remove the old link and hand its id to the new. The old stylesheet
+  // stays applied for the whole fetch, so the page never falls back to the base
+  // defaults mid-swap. On load error the fresh link is discarded (the working
+  // theme stands). A no-op when the href is already current.
+  function swapThemeLink(id, href) {
+    const old = document.getElementById(id);
+    if (!old) return;
+    if (old.getAttribute('href') === href) return;
+    const fresh = document.createElement('link');
+    fresh.rel = 'stylesheet';
+    fresh.href = href;
+    fresh.addEventListener('load', function () {
+      old.removeAttribute('id');
+      fresh.setAttribute('id', id);
+      if (old.parentNode) old.parentNode.removeChild(old);
+    });
+    fresh.addEventListener('error', function () {
+      if (fresh.parentNode) fresh.parentNode.removeChild(fresh);
+    });
+    old.parentNode.insertBefore(fresh, old.nextSibling);
   }
 
   function getDeploymentDefault() {

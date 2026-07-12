@@ -5,7 +5,7 @@
 use crate::{
     account::AppPasswordInfo,
     config::ServerConfig,
-    db::account::{ActorAccount, Session},
+    db::account::{ActorAccount, ActorServeState, DidWebAccount, Session},
     error::{PdsError, PdsResult},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -275,50 +275,61 @@ impl AccountManager {
         identifier: &str,
         password: &str,
     ) -> PdsResult<(ActorAccount, Session)> {
-        // Start timing for attack mitigation
+        // Verify the credential (timing-attack-mitigated), then mint a session.
+        let account = self.verify_password(identifier, password).await?;
+        let session = self.create_session(&account.did, None).await?;
+        Ok((account, session))
+    }
+
+    /// Verify a local account's password WITHOUT minting a session.
+    ///
+    /// The credential-checking half of [`AccountManager::login`]: resolve the
+    /// identifier, reject deactivated/taken-down accounts, and verify the argon2
+    /// hash — all under a fixed 350ms floor so response time cannot distinguish
+    /// an unknown identifier from a wrong password (username-oracle resistance).
+    /// Used by the AS browser sign-in (chainlink #439), which needs the password
+    /// check but mints a *browser* session rather than an account session.
+    pub async fn verify_password(
+        &self,
+        identifier: &str,
+        password: &str,
+    ) -> PdsResult<ActorAccount> {
+        // Start timing for attack mitigation.
         let start = std::time::Instant::now();
 
-        // Perform login logic - wrap in a scope so we can handle timing in finally block
         let result = async {
-            // Find account by handle or email
+            // Find account by handle or email.
             let account = self.get_account_by_identifier(identifier).await?;
 
-            // Check if account is deactivated or taken down
+            // Reject deactivated or taken-down accounts.
             if account.deactivated_at.is_some() {
                 return Err(PdsError::Authorization(
                     "Account is deactivated".to_string(),
                 ));
             }
-
             if account.takedown_ref.is_some() {
                 return Err(PdsError::Authorization(
                     "Account has been taken down".to_string(),
                 ));
             }
 
-            // Verify password exists (must have local account)
+            // Verify password exists (must have local account).
             let password_hash = account.password_hash.as_ref().ok_or_else(|| {
                 PdsError::Authentication("No local account credentials".to_string())
             })?;
 
-            // Verify password
             let valid = crate::auth::PasswordHasher::verify(password, password_hash)
                 .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
-
             if !valid {
                 return Err(PdsError::Authentication("Invalid credentials".to_string()));
             }
 
-            // Create session
-            let session = self.create_session(&account.did, None).await?;
-
-            Ok((account, session))
+            Ok(account)
         }
         .await;
 
-        // Mitigate timing attacks by ensuring minimum execution time
-        // This prevents attackers from distinguishing valid vs invalid usernames
-        // based on response time differences
+        // Mitigate timing attacks by ensuring a minimum execution time, so an
+        // attacker cannot distinguish valid vs invalid identifiers by latency.
         let elapsed = start.elapsed().as_millis() as i64;
         let wait_time = 350 - elapsed;
         if wait_time > 0 {
@@ -334,19 +345,50 @@ impl AccountManager {
         did: &str,
         app_password_name: Option<String>,
     ) -> PdsResult<Session> {
+        // Regular sessions: 1h access / 180d refresh, no IP binding.
+        self.create_session_with(
+            did,
+            app_password_name,
+            Duration::hours(1),
+            Duration::days(180),
+            None,
+        )
+        .await
+    }
+
+    /// Create a session with explicit access- and refresh-token lifetimes and an
+    /// optional bound IP. [`AccountManager::create_session`] is the
+    /// regular-default wrapper; admin sessions (Phase 4 · #442) pass a single
+    /// role-based (task-time) lifetime for both tokens.
+    ///
+    /// This is an interactive login, so `authenticated_at` is stamped to now —
+    /// the step-up freshness clock. It is preserved (not reset) across refreshes.
+    ///
+    /// `bound_ip` is persisted on the `session` row for the IP-binding commit; it
+    /// is NOT enforced here (enforcement lands with the trust_proxy-gated check).
+    pub async fn create_session_with(
+        &self,
+        did: &str,
+        app_password_name: Option<String>,
+        access_ttl: Duration,
+        refresh_ttl: Duration,
+        bound_ip: Option<String>,
+    ) -> PdsResult<Session> {
         let session_id = Uuid::new_v4().to_string();
 
-        // Generate JWT tokens
-        let access_token = self.generate_access_token(did, &session_id)?;
+        // Generate JWT tokens. The access JWT's exp mirrors access_ttl so the
+        // exp claim matches the session row (and the UI's refresh scheduling).
+        let access_token = self.generate_access_token(did, &session_id, access_ttl)?;
         let refresh_token_str = self.generate_refresh_token(did, &session_id)?;
 
         let now = Utc::now();
-        let expires_at = now + Duration::hours(1); // Access token expires in 1 hour
+        let expires_at = now + access_ttl;
 
-        // Insert session
+        // Insert session. authenticated_at == created_at here: a fresh login is,
+        // by definition, a fresh authentication.
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip, authenticated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         )
         .bind(&session_id)
         .bind(did)
@@ -355,13 +397,15 @@ impl AccountManager {
         .bind(now.to_rfc3339())
         .bind(expires_at.to_rfc3339())
         .bind(&app_password_name)
+        .bind(&bound_ip)
+        .bind(now.to_rfc3339())
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
 
         // Store refresh token
         let refresh_token_id = Uuid::new_v4().to_string();
-        let refresh_expires = now + Duration::days(180); // Refresh token expires in 6 months
+        let refresh_expires = now + refresh_ttl;
 
         sqlx::query(
             "INSERT INTO refresh_token (id, did, token, created_at, expires_at, used, next_id)
@@ -388,14 +432,39 @@ impl AccountManager {
         })
     }
 
-    /// Validate access token and return session info
+    /// Validate access token and return session info. IP-binding-agnostic
+    /// convenience wrapper for tests; every runtime request-auth path (including
+    /// the forwarded/local-verify dispatch) calls
+    /// [`AccountManager::validate_access_token_with_ip`] with the request's client
+    /// IP so a bound admin session is enforced. Test-only: gating it on
+    /// `cfg(test)` keeps the bin build (which has no non-test caller) free of the
+    /// lib/bin dead-code warning.
+    #[cfg(test)]
     pub async fn validate_access_token(
         &self,
         token: &str,
     ) -> PdsResult<crate::account::ValidatedSession> {
+        self.validate_access_token_with_ip(token, None).await
+    }
+
+    /// Validate an access token, additionally enforcing IP binding (#442). When
+    /// the session row carries a `bound_ip` (set at login for an admin who opted
+    /// into IP binding), the request's `current_ip` MUST match it or the token is
+    /// rejected as though invalid. UNBOUND sessions (`bound_ip = NULL`, the
+    /// common case) are unaffected regardless of `current_ip`. Enforcement is
+    /// fail-closed: a bound session with a non-matching or absent `current_ip`
+    /// (including `None`) is rejected, so a request path that fails to thread the
+    /// client IP can't slip a bound session through unchecked. Internal callers
+    /// pass `None` and only ever handle unbound sessions; every real request-auth
+    /// path threads the client IP.
+    pub async fn validate_access_token_with_ip(
+        &self,
+        token: &str,
+        current_ip: Option<std::net::IpAddr>,
+    ) -> PdsResult<crate::account::ValidatedSession> {
         // Find session by access token
         let row = sqlx::query(
-            "SELECT id, did, expires_at, app_password_name FROM session WHERE access_token = $1",
+            "SELECT id, did, expires_at, app_password_name, bound_ip FROM session WHERE access_token = $1",
         )
         .bind(token)
         .fetch_optional(&self.db)
@@ -407,10 +476,36 @@ impl AccountManager {
         let did: String = row.get("did");
         let expires_at: DateTime<Utc> = parse_timestamp(&row.get::<String, _>("expires_at"))?;
         let app_password_name: Option<String> = row.get("app_password_name");
+        let bound_ip: Option<String> = row.get("bound_ip");
 
         // Check expiration
         if Utc::now() > expires_at {
             return Err(PdsError::Authentication("Session expired".to_string()));
+        }
+
+        // IP binding: a bound session may only be used from its bound IP. Fails
+        // closed — a request whose client IP can't be resolved to the bound value
+        // (including `current_ip == None` in a request path) is rejected. The
+        // error mirrors the invalid-token message so a mismatch isn't an oracle.
+        if let Some(bound) = bound_ip {
+            let current_str = current_ip.map(|ip| ip.to_string());
+            if current_str.as_deref() != Some(bound.as_str()) {
+                // #442 diagnostic: a bound session is rejected because the request
+                // IP doesn't match the IP stamped at login. Behind a CDN/reverse
+                // proxy these can legitimately differ (edge-node variance /
+                // XFF-chain position) — the reason enablement is gated off until
+                // v0.11. Logged at debug so the per-request enforcement work can
+                // compare the two resolutions; the client sees only the generic
+                // message above (no IP-mismatch oracle).
+                tracing::debug!(
+                    bound_ip = %bound,
+                    current_ip = ?current_str,
+                    "ip_binding_rejected: bound IP != request IP (#442)"
+                );
+                return Err(PdsError::Authentication(
+                    "Invalid or expired session".to_string(),
+                ));
+            }
         }
 
         Ok(crate::account::ValidatedSession {
@@ -525,6 +620,24 @@ impl AccountManager {
     /// When a token is refreshed, the old token remains valid for 2 hours but points to
     /// the new token, preventing race conditions.
     pub async fn refresh_session(&self, refresh_token: &str) -> PdsResult<Session> {
+        // Regular sessions: 1h access / 180d refresh.
+        self.refresh_session_with(refresh_token, Duration::hours(1), Duration::days(180))
+            .await
+    }
+
+    /// Rotate a session's tokens with explicit access-/refresh-token lifetimes
+    /// (Phase 4 · #442). Admin refresh passes a single role-based (task-time)
+    /// lifetime for both tokens, so activity within the window slides the session
+    /// and idle beyond it expires. The rotated session carries the previous
+    /// session's `bound_ip` AND `authenticated_at` forward: an IP-bound session
+    /// stays bound, and — crucially — a refresh does NOT reset the step-up
+    /// freshness clock, so only a real re-login counts as recent authentication.
+    pub async fn refresh_session_with(
+        &self,
+        refresh_token: &str,
+        access_ttl: Duration,
+        refresh_ttl: Duration,
+    ) -> PdsResult<Session> {
         let now = Utc::now();
 
         // Find and validate refresh token. Lookup + expiry are shared with
@@ -572,10 +685,28 @@ impl AccountManager {
             ));
         }
 
+        // Carry the previous session's bound IP + authenticated_at forward
+        // (Phase 4 · #442): an IP-bound session stays bound, and the step-up
+        // freshness clock is preserved so a refresh never counts as a fresh
+        // authentication. The old session still exists (its access token is valid
+        // until expiry) and still points at the token being refreshed.
+        let carried: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT bound_ip, authenticated_at FROM session WHERE refresh_token = $1",
+        )
+        .bind(refresh_token)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        let (bound_ip, carried_authenticated_at) = carried.unwrap_or((None, None));
+        // Fall back to now if the previous row predates the authenticated_at
+        // column (NULL) — the worst case is treating an old session as freshly
+        // authenticated, and such sessions age out within the short admin window.
+        let authenticated_at = carried_authenticated_at.unwrap_or_else(|| now.to_rfc3339());
+
         // Create new refresh token
         let new_token_id = uuid::Uuid::new_v4().to_string();
         let new_refresh_token = self.generate_refresh_token(&did, &new_token_id)?;
-        let refresh_expires = now + Duration::days(180); // 180 days
+        let refresh_expires = now + refresh_ttl;
 
         // Insert new refresh token
         sqlx::query(
@@ -607,15 +738,17 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
-        // Create new access token
+        // Create new access token (exp mirrors access_ttl, matching the row).
         let new_session_id = uuid::Uuid::new_v4().to_string();
-        let access_token = self.generate_access_token(&did, &new_session_id)?;
-        let access_expires = now + Duration::hours(1);
+        let access_token = self.generate_access_token(&did, &new_session_id, access_ttl)?;
+        let access_expires = now + access_ttl;
 
-        // Insert new session
+        // Insert new session (carrying the bound IP + authenticated_at forward).
+        // created_at is now (this row is new); authenticated_at is the original
+        // login time, so the step-up clock does not reset on refresh.
         sqlx::query(
-            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name)
-             VALUES ($1, $2, $3, $4, $5, $6, NULL)"
+            "INSERT INTO session (id, did, access_token, refresh_token, created_at, expires_at, app_password_name, bound_ip, authenticated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)"
         )
         .bind(&new_session_id)
         .bind(&did)
@@ -623,6 +756,8 @@ impl AccountManager {
         .bind(&new_refresh_token)
         .bind(now.to_rfc3339())
         .bind(access_expires.to_rfc3339())
+        .bind(&bound_ip)
+        .bind(&authenticated_at)
         .execute(&self.db)
         .await
         .map_err(PdsError::Database)?;
@@ -636,6 +771,44 @@ impl AccountManager {
             expires_at: access_expires,
             app_password_name: None,
         })
+    }
+
+    /// The interactive-authentication time of a session, by session id — the
+    /// step-up freshness clock (Phase 4 · #442). Distinct from `created_at`,
+    /// which the sliding-refresh rotation resets; `authenticated_at` is stamped
+    /// at login and carried across refreshes. COALESCEs to `created_at` for
+    /// sessions that predate the column. Returns `None` when no such session row
+    /// exists (e.g. a synthetic/HS256 admin session id), which step-up callers
+    /// treat as "cannot verify freshness" and fail closed.
+    pub async fn session_authenticated_at(
+        &self,
+        session_id: &str,
+    ) -> PdsResult<Option<DateTime<Utc>>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT COALESCE(authenticated_at, created_at) FROM session WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        match row {
+            Some((ts,)) => Ok(Some(parse_timestamp(&ts)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Bind an existing session to a client IP (#442), by session id. Used by the
+    /// password-login path to bind an admin's just-minted session to the IP the
+    /// login came from (the OAuth path binds at creation via `create_session_with`).
+    /// Subsequent `validate_access_token_with_ip` calls then enforce it.
+    pub async fn bind_session_ip(&self, session_id: &str, bound_ip: &str) -> PdsResult<()> {
+        sqlx::query("UPDATE session SET bound_ip = $1 WHERE id = $2")
+            .bind(bound_ip)
+            .bind(session_id)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(())
     }
 
     /// Get account by DID
@@ -660,6 +833,7 @@ impl AccountManager {
             PdsError::Internal(format!("atproto_signing_key for {} is malformed hex: {}", did, e))
         })
     }
+
 
     /// Generate a fresh per-account atproto signing keypair for rotation
     /// (key-rotation arc #372 / B1 §4.2.1 Path A). Pure: no DB, no PLC — side
@@ -803,6 +977,61 @@ impl AccountManager {
             email_confirmed_at: opt_parse_timestamp(row.get::<Option<String>, _>("email_confirmed_at"))?,
             invites_disabled: Some(crate::db::read_bool(&row, "invites_disabled")?),
         })
+    }
+
+    /// v0.10 Arc 1 Phase B (#414) — look up a did:web account by its `slug` (the
+    /// serve-route reverse lookup for `/user/{slug}/did.json`). Returns `None`
+    /// when no row matches. The by-DID lookup and the write helper ship in Phase C
+    /// (no Arc-1-standalone bin consumer; dead-code-tax per LOCKED §4).
+    pub async fn get_did_web_account_by_slug(
+        &self,
+        slug: &str,
+    ) -> PdsResult<Option<DidWebAccount>> {
+        sqlx::query_as::<_, DidWebAccount>(
+            "SELECT did, domain, slug, identity_public_key, created_at \
+             FROM did_web_account WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)
+    }
+
+    /// v0.10 Arc 2 Phase β.2 (#420) — the by-DID companion to
+    /// `get_did_web_account_by_slug`. The atproto-OAuth AS-login endpoint
+    /// (login-α) needs the holder's stored `identity_public_key` to verify
+    /// the challenge signature, and it is handed a DID (not a slug). `None`
+    /// when the DID is not a did:web account on this PDS.
+    pub async fn get_did_web_account_by_did(
+        &self,
+        did: &str,
+    ) -> PdsResult<Option<DidWebAccount>> {
+        sqlx::query_as::<_, DidWebAccount>(
+            "SELECT did, domain, slug, identity_public_key, created_at \
+             FROM did_web_account WHERE did = $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)
+    }
+
+    /// v0.10 Arc 1 Phase D (#414) — the actor-only serve state for the did:web
+    /// document route: handle (for `alsoKnownAs`) + the AD-1 gate inputs
+    /// (deactivated_at / takedown_ref presence). No `account` join, so it works
+    /// for any actor row. `None` when no actor row exists for the DID.
+    pub async fn get_actor_serve_state(&self, did: &str) -> PdsResult<Option<ActorServeState>> {
+        use sqlx::Row as _;
+        let row = sqlx::query("SELECT handle, deactivated_at, takedown_ref FROM actor WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(row.map(|r| ActorServeState {
+            handle: r.get::<Option<String>, _>("handle"),
+            deactivated: r.get::<Option<String>, _>("deactivated_at").is_some(),
+            taken_down: r.get::<Option<String>, _>("takedown_ref").is_some(),
+        }))
     }
 
     /// Find account by DID, handle, or email (public for password reset).
@@ -1032,6 +1261,12 @@ impl AccountManager {
     /// Apply the actual UPDATE without re-running validation. Used by
     /// `update_handle` (which validates upfront) and
     /// `update_handle_in_tx` (which validates inside the tx).
+    ///
+    /// v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): this is the shared
+    /// `actor.handle` writer for **both** DID methods. For did:plc the caller
+    /// republishes the handle to the PLC directory; for did:web there is no PLC
+    /// doc — the served `alsoKnownAs` recomposes from `actor.handle` at the
+    /// per-account serve route (Phase D). No method guard here by design.
     async fn update_handle_unchecked_in_tx<'c>(
         tx: &mut sqlx::Transaction<'c, sqlx::Any>,
         did: &str,
@@ -1214,16 +1449,22 @@ impl AccountManager {
             .services(services)
             .build()?;
 
-        // §6.3.1 / Step 0.6.1: DID suffix is SHA-256 of canonical
-        // DAG-CBOR of unsigned op, base32-lower (no padding), first
-        // 24 chars.
-        let did_suffix = derive_did_suffix(&unsigned)?;
-        let did = format!("did:plc:{}", did_suffix);
-
-        // §6.3.2: the PDS-wide rotation key signs (its `did:key`
+        // §6.3.2: the PDS-wide rotation key signs FIRST (its `did:key`
         // is in `rotation_keys[0]`, satisfying chainlink #61 §1.4.5
-        // signer-in-rotation-keys invariant).
+        // signer-in-rotation-keys invariant). Signing must precede DID
+        // derivation because the did:plc spec derives the DID from the
+        // SIGNED genesis op.
         let signed_operation = rotation_signer.sign_operation(unsigned)?;
+
+        // §6.3.1 / Step 0.6.1: per the did:plc spec, the DID suffix is
+        // SHA-256 of the canonical DAG-CBOR of the SIGNED genesis op
+        // (sig field included), base32-lower (no padding), first 24
+        // chars — the same bytes plc.directory recomputes from the
+        // submitted body to validate `POST /{did}`. Deriving from the
+        // unsigned op yields a different suffix and a DID-identity
+        // rejection (chainlink #430 follow-on).
+        let did_suffix = derive_did_suffix(&signed_operation)?;
+        let did = format!("did:plc:{}", did_suffix);
 
         let plc_url = self.config.identity.did_plc_url.as_str();
 
@@ -1274,7 +1515,12 @@ impl AccountManager {
     }
 
     /// Generate access JWT token
-    fn generate_access_token(&self, did: &str, session_id: &str) -> PdsResult<String> {
+    fn generate_access_token(
+        &self,
+        did: &str,
+        session_id: &str,
+        access_ttl: Duration,
+    ) -> PdsResult<String> {
         use jsonwebtoken::{encode, EncodingKey, Header};
         use serde::{Deserialize, Serialize};
 
@@ -1286,12 +1532,17 @@ impl AccountManager {
             exp: i64,
         }
 
+        // The JWT `exp` MUST match the session row's `expires_at` (both
+        // now + access_ttl). validate_access_token gates on the DB row, but the
+        // exp claim is what the admin UI reads to schedule its proactive refresh
+        // (#442) — a stale hardcoded 1h here (vs a 15m role lifetime) scheduled
+        // the refresh long past the real expiry, so the session never slid.
         let now = Utc::now().timestamp();
         let claims = Claims {
             sub: did.to_string(),
             sid: session_id.to_string(),
             iat: now,
-            exp: now + 3600, // 1 hour
+            exp: now + access_ttl.num_seconds(),
         };
 
         // Arc 12 §5.4 Step 0.6.2: include kid="aurora-local-v1"
@@ -2327,7 +2578,15 @@ impl AccountManager {
 
     // ==================== App Passwords ====================
 
-    /// Create an app password for third-party applications
+    /// Create an app password for third-party applications.
+    ///
+    /// v0.10 (#448): available for did:web accounts on the same terms as did:plc.
+    /// The prior SD-A5=(b) rejection was justified by "the substrate never holds
+    /// the did:web signing key"; v0.10 did:web accounts hold their key on the PDS
+    /// (parity), so an app-password credential is no longer a category error.
+    /// v0.11 (Phase γ / did:web sovereignty) revisits this alongside
+    /// holder-mediated signing — a sovereign holder authenticates third-party
+    /// apps through the atproto-OAuth provider, not a server-held password.
     pub async fn create_app_password(
         &self,
         did: &str,
@@ -3322,6 +3581,8 @@ mod tests {
                 jwt_secret: "test-secret-key-for-testing-only".to_string(),
                 repo_signing_key: "test-key".to_string(),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: crate::config::OAuthConfig {
                     client_id: "test-client".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -3329,7 +3590,6 @@ mod tests {
                 },
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -3349,6 +3609,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -3757,6 +4018,176 @@ mod tests {
         assert!(matches!(missing, Err(PdsError::Authentication(_))));
     }
 
+    /// Phase 4 (#442) wiring tripwire: `authenticated_at` is stamped at login and
+    /// PRESERVED across a refresh (not reset to the rotation time). This is what
+    /// makes the step-up freshness gate correct — a silent refresh must not count
+    /// as a fresh authentication.
+    #[tokio::test]
+    async fn authenticated_at_is_stamped_at_login_and_preserved_across_refresh() {
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "stepupuser".to_string(),
+                Some("stepup@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = manager.create_session(&account.did, None).await.unwrap();
+
+        // Login stamps authenticated_at ≈ now.
+        let login_auth = manager
+            .session_authenticated_at(&session.id)
+            .await
+            .unwrap()
+            .expect("login session has authenticated_at");
+        assert!(
+            (Utc::now() - login_auth).num_seconds().abs() <= 5,
+            "authenticated_at should be ~now at login"
+        );
+
+        // Backdate it, then refresh: the new session must carry the SAME
+        // (backdated) authenticated_at, proving a refresh does not reset it.
+        let backdated = (Utc::now() - Duration::minutes(20)).to_rfc3339();
+        sqlx::query("UPDATE session SET authenticated_at = $1 WHERE id = $2")
+            .bind(&backdated)
+            .bind(&session.id)
+            .execute(&manager.db)
+            .await
+            .unwrap();
+
+        let refreshed = manager
+            .refresh_session(&session.refresh_token)
+            .await
+            .unwrap();
+        let refreshed_auth = manager
+            .session_authenticated_at(&refreshed.id)
+            .await
+            .unwrap()
+            .expect("refreshed session has authenticated_at");
+        assert!(
+            (Utc::now() - refreshed_auth).num_seconds() >= 19 * 60,
+            "refresh must preserve the original (backdated) authenticated_at, got {refreshed_auth}"
+        );
+
+        // An unknown session id resolves to None (step-up fails closed).
+        assert!(manager
+            .session_authenticated_at("no-such-session")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Phase 4 (#442): IP-binding enforcement in validate_access_token_with_ip.
+    #[tokio::test]
+    async fn validate_access_token_enforces_ip_binding() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "ipbinduser".to_string(),
+                Some("ipbind@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bound = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        // A session bound to `bound` may only be used from `bound`.
+        let session = manager
+            .create_session_with(
+                &account.did,
+                None,
+                Duration::hours(1),
+                Duration::hours(1),
+                Some(bound.to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, Some(bound))
+            .await
+            .is_ok());
+        // Wrong IP → rejected.
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, Some(other))
+            .await
+            .is_err());
+        // No IP context → rejected (fail-closed); the IP-agnostic wrapper too.
+        assert!(manager
+            .validate_access_token_with_ip(&session.access_token, None)
+            .await
+            .is_err());
+        assert!(manager
+            .validate_access_token(&session.access_token)
+            .await
+            .is_err());
+
+        // An UNBOUND session validates from any IP (and with no IP).
+        let unbound = manager.create_session(&account.did, None).await.unwrap();
+        assert!(manager
+            .validate_access_token_with_ip(&unbound.access_token, Some(other))
+            .await
+            .is_ok());
+        assert!(manager
+            .validate_access_token_with_ip(&unbound.access_token, None)
+            .await
+            .is_ok());
+        assert!(manager
+            .validate_access_token(&unbound.access_token)
+            .await
+            .is_ok());
+    }
+
+    /// Phase 4 (#442) regression: the access JWT's `exp` claim must track the
+    /// access_ttl (not the old hardcoded 1h), so the admin UI's proactive-refresh
+    /// timer schedules against the real session lifetime rather than 48 min out.
+    #[tokio::test]
+    async fn access_token_exp_tracks_access_ttl() {
+        use base64::Engine as _;
+        let manager = create_test_manager().await;
+        let account = manager
+            .create_account(
+                "expuser".to_string(),
+                Some("exp@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let before = Utc::now().timestamp();
+        // A 15-minute access lifetime (superadmin-like), NOT the legacy 1h.
+        let session = manager
+            .create_session_with(
+                &account.did,
+                None,
+                Duration::minutes(15),
+                Duration::minutes(15),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let payload_b64 = session.access_token.split('.').nth(1).expect("JWT payload");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .expect("base64url payload");
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let exp = claims["exp"].as_i64().expect("exp claim");
+        let ttl_secs = exp - before;
+        assert!(
+            (14 * 60..=16 * 60).contains(&ttl_secs),
+            "exp should track the 15m access_ttl, got {ttl_secs}s (regression: hardcoded 1h?)"
+        );
+    }
+
     // ---- Arc 4 (§6) — validate_refresh_token + deleteSession (Q8) ----
 
     /// §6 test #1 — validate_refresh_token positive → right {did, session_id, token_id}.
@@ -4032,6 +4463,31 @@ mod tests {
 
         let passwords = manager.list_app_passwords(&account.did).await.unwrap();
         assert_eq!(passwords.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_app_password_works_for_did_web() {
+        let manager = setup_test_db().await;
+        let did = "did:web:alice.example.com";
+        // v0.10 (#448): did:web accounts hold a PDS-held key (parity with
+        // did:plc), so the prior SD-A5=(b) app-password rejection is lifted.
+        // app_password FKs to actor(did), so seed the actor row.
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind("alice.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&manager.db)
+            .await
+            .expect("seed did:web actor");
+
+        let pw = manager
+            .create_app_password(did, "Test App", false)
+            .await
+            .expect("did:web app password now succeeds (v0.10 parity)");
+        assert_eq!(pw.len(), 39);
+        let list = manager.list_app_passwords(did).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Test App");
     }
 
     #[tokio::test]
@@ -4890,6 +5346,51 @@ mod tests {
              K256Keypair::from_private_key(plc_keys.atproto_signing_key for alice). \
              A mismatch means the helper is not reading the published per-account key."
         );
+    }
+
+    /// v0.10 did:web parity (#448): a did:web account holding a PDS-side key
+    /// resolves and signs through the SAME key-presence path as did:plc — the key
+    /// round-trips and `create_actor_signer` yields a working repo signer. The
+    /// key is seeded directly here; a did:web account-creation route (which would
+    /// provision the key) lands in v0.11 alongside sovereignty.
+    #[tokio::test]
+    async fn did_web_account_with_pds_held_key_signs_like_did_plc() {
+        let manager = setup_test_db().await;
+        let did = "did:web:alice.example.com";
+
+        // A did:web account with a PDS-held atproto key: seed the actor row, then
+        // a plc_keys row (last_operation_cid NULL — no PLC operation for did:web).
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind("alice.example.com")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&manager.db)
+            .await
+            .expect("seed did:web actor");
+        sqlx::query(
+            "INSERT INTO plc_keys (did, last_operation_cid, atproto_signing_key) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(did)
+        .bind(Option::<String>::None)
+        .bind("77".repeat(32))
+        .execute(&manager.db)
+        .await
+        .expect("seed did:web plc_keys");
+
+        // The key resolves via the same accessor the repo/service-auth paths use.
+        let key = manager
+            .get_atproto_signing_key_bytes(did)
+            .await
+            .expect("did:web key resolves like did:plc");
+        assert_eq!(key.len(), 32);
+
+        // And a repo signer signs in-process — commit-signing parity.
+        let signer = crate::api::repo::create_actor_signer(&manager, did)
+            .await
+            .expect("did:web repo signer");
+        let sig = signer.sign(b"did-web-parity-check").expect("did:web signs");
+        assert!(!sig.is_empty());
     }
 
     // ============================================================

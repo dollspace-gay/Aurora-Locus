@@ -1,17 +1,20 @@
 //! OAuth-based admin authentication endpoints.
 //!
-//! Wraps proto-blue's OAuth client to authenticate operators via their
-//! atproto identity. The flow:
+//! Drives the admin login ceremony against Aurora's OWN authorization server
+//! with the Aurora-owned [`AdminOAuthClient`] (chainlink #439) — no
+//! proto-blue-oauth in the loop, so the flow does not inherit that client's
+//! DPoP-`exp` non-compliance (RFC 9449 §4.2). The flow:
 //!
-//! 1. `/admin-oauth/login` — discover the user's AS, build a PAR/PKCE
-//!    authorization URL, stash the `AuthState` + server metadata under
-//!    the `state` parameter, redirect.
-//! 2. `/admin-oauth/callback` — look up the stash, exchange the code
-//!    for a token, verify the resulting DID is on the admin list, mint
-//!    PDS access/refresh tokens, render a small HTML page that stows
-//!    them in localStorage.
-//! 3. `/oauth/client-metadata.json` — public client-metadata document
-//!    consumed by the AS during discovery.
+//! 1. `/admin-oauth/login` — build the client, generate PKCE + state, push a
+//!    PAR to our own AS, stash the PKCE verifier under the `state` parameter,
+//!    redirect the browser to the authorize URL.
+//! 2. `/admin-oauth/callback` — look up the stash, exchange the code for a
+//!    (throwaway) DPoP-bound token, resolve the authenticated DID from that
+//!    token via the loopback validation path, verify the DID is a local admin,
+//!    mint a real PDS account session, render a small HTML page that stows the
+//!    session tokens in localStorage.
+//! 3. `/oauth/client-metadata.json` — public client-metadata document the AS
+//!    fetches to resolve + trust the client during PAR.
 use crate::AppContext;
 use axum::{
     extract::{Query, State},
@@ -20,10 +23,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use proto_blue::oauth::{
-    types::{AuthState, OAuthClientMetadata, OAuthServerMetadata},
-    OAuthClient,
-};
+use crate::oauth_client::admin::AdminOAuthClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,13 +64,18 @@ impl OAuthStateStore {
 }
 
 /// Per-flow data we need to remember between `/login` and `/callback`.
+///
+/// The DPoP key is deliberately NOT carried across the round-trip: Aurora's AS
+/// does not bind the PAR proof's key to the issued token (only the
+/// token-exchange proof's key is bound), and the admin flow discards the OAuth
+/// token immediately after resolving the DID — so a fresh ephemeral key at the
+/// callback is sufficient and correct.
 #[derive(Clone)]
 pub struct OAuthStateData {
-    /// PKCE verifier + DPoP key + issuer, produced by `OAuthClient::authorize`.
-    pub auth_state: AuthState,
-    /// AS metadata fetched during discovery — the callback needs it again to
-    /// drive token exchange (token_endpoint, iss-parameter support, etc.).
-    pub server_metadata: OAuthServerMetadata,
+    /// PKCE verifier — replayed at the callback to complete the code exchange.
+    pub code_verifier: String,
+    /// The redirect_uri bound to this flow; must match at the token exchange.
+    pub redirect_uri: String,
     /// Optional handle hint, retained only for tracing.
     #[allow(dead_code)]
     pub handle: Option<String>,
@@ -80,6 +85,7 @@ pub struct OAuthStateData {
 pub fn routes(state_store: OAuthStateStore) -> Router<AppContext> {
     let oauth_router = Router::new()
         .route("/admin-oauth/login", get(initiate_oauth))
+        .route("/admin-oauth/password-login", post(password_login_gate))
         .route("/admin-oauth/callback", get(handle_oauth_callback))
         .route("/admin-oauth/refresh", post(handle_refresh))
         .layer(axum::Extension(state_store));
@@ -299,8 +305,44 @@ async fn handle_refresh(
         }
     }
 
-    // Path 2: account-backed admin refresh token (rotates).
-    match ctx.account_manager.refresh_session(&req.refresh_token).await {
+    // Path 2: account-backed admin refresh token (rotates). Phase 4 · #442:
+    // re-mint both tokens with the DID's single role-based (task-time) lifetime
+    // (honoring any per-account override), so admin sessions slide on activity
+    // and expire on idle. The DID is read directly (not via
+    // validate_refresh_token, whose fail-closed semantics would reject a
+    // grace-period token that refresh_session handles); a non-admin token (no
+    // role) keeps the regular refresh lifetimes.
+    use crate::admin::security_config as sec;
+    let did: Option<String> =
+        sqlx::query_scalar("SELECT did FROM refresh_token WHERE token = $1")
+            .bind(&req.refresh_token)
+            .fetch_optional(&ctx.account_db)
+            .await
+            .ok()
+            .flatten();
+    let admin_role = match &did {
+        Some(d) => ctx.admin_role_manager.get_role(d).await.ok().flatten(),
+        None => None,
+    };
+    let refresh_result = match admin_role {
+        Some(ar) => {
+            let cfg = match &did {
+                Some(d) => ctx.admin_security_store.get_config(d).await.ok().flatten(),
+                None => None,
+            };
+            let lifetime_secs =
+                sec::compute_admin_session_lifetime_secs(ar.role, cfg.as_ref());
+            ctx.account_manager
+                .refresh_session_with(
+                    &req.refresh_token,
+                    chrono::Duration::seconds(lifetime_secs),
+                    chrono::Duration::seconds(lifetime_secs),
+                )
+                .await
+        }
+        None => ctx.account_manager.refresh_session(&req.refresh_token).await,
+    };
+    match refresh_result {
         Ok(session) => {
             tracing::debug!(did = %session.did, "admin access token refreshed (account path)");
             Ok(Json(RefreshResponse {
@@ -319,26 +361,225 @@ async fn handle_refresh(
     }
 }
 
-/// Build a fresh `OAuthClient` configured for this PDS's admin flow.
-fn build_oauth_client(ctx: &AppContext) -> OAuthClient {
-    let metadata = OAuthClientMetadata {
-        client_id: ctx.config.authentication.oauth.client_id.clone(),
-        redirect_uris: vec![ctx.config.authentication.oauth.redirect_uri.clone()],
-        response_types: Some(vec!["code".to_string()]),
-        grant_types: Some(vec![
-            "authorization_code".to_string(),
-            "refresh_token".to_string(),
-        ]),
-        scope: Some("atproto transition:generic".to_string()),
-        token_endpoint_auth_method: Some("none".to_string()),
-        token_endpoint_auth_signing_alg: None,
-        application_type: Some("web".to_string()),
-        dpop_bound_access_tokens: Some(true),
-        client_name: Some("Aurora Locus Admin".to_string()),
-        client_uri: None,
-        logo_uri: None,
+/// Request body for `POST /admin-oauth/password-login`.
+#[derive(Deserialize)]
+struct AdminLoginRequest {
+    /// Handle or email of the local admin account.
+    identifier: String,
+    password: String,
+    /// TOTP code (#442), required only for admins who have confirmed 2FA.
+    #[serde(default)]
+    totp_code: Option<String>,
+}
+
+/// Response from `POST /admin-oauth/password-login`. Mirrors the token shape the
+/// OAuth callback stows in localStorage, so the admin UI consumes both paths
+/// identically (Bearer in `Authorization`).
+#[derive(Serialize, Debug)]
+struct AdminLoginResponse {
+    access_token: String,
+    refresh_token: String,
+    did: String,
+    role: String,
+}
+
+/// `POST /admin-oauth/password-login` — password-based admin login (chainlink
+/// #434).
+///
+/// A Bearer-token alternative to the OAuth admin flow, which is blocked upstream
+/// by a proto-blue-oauth DPoP-`exp` compliance bug (RFC 9449 §4.2). It reuses
+/// the exact session mechanism the OAuth callback + holder OAuth use —
+/// `account_manager.login` (timing-attack-mitigated password verification +
+/// deactivation/takedown checks) then a v0.10 local-account admin-role gate —
+/// and returns `account_manager.create_session` tokens as JSON. The admin UI
+/// stores them in localStorage and sends `Authorization: Bearer`, validated by
+/// the same `route_local_verify` → `validate_access_token_with_ip` path as every
+/// other admin request.
+///
+/// No cookie is set and no CSRF token is required: the response carries the
+/// Bearer token in the JSON body (not an ambient cookie credential), so this
+/// login is not a CSRF sink — the same posture as the OAuth callback.
+/// Toggle gate in front of [`handle_password_login`] (#442). Password login is a
+/// fallback, OFF by default; when disabled it 302-redirects to the OAuth login
+/// landing (`/admin/`) — the friendly UX for a stale bookmark / muscle memory —
+/// rather than exposing the credential endpoint. Enabled per-deployment via
+/// `PDS_ADMIN_PASSWORD_LOGIN_ENABLED` (cached in config at boot). Kept separate
+/// from the handler so the handler's own tests exercise the login logic directly.
+async fn password_login_gate(
+    State(ctx): State<AppContext>,
+    headers: axum::http::HeaderMap,
+    body: Json<AdminLoginRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if !ctx.config.authentication.password_login_enabled {
+        return (
+            StatusCode::FOUND,
+            [(axum::http::header::LOCATION, "/admin/")],
+        )
+            .into_response();
+    }
+    // Resolve the client IP for IP binding (#442) before consuming ctx.
+    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+    match handle_password_login(State(ctx), client_ip, body).await {
+        Ok(json) => json.into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+async fn handle_password_login(
+    State(ctx): State<AppContext>,
+    client_ip: Option<std::net::IpAddr>,
+    Json(req): Json<AdminLoginRequest>,
+) -> Result<Json<AdminLoginResponse>, (StatusCode, String)> {
+    // Verify the password and mint a session. `login` resolves the identifier to
+    // a LOCAL account, rejects deactivated/taken-down accounts, verifies the
+    // argon2 hash, and applies timing-attack mitigation. A generic 401 avoids
+    // leaking whether the identifier or the password was wrong.
+    let (account, session) = ctx
+        .account_manager
+        .login(&req.identifier, &req.password)
+        .await
+        .map_err(|e| {
+            tracing::debug!("admin password login failed: {}", e);
+            (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())
+        })?;
+
+    // v0.10 constitutional claim: admin/superadmin roles are restricted to local
+    // accounts (`login` guarantees local). Require an admin_roles entry; a local
+    // account without one is refused. Authority is the admin_role table, live per
+    // request (#267).
+    let admin_role = ctx
+        .admin_role_manager
+        .get_role(&account.did)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to query admin role: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check admin status".to_string(),
+            )
+        })?;
+    let Some(admin_role) = admin_role else {
+        tracing::warn!(
+            did = %account.did,
+            "Password admin login rejected: account has no admin role on this PDS"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Account has no admin role on this PDS".to_string(),
+        ));
     };
-    OAuthClient::new(metadata)
+
+    // Per-account security config (TOTP + IP binding), fetched once.
+    let security_config = ctx
+        .admin_security_store
+        .get_config(&account.did)
+        .await
+        .ok()
+        .flatten();
+
+    // TOTP 2FA (#442): if this admin has confirmed TOTP, require + verify a code
+    // before releasing the session. `login` already minted the session, so on any
+    // TOTP failure we revoke it and return the SAME generic 401 as a bad password
+    // — otherwise a TOTP-specific error would confirm the password was correct
+    // (a password oracle).
+    if let Some(cfg) = security_config.as_ref() {
+        if cfg.totp_confirmed_at.is_some()
+            && !verify_login_totp(&ctx, cfg, req.totp_code.as_deref()).await
+        {
+            let _ = ctx.account_manager.delete_session(&session.id).await;
+            tracing::debug!(did = %account.did, "admin password login rejected: TOTP failed");
+            return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
+        }
+    }
+
+    // IP binding (#442): bind the just-minted session to the login IP when the
+    // admin opted in. Enforced on every later request by
+    // validate_access_token_with_ip. Fail-closed: if the bind write fails we
+    // revoke the session rather than release an unbound one for a binding admin.
+    if security_config
+        .as_ref()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        if let Some(ip) = client_ip {
+            if let Err(e) = ctx
+                .account_manager
+                .bind_session_ip(&session.id, &ip.to_string())
+                .await
+            {
+                tracing::error!(did = %account.did, "failed to bind session IP: {}", e);
+                let _ = ctx.account_manager.delete_session(&session.id).await;
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to bind session".to_string(),
+                ));
+            }
+        }
+        // No client IP (e.g. trust_proxy off → no real IP): binding degrades to a
+        // no-op by design; the session is released unbound.
+    }
+
+    tracing::info!(
+        did = %account.did,
+        role = %admin_role.role.as_str(),
+        "Admin logged in via password"
+    );
+    Ok(Json(AdminLoginResponse {
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+        did: account.did,
+        role: admin_role.role.as_str().to_string(),
+    }))
+}
+
+/// Verify a login-time TOTP code against a DID's confirmed secret (#442). Fails
+/// closed on every ambiguity: no code submitted, no encryption key configured, a
+/// decrypt failure, or a bad code all return `false`.
+async fn verify_login_totp(
+    ctx: &AppContext,
+    cfg: &crate::admin::security_config::AdminSecurityConfig,
+    submitted: Option<&str>,
+) -> bool {
+    let (Some(code), Some(enc), Some(cipher)) = (
+        submitted,
+        cfg.totp_secret_encrypted.as_deref(),
+        ctx.admin_totp_cipher.as_ref(),
+    ) else {
+        return false;
+    };
+    match cipher.decrypt(enc) {
+        Ok(secret) => crate::admin::totp::verify_code(secret, code.trim()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Generate a PKCE `(code_verifier, S256 code_challenge)` pair (RFC 7636). The
+/// verifier is 43 URL-safe chars (base64url of 32 random bytes), well within the
+/// 43–128 range, and the challenge is `base64url(SHA-256(verifier))` — exactly
+/// what the AS recomputes in `oauth::atproto::token`'s PKCE check.
+fn generate_pkce() -> (String, String) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let verifier = URL_SAFE_NO_PAD.encode(seed);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// Generate an opaque, high-entropy `state` parameter (CSRF/flow binding).
+fn generate_state() -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngCore;
+
+    let mut bytes = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Query parameters for OAuth initiation
@@ -356,52 +597,75 @@ async fn initiate_oauth(
 ) -> Result<Redirect, (StatusCode, String)> {
     tracing::info!("Initiating OAuth admin login");
 
-    let oauth_client = build_oauth_client(&ctx);
+    // #432 Fix 2 front-door: admin login is restricted to LOCAL accounts. When
+    // a handle hint is supplied, reject a non-local one HERE — before the OAuth
+    // round-trip — so the operator sees a clear error instead of failing at the
+    // callback. Resolution is against the LOCAL account store only (not PLC), so
+    // a handle that happens to resolve elsewhere is still refused. The no-hint
+    // case is caught by Fix 1's callback gate (`authorize_local_admin`).
+    if let Some(handle) = params.handle.as_deref() {
+        if ctx.account_manager.get_account_by_identifier(handle).await.is_err() {
+            tracing::warn!(
+                handle = %handle,
+                "Admin login rejected: handle has no local account on this PDS"
+            );
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Admin login requires an account hosted on this PDS.".to_string(),
+            ));
+        }
+    }
 
-    // Discover the AS for this PDS.
-    let pds_url = &ctx.config.authentication.oauth.pds_url;
-    let server_metadata = oauth_client.discover_server(pds_url).await.map_err(|e| {
-        tracing::error!("Failed to discover server metadata: {}", e);
+    // #432 Fix 2: admins are local accounts (see `authorize_local_admin`), so
+    // the authorization server is always THIS PDS. `AdminOAuthClient::from_config`
+    // targets `service.effective_public_url()` — the same value the AS metadata
+    // publishes as `issuer` and did.json as `serviceEndpoint` — and generates a
+    // fresh ephemeral DPoP key for this ceremony. The browser is then routed to
+    // `{issuer}/oauth/atproto/authorize` (PAR-based) and lands back at
+    // `/admin-oauth/callback`.
+    let mut oauth_client = AdminOAuthClient::from_config(&ctx.config).map_err(|e| {
+        tracing::error!("Failed to build admin OAuth client: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to discover OAuth server: {}", e),
+            format!("Failed to build OAuth client: {}", e),
         )
     })?;
 
-    // Build authorization URL — proto-blue generates PKCE + DPoP keys + state internally.
-    let (auth_url, auth_state) = oauth_client
-        .authorize(&server_metadata)
+    // Generate PKCE + state locally (the Aurora-owned client does not hide these
+    // the way proto-blue did), push the authorization request to our own AS, and
+    // build the authorize URL from the returned request_uri.
+    let (code_verifier, code_challenge) = generate_pkce();
+    let state = generate_state();
+    let redirect_uri = ctx.config.authentication.oauth.redirect_uri.clone();
+
+    let par = oauth_client
+        .pushed_authorization_request(&state, &code_challenge, &redirect_uri)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to build authorization URL: {}", e);
+            tracing::error!("Failed to push authorization request: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to build authorization URL: {}", e),
+                format!("Failed to push authorization request: {}", e),
             )
         })?;
 
-    // The state we'll receive back on the callback is `app_state` on AuthState.
-    let state_key = auth_state.app_state.clone().ok_or_else(|| {
-        tracing::error!("OAuth client returned AuthState without app_state");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "OAuth client returned no state parameter".to_string(),
-        )
-    })?;
+    let auth_url = oauth_client.build_authorize_url(&par.request_uri);
 
+    // Stash the PKCE verifier + redirect_uri under the state the AS will echo
+    // back on the callback.
     state_store
         .store(
-            state_key,
+            state,
             OAuthStateData {
-                auth_state,
-                server_metadata,
+                code_verifier,
+                redirect_uri,
                 handle: params.handle.clone(),
             },
         )
         .await;
 
-    tracing::info!("Redirecting to authorization URL: {}", auth_url);
-    Ok(Redirect::to(auth_url.as_str()))
+    tracing::info!("Redirecting to authorization URL");
+    Ok(Redirect::to(&auth_url))
 }
 
 /// OAuth callback parameters
@@ -423,6 +687,126 @@ struct OAuthLoginResponse {
     did: String,
     is_admin: bool,
     role: Option<String>,
+}
+
+/// Resolve an authenticated OAuth login (`did`) into PDS-side admin session
+/// tokens, enforcing the v0.10 constitutional claim that admin/superadmin roles
+/// are restricted to LOCAL accounts — DIDs with a row in this PDS's `account`
+/// table. Returns `(access_token, refresh_token, role)` from a real account
+/// session, i.e. the tokens `route_local_verify` (`account_manager
+/// ::validate_access_token_with_ip`) accepts on every subsequent request.
+///
+/// Two rejections, both 403, in this order:
+///  1. **Non-local DID** — the DID authenticated as a valid ATProto identity
+///     but has no local account. Admin trust is a claim about accounts the
+///     operator controls on THIS PDS, so it cannot hold a role here (even if a
+///     legacy `admin_roles` row exists). Checked FIRST so the message is
+///     accurate rather than a misleading "not an admin".
+///  2. **Local non-admin** — a local account with no `admin_roles` entry.
+///
+/// This replaces the pre-v0.10 split that minted an "AS-only" HS256 admin JWT
+/// backed by `operator_session_store` for admins without a local account. Those
+/// tokens were not understood by `route_local_verify`, so every request after
+/// login 401'd and the browser looped back to the login page. Constraining
+/// admins to local accounts means the login always yields a real, validatable
+/// account session and that path is gone.
+async fn authorize_local_admin(
+    ctx: &AppContext,
+    did: &str,
+    current_ip: Option<std::net::IpAddr>,
+) -> Result<(String, String, String), (StatusCode, String)> {
+    // (1) Local-account gate — runs before the admin_roles lookup.
+    if ctx.account_manager.get_account(did).await.is_err() {
+        tracing::warn!(
+            did = %did,
+            "Admin OAuth login rejected: DID has no local account. Admin roles \
+             are restricted to accounts hosted on this PDS."
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Admin roles are restricted to accounts hosted on this PDS. \
+             Log in with a local account."
+                .to_string(),
+        ));
+    }
+
+    // (2) Admin authorisation. Authority comes from the admin_role table only
+    // (resolved live per request, #267). The first SuperAdmin is inserted
+    // directly per the README "First Admin User" bootstrap; subsequent grants
+    // flow through tools.aurora.superadmin.grantRole and the audit chain.
+    let admin_role = ctx.admin_role_manager.get_role(did).await.map_err(|e| {
+        tracing::error!("Failed to query admin role: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check admin status".to_string(),
+        )
+    })?;
+    let Some(admin_role) = admin_role else {
+        tracing::warn!("User {} is not an admin on this PDS", did);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "User is not authorized as an admin on this PDS".to_string(),
+        ));
+    };
+    let role = admin_role.role.as_str().to_string();
+    tracing::info!("Admin {} authenticated with role {}", did, role);
+
+    // A local account is guaranteed above, so this always yields a real account
+    // session whose tokens `route_local_verify` validates. Phase 4 · #442:
+    // access and refresh tokens share a single role-based (task-time) lifetime,
+    // honoring any per-account override, so activity slides the whole session
+    // and idle past the window expires it. bound_ip is None here — IP binding
+    // wires in a later commit.
+    use crate::admin::security_config as sec;
+    let security_config = ctx.admin_security_store.get_config(did).await.ok().flatten();
+    // TOTP-enrolled admins must use the password-login form, which verifies the
+    // code (#442). The OAuth browser redirect has no code-entry step, so minting
+    // a session here would be a silent 2FA bypass; block + direct to password
+    // login rather than skip the second factor.
+    if security_config
+        .as_ref()
+        .and_then(|c| c.totp_confirmed_at.as_deref())
+        .is_some()
+    {
+        tracing::warn!(did = %did, "OAuth admin login blocked: account has TOTP enabled");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This admin account has TOTP enabled; sign in via the password login form."
+                .to_string(),
+        ));
+    }
+    let lifetime_secs =
+        sec::compute_admin_session_lifetime_secs(admin_role.role, security_config.as_ref());
+    // IP binding (#442): bind at creation when the admin opted in and a real
+    // client IP is available (trust_proxy on). None otherwise → unbound.
+    let bound_ip = if security_config
+        .as_ref()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        current_ip.map(|ip| ip.to_string())
+    } else {
+        None
+    };
+    let session = ctx
+        .account_manager
+        .create_session_with(
+            did,
+            None,
+            chrono::Duration::seconds(lifetime_secs),
+            chrono::Duration::seconds(lifetime_secs),
+            bound_ip,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create session: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create session: {}", e),
+            )
+        })?;
+
+    Ok((session.access_token, session.refresh_token, role))
 }
 
 /// Handle OAuth callback
@@ -469,17 +853,34 @@ async fn handle_oauth_callback(
         )
     })?;
 
-    let oauth_client = build_oauth_client(&ctx);
+    // RFC 9207 (defense in depth): the admin flow only ever targets our own AS,
+    // but if the AS echoed an `iss`, it must match the issuer we push to. A
+    // mismatch signals a mix-up attempt.
+    let expected_iss = ctx.service_url();
+    if let Some(iss) = params.iss.as_deref() {
+        if iss != expected_iss {
+            tracing::warn!(got = %iss, expected = %expected_iss, "OAuth callback iss mismatch");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "OAuth issuer mismatch".to_string(),
+            ));
+        }
+    }
 
-    // RFC 9207: when the AS supports it, verify the `iss` we got back matches
-    // the one we stored before exchanging the code.
-    let token_set = oauth_client
-        .callback_with_iss(
-            &code,
-            params.iss.as_deref(),
-            &state_data.auth_state,
-            &state_data.server_metadata,
+    // Exchange the code with the Aurora-owned client (fresh ephemeral DPoP key).
+    // The AS binds the issued token to that key, but the admin flow uses the
+    // token only to learn the authenticated DID and then discards it, so the
+    // key need not survive beyond this call.
+    let mut oauth_client = AdminOAuthClient::from_config(&ctx.config).map_err(|e| {
+        tracing::error!("Failed to build admin OAuth client: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to build OAuth client: {}", e),
         )
+    })?;
+
+    let tokens = oauth_client
+        .exchange_code_for_tokens(&code, &state_data.code_verifier, &state_data.redirect_uri)
         .await
         .map_err(|e| {
             tracing::error!("Failed to exchange code: {}", e);
@@ -489,121 +890,49 @@ async fn handle_oauth_callback(
             )
         })?;
 
-    let did = token_set.sub.clone();
-    tracing::info!("OAuth authentication successful for DID: {}", did);
-
-    // Admin authorisation check. Authority comes from the admin_role
-    // table only. The first SuperAdmin must be inserted directly into
-    // admin_role per the bootstrap path in README "First Admin User";
-    // subsequent grants flow through tools.aurora.superadmin.grantRole
-    // and the audit chain.
-    let admin_role = ctx.admin_role_manager.get_role(&did).await.map_err(|e| {
-        tracing::error!("Failed to query admin role: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to check admin status".to_string(),
-        )
-    })?;
-
-    let Some(ref admin_role) = admin_role else {
-        tracing::warn!("User {} is not an admin on this PDS", did);
-        return Err((
-            StatusCode::FORBIDDEN,
-            "User is not authorized as an admin on this PDS".to_string(),
-        ));
-    };
-
-    let role = Some(admin_role.role.as_str().to_string());
-
-    tracing::info!("Admin {} authenticated with role {:?}", did, role);
-
-    // Mint PDS-side tokens (real session if the user has an account, otherwise a
-    // 24h admin-scoped JWT for AS-only admins).
-    let account_exists = ctx.account_manager.get_account(&did).await.is_ok();
-
-    let (access_token, refresh_token) = if account_exists {
-        let session = ctx
-            .account_manager
-            .create_session(&did, None)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create session: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create session: {}", e),
-                )
-            })?;
-
-        (session.access_token, session.refresh_token)
-    } else {
-
-        // Record a server-side operator session (§8.1.7 / #271). It outlives
-        // the 24h access token, so tie its lifetime to the 30d refresh
-        // window. `refresh_id` is the rotation-chain head (#272). Both the
-        // access and refresh tokens carry the resulting `sid` so the auth
-        // path can validate/touch/revoke this session per request.
-        let refresh_id = uuid::Uuid::new_v4().to_string();
-        let source_ip =
-            crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
-                .map(|ip| ip.to_string());
-        let user_agent = headers
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let sid = ctx
-            .operator_session_store
-            .create(
-                &did,
-                source_ip.as_deref(),
-                user_agent.as_deref(),
-                &refresh_id,
-                chrono::Duration::days(30),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create operator session: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create session".to_string(),
-                )
-            })?;
-
-        let now = chrono::Utc::now().timestamp();
-
-        let access_token =
-            mint_admin_access_jwt(&ctx.config.authentication.jwt_secret, &did, Some(&sid))
-                .map_err(|e| {
-                    tracing::error!("Failed to create JWT: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to create token".to_string(),
-                    )
-                },
-            )?;
-
-        let refresh_token = mint_admin_refresh_jwt(
-            &ctx.config.authentication.jwt_secret,
-            &did,
-            &sid,
-            &refresh_id,
-            now + 2592000, // 30 days
-        )
+    // Loopback DID resolution: Aurora's AS token response carries no `sub`, but
+    // the token it just minted lives in this PDS's own `token` table, so we
+    // validate it locally to learn the authenticated DID — the loopback
+    // equivalent of the userinfo call an external client would make.
+    let did = crate::auth::validate_oauth_token(&ctx, &tokens.access_token)
+        .await
         .map_err(|e| {
-            tracing::error!("Failed to create refresh token: {}", e);
+            tracing::error!("Failed to resolve DID from the issued token: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create refresh token".to_string(),
+                "Failed to resolve authenticated identity".to_string(),
             )
-        })?;
+        })?
+        .did;
+    tracing::info!("OAuth authentication successful for DID: {}", did);
 
-        (access_token, refresh_token)
-    };
+    // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL
+    // accounts. Resolve the login into a real account session (the tokens the
+    // request-auth path validates), rejecting non-local DIDs and non-admins.
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let (access_token, refresh_token, role) =
+        authorize_local_admin(&ctx, &did, current_ip).await?;
+
+    // Resolve the deployment-default theme's token CSS to inline into the
+    // transition screen (chainlink #441), so it paints the right theme instantly
+    // instead of fetching /theme/active.css (which lagged and, uncached, served a
+    // stale theme).
+    let theme_id = crate::api::aurora_admin::deployment_default_theme(&ctx).await;
+    let theme_css = ctx.theme_registry.resolve_token_css(&theme_id).unwrap_or_default();
 
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Login Successful</title>
+    <!-- Theme this transition screen with the SAME token layer as the login page
+         and admin UI: the base alias tokens (static), then the deployment-default
+         theme's resolved `:root` overrides INLINED below. Inlining — rather than
+         linking /theme/active.css — means the correct theme paints from the first
+         byte: no fetch to lag behind the 500ms redirect, and no stale cached
+         theme to flash (chainlink #441). -->
+    <link rel="stylesheet" href="/admin/styles/tokens.css">
+    <style>{theme_css}</style>
     <style>
         body {{
             font-family: system-ui, -apple-system, sans-serif;
@@ -612,8 +941,8 @@ async fn handle_oauth_callback(
             align-items: center;
             height: 100vh;
             margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: var(--color-surface-primary);
+            color: var(--color-text-primary);
         }}
         .container {{
             text-align: center;
@@ -622,8 +951,8 @@ async fn handle_oauth_callback(
         .spinner {{
             width: 48px;
             height: 48px;
-            border: 4px solid rgba(255,255,255,0.3);
-            border-top-color: white;
+            border: 4px solid var(--color-surface-tertiary);
+            border-top-color: var(--color-accent-primary);
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             margin: 0 auto 1rem;
@@ -658,7 +987,8 @@ async fn handle_oauth_callback(
         serde_json::to_string(&access_token).unwrap(),
         serde_json::to_string(&refresh_token).unwrap(),
         serde_json::to_string(&did).unwrap(),
-        serde_json::to_string(&role).unwrap()
+        serde_json::to_string(&role).unwrap(),
+        theme_css = theme_css,
     );
 
     Ok(axum::response::Html(html))
@@ -698,7 +1028,12 @@ async fn client_metadata(State(ctx): State<AppContext>) -> Json<ClientMetadataRe
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_refresh, mint_admin_access_jwt, RefreshRequest};
+    use super::{
+        authorize_local_admin, generate_pkce, handle_oauth_callback, handle_password_login,
+        handle_refresh, initiate_oauth, mint_admin_access_jwt, password_login_gate,
+        AdminLoginRequest, OAuthCallbackParams, OAuthInitParams, OAuthStateData, OAuthStateStore,
+        RefreshRequest,
+    };
     use crate::admin::roles::Role;
     use crate::config::*;
     use crate::AppContext;
@@ -712,6 +1047,16 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-key-aurora-admin-test-32xx";
 
     async fn create_test_context() -> AppContext {
+        build_test_context(None, true, None).await
+    }
+
+    /// As `create_test_context`, but with an explicit `service.public_url` — used
+    /// by the loopback test to point the admin OAuth client at an in-process AS.
+    async fn build_test_context(
+        public_url: Option<String>,
+        password_login_enabled: bool,
+        admin_totp_encryption_key_hex: Option<String>,
+    ) -> AppContext {
         let dir = tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
         let config = ServerConfig {
@@ -721,7 +1066,7 @@ mod tests {
                 service_did: "did:web:localhost".to_string(),
                 version: "0.1.0-test".to_string(),
                 blob_upload_limit: 5_242_880,
-                public_url: None,
+                public_url,
                 max_blob_fetch_size: 50_000_000,
                 blob_fetch_timeout_seconds: 30,
                 blob_fetch_max_retries: 3,
@@ -752,7 +1097,8 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
-                oauth_features: Default::default(),
+                password_login_enabled,
+                admin_totp_encryption_key_hex,
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -772,6 +1118,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -979,5 +1326,838 @@ mod tests {
         .await
         .expect_err("stale rid must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Seed a local account (actor + account rows) so `get_account` /
+    /// `create_session` resolve — bypasses createAccount's PLC round-trip.
+    async fn seed_local_account(ctx: &AppContext, did: &str, handle: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, 'test-hash', NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("admin@example.test"))
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    /// Seed a local account with a REAL argon2 password hash (so `login` can
+    /// verify it) and optionally an admin role.
+    async fn seed_password_admin(
+        ctx: &AppContext,
+        did: &str,
+        handle: &str,
+        password: &str,
+        role: Option<Role>,
+    ) {
+        let hash = crate::auth::PasswordHasher::hash(password).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled)
+             VALUES (?1, ?2, ?3, NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("admin@example.test"))
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        if let Some(role) = role {
+            ctx.admin_role_manager
+                .grant_role(did, role, "system", None)
+                .await
+                .unwrap();
+        }
+    }
+
+    // Fix 1 (#434): password-based admin login (Bearer).
+
+    #[tokio::test]
+    async fn password_login_happy_path_mints_validatable_admin_session() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwadmin000000000000000000",
+            "admin.localhost",
+            "correct-horse-battery-staple",
+            Some(Role::SuperAdmin),
+        )
+        .await;
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "correct-horse-battery-staple".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("valid admin login must succeed");
+        assert_eq!(resp.0.role, "superadmin");
+        assert_eq!(resp.0.did, "did:plc:pwadmin000000000000000000");
+        // Token validates via the same path route_local_verify uses.
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&resp.0.access_token)
+            .await
+            .expect("minted access token must validate");
+        assert_eq!(validated.did, "did:plc:pwadmin000000000000000000");
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_wrong_password() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwadmin000000000000000000",
+            "admin.localhost",
+            "the-right-password",
+            Some(Role::SuperAdmin),
+        )
+        .await;
+        let err = handle_password_login(
+            State(ctx),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "the-WRONG-password".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect_err("wrong password must be refused");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "Invalid credentials");
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_local_account_without_admin_role() {
+        let ctx = create_test_context().await;
+        seed_password_admin(
+            &ctx,
+            "did:plc:pwnonadmin0000000000000000",
+            "bob.localhost",
+            "bobs-password",
+            None, // local account, no admin role
+        )
+        .await;
+        let err = handle_password_login(
+            State(ctx),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "bob.localhost".to_string(),
+                password: "bobs-password".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect_err("non-admin must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("no admin role"), "got: {}", err.1);
+    }
+
+    #[tokio::test]
+    async fn password_login_rejects_unknown_identifier() {
+        let ctx = create_test_context().await;
+        let err = handle_password_login(
+            State(ctx),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "ghost.localhost".to_string(),
+                password: "whatever".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect_err("unknown identifier must be refused");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1, "Invalid credentials");
+    }
+
+    // #442: password login is a fallback, OFF by default. The gate 302s to
+    // /admin/ when disabled and delegates to the handler when enabled.
+
+    #[tokio::test]
+    async fn password_login_gate_redirects_to_admin_when_disabled() {
+        use axum::http::header;
+        let ctx = build_test_context(None, false, None).await;
+        let resp = password_login_gate(
+            State(ctx),
+            axum::http::HeaderMap::new(),
+            Json(AdminLoginRequest {
+                identifier: "admin.localhost".to_string(),
+                password: "whatever".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap().to_str().unwrap(),
+            "/admin/",
+            "disabled password login must 302 to the OAuth login landing, not expose the endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_login_gate_delegates_when_enabled() {
+        // Enabled: the gate passes through to the handler, which rejects an
+        // unknown identifier with 401 (not a 302) — proving delegation.
+        let ctx = build_test_context(None, true, None).await;
+        let resp = password_login_gate(
+            State(ctx),
+            axum::http::HeaderMap::new(),
+            Json(AdminLoginRequest {
+                identifier: "ghost.localhost".to_string(),
+                password: "whatever".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Fix 1 (#432): admin OAuth is constrained to local accounts.
+
+    #[tokio::test]
+    async fn initiate_oauth_rejects_non_local_handle_at_front_door() {
+        // Fix 2 (#432) front-door: a handle hint with no local account is
+        // refused before any OAuth round-trip (no network / discovery reached).
+        let ctx = create_test_context().await;
+        let res = initiate_oauth(
+            State(ctx),
+            axum::Extension(OAuthStateStore::new()),
+            axum::extract::Query(OAuthInitParams {
+                handle: Some("stranger.example.com".to_string()),
+            }),
+        )
+        .await;
+        let err = res.expect_err("non-local handle must be refused at the front door");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("hosted on this PDS"),
+            "expected local-account message, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_local_admin_rejects_non_local_did() {
+        let ctx = create_test_context().await;
+        // A DID that OAuth-authenticated but has NO local account — and even
+        // carries a (legacy) admin_roles row — must still be refused, because
+        // the local-account gate runs BEFORE the role lookup.
+        let did = "did:plc:nonlocaladmin0000000000000";
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+        let err = authorize_local_admin(&ctx, did, None)
+            .await
+            .expect_err("non-local DID must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("hosted on this PDS"),
+            "expected local-account message, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_local_admin_happy_path_mints_validatable_session() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:localadmin00000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+
+        let (access, refresh, role) = authorize_local_admin(&ctx, did, None)
+            .await
+            .expect("local admin must be authorized");
+        assert_eq!(role, "superadmin");
+        assert!(!refresh.is_empty());
+
+        // The minted access token must validate via the exact path
+        // route_local_verify uses — proving the login→401→login loop is gone.
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&access)
+            .await
+            .expect("session access token must validate via account_manager");
+        assert_eq!(validated.did, did);
+    }
+
+    #[tokio::test]
+    async fn authorize_local_admin_rejects_local_non_admin() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:localnonadmin000000000000";
+        seed_local_account(&ctx, did, "bob.localhost").await;
+        // Local account, but NO admin_roles entry — the existing "not an admin"
+        // 403 must still fire (no regression).
+        let err = authorize_local_admin(&ctx, did, None)
+            .await
+            .expect_err("local non-admin must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("not authorized as an admin"),
+            "expected not-an-admin message, got: {}",
+            err.1
+        );
+    }
+
+    // Phase 4 (#442): admin TOTP 2FA at login — enforced on the password path,
+    // and the OAuth path blocked for TOTP-enrolled admins (no bypass).
+    const TOTP_LOGIN_KEY_HEX: &str =
+        "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    /// Store a CONFIRMED TOTP enrollment for a DID and return the raw secret so a
+    /// test can compute live codes.
+    async fn seed_confirmed_totp(ctx: &AppContext, did: &str) -> Vec<u8> {
+        let enrollment = crate::admin::totp::generate_enrollment(did).unwrap();
+        let enc = ctx
+            .admin_totp_cipher
+            .as_ref()
+            .expect("test context has a TOTP key")
+            .encrypt(&enrollment.secret_bytes)
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config \
+             (did, ip_binding_enabled, totp_secret_encrypted, totp_confirmed_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(did)
+        .bind(false)
+        .bind(&enc)
+        .bind(&now)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        enrollment.secret_bytes
+    }
+
+    fn totp_code_for(secret: &[u8]) -> String {
+        totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 1, 30, secret.to_vec())
+            .unwrap()
+            .generate_current()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn password_login_enforces_totp_when_enrolled() {
+        let ctx = build_test_context(None, true, Some(TOTP_LOGIN_KEY_HEX.to_string())).await;
+        let did = "did:plc:totplogin0000000000000000";
+        seed_password_admin(&ctx, did, "totp.localhost", "correct-horse", Some(Role::Admin)).await;
+        let secret = seed_confirmed_totp(&ctx, did).await;
+
+        // Correct password + correct code → success.
+        let ok = handle_password_login(
+            State(ctx.clone()),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: Some(totp_code_for(&secret)),
+            }),
+        )
+        .await
+        .expect("valid password + TOTP logs in");
+        assert_eq!(ok.0.did, did);
+
+        // Correct password, MISSING code → 401 (fails closed).
+        let err = handle_password_login(
+            State(ctx.clone()),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        // Correct password, WRONG code → 401. (Pick a code different from live.)
+        let live = totp_code_for(&secret);
+        let wrong = if live == "000000" { "111111" } else { "000000" };
+        let err = handle_password_login(
+            State(ctx.clone()),
+            None,
+            Json(AdminLoginRequest {
+                identifier: "totp.localhost".to_string(),
+                password: "correct-horse".to_string(),
+                totp_code: Some(wrong.to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_blocked_for_totp_enrolled_admin() {
+        let ctx = build_test_context(None, true, Some(TOTP_LOGIN_KEY_HEX.to_string())).await;
+        let did = "did:plc:totpoauth0000000000000000";
+        seed_password_admin(&ctx, did, "totpoauth.localhost", "pw", Some(Role::Admin)).await;
+        seed_confirmed_totp(&ctx, did).await;
+
+        // The OAuth callback path (authorize_local_admin) has no code-entry step,
+        // so it must refuse rather than silently skip the second factor.
+        let err = authorize_local_admin(&ctx, did, None).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(
+            err.1.contains("password login"),
+            "message should redirect to password login, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn password_login_binds_session_to_client_ip_when_enabled() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:ipbindlogin00000000000000";
+        seed_password_admin(&ctx, did, "ipbind.localhost", "pw-correct", Some(Role::Admin)).await;
+        // Opt this admin into IP binding.
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        // Log in from a specific IP — the minted session is bound to it.
+        let login_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(login_ip),
+            Json(AdminLoginRequest {
+                identifier: "ipbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login succeeds and binds");
+        let token = resp.0.access_token;
+
+        // Usable from the bound IP; rejected from any other.
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(login_ip))
+            .await
+            .is_ok());
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(other))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_verify_path_enforces_ip_binding() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // #442 Gate 1 regression: getSession — and every `verify_jwt_with_allowlist`
+        // caller (`require_auth_unified` / `require_auth_forwarded` /
+        // `AuthContextForwarded`) — routes a local session token through
+        // `route_local_verify`. Before the fix that path validated with NO client
+        // IP, so it both failed to enforce binding against the real IP AND
+        // fail-closed a genuinely-bound session. It must now enforce: a bound
+        // session is usable only from its bound IP.
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:fwdverifyipbind0000000000";
+        seed_password_admin(&ctx, did, "fwdbind.localhost", "pw-correct", Some(Role::Admin)).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        let login_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(login_ip),
+            Json(AdminLoginRequest {
+                identifier: "fwdbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login binds");
+        let token = resp.0.access_token;
+
+        let service_did = ctx.service_did().to_string();
+        let allow = [service_did.as_str()];
+
+        // Accepted from the bound IP.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(login_ip))
+            .await
+            .is_ok());
+        // Rejected from another IP — enforcement, not a bypass.
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(other))
+            .await
+            .is_err());
+        // Rejected when no IP is threaded — fail-closed guard so this path can
+        // never silently drop binding again.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn forwarded_verify_path_unaffected_for_unbound_session() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // The common case: an UNBOUND session must stay usable on the verify path
+        // regardless of request IP — threading the IP must not break normal auth.
+        let ctx = build_test_context(None, true, None).await;
+        let did = "did:plc:fwdverifyunbound000000000";
+        seed_password_admin(
+            &ctx,
+            did,
+            "fwdunbound.localhost",
+            "pw-correct",
+            Some(Role::Admin),
+        )
+        .await;
+        // No admin_security_config row → binding off → unbound session.
+        let resp = handle_password_login(
+            State(ctx.clone()),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            Json(AdminLoginRequest {
+                identifier: "fwdunbound.localhost".to_string(),
+                password: "pw-correct".to_string(),
+                totp_code: None,
+            }),
+        )
+        .await
+        .expect("login succeeds");
+        let token = resp.0.access_token;
+
+        let service_did = ctx.service_did().to_string();
+        let allow = [service_did.as_str()];
+        // Accepted from an unrelated IP and with no IP.
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))))
+            .await
+            .is_ok());
+        assert!(ctx
+            .verify_jwt_with_allowlist(&token, &allow, None)
+            .await
+            .is_ok());
+    }
+
+    // Phase 4 (#442): admin session hardening — the security-config store + the
+    // sliding-refresh lifetime wired into the OAuth session mint.
+
+    #[tokio::test]
+    async fn admin_security_store_session_lifetime_round_trip() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:sechardening00000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        let store = &ctx.admin_security_store;
+
+        // No row → None (all defaults).
+        assert!(store.get_config(did).await.unwrap().is_none());
+
+        // Set → round-trips.
+        store.set_session_lifetime(did, Some(3600)).await.unwrap();
+        assert_eq!(
+            store.get_config(did).await.unwrap().unwrap().session_lifetime_secs,
+            Some(3600)
+        );
+
+        // Clear (None) → the override is cleared (row persists, value NULL).
+        store.set_session_lifetime(did, None).await.unwrap();
+        assert_eq!(
+            store.get_config(did).await.unwrap().unwrap().session_lifetime_secs,
+            None
+        );
+
+        // Out-of-bounds rejected at write time.
+        assert!(store.set_session_lifetime(did, Some(1)).await.is_err());
+        assert!(store
+            .set_session_lifetime(did, Some(31 * 24 * 3600))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_session_uses_single_role_based_lifetime() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:seclifetime000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now();
+        let (access, refresh, role) = authorize_local_admin(&ctx, did, None).await.unwrap();
+        assert_eq!(role, "superadmin");
+
+        // Both tokens share the superadmin 15m task-time lifetime — activity
+        // slides the whole session, idle past the window expires it.
+        let access_exp: String =
+            sqlx::query_scalar("SELECT expires_at FROM session WHERE access_token = $1")
+                .bind(&access)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        let access_secs = (parse_rfc3339(&access_exp) - before).num_seconds();
+        assert!(
+            (14 * 60..=16 * 60).contains(&access_secs),
+            "superadmin access should be ~15m, got {access_secs}s"
+        );
+
+        let refresh_exp: String =
+            sqlx::query_scalar("SELECT expires_at FROM refresh_token WHERE token = $1")
+                .bind(&refresh)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        let refresh_secs = (parse_rfc3339(&refresh_exp) - before).num_seconds();
+        assert!(
+            (14 * 60..=16 * 60).contains(&refresh_secs),
+            "superadmin refresh should also be ~15m, got {refresh_secs}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_session_honors_lifetime_override() {
+        let ctx = create_test_context().await;
+        let did = "did:plc:secoverride0000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+        // Override the superadmin 15m default to 2h — both tokens honor it.
+        ctx.admin_security_store
+            .set_session_lifetime(did, Some(7200))
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now();
+        let (access, refresh, _role) = authorize_local_admin(&ctx, did, None).await.unwrap();
+
+        let access_exp: String =
+            sqlx::query_scalar("SELECT expires_at FROM session WHERE access_token = $1")
+                .bind(&access)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        let access_secs = (parse_rfc3339(&access_exp) - before).num_seconds();
+        assert!(
+            (119 * 60..=121 * 60).contains(&access_secs),
+            "overridden access should be ~2h, got {access_secs}s"
+        );
+
+        let refresh_exp: String =
+            sqlx::query_scalar("SELECT expires_at FROM refresh_token WHERE token = $1")
+                .bind(&refresh)
+                .fetch_one(&ctx.account_db)
+                .await
+                .unwrap();
+        let refresh_secs = (parse_rfc3339(&refresh_exp) - before).num_seconds();
+        assert!(
+            (119 * 60..=121 * 60).contains(&refresh_secs),
+            "overridden refresh should be ~2h, got {refresh_secs}s"
+        );
+    }
+
+    fn parse_rfc3339(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    // Phase 3 (#439): full loopback — the callback exchanges a real code against
+    // Aurora's own in-process AS with an Aurora-built DPoP proof, resolves the
+    // DID from the issued token, and mints a validatable admin session.
+
+    /// Pull a `localStorage.setItem('<key>', "<json>")` value out of the success
+    /// HTML the callback renders.
+    fn extract_localstorage_value(html: &str, key: &str) -> String {
+        let needle = format!("localStorage.setItem('{key}', ");
+        let start = html.find(&needle).expect("localStorage key present") + needle.len();
+        let rest = &html[start..];
+        let end = rest.find(");").expect("setItem statement terminator");
+        serde_json::from_str::<String>(rest[..end].trim()).expect("value is a JSON string")
+    }
+
+    #[tokio::test]
+    async fn callback_completes_loopback_exchange_and_mints_validatable_session() {
+        use crate::oauth::atproto::request_store::{self, AtprotoAuthorizationRequest};
+
+        // Bind the in-process AS first so we know its port before building ctx.
+        // Address it as `localhost` (not `127.0.0.1`) so the WebAuthn RP config
+        // derived from the public URL is valid — a bare IP is rejected — while
+        // still resolving to this loopback listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let as_url = format!("http://localhost:{port}");
+
+        // A context whose public URL IS that in-process AS (Aurora talks to its
+        // own AS); both the admin client and the AS handlers derive their URLs
+        // from this, so their DPoP htu values line up.
+        let ctx = build_test_context(Some(as_url.clone()), true, None).await;
+
+        // Serve Aurora's real AS routes on the same ctx (shared account_db).
+        let app = crate::oauth::atproto::routes().with_state(ctx.clone());
+        let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .ok();
+        });
+
+        // Seed a local superadmin + a redeemable authorization code bound to it
+        // (as consent would have, but seeded directly so the test needn't drive
+        // the browser-session authorize step).
+        let did = "did:plc:loopadmin0000000000000000";
+        seed_local_account(&ctx, did, "admin.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(did, Role::SuperAdmin, "system", None)
+            .await
+            .unwrap();
+
+        let code = "loopback-authorization-code";
+        let (verifier, challenge) = generate_pkce();
+        let redirect_uri = ctx.config.authentication.oauth.redirect_uri.clone();
+        let now = chrono::Utc::now();
+        request_store::insert(
+            &ctx.account_db,
+            &AtprotoAuthorizationRequest {
+                request_id: "loop-req".to_string(),
+                request_uri: None,
+                client_id: ctx.config.authentication.oauth.client_id.clone(),
+                redirect_uri: redirect_uri.clone(),
+                scope: "atproto transition:generic".to_string(),
+                state: None,
+                code_challenge: challenge,
+                code_challenge_method: "S256".to_string(),
+                did: Some(did.to_string()),
+                code_hash: Some(crate::oauth::access_token_hash(code)),
+                code_used_at: None,
+                denied_at: None,
+                created_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Pre-store the flow state exactly as `initiate_oauth` would.
+        let state_store = OAuthStateStore::new();
+        let state = "loopback-state";
+        state_store
+            .store(
+                state.to_string(),
+                OAuthStateData {
+                    code_verifier: verifier,
+                    redirect_uri,
+                    handle: None,
+                },
+            )
+            .await;
+
+        // Drive the callback: it exchanges the code over HTTP against the
+        // in-process AS (Aurora-built DPoP proof, incl. the exp claim upstream
+        // omits), resolves the DID via the loopback validation path, and mints a
+        // real account session.
+        let html = handle_oauth_callback(
+            State(ctx.clone()),
+            axum::Extension(state_store),
+            axum::http::HeaderMap::new(),
+            axum::extract::Query(OAuthCallbackParams {
+                code: Some(code.to_string()),
+                state: Some(state.to_string()),
+                iss: None,
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await
+        .expect("loopback callback must succeed")
+        .0;
+
+        // The HTML stows a session token that validates via the exact path
+        // route_local_verify uses.
+        let token = extract_localstorage_value(&html, "aurora-admin-token");
+        let validated = ctx
+            .account_manager
+            .validate_access_token(&token)
+            .await
+            .expect("minted session token must validate");
+        assert_eq!(validated.did, did);
+        assert!(html.contains("superadmin"));
+
+        // The transition screen is themed with the shared token layer (chainlink
+        // #440/#441): the base alias tokens load statically and the theme is
+        // INLINED, so there is no /theme/active.css fetch to lag or serve a stale
+        // cached theme — and never the old hardcoded off-brand gradient.
+        assert!(
+            html.contains(r#"href="/admin/styles/tokens.css""#),
+            "base token layer must load"
+        );
+        assert!(
+            !html.contains(r#"href="/theme/active.css""#),
+            "the FOUC-prone dynamic theme link must be gone (inlined instead)"
+        );
+        assert!(html.contains("var(--color-surface-primary)"));
+        assert!(html.contains("var(--color-accent-primary)"));
+        assert!(
+            !html.contains("667eea") && !html.contains("764ba2"),
+            "the hardcoded off-brand gradient must be gone"
+        );
+
+        let _ = shutdown.send(());
     }
 }

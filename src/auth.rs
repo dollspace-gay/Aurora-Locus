@@ -75,6 +75,17 @@ pub struct AuthContext {
     pub auth_method: AuthMethod,
 }
 
+/// The request's client IP for admin session IP-binding enforcement (#442).
+/// Honors X-Forwarded-For/X-Real-IP only when `trust_proxy` is on, else a
+/// loopback placeholder — so a client can't spoof its bound IP via the header
+/// unless the operator has opted into trusting the proxy.
+pub(crate) fn request_client_ip(
+    headers: &axum::http::HeaderMap,
+    ctx: &AppContext,
+) -> Option<std::net::IpAddr> {
+    crate::rate_limit::extract_client_ip(headers, ctx.rate_limiter.trust_proxy)
+}
+
 #[async_trait]
 impl FromRequestParts<AppContext> for AuthContext {
     type Rejection = PdsError;
@@ -116,8 +127,13 @@ impl FromRequestParts<AppContext> for AuthContext {
                 })
             }
             Err(_) => {
-                // Fallback to JWT validation for backward compatibility
-                let session = state.account_manager.validate_access_token(&token).await?;
+                // Fallback to JWT validation for backward compatibility. Thread
+                // the client IP so a bound admin session is enforced (#442).
+                let current_ip = request_client_ip(&parts.headers, state);
+                let session = state
+                    .account_manager
+                    .validate_access_token_with_ip(&token, current_ip)
+                    .await?;
 
                 let did = session.did.clone();
                 let duration = start.elapsed().as_secs_f64();
@@ -169,7 +185,12 @@ impl FromRequestParts<AppContext> for AuthContextForwarded {
         if let Some(eid) = entryway_did_owned.as_deref() {
             allowlist.push(eid);
         }
-        let auth = ctx.verify_jwt_with_allowlist(&token, &allowlist).await?;
+        // #442: thread the client IP so a bound admin session is enforced on this
+        // forwarded path (getSession routes here), not fail-closed.
+        let current_ip = request_client_ip(&parts.headers, ctx);
+        let auth = ctx
+            .verify_jwt_with_allowlist(&token, &allowlist, current_ip)
+            .await?;
         Ok(Self {
             did: auth.did().to_string(),
         })
@@ -227,8 +248,14 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                     })
                 }
                 Err(_) => {
-                    // Fallback to JWT validation
-                    match state.account_manager.validate_access_token(&token).await {
+                    // Fallback to JWT validation. Thread the client IP so a bound
+                    // admin session is enforced here too (#442).
+                    let current_ip = request_client_ip(&parts.headers, state);
+                    match state
+                        .account_manager
+                        .validate_access_token_with_ip(&token, current_ip)
+                        .await
+                    {
                         Ok(session) => {
                             let did = session.did.clone();
                             let duration = start.elapsed().as_secs_f64();
@@ -279,7 +306,8 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
     ) -> Result<Self, Self::Rejection> {
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
-        admin_auth_from_token(state, &token).await
+        let current_ip = request_client_ip(&parts.headers, state);
+        admin_auth_from_token_with_ip(state, &token, current_ip).await
     }
 }
 
@@ -288,7 +316,7 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
 /// JWTs, gated by a four-case pre-check (§5.3.1) so non-ES256K
 /// tokens never trigger the resolver. The full layering is:
 ///
-/// 1. Local session (`account_manager.validate_access_token`).
+/// 1. Local session (`account_manager.validate_access_token_with_ip`).
 /// 2. HS256 admin JWT (`verify_jwt_token`, scope=admin).
 /// 3. ES256K pre-check (`pre_check_es256k`) — four explicit
 ///    fall-through cases, NO `?` propagation.
@@ -308,8 +336,24 @@ pub(crate) async fn admin_auth_from_token(
     state: &AppContext,
     token: &str,
 ) -> Result<AdminAuthContext, PdsError> {
+    // IP-binding-agnostic wrapper for internal/test callers (which only handle
+    // unbound sessions). The request extractor uses the `_with_ip` variant.
+    admin_auth_from_token_with_ip(state, token, None).await
+}
+
+/// [`admin_auth_from_token`] threading the request's client IP through layer 1
+/// so a bound admin session is enforced against it (#442).
+pub(crate) async fn admin_auth_from_token_with_ip(
+    state: &AppContext,
+    token: &str,
+    current_ip: Option<std::net::IpAddr>,
+) -> Result<AdminAuthContext, PdsError> {
     // Layer 1: local session
-    match state.account_manager.validate_access_token(token).await {
+    match state
+        .account_manager
+        .validate_access_token_with_ip(token, current_ip)
+        .await
+    {
         Ok(session) => {
             let did = session.did.clone();
             return finalize_admin_role(state, did, session).await;
@@ -620,7 +664,7 @@ fn log_service_auth_error(err: &crate::service_auth::ServiceAuthError, expected_
         // The actual wire shape (HTTP 400 + `{"error":"DidTombstoned",
         // ...}`) is produced by the From<ServiceAuthError> for
         // PdsError impl + IntoResponse for PdsError::DidTombstoned
-        // (src/error.rs:620-624).
+        // (src/error.rs:863-865).
         ServiceAuthError::DidTombstoned(did) => {
             tracing::debug!("service-auth: issuer DID tombstoned: {}", did);
         }
@@ -1017,18 +1061,21 @@ pub async fn validate_oauth_token(
     ctx: &AppContext,
     access_token: &str,
 ) -> Result<OAuthToken, PdsError> {
-    // Query token table for this access token
-    // Note: In the actual implementation, access tokens should be stored hashed
-    // For now, we'll do a direct lookup
-
+    // Query the token table by the SHA-256 hash of the presented bearer
+    // (β.1 / R1 F-3.1). The raw bearer is never stored; `token.rs` and
+    // `token_rotation.rs` persist `access_token_hash` at issuance and refresh.
+    // `NOT revoked` both enforces revocation and lets the planner use the
+    // partial `idx_token_access_hash` index. (`NOT revoked` is the
+    // dual-dialect idiom — sqlite INTEGER and postgres BOOLEAN both honor it.)
+    let presented_hash = crate::oauth::access_token_hash(access_token);
     let row = sqlx::query(
         r#"
         SELECT token_id, did, client_id, scope, dpop_thumbprint, device_id, expires_at
         FROM token
-        WHERE token_id = ?
+        WHERE access_token_hash = $1 AND NOT revoked
         "#,
     )
-    .bind(access_token)
+    .bind(&presented_hash)
     .fetch_optional(&ctx.account_db)
     .await
     .map_err(PdsError::Database)?
@@ -1062,38 +1109,6 @@ pub fn extract_dpop_header(headers: &axum::http::HeaderMap) -> Option<String> {
         .get("dpop")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
-}
-
-/// Validate DPoP proof
-///
-/// Verifies that:
-/// 1. DPoP proof JWT is well-formed and signed correctly
-/// 2. JWK thumbprint matches the token's bound thumbprint
-/// 3. htm (HTTP method) and htu (HTTP URI) match the request
-/// 4. Proof is not expired and not reused (via jti)
-///
-/// This will be fully implemented when we integrate DPoP validation.
-pub async fn validate_dpop_proof(
-    _ctx: &AppContext,
-    _dpop_proof: &str,
-    _expected_thumbprint: &str,
-    _http_method: &str,
-    _http_uri: &str,
-) -> Result<(), PdsError> {
-    // TODO: Implement full DPoP proof validation
-    // For now, we'll skip DPoP validation and mark it as a future task
-
-    // Steps:
-    // 1. Parse DPoP proof JWT
-    // 2. Extract JWK from proof header
-    // 3. Compute JWK thumbprint
-    // 4. Verify thumbprint matches expected_thumbprint
-    // 5. Verify proof signature using JWK
-    // 6. Verify htm and htu claims
-    // 7. Verify jti is unique (replay prevention)
-    // 8. Verify proof is not expired
-
-    Ok(())
 }
 
 /// Argon2id password hashing.
@@ -1204,6 +1219,7 @@ pub async fn verify_jwt_with_allowlist_impl(
     ctx: &AppContext,
     token: &str,
     audience_allowlist: &[&str],
+    current_ip: Option<std::net::IpAddr>,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1234,7 +1250,9 @@ pub async fn verify_jwt_with_allowlist_impl(
     let iss = decode_jwt_iss_only(parts[1]).unwrap_or(None);
 
     match (alg.as_str(), kid.as_deref()) {
-        ("HS256", Some("aurora-local-v1") | None) => route_local_verify(ctx, token).await,
+        ("HS256", Some("aurora-local-v1") | None) => {
+            route_local_verify(ctx, token, current_ip).await
+        }
         ("HS256", Some(unknown_kid)) => {
             tracing::warn!(
                 kid = %unknown_kid,
@@ -1301,8 +1319,22 @@ async fn route_opaque_oauth(
 async fn route_local_verify(
     ctx: &AppContext,
     token: &str,
+    current_ip: Option<std::net::IpAddr>,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
-    match ctx.account_manager.validate_access_token(token).await {
+    // IP binding (#442): this local-session dispatch backs BOTH the non-forwarded
+    // (`require_auth_unified`) and forwarded (`require_auth_forwarded`,
+    // `AuthContextForwarded`) admin-facing auth paths — getSession routes here —
+    // so it must enforce IP binding against the real request IP. `current_ip` is
+    // threaded from the caller (via `verify_jwt_with_allowlist`); a request path
+    // that reaches here always supplies it, so a bound session is checked, not
+    // fail-closed, and an unbound one is unaffected. Only the internal `None`
+    // callers (service-to-service, which never carry a bound local session) pass
+    // no IP.
+    match ctx
+        .account_manager
+        .validate_access_token_with_ip(token, current_ip)
+        .await
+    {
         Ok(session) => {
             tracing::info!(
                 did = %session.did,
@@ -1583,6 +1615,8 @@ mod admin_auth_third_path_tests {
                 jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -1591,7 +1625,6 @@ mod admin_auth_third_path_tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url:
                     "https://docs.atproto.com/guides/oauth-migration".to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -1611,6 +1644,7 @@ mod admin_auth_third_path_tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
             buckets_retention_days: 7,
+            trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -2137,6 +2171,111 @@ mod admin_auth_third_path_tests {
             Err(PdsError::Authentication(_)) => {}
             other => panic!("expected Authentication (401) for unknown sid, got {:?}", other),
         }
+    }
+
+    // ---------- β.1: OAuth bearer validation (R1 F-3.1) ----------
+
+    /// Insert a `token` row directly, mirroring `oauth/token.rs`'s issuance
+    /// shape. `hash` is the stored `access_token_hash` (None => pre-β.1 row).
+    async fn seed_oauth_token(
+        ctx: &AppContext,
+        token_id: &str,
+        did: &str,
+        bearer_hash: Option<&str>,
+        revoked: bool,
+    ) {
+        let now = chrono::Utc::now();
+        let exp = (now + chrono::Duration::hours(1)).to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO token (
+                token_id, did, client_id, current_refresh_token,
+                scope, created_at, updated_at, expires_at,
+                dpop_thumbprint, device_id, access_token_hash, revoked
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            "#,
+        )
+        .bind(token_id)
+        .bind(did)
+        .bind("client-x")
+        .bind(Option::<String>::None)
+        .bind("atproto")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(&exp)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(bearer_hash)
+        .bind(revoked)
+        .execute(&ctx.account_db)
+        .await
+        .expect("seed token row");
+    }
+
+    #[tokio::test]
+    async fn oauth_bearer_validates_by_hash_not_token_id() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let bearer = "at_deadbeefdeadbeefdeadbeefdeadbeef";
+        let token_id = "tok-hash-1";
+        let hash = crate::oauth::access_token_hash(bearer);
+        seed_oauth_token(&ctx, token_id, "did:web:alice.example.com", Some(&hash), false)
+            .await;
+
+        // F-3.1 regression: the bearer validates — lookup is by hash now, not
+        // by token_id. On HEAD before β.1 this returned Authentication error
+        // because the bearer was never stored as token_id.
+        let ok = super::validate_oauth_token(&ctx, bearer)
+            .await
+            .expect("freshly-issued bearer must validate");
+        assert_eq!(ok.did, "did:web:alice.example.com");
+        assert_eq!(ok.token_id, token_id);
+
+        // Presenting the token_id string as a bearer must NOT validate (the
+        // old broken lookup key).
+        assert!(
+            super::validate_oauth_token(&ctx, token_id).await.is_err(),
+            "token_id must not be accepted as a bearer"
+        );
+
+        // A tampered bearer (last char flipped) must not validate.
+        let tampered = "at_deadbeefdeadbeefdeadbeefdeadbeee";
+        assert!(
+            super::validate_oauth_token(&ctx, tampered).await.is_err(),
+            "tampered bearer must not validate"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_pre_beta1_null_hash_row_does_not_validate() {
+        // A row with NULL access_token_hash (a pre-β.1 broken-issuance row)
+        // never validates by bearer — a hash lookup cannot match NULL.
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        seed_oauth_token(&ctx, "tok-old", "did:web:bob.example.com", None, false).await;
+        assert!(
+            super::validate_oauth_token(&ctx, "at_oldbrokentoken")
+                .await
+                .is_err(),
+            "pre-β.1 NULL-hash row must not validate by bearer"
+        );
+        assert!(
+            super::validate_oauth_token(&ctx, "tok-old").await.is_err(),
+            "pre-β.1 row must not validate by token_id either"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_revoked_bearer_does_not_validate() {
+        // The `NOT revoked` clause in the lookup excludes revoked tokens.
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let bearer = "at_revokedrevokedrevokedrevoked01";
+        let hash = crate::oauth::access_token_hash(bearer);
+        seed_oauth_token(&ctx, "tok-rev", "did:web:carol.example.com", Some(&hash), true)
+            .await;
+        assert!(
+            super::validate_oauth_token(&ctx, bearer).await.is_err(),
+            "revoked bearer must not validate"
+        );
     }
 }
 

@@ -143,19 +143,26 @@ impl TokenRotationManager {
         let _access_expires = now + Duration::hours(1); // TODO: store access token expiration
         let refresh_expires = now + Duration::days(90);
 
-        // Step 8: Update token record with new tokens
+        // Step 8: Update token record with new tokens. The new bearer is
+        // persisted as a SHA-256 hash (β.1 / R1 F-3.1) so the rotated access
+        // token validates via `validate_oauth_token`'s hash lookup; the old
+        // bearer's hash is overwritten, so the prior bearer no longer
+        // validates.
+        let new_access_token_hash = crate::oauth::access_token_hash(&new_access_token);
         sqlx::query(
             r#"
             UPDATE token
             SET current_refresh_token = $1,
                 updated_at = $2,
-                expires_at = $3
-            WHERE token_id = $4
+                expires_at = $3,
+                access_token_hash = $4
+            WHERE token_id = $5
             "#,
         )
         .bind(&new_refresh_token)
         .bind(now.to_rfc3339())
         .bind(refresh_expires.to_rfc3339())
+        .bind(&new_access_token_hash)
         .bind(&token_record.token_id)
         .execute(&self.db)
         .await?;

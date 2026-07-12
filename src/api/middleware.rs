@@ -12,7 +12,7 @@ use crate::{
 };
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -27,6 +27,163 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.to_string()))
 }
 
+/// Extract an atproto-OAuth bearer (`Authorization: DPoP <token>`). The DPoP
+/// auth-scheme is what distinguishes an atproto-OAuth bearer (β.3) from a
+/// `Bearer`-scheme session/JWT token, so the two auth paths never collide.
+pub fn extract_dpop_bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("DPoP ").map(|t| t.to_string()))
+}
+
+/// Internal, **server-set-only** header the [`atproto_oauth_gate`] middleware
+/// stamps with the DID an atproto-OAuth bearer resolved to (Arc 2 Phase ε.3).
+/// The gate STRIPS any inbound value before optionally setting it, so a
+/// downstream `fn(State, headers)` resolver (`require_auth` /
+/// `require_auth_unified` — neither has request-line or extensions access) can
+/// read + trust it. Trust is sound only because the gate is layered on the
+/// router hosting every resolver caller, so no client-supplied value survives.
+const OAUTH_RESOLVED_DID_HEADER: &str = "x-aurora-oauth-resolved-did";
+/// Companion to [`OAUTH_RESOLVED_DID_HEADER`] carrying the (internal-form) scope
+/// the OAuth path resolved to. ε.3 stubs this to the internal all-scope
+/// (`atproto:*`); ε.4's scope-translation replaces the stub.
+const OAUTH_RESOLVED_SCOPE_HEADER: &str = "x-aurora-oauth-resolved-scope";
+
+/// Read the gate-resolved atproto-OAuth DID, if the middleware authenticated one.
+fn oauth_resolved_did(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(OAUTH_RESOLVED_DID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Read the gate-resolved internal-form scope.
+fn oauth_resolved_scope(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(OAUTH_RESOLVED_SCOPE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Arc 2 Phase ε.3 — the general-XRPC atproto-OAuth bearer gate (registry-
+/// gated). Runs as a router-level middleware so the whole XRPC surface becomes
+/// OAuth-capable without per-handler edits: `fn(State, headers)` resolvers
+/// (`require_auth`, `require_auth_unified`) can't host DPoP (no request line)
+/// nor read extensions, so the gate does the DPoP + registry work here and
+/// hands the resolved DID to them through a stripped-then-set internal header.
+///
+/// For a request bearing `Authorization: DPoP <token>` it enforces, in order:
+/// the bearer validates (β.1 hash lookup); a DPoP proof is present and valid
+/// (α₁: htm/htu/ath/exp/jti); the proof key matches the token's bound
+/// thumbprint (β.3); AND the key is a registered, non-revoked device for the
+/// bearer's DID (ε.2 registry — the new registry-gates-auth invariant). Any
+/// failure fails closed (the request does not fall through to the session
+/// path). A request with no `DPoP`-scheme auth passes through untouched.
+///
+/// Scope is STUBBED at ε.3: a bearer carrying the `atproto` scope is admitted
+/// broadly (mapped to the internal `atproto:*` all-scope so handler-side
+/// `enforce_scope` passes). ε.4's scope-translation replaces the stub.
+pub async fn atproto_oauth_gate(
+    State(ctx): State<AppContext>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    // Spoof defense: never trust an inbound value of the internal headers.
+    req.headers_mut().remove(OAUTH_RESOLVED_DID_HEADER);
+    req.headers_mut().remove(OAUTH_RESOLVED_SCOPE_HEADER);
+
+    let Some(token) = extract_dpop_bearer(req.headers()) else {
+        // Not an atproto-OAuth bearer — the Bearer/JWT session path handles it.
+        return next.run(req).await;
+    };
+
+    // Extract everything the validation needs as OWNED values BEFORE any await:
+    // a `&Request` cannot be held across an await point (`Body` is not `Sync`,
+    // so the middleware future would be non-`Send` and fail `from_fn`'s bound).
+    let method = req.method().as_str().to_string();
+    let htu = format!("{}{}", ctx.service_url(), req.uri().path());
+    let dpop_proof = req
+        .headers()
+        .get("dpop")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match resolve_atproto_oauth(&ctx, &method, &htu, dpop_proof.as_deref(), &token).await {
+        Ok((did, scope)) => {
+            match (HeaderValue::from_str(&did), HeaderValue::from_str(&scope)) {
+                (Ok(dv), Ok(sv)) => {
+                    req.headers_mut().insert(OAUTH_RESOLVED_DID_HEADER, dv);
+                    req.headers_mut().insert(OAUTH_RESOLVED_SCOPE_HEADER, sv);
+                    next.run(req).await
+                }
+                _ => PdsError::Internal("resolved DID/scope not header-safe".to_string())
+                    .into_response(),
+            }
+        }
+        // A present-but-invalid atproto-OAuth bearer fails closed here.
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The gate's validation core — takes owned request bits (never a `&Request`,
+/// which would make the caller's future non-`Send`). Returns
+/// `(did, internal_scope)` on success.
+async fn resolve_atproto_oauth(
+    ctx: &AppContext,
+    method: &str,
+    htu: &str,
+    dpop_proof: Option<&str>,
+    token: &str,
+) -> PdsResult<(String, String)> {
+    // 1. bearer → token row (β.1 access_token_hash lookup; missing/revoked/
+    //    expired → Authentication error → 401).
+    let token_info = crate::auth::validate_oauth_token(ctx, token).await?;
+
+    // 2. DPoP proof required + verified against this request (htm/htu/ath).
+    let proof = dpop_proof
+        .ok_or_else(|| PdsError::Authentication("DPoP proof required".to_string()))?;
+    let ath = crate::federation::dpop::compute_ath(token);
+    let proof_jkt = ctx
+        .dpop_verifier
+        .verify_dpop_proof(proof, method, htu, Some(&ath))
+        .await?;
+
+    // 3. proof key == the token's bound DPoP thumbprint (β.3 binding).
+    match token_info.dpop_thumbprint.as_deref() {
+        Some(bound) if bound == proof_jkt => {}
+        _ => {
+            return Err(PdsError::Authentication(
+                "DPoP key does not match the token's bound thumbprint".to_string(),
+            ))
+        }
+    }
+
+    // 4. registry gate (ε.2): the key must be a registered active device for
+    //    the bearer's DID.
+    let device = ctx
+        .atproto_device_manager
+        .get_device_by_jkt(&token_info.did, &proof_jkt)
+        .await?
+        .ok_or_else(|| PdsError::Authentication("device not registered".to_string()))?;
+
+    // 5. best-effort activity tracking (never fails the request).
+    let _ = ctx.atproto_device_manager.touch(&device.device_id).await;
+
+    // 6. scope (ε.4 scope-α, translate-at-gate): require the base `atproto`
+    //    scope, then translate the bearer's atproto-spec scopes into the
+    //    internal-vocabulary scope string the handler-side `enforce_scope`
+    //    evaluates (transition:generic → repo.* + blob.upload; base-only → no
+    //    write capability; admin never granted).
+    if !token_info.scope.split_whitespace().any(|s| s == "atproto") {
+        return Err(PdsError::Authorization(
+            "token lacks the required 'atproto' scope".to_string(),
+        ));
+    }
+    let internal_scope = crate::oauth::atproto::scope::to_internal_scope(&token_info.scope);
+    Ok((token_info.did, internal_scope))
+}
+
 /// Authenticate request and add session to extensions
 pub async fn authenticate(
     State(ctx): State<AppContext>,
@@ -36,7 +193,13 @@ pub async fn authenticate(
     let headers = req.headers().clone();
 
     if let Some(token) = extract_bearer_token(&headers) {
-        match ctx.account_manager.validate_access_token(&token).await {
+        // Thread the client IP so a bound admin session is enforced here (#442).
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        match ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, current_ip)
+            .await
+        {
             Ok(session) => {
                 // Add session to request extensions
                 req.extensions_mut().insert(session);
@@ -56,13 +219,29 @@ pub async fn require_auth(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<ValidatedSession> {
+    // Arc 2 ε.3: honor an atproto-OAuth identity the `atproto_oauth_gate`
+    // middleware already validated (DPoP + registered device). The synthetic
+    // session_id marks the OAuth origin; there is no `session` row.
+    if let Some(did) = oauth_resolved_did(&headers) {
+        return Ok(ValidatedSession {
+            session_id: format!("atproto-oauth:{did}"),
+            did,
+            is_app_password: false,
+        });
+    }
+
     let token = extract_bearer_token(&headers).ok_or_else(|| {
         warn!("authentication_failed: missing authorization header");
         metrics::record_error("AuthenticationFailed", "middleware");
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
 
-    match ctx.account_manager.validate_access_token(&token).await {
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    match ctx
+        .account_manager
+        .validate_access_token_with_ip(&token, current_ip)
+        .await
+    {
         Ok(session) => {
             info!(
                 did = %session.did,
@@ -141,13 +320,24 @@ pub async fn require_auth_unified(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<UnifiedAuthContext> {
+    // Arc 2 ε.3: honor a gate-resolved atproto-OAuth identity (DPoP + registered
+    // device already verified). The internal-form scope is the ε.3 stub
+    // (`atproto:*`) until ε.4's scope-translation.
+    if let Some(did) = oauth_resolved_did(&headers) {
+        let scope = oauth_resolved_scope(&headers).unwrap_or_default();
+        return Ok(UnifiedAuthContext::OAuth { did, scope });
+    }
+
     let token = extract_bearer_token(&headers).ok_or_else(|| {
         warn!("authentication_failed: missing authorization header");
         metrics::record_error("AuthenticationFailed", "middleware");
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
     let service_did = ctx.service_did().to_string();
-    ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()])
+    // #442: thread the client IP so a bound admin session is enforced (or, for an
+    // unbound session, unaffected) on this non-forwarded path.
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()], current_ip)
         .await
 }
 
@@ -173,7 +363,12 @@ pub async fn require_auth_forwarded(
     if let Some(eid) = entryway_did.as_deref() {
         allowlist.push(eid);
     }
-    ctx.verify_jwt_with_allowlist(&token, &allowlist).await
+    // #442: thread the client IP so getSession (and the other forwarded mint-
+    // pattern handlers) enforce a bound admin session against the real request IP
+    // instead of fail-closing it.
+    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    ctx.verify_jwt_with_allowlist(&token, &allowlist, current_ip)
+        .await
 }
 
 /// Moderation enforcement middleware
@@ -190,7 +385,12 @@ pub async fn check_account_moderation(
 
     // Only check moderation for authenticated requests
     if let Some(token) = extract_bearer_token(&headers) {
-        if let Ok(session) = ctx.account_manager.validate_access_token(&token).await {
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        if let Ok(session) = ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, current_ip)
+            .await
+        {
             // Check if this is an admin - admins bypass moderation checks
             let is_admin = ctx
                 .admin_role_manager
@@ -435,10 +635,11 @@ pub async fn service_auth(
 
     // Check if this is a service auth request
     if let Some(token) = extract_bearer_token(&headers) {
-        // Try local auth first
+        // Try local auth first (threading the client IP for bound sessions, #442)
+        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
         if ctx
             .account_manager
-            .validate_access_token(&token)
+            .validate_access_token_with_ip(&token, current_ip)
             .await
             .is_ok()
         {
@@ -1070,5 +1271,237 @@ mod namespace_scope_tests {
         assert!(!token_looks_like_jwt("aaa..ccc"));
         assert!(!token_looks_like_jwt(".bbb.ccc"));
         assert!(!token_looks_like_jwt("aaa.bbb."));
+    }
+}
+
+#[cfg(test)]
+mod epsilon_oauth_gate_tests {
+    use super::*;
+    use crate::federation::dpop::{DPopClaims, Jwk};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    async fn ctx() -> AppContext {
+        crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await
+    }
+
+    async fn seed_actor(ctx: &AppContext, did: &str) {
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1,$2,$3)")
+            .bind(did)
+            .bind(format!("{}.example.com", did.replace(':', "-")))
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+    }
+
+    // ---- simple: the fn-resolvers honor the gate-set internal header ----
+
+    #[tokio::test]
+    async fn require_auth_honors_gate_resolved_did() {
+        let ctx = ctx().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OAUTH_RESOLVED_DID_HEADER,
+            HeaderValue::from_static("did:web:alice.example.com"),
+        );
+        let s = require_auth(State(ctx.clone()), headers).await.unwrap();
+        assert_eq!(s.did, "did:web:alice.example.com");
+        assert!(!s.is_app_password);
+    }
+
+    #[tokio::test]
+    async fn require_auth_unified_honors_gate_resolved_did() {
+        let ctx = ctx().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OAUTH_RESOLVED_DID_HEADER,
+            HeaderValue::from_static("did:web:bob.example.com"),
+        );
+        headers.insert(OAUTH_RESOLVED_SCOPE_HEADER, HeaderValue::from_static("atproto:*"));
+        let auth = require_auth_unified(State(ctx.clone()), headers).await.unwrap();
+        assert!(auth.is_oauth());
+        assert_eq!(auth.did(), "did:web:bob.example.com");
+        assert_eq!(auth.oauth_scope(), Some("atproto:*"));
+    }
+
+    // ---- resolve_atproto_oauth: full validation core ----
+
+    fn fresh_p256() -> (p256::ecdsa::SigningKey, Jwk) {
+        use p256::ecdsa::SigningKey;
+        use p256::EncodedPoint;
+        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let enc: EncodedPoint = sk.verifying_key().to_encoded_point(false);
+        let jwk = Jwk {
+            kty: "EC".to_string(),
+            crv: "P-256".to_string(),
+            x: URL_SAFE_NO_PAD.encode(enc.x().unwrap()),
+            y: URL_SAFE_NO_PAD.encode(enc.y().unwrap()),
+        };
+        (sk, jwk)
+    }
+
+    fn dpop_proof(sk: &p256::ecdsa::SigningKey, jwk: &Jwk, htu: &str, ath: &str) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use p256::pkcs8::EncodePrivateKey;
+        let claims = DPopClaims {
+            jti: uuid::Uuid::new_v4().to_string(),
+            htm: "POST".to_string(),
+            htu: htu.to_string(),
+            iat: chrono::Utc::now().timestamp(),
+            exp: chrono::Utc::now().timestamp() + 120,
+            ath: Some(ath.to_string()),
+        };
+        let pem = sk.to_pkcs8_pem(Default::default()).unwrap().to_string();
+        let key = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
+        let mut h = Header::new(Algorithm::ES256);
+        h.typ = Some("dpop+jwt".to_string());
+        h.jwk = Some(serde_json::from_value(serde_json::to_value(jwk).unwrap()).unwrap());
+        encode(&h, &claims, &key).unwrap()
+    }
+
+    /// Seed a token row + a registered device whose key == the proof key.
+    /// Returns (bearer, jkt).
+    async fn seed_token_and_device(ctx: &AppContext, did: &str, jwk: &Jwk, scope: &str) -> (String, String) {
+        let jwk_json = serde_json::to_string(jwk).unwrap();
+        let dev = ctx
+            .atproto_device_manager
+            .register_device(did, &jwk_json, Some("dev"), None)
+            .await
+            .unwrap();
+        let bearer = format!("at_{}", uuid::Uuid::new_v4().simple());
+        let hash = crate::oauth::access_token_hash(&bearer);
+        sqlx::query(
+            "INSERT INTO token (token_id, did, client_id, scope, created_at, updated_at, \
+             expires_at, dpop_thumbprint, access_token_hash) VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(did)
+        .bind("https://app/cm.json")
+        .bind(scope)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2099-01-01T00:00:00Z")
+        .bind(&dev.dpop_jkt)
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        (bearer, dev.dpop_jkt)
+    }
+
+
+    #[tokio::test]
+    async fn resolve_happy_path_translates_scope() {
+        let ctx = ctx().await;
+        let did = "did:web:carol.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        // transition:generic → the internal repo.* + blob.upload capabilities.
+        let (bearer, _jkt) =
+            seed_token_and_device(&ctx, did, &jwk, "atproto transition:generic").await;
+
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+
+        let (rdid, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+            .await
+            .expect("resolve");
+        assert_eq!(rdid, did);
+        assert_eq!(rscope, "atproto:repo.* atproto:blob.upload"); // ε.4 scope-α
+    }
+
+    #[test]
+    fn translated_scope_gates_enforce_scope_end_to_end() {
+        // ε.3 (gate) → ε.4 (translation) → handler enforce_scope, tied together.
+        use crate::oauth::atproto::scope::to_internal_scope;
+        use crate::oauth::AtProtoScope;
+
+        let generic = UnifiedAuthContext::OAuth {
+            did: "did:web:x.example.com".to_string(),
+            scope: to_internal_scope("atproto transition:generic"),
+        };
+        // transition:generic admits the repo-write family + blob upload…
+        assert!(enforce_scope(&generic, &AtProtoScope::RepoCreate).is_ok());
+        assert!(enforce_scope(&generic, &AtProtoScope::RepoDelete).is_ok());
+        assert!(enforce_scope(&generic, &AtProtoScope::BlobUpload).is_ok());
+        // …but never admin.
+        assert!(enforce_scope(&generic, &AtProtoScope::AdminAll).is_err());
+
+        // Base `atproto` alone grants no write capability.
+        let base = UnifiedAuthContext::OAuth {
+            did: "did:web:y.example.com".to_string(),
+            scope: to_internal_scope("atproto"),
+        };
+        assert!(enforce_scope(&base, &AtProtoScope::RepoCreate).is_err());
+        assert!(enforce_scope(&base, &AtProtoScope::BlobUpload).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_base_atproto_only_grants_no_write_scope() {
+        let ctx = ctx().await;
+        let did = "did:web:grace.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        // Base `atproto` only → empty internal scope (reads ok, writes 403).
+        let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "atproto").await;
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let (_did, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+            .await
+            .expect("resolve");
+        assert_eq!(rscope, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_unregistered_device() {
+        let ctx = ctx().await;
+        let did = "did:web:dave.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        // Seed the token bound to the key's jkt, but do NOT register a device.
+        let jkt = crate::federation::dpop::compute_jwk_thumbprint(
+            &serde_json::to_value(&jwk).unwrap(),
+        )
+        .unwrap();
+        let bearer = format!("at_{}", uuid::Uuid::new_v4().simple());
+        let hash = crate::oauth::access_token_hash(&bearer);
+        sqlx::query(
+            "INSERT INTO token (token_id, did, client_id, scope, created_at, updated_at, \
+             expires_at, dpop_thumbprint, access_token_hash) VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(did)
+        .bind("https://app/cm.json")
+        .bind("atproto")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2099-01-01T00:00:00Z")
+        .bind(&jkt)
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+
+        let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.unwrap_err();
+        assert!(matches!(err, PdsError::Authentication(ref m) if m.contains("device not registered")));
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_missing_atproto_scope() {
+        let ctx = ctx().await;
+        let did = "did:web:erin.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        // Scope lacks the base `atproto` token.
+        let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "transition:generic").await;
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)));
     }
 }

@@ -176,7 +176,7 @@ pub async fn rotate_keys_from_file(
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| line.starts_with("did:plc:"))
+        .filter(|line| crate::identity::did_method::is_plc(line))
         .collect();
 
     if dids.is_empty() {
@@ -207,7 +207,7 @@ async fn rotate_key_for_did(
     rationale: Option<&str>,
 ) -> PdsResult<bool> {
     // Validate DID format
-    if !did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(did) {
         return Err(PdsError::Validation(format!(
             "Not a did:plc identifier: {}",
             did

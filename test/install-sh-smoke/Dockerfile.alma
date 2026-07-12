@@ -1,0 +1,24 @@
+# install.sh preflight smoke — AlmaLinux (rhel / dnf branch).
+#
+# Same intent as Dockerfile.rocky: AlmaLinux is a RHEL rebuild that ships
+# /etc/redhat-release, so detect_distro resolves to `rhel` and ensure_c_toolchain
+# takes the `dnf install` branch. Preflight smoke only (see Dockerfile.rocky for
+# the full rationale). A red build → flag via chainlink, do NOT patch install.sh.
+FROM almalinux:9
+
+# Minimal prereqs ONLY (git + openssl; curl + bash ship in the base). NOT the C
+# toolchain — ensure_c_toolchain must find it missing to fire the dnf branch.
+RUN dnf -y install git openssl && dnf clean all
+
+WORKDIR /aurora
+COPY install.sh .env.example ./
+
+RUN bash install.sh --non-interactive --skip-rustup --reverse-proxy none --domain localhost \
+        > /tmp/install.log 2>&1 || true; \
+    if grep -q "C build toolchain (rhel)" /tmp/install.log \
+       && grep -q "C build toolchain installed" /tmp/install.log; then \
+        echo "SMOKE-OK: Alma -> rhel/dnf preflight branch exercised and completed"; \
+    else \
+        echo "SMOKE-FAIL: Alma -> rhel/dnf preflight branch did not complete"; \
+        echo "----- install.log -----"; cat /tmp/install.log; exit 1; \
+    fi

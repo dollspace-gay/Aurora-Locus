@@ -63,7 +63,7 @@ pub struct Sequencer {
 impl Sequencer {
     /// Create a new sequencer (single-instance mode — `is_leader` defaults
     /// to true).
-    #[allow(dead_code)] // Public API for future use
+    #[allow(dead_code)] // consumed by rebuild.rs (bin-invisible; not on the default runtime path)
     pub fn new(db: AnyPool, config: SequencerConfig) -> Self {
         Self {
             db,
@@ -144,7 +144,6 @@ impl Sequencer {
     }
 
     /// Sequence a sync event (lightweight repo state sync for account creation/activation)
-    #[allow(dead_code)] // Will be used when implementing sync events
     pub async fn sequence_sync(&self, evt: SyncEvent) -> PdsResult<i64> {
         self.check_leader()?;
         let event_bytes = serde_cbor::to_vec(&evt)

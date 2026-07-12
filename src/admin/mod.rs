@@ -17,7 +17,9 @@ pub mod moderation;
 pub mod operator_session;
 pub mod reports;
 pub mod roles;
+pub mod security_config;
 pub mod time_range;
+pub mod totp;
 
 pub use invites::{InviteCode, InviteCodeManager};
 pub use labels::LabelManager;

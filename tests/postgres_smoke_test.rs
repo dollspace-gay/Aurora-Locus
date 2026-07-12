@@ -160,64 +160,11 @@ async fn jobs_account_purge_queries_parse_on_postgres() {
 }
 
 // ===========================================================================
-// Group 3: src/oauth/* — OAuth managers (chainlink #93 / Phase 5.0.3)
-//
-// 32 SQL strings across 6 files. DeviceManager round-trip is the
-// representative smoke — exercises INSERT (create_device + associate),
-// SELECT (get_device, list), UPDATE, DELETE in one flow.
+// Group 3 (src/oauth/* — the legacy `DeviceManager` Postgres smoke) was retired
+// in Phase ζ with the legacy `/oauth/*` provider. The remaining live oauth SQL
+// (flow_state_adapter) is exercised on Postgres by
+// `tests/distributed_substrate_test.rs`.
 // ===========================================================================
-
-#[tokio::test]
-async fn oauth_device_manager_round_trip_on_postgres() {
-    use aurora_locus::oauth::DeviceManager;
-    use aurora_locus::oauth::models::DeviceData;
-    use chrono::Utc;
-
-    let (_pg, url) = start_postgres().await;
-    let pool = open_pool(&url).await;
-    let mgr = DeviceManager::new(pool);
-
-    // Create device
-    let device_id = mgr
-        .create_device(DeviceData {
-            session_id: "sess-1".to_string(),
-            user_agent: Some("test-ua".to_string()),
-            ip_address: Some("127.0.0.1".to_string()),
-            last_seen_at: Utc::now(),
-            dpop_public_key: None,
-        })
-        .await
-        .expect("create_device");
-
-    // Get device by id
-    let dev = mgr.get_device(&device_id).await.expect("get_device");
-    assert_eq!(dev.session_id, "sess-1");
-
-    // Update device metadata. Skipping associate_device here because
-    // Postgres enforces the account_device → device FK strictly and a
-    // subsequent remove_device would fail — that's a real semantic
-    // (orphan rows aren't allowed) not a placeholder issue. The
-    // placeholders pass through INSERT, SELECT, and UPDATE here, which
-    // is what this smoke is verifying.
-    mgr.update_device(
-        &device_id,
-        DeviceData {
-            session_id: "sess-1".to_string(),
-            user_agent: Some("updated-ua".to_string()),
-            ip_address: Some("127.0.0.1".to_string()),
-            last_seen_at: Utc::now(),
-            dpop_public_key: None,
-        },
-    )
-    .await
-    .expect("update_device");
-
-    // Remove device (FK-safe: no associate_device run first).
-    mgr.remove_device(&device_id)
-        .await
-        .expect("remove_device");
-    assert!(mgr.get_device(&device_id).await.is_err());
-}
 
 // ===========================================================================
 // Group 4: src/blob_store/* — blob metadata + quarantine (chainlink #93 / Phase 5.0.4)
@@ -373,6 +320,8 @@ async fn account_manager_round_trip_on_postgres() {
             jwt_secret: "test-secret-key-for-account-smoke-32-chars".to_string(),
             repo_signing_key: "a".repeat(64),
             plc_rotation_key: "b".repeat(64),
+            password_login_enabled: false,
+            admin_totp_encryption_key_hex: None,
             oauth: OAuthConfig {
                 client_id: "http://localhost:3000/client-metadata.json".to_string(),
                 redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -380,7 +329,6 @@ async fn account_manager_round_trip_on_postgres() {
             },
             jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
             oauth_migration_guide_url: "https://docs.example.com/oauth-migration".to_string(),
-            oauth_features: Default::default(),
         },
         identity: IdentityConfig {
             // chainlink #109 Option A — point at the CI mock PLC on
@@ -411,6 +359,7 @@ async fn account_manager_round_trip_on_postgres() {
             global_requests_per_minute: 3000,
             exempt_admin_assets: true,
             buckets_retention_days: 7,
+            trust_proxy: false,
         },
         logging: LoggingConfig {
             level: "info".to_string(),

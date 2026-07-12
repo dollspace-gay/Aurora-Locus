@@ -95,7 +95,7 @@ async fn readme_bootstrap_block_executes_cleanly() {
     // preamble names as required) must have a value in the spawned
     // subprocess's environment. Adding a placeholder to the README
     // without adding it here causes this test to fail.
-    // Run bash from inside the tempdir so dotenv()'s `.env`-file
+    // Run bash from inside the tempdir so dotenvy()'s `.env`-file
     // search starts there (and finds nothing). If the workspace's
     // `.env` were picked up, its `PDS_ACCOUNT_DB_LOCATION=./data/...`
     // would override the test's `PDS_DATA_DIRECTORY` derivation and

@@ -1,8 +1,8 @@
 /// HTTP server setup and routing
 use crate::{
     api::middleware::{
-        check_account_moderation, federation_enabled_gate, jwt_deprecation_headers,
-        namespace_scope_check,
+        atproto_oauth_gate, check_account_moderation, federation_enabled_gate,
+        jwt_deprecation_headers, namespace_scope_check,
     },
     context::AppContext,
     error::{PdsError, PdsResult},
@@ -26,6 +26,29 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::info;
+
+/// Force `Cache-Control: no-store` on EVERY admin static response, regardless of
+/// content-type.
+///
+/// This closes a class, not one file. The admin surface is low-traffic and
+/// operator-only, so re-fetching a few KB per visit is negligible next to the
+/// failure mode it prevents: a browser or edge serving ANY stale admin asset
+/// after a fix has shipped — login.html (an old form missing `method="POST"` →
+/// credentials in the URL, #436), login.js (the submit handler never runs, so the
+/// form POSTs to login.html instead of the real endpoint → 405), client.js (auth
+/// broken), login.css (silent layout regression). `ServeDir` sets no
+/// `Cache-Control` and only `Last-Modified`/`ETag`, so without this admin assets
+/// cache by heuristic freshness and a shipped fix may never reach the client.
+/// Applied ONLY to the `static/admin` tree (see `admin_static`), so responses
+/// from outside it are unaffected; the small re-fetch cost is a deliberate
+/// tradeoff for an always-fresh admin surface.
+fn no_store(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
 
 /// Build the main application router.
 ///
@@ -60,19 +83,44 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         .ok()
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    // Password login is a fallback, OFF by default (#442). When disabled, the
+    // fallback page 302-redirects to the OAuth login landing rather than
+    // rendering. Read once here from the cached config (a Copy bool captured into
+    // the per-request closure), so it is not re-read per request.
+    let password_login_enabled = ctx.config.authentication.password_login_enabled;
     let admin_static = Router::new()
         .nest_service("/admin", ServeDir::new("static/admin"))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
-            // Capture into the async closure by value — bool is Copy
+            // Capture into the async closure by value — bools are Copy
             // so this is a zero-cost copy per request.
-            let enabled = debug_pages_enabled;
+            let debug_enabled = debug_pages_enabled;
+            let pw_login = password_login_enabled;
             async move {
-                if !enabled && req.uri().path() == "/admin/debug.html" {
+                let path = req.uri().path();
+                if !debug_enabled && path == "/admin/debug.html" {
                     return (StatusCode::NOT_FOUND, "Not found").into_response();
                 }
-                next.run(req).await
+                if !pw_login && path == "/admin/password-login.html" {
+                    return (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/admin/")],
+                    )
+                        .into_response();
+                }
+                no_store(next.run(req).await)
             }
         }));
+
+    // Static file serving for the did:web holder self-service UI
+    // (Phase 1, chainlink #424). Serves the JS crypto islands
+    // (secp256k1 login signing, P-256 DPoP keygen) + CSS from disk,
+    // parallel to the admin static tree. These assets are public
+    // (client-side crypto code + styling, no secrets) and carry no
+    // session — the authenticated holder *pages* are handler-rendered
+    // under /oauth/atproto/holder/* where the Path=/oauth session
+    // cookie reaches them. The /holder/* asset prefix is a distinct
+    // path from those pages, so there is no route collision.
+    let holder_static = Router::new().nest_service("/holder", ServeDir::new("static/holder"));
 
     // Build router with middleware
     Router::new()
@@ -85,6 +133,9 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         .with_state(ctx.clone())
         // Merge admin static files (after with_state so it doesn't need state)
         .merge(admin_static)
+        // Merge holder self-service static assets (JS/CSS islands, also
+        // state-free — served after with_state like the admin tree).
+        .merge(holder_static)
         // Apply moderation check middleware (checks if account is suspended/taken down)
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
@@ -97,6 +148,14 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
             ctx.clone(),
             namespace_scope_check,
         ))
+        // Arc 2 ε.3 — atproto-OAuth bearer gate (registry-gated). Resolves a
+        // `DPoP`-scheme bearer to a DID (validate + DPoP proof + registered
+        // device) and stamps the trusted internal header the fn-based auth
+        // resolvers (require_auth / require_auth_unified) read. Layered OUTER of
+        // the scope-check + moderation layers (and the handlers), so the
+        // resolved DID is set before any of them run. Strips the inbound
+        // internal header unconditionally — spoof defense.
+        .layer(middleware::from_fn_with_state(ctx.clone(), atproto_oauth_gate))
         // v0.9 Federation runtime-mutability arc §3.7 (#395) — request-layer
         // short-circuit: 503 the inbound federation operational endpoints when
         // federation.enabled resolves false (incident response, effective before
@@ -280,6 +339,61 @@ mod shutdown_wiring_tests {
         assert!(
             res.is_ok(),
             "watchdog should complete within the drain deadline after a signal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_header_tests {
+    //! #436: EVERY admin static response is served `no-store` so a stale cached
+    //! asset — login.html, login.js, login.css, client.js — can't keep running
+    //! after a fix has shipped. `no_store` is applied ONLY to the `static/admin`
+    //! tree (see `build_router`'s `admin_static` layer), so responses from
+    //! outside it are unaffected — the layer's scope, not the helper, provides
+    //! that boundary.
+    use super::no_store;
+    use axum::http::{header, StatusCode};
+    use axum::response::{IntoResponse, Response};
+
+    fn resp_with_content_type(ct: &'static str) -> Response {
+        (StatusCode::OK, [(header::CONTENT_TYPE, ct)], "body").into_response()
+    }
+
+    #[test]
+    fn every_admin_asset_type_is_marked_no_store() {
+        // The whole class — HTML shells AND the JS/CSS/SVG/JSON that carry
+        // critical regressions — must be no-store, not just text/html.
+        for ct in [
+            "text/html; charset=utf-8",
+            "application/javascript",
+            "text/css",
+            "image/svg+xml",
+            "application/json",
+        ] {
+            let resp = no_store(resp_with_content_type(ct));
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{ct} must be served no-store"
+            );
+        }
+    }
+
+    #[test]
+    fn no_store_is_content_type_agnostic_and_overriding() {
+        // Guarantee must not depend on a content-type being present, and it
+        // overrides any Cache-Control ServeDir might set.
+        let mut resp = (StatusCode::OK, "body").into_response();
+        resp.headers_mut().remove(header::CONTENT_TYPE);
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("max-age=31536000"),
+        );
+        let resp = no_store(resp);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "no_store must override a pre-existing Cache-Control and not need a content-type"
         );
     }
 }

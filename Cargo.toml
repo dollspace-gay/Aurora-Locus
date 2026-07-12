@@ -1,6 +1,6 @@
 [package]
 name = "aurora-locus"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 authors = ["Aurora Locus Contributors"]
 description = "ATProto Personal Data Server implementation in Rust"
@@ -59,7 +59,10 @@ serde_json = "1"
 serde_yaml = "0.9"
 
 # Configuration
-dotenv = "0.15"
+# dotenvy is the maintained fork of the (unmaintained) dotenv crate; identical
+# API. Migrated off dotenv 0.15 to clear the RUSTSEC-2021-0141 unmaintained
+# advisory (housekeeping #421).
+dotenvy = "0.15"
 
 # Error handling
 thiserror = "2"
@@ -88,7 +91,7 @@ aws-credential-types = "1"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 url = "2.5"
 base64 = "0.22"
 # jsonwebtoken 10 requires picking a crypto provider feature explicitly —
@@ -153,6 +156,15 @@ bs58 = "0.5"
 # Base32 encoding for did:plc identifiers
 base32 = "0.5"
 
+# Admin TOTP 2FA (#442): RFC-6238 code generation/verification. `gen_secret`
+# pulls the enrollment secret generator.
+totp-rs = { version = "5", features = ["gen_secret"] }
+
+# AES-256-GCM to encrypt admin TOTP secrets at rest (#442), keyed by
+# PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX. RustCrypto, matching the argon2/sha2/k256
+# stack already in use.
+aes-gcm = "0.10"
+
 # Metrics and telemetry
 prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.4"
@@ -173,6 +185,7 @@ flate2 = "1.1.5"
 # TAR archive serialization for tools.aurora.admin.exportAccountForensic
 # (Phase 3.8 / chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §8.7).
 tar = "0.4"
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -192,3 +205,4 @@ serde_urlencoded = "0.7"
 # multi-instance leader election and LISTEN/NOTIFY cache invalidation.
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }

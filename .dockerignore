@@ -1,0 +1,51 @@
+# Keep the build context small (target/ alone is tens of GB). Denylist only, so
+# it can't starve a COPY the Dockerfile needs.
+
+# Build artifacts
+target/
+**/target/
+
+# VCS + local tooling
+.git/
+.gitignore
+.gitattributes
+.github/
+.claude/
+.chainlink/
+.beads/
+.archived/
+.cargo/
+
+# Secrets (keep the tracked template)
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+data.backup/
+data.bak/
+
+# Not build inputs
+docs/
+tests/
+scripts/
+packaging/
+phase-b/
+create-account.sh
+install.sh
+docker-compose.yml
+Caddyfile
+*.md
+LICENSE
+LICENSE-APACHE
+LICENSE-MIT
+
+# Cruft
+*.log
+*.tmp
+*.swp
+*~
+*.bat
+__pycache__/
+*.pyc

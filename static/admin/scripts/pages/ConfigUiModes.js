@@ -94,12 +94,11 @@
       // The deployment moderation tier (full / reduced / disabled) moved to
       // Configuration → Moderation policy (#340); this page is theme/language/
       // branding only.
+      // Theme selection now lives entirely in the Installed Themes section below
+      // — a personal "Use this theme" for every operator, plus a superadmin
+      // "Set as deployment default" — so the redundant Theme dropdown card is
+      // gone (#441). Language stays.
       '<div class="settings-grid">' +
-      '  <div class="settings-card">' +
-      '    <h3>Theme</h3>' +
-      '    <div id="ui-theme-toggle"></div>' +
-      '    <p class="settings-help">Choose an installed theme, or follow the deployment default.</p>' +
-      '  </div>' +
       '  <div class="settings-card">' +
       '    <h3>Language</h3>' +
       '    <select id="ui-language"><option value="en">English</option></select>' +
@@ -124,16 +123,15 @@
         '  <button type="button" class="btn-primary" id="branding-save">Save branding</button>' +
         '</section>'
         : '') +
-      // Installed Themes — folded in from the former standalone Themes page
-      // (#322). The row list is owned by AuroraInstalledThemes; set-default is
-      // superadmin-only, the rest is read-only for moderator/admin.
+      // Installed Themes — now the sole theme-selection surface (#441). The row
+      // list is owned by AuroraInstalledThemes: every operator gets a personal
+      // "Use this theme"; superadmins also get the deployment-default action.
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
       '  <h3>Installed Themes</h3>' +
       '  <div id="installed-themes"></div>' +
       '</section>';
 
-    if (global.AuroraThemeToggle) global.AuroraThemeToggle.mountDropdown(document.getElementById('ui-theme-toggle'));
     if (global.AuroraInstalledThemes) global.AuroraInstalledThemes.mount(document.getElementById('installed-themes'), isSuper);
 
     const langSel = document.getElementById('ui-language');

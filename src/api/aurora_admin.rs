@@ -4654,10 +4654,20 @@ pub async fn serve_active_theme_css(
     let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_token_css(&id).unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -4666,7 +4676,7 @@ pub async fn serve_active_theme_css(
 /// (runtime row → file tier → compiled default `aurora-classic`). Used by the
 /// unauthenticated active-theme serve routes when no `?id` is given; never
 /// errors — falls back to the inheritance root on any DB error.
-async fn deployment_default_theme(ctx: &AppContext) -> String {
+pub(crate) async fn deployment_default_theme(ctx: &AppContext) -> String {
     use sqlx::Row as _;
     let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
         .bind(THEME_DEPLOYMENT_DEFAULT_KEY)
@@ -4762,10 +4772,20 @@ pub async fn serve_active_theme_effects_css(
     let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_effect_css(&id).unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -4784,10 +4804,20 @@ pub async fn serve_active_theme_extensions_css(
         .resolve_extension_css(&id)
         .unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -6107,8 +6137,8 @@ pub async fn retry_bulk_diddoc_update_for_did(
             auth.role
         )));
     }
-    // v0.9: only did:plc accounts exist (#381); did:web is a v0.10 path.
-    if !input.did.starts_with("did:plc:") {
+    // v0.10: route the method discrimination through the classifier (#414 Phase A).
+    if !crate::identity::did_method::is_plc(&input.did) {
         return Err(validation(format!(
             "only did:plc accounts can be re-pointed; got '{}'",
             input.did
@@ -6406,6 +6436,8 @@ mod tests {
                 jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -6414,7 +6446,6 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -6434,6 +6465,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -6542,6 +6574,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(markers, 1, "sibling marker committed atomically");
+    }
+
+    #[tokio::test]
+    async fn active_theme_css_is_served_no_store() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        // The no-`?id` response is the deployment-default theme, which changes;
+        // no-store keeps every surface (esp. the server-rendered transition
+        // screen) from painting a stale cached theme (chainlink #441).
+        let ctx = create_test_context().await;
+        let resp = serve_active_theme_css(State(ctx.clone()), Query(ActiveThemeParams { id: None }))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "/theme/active.css must be no-store"
+        );
     }
 
     #[tokio::test]
@@ -10615,6 +10667,8 @@ mod tests {
                 jwt_secret: "test-secret-key-aurora-admin-test-32xx".to_string(),
                 repo_signing_key: "a".repeat(64),
                 plc_rotation_key: "b".repeat(64),
+                password_login_enabled: false,
+                admin_totp_encryption_key_hex: None,
                 oauth: OAuthConfig {
                     client_id: "http://localhost:3000/client-metadata.json".to_string(),
                     redirect_uri: "http://localhost:3000/oauth/callback".to_string(),
@@ -10623,7 +10677,6 @@ mod tests {
                 jwt_sunset_date: "Sat, 31 Dec 2024 23:59:59 GMT".to_string(),
                 oauth_migration_guide_url: "https://docs.atproto.com/guides/oauth-migration"
                     .to_string(),
-                oauth_features: Default::default(),
             },
             identity: IdentityConfig {
                 did_plc_url: "https://plc.directory".to_string(),
@@ -10643,6 +10696,7 @@ mod tests {
                 global_requests_per_minute: 3000,
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
+                trust_proxy: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

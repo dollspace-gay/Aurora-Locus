@@ -336,17 +336,18 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> PdsResult<Json<SessionResponse>> {
+    // #442: resolve the client IP once — reused for identifier+IP rate limiting
+    // and, after the session is minted, IP-binding enforcement.
+    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+
     // Identifier+IP rate limiting for login attempts (30 per 5min per identifier+IP)
     // Prevents brute-force attacks on specific accounts from specific IPs
-    if let Some(client_ip) =
-        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
-    {
+    if let Some(ip) = client_ip {
         tracing::debug!(
             "create_session: Checking identifier+IP rate limit for {}",
             req.identifier
         );
-        ctx.rate_limiter
-            .check_identifier_ip(&req.identifier, &client_ip)?;
+        ctx.rate_limiter.check_identifier_ip(&req.identifier, &ip)?;
     }
 
     // Try regular password authentication first. If that returns a
@@ -380,6 +381,37 @@ async fn create_session(
                 .map(|(account, session, _name)| (account, session))?
         }
     };
+
+    // #442: IP binding must hold no matter which endpoint mints the session. The
+    // admin OAuth callback and the password-login handler both bind; this standard
+    // `com.atproto.server.createSession` path did not, leaving a bypass — an admin
+    // who enabled binding but authenticated here (e.g. a direct XRPC call) got an
+    // unbound session. Bind the just-minted session to the login IP when the
+    // account opted in. Non-admins have no security config → no-op. Fail-closed: a
+    // bind-write failure revokes the session rather than releasing it unbound.
+    if ctx
+        .admin_security_store
+        .get_config(&account.did)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.ip_binding_enabled)
+        .unwrap_or(false)
+    {
+        if let Some(ip) = client_ip {
+            if let Err(e) = ctx
+                .account_manager
+                .bind_session_ip(&session.id, &ip.to_string())
+                .await
+            {
+                tracing::error!(did = %account.did, "failed to bind session IP: {}", e);
+                let _ = ctx.account_manager.delete_session(&session.id).await;
+                return Err(e);
+            }
+        }
+        // No resolvable client IP (e.g. trust_proxy off): binding degrades to a
+        // no-op by design, matching the password-login handler.
+    }
 
     Ok(Json(SessionResponse {
         did: account.did,
@@ -1159,6 +1191,16 @@ async fn get_service_auth(
     auth: AuthContext,
     Query(req): Query<GetServiceAuthQuery>,
 ) -> PdsResult<Json<GetServiceAuthResponse>> {
+    // v0.10 Arc 1 §10 / R2 F-3: getServiceAuth signs an ES256K JWT with the
+    // caller's own `#atproto` key. A public-key-only did:web account has no
+    // substrate-held signing key, so signing it in-process is impossible (and
+    // substrate-signing as the holder would be a sovereignty break — the same
+    // single-key reasoning as commit signing). Arc 2 Phase δ (LOCKED §5) closes
+    // the Arc-1 gap by *mediating* the signature through the holder signing
+    // channel. The did:web branch lives at the signing step below (not here) so
+    // a did:web request still runs the full exp / takedown / protected-method
+    // validation before dispatch — identical policy to the did:plc path.
+
     let now = Utc::now().timestamp();
 
     // Validate expiration if provided
@@ -1242,25 +1284,51 @@ async fn get_service_auth(
     // one layer up. Same key surface used by genesis-commit signing
     // (Arc 15, api/account_emit.rs::create_account_emit_sequence)
     // and Arc 18's record-write fix.
-    let signing_key_bytes = ctx
+    // Generate the service-auth JWT. Routing is KEY-PRESENCE-based (#448): when
+    // the PDS holds the account's per-account key it signs in-process — did:plc
+    // and, as of v0.10, did:web accounts with a PDS-held key (parity). When no
+    // key is stored — a sovereign did:web whose holder keeps the private key —
+    // the signature is mediated through the holder channel (v0.11 / Phase γ; the
+    // default `UnavailableHolderSigningChannel` returns a clean "not yet wired"
+    // 4xx today). See chainlink #447 (async signer) / #448 (this parity work).
+    let token = match ctx
         .account_manager
         .get_atproto_signing_key_bytes(&auth.did)
-        .await?;
-
-    if signing_key_bytes.len() != 32 {
-        return Err(PdsError::Internal(
-            "Signing key must be exactly 32 bytes".to_string(),
-        ));
-    }
-
-    // Generate service auth JWT
-    let token = service_auth::create_service_jwt(
-        &auth.did,          // Issuer DID (authenticated user)
-        &req.aud,           // Audience DID (target service)
-        exp_duration,       // Expiration duration in seconds
-        req.lxm.as_deref(), // Optional lexicon method
-        &signing_key_bytes, // Per-account signing key (chainlink #143)
-    )?;
+        .await
+    {
+        Ok(signing_key_bytes) => {
+            if signing_key_bytes.len() != 32 {
+                return Err(PdsError::Internal(
+                    "Signing key must be exactly 32 bytes".to_string(),
+                ));
+            }
+            service_auth::create_service_jwt(
+                &auth.did,          // Issuer DID (authenticated user)
+                &req.aud,           // Audience DID (target service)
+                exp_duration,       // Expiration duration in seconds
+                req.lxm.as_deref(), // Optional lexicon method
+                &signing_key_bytes, // Per-account signing key (chainlink #143)
+            )?
+        }
+        Err(PdsError::NotFound(nf)) => {
+            // No PDS-held key. A did:web account is sovereign — mediate through
+            // the holder channel. Any other DID with no key is simply unknown;
+            // surface that as-is rather than misroute it to the holder path.
+            if crate::identity::did_method::is_web(&auth.did) {
+                mint_service_jwt_via_holder(
+                    ctx.holder_signing_channel.as_ref(),
+                    &auth.did,
+                    &req.aud,
+                    exp_duration,
+                    req.lxm.as_deref(),
+                )
+                .await?
+            } else {
+                return Err(PdsError::NotFound(nf));
+            }
+        }
+        Err(e) => return Err(e),
+    };
 
     tracing::info!(
         did = %auth.did,
@@ -1271,6 +1339,34 @@ async fn get_service_auth(
     );
 
     Ok(Json(GetServiceAuthResponse { token }))
+}
+
+/// The holder-mediated (keyless-account) branch of getServiceAuth minting.
+/// Reached only when the PDS holds no per-account key — a sovereign did:web
+/// account (v0.11 / Phase γ; chainlink #447 / #448). In v0.10 did:web accounts
+/// hold their key on the PDS, so this branch is not reached by any reachable
+/// account. Structurally parallel to [`service_auth::create_service_jwt`]'s
+/// in-process signing, but the signature comes from the account holder over the
+/// [`crate::holder_signing::HolderSigningChannel`].
+///
+/// The header + claims + signing input are built by the SAME
+/// `service_auth::service_jwt_signing_input` the in-process path uses, so the two
+/// emit an identical JWT format; the holder's 64-byte compact ES256K signature
+/// is re-encoded to DER for the JWT wire form (`verify_service_jwt` decodes
+/// DER). Until Phase γ installs the real channel, the default
+/// `UnavailableHolderSigningChannel` makes this return a clean 4xx
+/// (`HolderSigningError::ChannelNotAvailable` → `PdsError::Validation`).
+async fn mint_service_jwt_via_holder(
+    channel: &dyn crate::holder_signing::HolderSigningChannel,
+    did: &str,
+    aud: &str,
+    exp_seconds: Option<i64>,
+    lxm: Option<&str>,
+) -> PdsResult<String> {
+    let signing_input = service_auth::service_jwt_signing_input(did, aud, exp_seconds, lxm)?;
+    let compact = channel.sign_service_auth(did, signing_input.as_bytes()).await?;
+    let der = service_auth::compact_es256k_to_der(&compact)?;
+    Ok(service_auth::assemble_service_jwt(&signing_input, &der))
 }
 
 // ==================== New Endpoints for XRPC Parity ====================
@@ -1892,6 +1988,79 @@ async fn reserve_signing_key(
 }
 
 #[cfg(test)]
+mod service_auth_holder_mediation_tests {
+    use super::*;
+    use crate::holder_signing::{MockHolderSigningChannel, UnavailableHolderSigningChannel};
+
+    #[tokio::test]
+    async fn mint_via_unavailable_channel_is_client_error_not_5xx() {
+        // Before Phase γ, the default channel makes the did:web branch return an
+        // honest 4xx — the successor to the pre-δ "not supported for did:web"
+        // rejection. Must NOT be a 5xx (holder unavailability is client-visible
+        // state, not a server bug).
+        let ch = UnavailableHolderSigningChannel;
+        let err = mint_service_jwt_via_holder(
+            &ch,
+            "did:web:alice.example.com",
+            "did:web:appview.test",
+            Some(60),
+            Some("com.atproto.repo.createRecord"),
+        )
+        .await
+        .expect_err("unavailable channel must fail");
+        assert!(matches!(err, PdsError::Validation(_)), "want 4xx Validation");
+        assert!(err.to_string().contains("Phase γ pending"));
+    }
+
+    #[tokio::test]
+    async fn mint_via_mock_holder_produces_verifiable_jwt() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use k256::ecdsa::{signature::Verifier, Signature};
+
+        let did = "did:web:alice.example.com";
+        let aud = "did:web:appview.test";
+        let mock = MockHolderSigningChannel::new();
+
+        let jwt = mint_service_jwt_via_holder(
+            &mock,
+            did,
+            aud,
+            Some(60),
+            Some("com.atproto.repo.createRecord"),
+        )
+        .await
+        .expect("mint via holder");
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT is header.claims.sig");
+
+        // Header shape matches the did:plc path (ES256K / JWT).
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "ES256K");
+        assert_eq!(header["typ"], "JWT");
+
+        // Claims carry iss = holder, aud = target, and the lxm.
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], did);
+        assert_eq!(claims["aud"], aud);
+        assert_eq!(claims["lxm"], "com.atproto.repo.createRecord");
+
+        // The holder's signature verifies over the signing input via the SAME
+        // DER-decode path a receiving peer uses (service_auth::verify_service_jwt
+        // → Signature::from_der). This proves the compact→DER re-encode is
+        // wire-correct and the assembled JWT is verifiable.
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig = Signature::from_der(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap())
+            .expect("signature segment is DER");
+        mock.verifying_key()
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("holder signature verifies against the mock's public key");
+    }
+}
+
+#[cfg(test)]
 mod describe_server_federation_tests {
     use super::*;
 
@@ -1925,5 +2094,124 @@ mod describe_server_federation_tests {
         assert_eq!(v["enabled"], true);
         assert_eq!(v["firehoseEnabled"], true);
         assert_eq!(v["crawlEnabled"], false);
+    }
+}
+
+#[cfg(test)]
+mod create_session_ip_binding_tests {
+    use super::*;
+    use crate::api::federation_peers::test_support::create_test_context_with;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::Json;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    async fn seed_password_account(ctx: &AppContext, did: &str, handle: &str, password: &str) {
+        let hash = crate::auth::PasswordHasher::hash(password).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at, takedown_ref, deactivated_at, delete_after) \
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+        )
+        .bind(did)
+        .bind(handle)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO account (did, email, password_hash, email_confirmed_at, invites_disabled) \
+             VALUES (?1, ?2, ?3, NULL, 0)",
+        )
+        .bind(did)
+        .bind(Some("acct@example.test"))
+        .bind(&hash)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+    }
+
+    // #442 Gate 1 regression: the standard `com.atproto.server.createSession` login
+    // endpoint bypassed IP binding — an admin who opted in but authenticated here
+    // (e.g. a direct XRPC call rather than the admin OAuth/password-login flow) got
+    // an UNBOUND session. It must now bind the minted session to the login IP.
+    #[tokio::test]
+    async fn create_session_binds_to_client_ip_when_enabled() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:createsessbind0000000000";
+        seed_password_account(&ctx, did, "createbind.localhost", "pw-correct").await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO admin_security_config (did, ip_binding_enabled, updated_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(did)
+        .bind(true)
+        .bind(&now)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.44".parse().unwrap());
+        let resp = create_session(
+            State(ctx.clone()),
+            headers,
+            Json(CreateSessionRequest {
+                identifier: "createbind.localhost".to_string(),
+                password: "pw-correct".to_string(),
+            }),
+        )
+        .await
+        .expect("login succeeds and binds");
+        let token = resp.0.access_jwt.clone();
+
+        // Usable only from the bound (X-Forwarded-For) IP.
+        let bound = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(bound))
+            .await
+            .is_ok());
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 44));
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(other))
+            .await
+            .is_err());
+    }
+
+    // No regression for a normal (non-binding) account: createSession still mints
+    // an unbound session usable from any IP.
+    #[tokio::test]
+    async fn create_session_leaves_non_binding_account_unbound() {
+        let ctx = create_test_context_with(|c| c.rate_limit.trust_proxy = true).await;
+        let did = "did:plc:createsessunbound00000000";
+        seed_password_account(&ctx, did, "createunbound.localhost", "pw-correct").await;
+        // No admin_security_config row → binding off.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.45".parse().unwrap());
+        let resp = create_session(
+            State(ctx.clone()),
+            headers,
+            Json(CreateSessionRequest {
+                identifier: "createunbound.localhost".to_string(),
+                password: "pw-correct".to_string(),
+            }),
+        )
+        .await
+        .expect("login succeeds");
+        let token = resp.0.access_jwt.clone();
+        // Usable from an unrelated IP and with no IP — unbound.
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))))
+            .await
+            .is_ok());
+        assert!(ctx
+            .account_manager
+            .validate_access_token_with_ip(&token, None)
+            .await
+            .is_ok());
     }
 }

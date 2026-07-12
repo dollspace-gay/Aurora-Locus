@@ -29,25 +29,44 @@
             </div>
 
             <div class="login-form-container">
-                <form id="login-form" onsubmit="handleLogin(event)">
+                <!-- OAuth is Aurora's default (and only surfaced) admin sign-in.
+                     login.js runs the whole ceremony as a single-page interaction:
+                     on submit it POSTs these credentials to /oauth/atproto/signin
+                     via fetch (establishing the AS browser session), then drives
+                     the OAuth redirect flow — which finds that session and
+                     auto-approves — so the operator never sees the AS signin page.
+                     The form's native `method="POST" action="/admin-oauth/password-login"`
+                     is the JS-off safety net: it keeps credentials in the request
+                     BODY (never a GET URL). Password login is otherwise not
+                     surfaced here; it also lives at /admin/password-login.html. -->
+                <form id="admin-login-form" method="POST" action="/admin-oauth/password-login">
                     <div class="form-group">
-                        <label for="handle">Your Handle (Optional)</label>
+                        <label for="admin-login-identifier">Handle or DID</label>
                         <input
                             type="text"
-                            id="handle"
-                            name="handle"
-                            placeholder="user.bsky.social"
+                            id="admin-login-identifier"
+                            name="identifier"
+                            placeholder="you.example.com"
                             autocomplete="username"
+                            required
                         >
-                        <small class="login-hint">
-                            Leave blank to use default PDS
-                        </small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="admin-login-password">Password</label>
+                        <input
+                            type="password"
+                            id="admin-login-password"
+                            name="password"
+                            autocomplete="current-password"
+                            required
+                        >
                     </div>
 
                     <div id="error-message" class="error-message" style="display: none;"></div>
 
-                    <button type="submit" class="btn-primary" id="login-btn">
-                        <span class="btn-text">Sign in with OAuth</span>
+                    <button type="submit" class="btn-primary" id="oauth-login-btn">
+                        <span class="btn-text">Sign in</span>
                         <span class="btn-spinner" style="display: none;">
                             <svg class="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                                 <circle cx="12" cy="12" r="10" stroke-width="4" stroke-opacity="0.25"/>

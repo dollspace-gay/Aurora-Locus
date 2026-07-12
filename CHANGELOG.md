@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-12
+
+### Added
+
+- Account holders get a self-service portal to sign in and manage their own account: home page, sign-in methods, connected apps, registered devices, personal theme, and sign-out
+- Account holders can sign in three ways: password (Argon2id), cryptographic key sign-in (proves control of the account's published key via a signed challenge, no server-stored secret, on by default, disable with `PDS_HOLDER_LOGIN_ALPHA_ENABLED=false`), and passkeys (WebAuthn). The portal refuses to remove a holder's last remaining sign-in method
+- Account holders can review and revoke their connected OAuth applications and registered devices; revoking a device also revokes the tokens bound to it
+- atproto OAuth provider — third-party applications sign in as account holders through `/oauth/atproto/*` with DPoP-bound tokens. Admin scope is never granted to an OAuth bearer
+- did:web accounts are now first-class alongside did:plc — the PDS classifies the DID method, stores did:web accounts locally, and serves each account's DID document with `alsoKnownAs` composed from the handle
+- did:web accounts whose atproto key the PDS holds sign repo commits and service-auth JWTs identically to did:plc; app passwords work on the same terms. Holder-mediated signing (did:web sovereignty) lands in v0.11 alongside the did:web account-creation route
+- Password-based admin login coexists with admin OAuth for operators who administer their own PDS, gated by `PDS_ADMIN_PASSWORD_LOGIN_ENABLED` (off by default)
+
+### Changed
+
+- Admin login now runs on Aurora's own OAuth authorization server and client end-to-end. The operator sees one page, one field, and one Sign in button; the authorization ceremony happens invisibly on the loopback path
+- Admin and superadmin roles are now constrained to local accounts — admin trust is a claim about accounts the operator provably controls
+- `install.sh` has been rewritten, verified across multiple Linux distributions (Rocky, Alma, Arch) via containerized smoke tests, and brought to native-install parity with docker-compose. The generated `.env` derives line-for-line from `.env.example` (making phantom or broken config vars structurally impossible), a Rust toolchain bootstraps via rustup, the script composes the deployment's public URL into `PDS_SERVICE_PUBLIC_URL` so a federated did.json advertises the reachable URL, and it offers to configure a TLS-terminating reverse proxy
+- `create-account.sh` uses `PDS_SERVICE_PUBLIC_URL` when set, adds curl timeouts, accepts the admin prompt case-insensitively, and corrects its printed admin-grant instructions (the right database path and the `admin_roles` table)
+- The Docker path is at v0.10 parity: `.dockerignore`, updated builder image, persistent data volume, readiness health check, and an automatic-TLS Caddy sidecar
+- The admin Installed Themes gallery is now the single theme surface, carrying both the per-operator personal theme and the superadmin deployment default within one card
+- `PDS_JWT_SUNSET_DATE` and `PDS_OAUTH_MIGRATION_GUIDE_URL` are now operator-tunable; previously the JWT sunset silently recomputed to "now + 90 days" on every boot
+
+### Removed
+
+- The dormant legacy OAuth surface at `/oauth/*` is retired — superseded by the atproto OAuth provider at `/oauth/atproto/*`. Legacy database tables are left dormant in-schema and dropped in a future version; clients on the legacy flow migrate to atproto OAuth
+
+### Security
+
+- Admin sessions now carry a task-time lifetime per role (SuperAdmin 15 minutes, Admin 30 minutes, Moderator 1 hour, with a per-account override inside sane bounds) that slides forward on activity and lapses on idle. The admin UI refreshes proactively before expiry
+- Admin hardening endpoints (session lifetime, TOTP enroll/confirm/disable, IP binding) require a recently-authenticated session (within five minutes) and fail closed when session freshness can't be established
+- TOTP two-factor authentication for admins, self-service, with the secret encrypted at rest under AES-256-GCM (keyed by `PDS_ADMIN_TOTP_ENCRYPTION_KEY_HEX`). Enforced at login on both the password and OAuth paths
+- Admin login credentials are submitted by POST and never appear in a URL, browser history, or access log. Admin HTML and static assets are served `no-store`, so a stale cached page can't strand a shipped security fix
+- Admin session IP binding ships as substrate only; the operator enable path is gated off until v0.11. Live testing behind a CDN showed the client IP resolved at login can differ from the IP seen on later requests, which would reject an operator's own traffic. Reliable enforcement lands with a single per-request layer in a future version
+
+### Fixed
+
+- Account creation against a live PLC directory now succeeds — the genesis operation serializes `prev` as an explicit `null` and the DID suffix is derived from the signed operation's canonical CBOR, so the DID this PDS registers matches the one PLC recomputes. Together these clear the rejections that had blocked did:plc account creation on production PLC
+- OAuth bearer tokens issued by the atproto provider now validate — tokens are stored and looked up by SHA-256 hash instead of a mismatched identifier
+- The admin UI no longer flashes the wrong theme (FOUC): active-theme CSS routes are served `no-store`, the post-login transition screen inherits the shared token layer, and a live theme swap loads the new theme before dropping the old one
+- The admin session's access-token expiry now tracks the session's actual lifetime instead of a hardcoded hour, so the proactive-refresh timer fires on schedule
+- `install.sh` is marked executable in git — a fresh clone can `./install.sh` without a manual `chmod +x` first
+
+### Dependencies
+
+- `dotenv` (unmaintained, RUSTSEC-2021-0141) replaced with its maintained fork `dotenvy` — identical API, already present transitively
+- `webauthn-rs` added for account-holder passkey support; a vendored `@noble/secp256k1` browser module backs in-browser cryptographic-key sign-in
+
 ## [0.9.0] - 2026-06-28
 
 ### Added

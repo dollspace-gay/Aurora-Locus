@@ -1825,7 +1825,7 @@ impl RepositoryManager {
             None
         }
         .or_else(|| {
-            if self.did.starts_with("did:web:") {
+            if crate::identity::did_method::is_web(&self.did) {
                 self.did.strip_prefix("did:web:").map(|s| s.to_string())
             } else {
                 None

@@ -1,27 +1,63 @@
-version: '3.8'
+# Aurora Locus PDS + Caddy TLS-terminating reverse proxy.
+#
+# NOTE (housekeeping #421 B.6): the previous compose set env vars the app never
+# reads (`HOSTNAME`/`PORT`/`SERVICE_DID`/`DATABASE_URL` — the app reads `PDS_*`,
+# so it silently ran on defaults), used a nonexistent health path
+# (`/xrpc/_health`) via a curl the runtime image lacked, and shipped no TLS.
+# This wires the app's real config surface + a Caddy sidecar that auto-provisions
+# a Let's Encrypt certificate for $AURORA_DOMAIN. Point your domain at the VPS,
+# set AURORA_DOMAIN (and the rest of .env, esp. PDS_HOSTNAME = your domain), and
+# `docker compose up` — TLS is automatic.
 
 services:
   aurora-locus:
     build: .
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./data:/data
-      - ./config:/config
+    # PDS_* configuration comes from .env (copy .env.example). PDS_HOSTNAME
+    # should equal your public domain; PDS_DATA_DIRECTORY is fixed to the volume.
+    env_file:
+      - .env
     environment:
-      - RUST_LOG=info
-      - DATABASE_URL=sqlite:///data/aurora-locus.db
-      - HOSTNAME=localhost
-      - PORT=3000
-      - SERVICE_DID=did:web:localhost
+      - PDS_DATA_DIRECTORY=/data
+    volumes:
+      - aurora-data:/data
+    # Internal only — Caddy terminates TLS and proxies to this. Not published to
+    # the host.
+    expose:
+      - "2583"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/xrpc/_health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:2583/health/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - aurora
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - aurora-locus
+    # Caddy answers the ACME HTTP-01 challenge on 80 and serves HTTPS on 443.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # The public domain Caddy provisions a cert for and routes. Must resolve
+      # to this host (A/AAAA record) for the Let's Encrypt challenge to pass.
+      - AURORA_DOMAIN=${AURORA_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    networks:
+      - aurora
+
+networks:
+  aurora:
 
 volumes:
-  data:
-  config:
+  aurora-data:
+  caddy-data:
+  caddy-config:

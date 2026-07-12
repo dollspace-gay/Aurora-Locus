@@ -312,23 +312,10 @@ fn row_to_authorization_request(
     })
 }
 
-/// JSON-encode an `AuthorizationRequestData` for the trait's
-/// `value: &[u8]` parameter. Exposed for callers that need to
-/// build the bytes before the trait call.
-pub fn encode_request_data(data: &AuthorizationRequestData) -> Vec<u8> {
-    // serialize_with cannot fail for this struct — all fields
-    // are `String`/`Option<String>` (no Map<NonString, _>, no
-    // f32/f64 that could be NaN). Unwrap is therefore safe.
-    serde_json::to_vec(data).expect("AuthorizationRequestData JSON serialization cannot fail")
-}
-
-/// Decode the trait's `value: Vec<u8>` from a successful
-/// `get("oauth_flow_state", _)` back into the typed
-/// `AuthorizationRequest`. Symmetric with the adapter's
-/// internal `serde_json::to_vec(&request)` on the read path.
-pub fn decode_request(bytes: &[u8]) -> Result<AuthorizationRequest, serde_json::Error> {
-    serde_json::from_slice(bytes)
-}
+// (The `encode_request_data` / `decode_request` external-caller convenience
+// helpers were retired in Phase ζ with the legacy `/oauth/*` provider that used
+// them — the adapter's own put/get path serializes AuthorizationRequest[Data]
+// directly.)
 
 #[cfg(test)]
 mod tests {
@@ -393,7 +380,7 @@ mod tests {
     }
 
     fn sample_value() -> Vec<u8> {
-        encode_request_data(&sample_data())
+        serde_json::to_vec(&sample_data()).unwrap()
     }
 
     fn lease_in_future() -> Lease {
@@ -474,7 +461,7 @@ mod tests {
             .await
             .unwrap()
             .expect("row present");
-        let request = decode_request(&bytes).unwrap();
+        let request = serde_json::from_slice::<AuthorizationRequest>(&bytes).unwrap();
         assert_eq!(request.request_id, "req-get");
         assert_eq!(request.did, "did:web:alice.example.com");
         assert!(request.authorization_code.is_none());
@@ -639,15 +626,5 @@ mod tests {
         ));
     }
 
-    // ---------- round-trip encode/decode ----------
-
-    #[test]
-    fn encode_decode_request_data_round_trip() {
-        let data = sample_data();
-        let bytes = encode_request_data(&data);
-        let decoded: AuthorizationRequestData = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded.did, data.did);
-        assert_eq!(decoded.state.as_deref(), Some("client-csrf-state"));
-    }
 }
 

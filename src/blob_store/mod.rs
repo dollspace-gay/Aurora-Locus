@@ -59,7 +59,6 @@ pub struct BlobListEntry {
 #[async_trait]
 pub trait BlobBackend: Send + Sync {
     /// Store a blob and return its CID
-    #[allow(dead_code)] // Trait methods for future blob backends
     async fn put(&self, cid: &str, data: Vec<u8>, mime_type: &str) -> PdsResult<()>;
 
     /// Retrieve a blob by CID

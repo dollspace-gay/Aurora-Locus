@@ -22,8 +22,10 @@
 //!
 //! See `docs/internal/dev-routes.md` for curl examples and a
 //! typical workflow.
-
-#![cfg(debug_assertions)]
+//!
+//! This whole module is debug-only; the gate lives on the `pub mod dev_routes`
+//! declaration in `api/mod.rs` (`#[cfg(debug_assertions)]`), so no inner
+//! `#![cfg(debug_assertions)]` is needed here (it would duplicate that gate).
 
 use axum::{
     extract::State,
@@ -548,6 +550,7 @@ async fn fed_mint_service_token(
 ) -> Result<Json<FedMintServiceTokenResponse>, (StatusCode, String)> {
     let headers = crate::federation::entryway_auth_headers(
         &ctx.account_db,
+        ctx.holder_signing_channel.as_ref(),
         &body.user_did,
         &body.aud,
         &body.lxm,
@@ -644,6 +647,7 @@ async fn fed_simulate_forward(
         let synthetic_aud = format!("did:web:{}", host_from_url(&body.stub_url));
         crate::federation::entryway_auth_headers(
             &ctx.account_db,
+            ctx.holder_signing_channel.as_ref(),
             user_did,
             &synthetic_aud,
             &body.nsid,
@@ -752,7 +756,7 @@ async fn tombstone_did(
     use crate::crypto::plc::{compute_op_cid, register_plc_did, PlcOperation, PlcSigner, PlcTombstone};
     use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
 
-    if !body.did.starts_with("did:plc:") {
+    if !crate::identity::did_method::is_plc(&body.did) {
         return Err(http_error(PdsError::Validation(
             "Only did:plc identifiers support PLC tombstone".to_string(),
         )));
