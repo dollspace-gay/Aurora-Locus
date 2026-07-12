@@ -4654,10 +4654,20 @@ pub async fn serve_active_theme_css(
     let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_token_css(&id).unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -4666,7 +4676,7 @@ pub async fn serve_active_theme_css(
 /// (runtime row → file tier → compiled default `aurora-classic`). Used by the
 /// unauthenticated active-theme serve routes when no `?id` is given; never
 /// errors — falls back to the inheritance root on any DB error.
-async fn deployment_default_theme(ctx: &AppContext) -> String {
+pub(crate) async fn deployment_default_theme(ctx: &AppContext) -> String {
     use sqlx::Row as _;
     let from_runtime = sqlx::query("SELECT value FROM runtime_settings WHERE key = $1")
         .bind(THEME_DEPLOYMENT_DEFAULT_KEY)
@@ -4762,10 +4772,20 @@ pub async fn serve_active_theme_effects_css(
     let id = resolve_active_theme_id(&ctx, &params).await;
     let css = ctx.theme_registry.resolve_effect_css(&id).unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -4784,10 +4804,20 @@ pub async fn serve_active_theme_extensions_css(
         .resolve_extension_css(&id)
         .unwrap_or_default();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/css; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/css; charset=utf-8",
+            ),
+            // no-store: the no-`?id` response is the deployment-default theme,
+            // which changes over time. A cached copy paints the PREVIOUS theme
+            // for a frame on the next navigation / theme switch (the FOUC in
+            // chainlink #441) — every surface that loads `/theme/active.css`
+            // without a cache-bust (notably the server-rendered transition
+            // screen) served the stale cached theme. Mirrors the admin-static
+            // no-store class (#436).
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         css,
     )
 }
@@ -6541,6 +6571,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(markers, 1, "sibling marker committed atomically");
+    }
+
+    #[tokio::test]
+    async fn active_theme_css_is_served_no_store() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        // The no-`?id` response is the deployment-default theme, which changes;
+        // no-store keeps every surface (esp. the server-rendered transition
+        // screen) from painting a stale cached theme (chainlink #441).
+        let ctx = create_test_context().await;
+        let resp = serve_active_theme_css(State(ctx.clone()), Query(ActiveThemeParams { id: None }))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "/theme/active.css must be no-store"
+        );
     }
 
     #[tokio::test]

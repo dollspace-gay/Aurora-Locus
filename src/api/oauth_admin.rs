@@ -730,11 +730,26 @@ async fn handle_oauth_callback(
     // request-auth path validates), rejecting non-local DIDs and non-admins.
     let (access_token, refresh_token, role) = authorize_local_admin(&ctx, &did).await?;
 
+    // Resolve the deployment-default theme's token CSS to inline into the
+    // transition screen (chainlink #441), so it paints the right theme instantly
+    // instead of fetching /theme/active.css (which lagged and, uncached, served a
+    // stale theme).
+    let theme_id = crate::api::aurora_admin::deployment_default_theme(&ctx).await;
+    let theme_css = ctx.theme_registry.resolve_token_css(&theme_id).unwrap_or_default();
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Login Successful</title>
+    <!-- Theme this transition screen with the SAME token layer as the login page
+         and admin UI: the base alias tokens (static), then the deployment-default
+         theme's resolved `:root` overrides INLINED below. Inlining — rather than
+         linking /theme/active.css — means the correct theme paints from the first
+         byte: no fetch to lag behind the 500ms redirect, and no stale cached
+         theme to flash (chainlink #441). -->
+    <link rel="stylesheet" href="/admin/styles/tokens.css">
+    <style>{theme_css}</style>
     <style>
         body {{
             font-family: system-ui, -apple-system, sans-serif;
@@ -743,8 +758,8 @@ async fn handle_oauth_callback(
             align-items: center;
             height: 100vh;
             margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: var(--color-surface-primary);
+            color: var(--color-text-primary);
         }}
         .container {{
             text-align: center;
@@ -753,8 +768,8 @@ async fn handle_oauth_callback(
         .spinner {{
             width: 48px;
             height: 48px;
-            border: 4px solid rgba(255,255,255,0.3);
-            border-top-color: white;
+            border: 4px solid var(--color-surface-tertiary);
+            border-top-color: var(--color-accent-primary);
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             margin: 0 auto 1rem;
@@ -789,7 +804,8 @@ async fn handle_oauth_callback(
         serde_json::to_string(&access_token).unwrap(),
         serde_json::to_string(&refresh_token).unwrap(),
         serde_json::to_string(&did).unwrap(),
-        serde_json::to_string(&role).unwrap()
+        serde_json::to_string(&role).unwrap(),
+        theme_css = theme_css,
     );
 
     Ok(axum::response::Html(html))
@@ -1494,6 +1510,25 @@ mod tests {
             .expect("minted session token must validate");
         assert_eq!(validated.did, did);
         assert!(html.contains("superadmin"));
+
+        // The transition screen is themed with the shared token layer (chainlink
+        // #440/#441): the base alias tokens load statically and the theme is
+        // INLINED, so there is no /theme/active.css fetch to lag or serve a stale
+        // cached theme — and never the old hardcoded off-brand gradient.
+        assert!(
+            html.contains(r#"href="/admin/styles/tokens.css""#),
+            "base token layer must load"
+        );
+        assert!(
+            !html.contains(r#"href="/theme/active.css""#),
+            "the FOUC-prone dynamic theme link must be gone (inlined instead)"
+        );
+        assert!(html.contains("var(--color-surface-primary)"));
+        assert!(html.contains("var(--color-accent-primary)"));
+        assert!(
+            !html.contains("667eea") && !html.contains("764ba2"),
+            "the hardcoded off-brand gradient must be gone"
+        );
 
         let _ = shutdown.send(());
     }
