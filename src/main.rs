@@ -59,6 +59,24 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> PdsResult<()> {
+    // Select the rustls process-level crypto provider before anything can
+    // negotiate TLS.
+    //
+    // Cargo feature unification leaves rustls 0.23 with BOTH `ring` (via
+    // our outbound-WS stack) and `aws_lc_rs` (via the AWS SDK) enabled.
+    // rustls refuses to guess between two providers: its
+    // `from_crate_features` returns `None` when both are on, and the
+    // lazy `get_default_or_install_from_crate_features` path then
+    // *panics* on first use. Installing explicitly here converts that
+    // latent panic into a deterministic startup choice. `ring` matches
+    // what the WS client stack specifies and needs no C toolchain.
+    //
+    // A second install (lost race or duplicate call) returns `Err`; the
+    // provider is already in place either way, so it is not fatal. This
+    // runs before tracing is initialised, so the outcome is deliberately
+    // not logged — there is no subscriber to receive it yet.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize logging with JSON support
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
 

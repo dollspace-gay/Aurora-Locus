@@ -119,8 +119,26 @@ reqwest = { version = "0.12", features = ["json"] }
 # constructor note in src/federation/dns_resolver.rs.
 hickory-resolver = "0.26.1"
 
-# WebSocket for relay support
-tokio-tungstenite = "0.27"
+# WebSocket for relay support.
+#
+# `rustls-tls-webpki-roots` is REQUIRED, not optional: the default feature
+# set is `["connect", "handshake"]`, which compiles no TLS backend at all.
+# Without it `connect_async` on any `wss://` URL fails at URL-parse time
+# with `UrlError::TlsFeatureNotEnabled` ("TLS support not compiled in") —
+# every outbound relay connection, `bsky.network` included. Rustls with
+# bundled webpki roots rather than `native-tls` so this path adds no
+# openssl system-library requirement of its own (openssl still enters the
+# graph via `lettre`, `webauthn-rs`, and `reqwest`/`hyper-tls`).
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+
+# Direct dep solely to install the process-level crypto provider in
+# `main`. Feature unification leaves rustls with both `ring` and
+# `aws_lc_rs` enabled (our WS stack and the AWS SDK respectively), which
+# makes rustls' lazy provider auto-selection panic on first TLS use; the
+# explicit `install_default` call in `main` resolves it. `default-features
+# = false` because the provider features arrive through unification — this
+# dep contributes only API access, not a backend choice.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 
 # URL encoding for search
