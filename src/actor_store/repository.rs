@@ -1703,46 +1703,168 @@ impl RepositoryManager {
         Ok((uri, commit_cid, rev))
     }
 
-    /// Update a record
-    pub async fn update_record(
+    /// Upsert a record (`com.atproto.repo.putRecord` semantics).
+    ///
+    /// putRecord is an upsert, not an update: a record that does not yet
+    /// exist at `(collection, rkey)` is **created**. Dispatching every
+    /// putRecord unconditionally into an `Update` write is what made
+    /// first-publish fail — proto-blue's MST rejects a `RepoWrite::Update`
+    /// whose key is absent with `RepoError::KeyNotFound`, which the commit
+    /// path wraps as `PdsError::Internal` (HTTP 500) rather than treating
+    /// as the ordinary "nothing there yet" case (#449). The former
+    /// update-only `update_record` helper this replaced is gone; it had no
+    /// remaining callers once the upsert branch landed.
+    ///
+    /// The four-way branch:
+    ///
+    /// | existing record | `swap_cid` | outcome |
+    /// |---|---|---|
+    /// | absent | `None` | create |
+    /// | absent | `Some(_)` | `PdsError::NotFound` (404) |
+    /// | present | `None` | update |
+    /// | present | `Some(_)` | update, gated on the CAS |
+    ///
+    /// The swap comparison itself is **not** reimplemented here. Both
+    /// swap-carrying arms route through [`Self::apply_batch_writes`], whose
+    /// `validate_batch` step owns the optimistic-concurrency check and
+    /// raises `PdsError::SwapCidMismatch` (409) or `PdsError::NotFound`
+    /// (404). Keeping one comparison site means putRecord and applyWrites
+    /// cannot drift apart on precondition semantics.
+    ///
+    /// Returns `(commit_cid, rev)` for the update arms and the record CID
+    /// for the create arm — see the return-value note below.
+    ///
+    /// # Errors
+    ///
+    /// - `PdsError::NotFound` — a `swap_cid` was supplied for a record that
+    ///   does not exist (the precondition cannot hold).
+    /// - `PdsError::SwapCidMismatch` — the record exists but its current
+    ///   CID differs from `swap_cid` (a concurrent write moved it).
+    /// - Anything [`Self::apply_writes`] surfaces (validation, blob STRICT,
+    ///   commit, or database failures).
+    pub async fn put_record(
         &self,
         collection: &str,
         rkey: &str,
         value: serde_json::Value,
         validate: Option<bool>,
+        swap_cid: Option<String>,
         signer: Arc<dyn Signer>,
     ) -> PdsResult<(String, String)> {
-        let writes = vec![WriteOp {
-            action: WriteOpAction::Update,
+        use crate::actor_store::models::{
+            PreparedWrite, WriteOpAction as ModelAction,
+        };
+
+        let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
+        let existing = self.store.get_record(&self.did, &uri).await?;
+
+        // A swap precondition against a record that was never there can
+        // never hold. Surface it as the same 404 `validate_batch` raises for
+        // the equivalent applyWrites op rather than letting the create arm
+        // silently ignore the caller's precondition.
+        if existing.is_none() {
+            if swap_cid.is_some() {
+                return Err(PdsError::NotFound(format!(
+                    "Cannot swap CID - record not found: {}/{}",
+                    collection, rkey
+                )));
+            }
+
+            // Create arm. `create_record` generates an rkey when passed
+            // `None`; putRecord always addresses an explicit rkey, so pin it.
+            let (_uri, commit_cid, rev) = self
+                .create_record(collection, Some(rkey), value, validate, signer)
+                .await?;
+            return Ok((commit_cid, rev));
+        }
+
+        // Update arm. Route through `apply_batch_writes` so `validate_batch`
+        // performs the swap CAS when `swap_cid` is present; with `None` it is
+        // a plain update and the CAS block is skipped entirely.
+        let writes = vec![PreparedWrite {
+            action: ModelAction::Update,
             collection: collection.to_string(),
             rkey: rkey.to_string(),
-            value: Some(value),
+            record: Some(value),
+            swap_cid,
             validate,
-            swap_cid: None,
-            kryphocron_authorization: None,
         }];
 
-        self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
+        self.apply_batch_writes(writes, signer).await
     }
 
-    /// Delete a record
+    /// Delete a record (`com.atproto.repo.deleteRecord` semantics).
+    ///
+    /// deleteRecord is **idempotent**: deleting a record that is not there
+    /// is a success, not an error. Dispatching unconditionally into the
+    /// commit path violated that — proto-blue's MST returns
+    /// `RepoError::KeyNotFound` when the key is absent
+    /// (`mst/node.rs::delete`), which the commit path wraps as
+    /// `PdsError::Internal` (HTTP 500). Same mismap class as the putRecord
+    /// create-path bug (#449/#450).
+    ///
+    /// The three arms:
+    ///
+    /// | existing record | `swap_cid` | outcome |
+    /// |---|---|---|
+    /// | absent | `None` | no-op success (idempotent) |
+    /// | absent | `Some(_)` | `PdsError::NotFound` (404) |
+    /// | present | any | delete, gated on the CAS when `swap_cid` is set |
+    ///
+    /// As in [`Self::put_record`], the swap comparison is not
+    /// reimplemented: the delete routes through
+    /// [`Self::apply_batch_writes`] so `validate_batch` remains the one
+    /// place optimistic concurrency is evaluated.
+    ///
+    /// # Returns
+    ///
+    /// `(commit_cid, rev)` when a commit happened. The idempotent no-op arm
+    /// has no commit to report, so it returns `Ok(None)` — callers that
+    /// need a rev should treat `None` as "already absent, repo unchanged".
+    ///
+    /// # Errors
+    ///
+    /// - `PdsError::NotFound` — a `swap_cid` was supplied for a record that
+    ///   does not exist (the precondition cannot hold).
+    /// - `PdsError::SwapCidMismatch` — the record exists but its current
+    ///   CID differs from `swap_cid`.
+    /// - Anything [`Self::apply_writes`] surfaces.
     pub async fn delete_record(
         &self,
         collection: &str,
         rkey: &str,
+        swap_cid: Option<String>,
         signer: Arc<dyn Signer>,
-    ) -> PdsResult<(String, String)> {
-        let writes = vec![WriteOp {
-            action: WriteOpAction::Delete,
+    ) -> PdsResult<Option<(String, String)>> {
+        use crate::actor_store::models::{PreparedWrite, WriteOpAction as ModelAction};
+
+        let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
+
+        if self.store.get_record(&self.did, &uri).await?.is_none() {
+            // A swap precondition against an absent record cannot hold —
+            // surface it rather than reporting a vacuous success.
+            if swap_cid.is_some() {
+                return Err(PdsError::NotFound(format!(
+                    "Cannot swap CID - record not found: {}/{}",
+                    collection, rkey
+                )));
+            }
+
+            // Idempotent no-op. Previously this reached the MST and came
+            // back as a 500.
+            return Ok(None);
+        }
+
+        let writes = vec![PreparedWrite {
+            action: ModelAction::Delete,
             collection: collection.to_string(),
             rkey: rkey.to_string(),
-            value: None,
+            record: None,
+            swap_cid,
             validate: None,
-            swap_cid: None,
-            kryphocron_authorization: None,
         }];
 
-        self.apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter)).await
+        self.apply_batch_writes(writes, signer).await.map(Some)
     }
 
     /// Get a record by AT-URI
@@ -2122,6 +2244,418 @@ mod tests {
         assert!(uri.starts_with(&format!("at://{}/app.bsky.feed.post/", did)));
         assert!(!cid.is_empty());
         assert!(!rev.is_empty());
+    }
+
+    // ---- #449 — putRecord upsert semantics ----
+    //
+    // Four arms, one test each, covering the table in `put_record`'s
+    // rustdoc. The absent+no-swap arm is the regression guard: it used
+    // to reach proto-blue as a `RepoWrite::Update` on a missing MST key
+    // and surface as `PdsError::Internal` (HTTP 500).
+
+    /// Absent record, no swap → create (was: 500 `Internal` via
+    /// `RepoError::KeyNotFound`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_creates_when_absent() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        let result = repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "first publish"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "put_record on an absent record must create it, got: {:?}",
+            result.err()
+        );
+
+        // The record is really in the repo with the submitted body, not
+        // just a clean return value.
+        let uri = format!("at://{}/app.bsky.labeler.service/self", did);
+        let fetched = repo_mgr
+            .get_record(&uri)
+            .await
+            .unwrap()
+            .expect("created record must be readable back");
+        assert_eq!(
+            record_text(&fetched),
+            Some("first publish"),
+            "created record must carry the submitted body"
+        );
+    }
+
+    /// Absent record, swap supplied → `NotFound`. The precondition
+    /// cannot hold, so the create arm must not silently ignore it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_absent_with_swap_is_not_found() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        let result = repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "should not land"}),
+                None,
+                Some("bafyreibogusswapcidthatmatchesnothing".to_string()),
+                test_signer(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(PdsError::NotFound(_))),
+            "swap against an absent record must be NotFound, got: {:?}",
+            result
+        );
+
+        // Nothing was written on the rejected path.
+        let uri = format!("at://{}/app.bsky.labeler.service/self", did);
+        assert!(
+            repo_mgr.get_record(&uri).await.unwrap().is_none(),
+            "rejected swap must not create the record"
+        );
+    }
+
+    /// Present record, no swap → update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_updates_when_present() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "v1"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("initial create");
+
+        repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "v2"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("update over the existing record");
+
+        let uri = format!("at://{}/app.bsky.labeler.service/self", did);
+        let fetched = repo_mgr.get_record(&uri).await.unwrap().unwrap();
+        assert_eq!(
+            record_text(&fetched),
+            Some("v2"),
+            "update must replace the record body"
+        );
+    }
+
+    /// Present record, mismatched swap → `SwapCidMismatch`, and the
+    /// stored body is untouched. Before #449 the swap was inert and
+    /// this overwrote the record silently (lost update).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_present_with_mismatched_swap_is_conflict() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "v1"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("initial create");
+
+        let result = repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "clobbered"}),
+                None,
+                Some("bafyreibogusswapcidthatmatchesnothing".to_string()),
+                test_signer(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(PdsError::SwapCidMismatch(_))),
+            "mismatched swap must be SwapCidMismatch, got: {:?}",
+            result
+        );
+
+        // The silent-lost-update guard: the original body survived.
+        let uri = format!("at://{}/app.bsky.labeler.service/self", did);
+        let fetched = repo_mgr.get_record(&uri).await.unwrap().unwrap();
+        assert_eq!(
+            record_text(&fetched),
+            Some("v1"),
+            "a failed swap precondition must NOT overwrite the record"
+        );
+    }
+
+    /// Present record, matching swap → update succeeds. Pairs with the
+    /// mismatch test to show the CAS accepts as well as rejects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_record_present_with_matching_swap_updates() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "v1"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("initial create");
+
+        // The CAS compares against the *record* CID as stored in the
+        // per-record metadata table, which is what a client reads back
+        // from getRecord — not the commit CID put_record returns.
+        let uri = format!("at://{}/app.bsky.labeler.service/self", did);
+        let current_cid = store_record_cid(&repo_mgr, &uri).await;
+
+        repo_mgr
+            .put_record(
+                "app.bsky.labeler.service",
+                "self",
+                serde_json::json!({"text": "v2"}),
+                None,
+                Some(current_cid),
+                test_signer(),
+            )
+            .await
+            .expect("matching swap must be accepted");
+
+        let fetched = repo_mgr.get_record(&uri).await.unwrap().unwrap();
+        assert_eq!(
+            record_text(&fetched),
+            Some("v2"),
+            "accepted swap must apply the update"
+        );
+    }
+
+    // ---- #450 — deleteRecord idempotence + swap preconditions ----
+
+    /// Absent record, no swap → idempotent no-op success (was: 500
+    /// `Internal` via `RepoError::KeyNotFound` from the MST delete).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_absent_is_idempotent_noop() {
+        let (store, _tmp) = test_store();
+        let repo_mgr = RepositoryManager::new(unique_did(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        let result = repo_mgr
+            .delete_record("app.bsky.feed.post", "never-existed", None, test_signer())
+            .await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "deleting an absent record must be an idempotent no-op, got: {:?}",
+            result
+        );
+    }
+
+    /// Absent record, swap supplied → `NotFound`. The precondition cannot
+    /// hold, so idempotence must not swallow it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_absent_with_swap_is_not_found() {
+        let (store, _tmp) = test_store();
+        let repo_mgr = RepositoryManager::new(unique_did(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        let result = repo_mgr
+            .delete_record(
+                "app.bsky.feed.post",
+                "never-existed",
+                Some("bafyreibogusswapcidthatmatchesnothing".to_string()),
+                test_signer(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(PdsError::NotFound(_))),
+            "swap against an absent record must be NotFound, got: {:?}",
+            result
+        );
+    }
+
+    /// Present record, no swap → deleted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_present_deletes() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.feed.post",
+                "doomed",
+                serde_json::json!({"text": "delete me"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("seed the record");
+
+        let result = repo_mgr
+            .delete_record("app.bsky.feed.post", "doomed", None, test_signer())
+            .await;
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "deleting a present record must commit, got: {:?}",
+            result
+        );
+
+        let uri = format!("at://{}/app.bsky.feed.post/doomed", did);
+        assert!(
+            repo_mgr.get_record(&uri).await.unwrap().is_none(),
+            "record must be gone after delete"
+        );
+    }
+
+    /// Present record, mismatched swap → `SwapCidMismatch`, and the record
+    /// SURVIVES. Before #450 the swap was inert and this deleted the
+    /// record anyway — a silent lost delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_mismatched_swap_is_conflict_and_preserves() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.feed.post",
+                "survivor",
+                serde_json::json!({"text": "keep me"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("seed the record");
+
+        let result = repo_mgr
+            .delete_record(
+                "app.bsky.feed.post",
+                "survivor",
+                Some("bafyreibogusswapcidthatmatchesnothing".to_string()),
+                test_signer(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(PdsError::SwapCidMismatch(_))),
+            "mismatched swap must be SwapCidMismatch, got: {:?}",
+            result
+        );
+
+        // The silent-lost-delete guard.
+        let uri = format!("at://{}/app.bsky.feed.post/survivor", did);
+        let fetched = repo_mgr
+            .get_record(&uri)
+            .await
+            .unwrap()
+            .expect("a failed swap precondition must NOT delete the record");
+        assert_eq!(
+            record_text(&fetched),
+            Some("keep me"),
+            "the surviving record must be unchanged"
+        );
+    }
+
+    /// Present record, matching swap → deleted. Pairs with the mismatch
+    /// test to show the CAS accepts as well as rejects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_record_matching_swap_deletes() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+
+        repo_mgr
+            .put_record(
+                "app.bsky.feed.post",
+                "pinned",
+                serde_json::json!({"text": "delete with pin"}),
+                None,
+                None,
+                test_signer(),
+            )
+            .await
+            .expect("seed the record");
+
+        let uri = format!("at://{}/app.bsky.feed.post/pinned", did);
+        let current_cid = store_record_cid(&repo_mgr, &uri).await;
+
+        repo_mgr
+            .delete_record(
+                "app.bsky.feed.post",
+                "pinned",
+                Some(current_cid),
+                test_signer(),
+            )
+            .await
+            .expect("matching swap must be accepted");
+
+        assert!(
+            repo_mgr.get_record(&uri).await.unwrap().is_none(),
+            "record must be gone after a pinned delete"
+        );
+    }
+
+    /// Pull the record body's `text` field out of `get_record`'s response.
+    ///
+    /// `get_record` returns a `{uri, cid, value}` envelope, not the bare
+    /// record — the body lives under `value`. Reading `text` off the top
+    /// level yields `None` for every record and would make these
+    /// assertions vacuous.
+    fn record_text(fetched: &serde_json::Value) -> Option<&str> {
+        fetched.get("value")?.get("text")?.as_str()
+    }
+
+    /// Read the record-level CID the swap CAS compares against.
+    async fn store_record_cid(repo_mgr: &RepositoryManager, uri: &str) -> String {
+        repo_mgr
+            .store
+            .get_record(&repo_mgr.did, uri)
+            .await
+            .expect("store lookup")
+            .expect("record present")
+            .cid
     }
 
     #[tokio::test(flavor = "multi_thread")]

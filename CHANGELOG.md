@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-27
+
+### Fixed
+
+- `com.atproto.repo.putRecord` correctly creates records that don't exist yet, and correctly rejects updates when the `swapRecord` precondition fails (previously returned 500 on first-publish, and silently overwrote records when `swapRecord` was mismatched)
+- `com.atproto.repo.deleteRecord` treats deleting an already-absent record as the idempotent success it is, and correctly rejects deletes when the `swapRecord` precondition fails (previously returned 500 for an absent record, and silently deleted records when `swapRecord` was mismatched)
+- Outbound HTTPS/WSS calls now succeed reliably (previously failed with "TLS support not compiled in" — federation relay, external DID resolution, and cross-PDS calls affected)
+
 ## [0.10.0] - 2026-07-12
 
 ### Added

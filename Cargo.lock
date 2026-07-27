@@ -346,6 +346,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "rustls 0.23.34",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -6381,8 +6382,12 @@ checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.34",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite 0.27.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -6665,6 +6670,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
+ "rustls 0.23.34",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.17",
  "utf-8",
@@ -7159,6 +7166,24 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

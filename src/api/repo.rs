@@ -65,12 +65,13 @@ struct PutRecordRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     validate: Option<bool>,
     record: serde_json::Value,
+    /// Record-level optimistic-concurrency precondition: the CID the
+    /// caller believes is currently at `(collection, rkey)`. Enforced by
+    /// `RepositoryManager::put_record` via the substrate's CAS —
+    /// a mismatch is `SwapCidMismatch` (409), and supplying it for a
+    /// record that does not exist is `NotFound` (404).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_record: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
-    swap_commit: Option<String>,
 }
 
 /// Response from updating a record
@@ -88,12 +89,13 @@ struct DeleteRecordRequest {
     repo: String,
     collection: String,
     rkey: String,
+    /// Record-level optimistic-concurrency precondition: the CID the
+    /// caller believes is currently at `(collection, rkey)`. Enforced by
+    /// `RepositoryManager::delete_record` via the substrate's CAS —
+    /// a mismatch is `SwapCidMismatch` (409), and supplying it for a
+    /// record that does not exist is `NotFound` (404).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_record: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
-    swap_commit: Option<String>,
 }
 
 /// Query parameters for getRecord
@@ -532,10 +534,12 @@ async fn create_record(
 ///   record body. No state mutation (rejection is before Phase A).
 /// - `BlobNotFound` (400) — Arc 16e §9.5.3.5: Phase B STRICT could
 ///   not find a newly-referenced blob's `blob_metadata` row.
-/// - `Validation` (400) — record-body size, lexicon validation, or
-///   swap-CID mismatch.
-/// - `NotFound` (404) — swap-CID supplied for a record that does
-///   not exist.
+/// - `Validation` (400) — record-body size or lexicon validation.
+/// - `SwapCidMismatch` (409) — `swapRecord` was supplied and does not
+///   match the record's current CID (#449).
+/// - `NotFound` (404) — `swapRecord` supplied for a record that does
+///   not exist. Absent record *without* a swap is a create, not an
+///   error.
 /// - `Database` / `Internal` (500) — sqlx or proto-blue commit
 ///   failures.
 async fn put_record(
@@ -570,11 +574,21 @@ async fn put_record(
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
-    // Update the record. Arc 16e §9.5.4 Step 2: blob-ref add/drop is
-    // computed in Phase B via `read_existing_refs` + set differences;
-    // see the `.with_blob_store(...)` builder call above.
+    // Upsert the record. putRecord creates when nothing exists at the
+    // target rkey and updates otherwise; the swap-CID precondition is
+    // enforced by the substrate's single CAS site (#449). Arc 16e §9.5.4
+    // Step 2: blob-ref add/drop is computed in Phase B via
+    // `read_existing_refs` + set differences; see the
+    // `.with_blob_store(...)` builder call above.
     let (cid, _rev) = repo_mgr
-        .update_record(&req.collection, &req.rkey, req.record, req.validate, signer)
+        .put_record(
+            &req.collection,
+            &req.rkey,
+            req.record,
+            req.validate,
+            req.swap_record,
+            signer,
+        )
         .await?;
 
     let uri = format!("at://{}/{}/{}", auth_did, req.collection, req.rkey);
@@ -603,10 +617,11 @@ async fn put_record(
 ///   against `AtProtoScope::RepoDelete` failed, or `repo` disagrees
 ///   with the authenticated DID.
 /// - `RateLimitExceeded` (429) — cross-PDS rate limiter rejected.
-/// - `Validation` (400) — swap-CID mismatch.
-/// - `NotFound` (404) — swap-CID supplied for a record that does
-///   not exist, or delete of a non-existent record (depending on
-///   the underlying store's contract).
+/// - `SwapCidMismatch` (409) — `swapRecord` was supplied and does not
+///   match the record's current CID (#450).
+/// - `NotFound` (404) — `swapRecord` supplied for a record that does
+///   not exist. A delete of a non-existent record *without* a swap is
+///   an idempotent success, not an error.
 /// - `Database` / `Internal` (500) — sqlx or proto-blue commit
 ///   failures.
 async fn delete_record(
@@ -643,11 +658,14 @@ async fn delete_record(
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
-    // Delete the record. Arc 16e §9.5.4 Step 2: blob refs for the
-    // record are unreferenced in Phase B via the wired `blob_store`;
-    // see the `.with_blob_store(...)` builder call above.
+    // Delete the record. deleteRecord is idempotent — an absent record is
+    // a no-op success (`Ok(None)`), not a 500 — and the swap-CID
+    // precondition is enforced by the substrate's single CAS site
+    // (#450). Arc 16e §9.5.4 Step 2: blob refs for the record are
+    // unreferenced in Phase B via the wired `blob_store`; see the
+    // `.with_blob_store(...)` builder call above.
     repo_mgr
-        .delete_record(&req.collection, &req.rkey, signer)
+        .delete_record(&req.collection, &req.rkey, req.swap_record, signer)
         .await?;
 
     // Invalidate read-after-write cache for this user
