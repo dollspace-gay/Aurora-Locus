@@ -71,22 +71,22 @@ tempfile = "3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "migrate", "macros"] }
 
 [patch.crates-io]
-# skydeval/proto-blue, level with upstream dollspace-gay/proto-blue at the
-# merge of upstream PR #13 (MST delete fix). Moves to the fork's
-# incremental-MST commit once that lands.
-proto-blue-syntax = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-lex-data = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-lex-cbor = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-lex-json = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-common = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-crypto = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-lexicon = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-repo = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-ws = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-identity = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-xrpc = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-api = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
-proto-blue-oauth = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+# skydeval/proto-blue `feat/lazy-mst`: upstream dollspace-gay/proto-blue
+# (including the PR #13 MST delete fix) plus the lazily loaded MST, which is
+# meant for upstream. Moves back to an upstream commit once it merges.
+proto-blue-syntax = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-lex-data = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-lex-cbor = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-lex-json = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-common = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-crypto = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-lexicon = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-repo = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-ws = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-identity = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-xrpc = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-api = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
+proto-blue-oauth = { git = "https://github.com/skydeval/proto-blue", rev = "a88e52e12b94daa3f6e316c2c631562b6c19e31d" }
 
 # kryphocron-lexicons 0.3.5 release commit ("Release 0.3.5: clear fields set by the encoder").
 kryphocron-lexicons = { git = "https://github.com/skydeval/kryphocron-lexicons", rev = "5d18e445aaef18ba0a517478c2c501353cb73393" }

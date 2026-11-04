@@ -8,10 +8,20 @@ publish.workspace = true
 
 [dependencies]
 locus-core.workspace = true
+locus-store.workspace = true
+proto-blue-syntax.workspace = true
 proto-blue-lex-data.workspace = true
 proto-blue-lex-cbor.workspace = true
 proto-blue-crypto.workspace = true
 proto-blue-repo.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rand.workspace = true
+hex.workspace = true
+sqlx.workspace = true
 
 [lints]
 workspace = true

@@ -6,6 +6,7 @@
 pub mod env;
 pub mod jobs;
 pub mod lease;
+pub mod repo;
 pub mod runtime;
 pub mod settings;
 

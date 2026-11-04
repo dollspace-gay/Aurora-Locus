@@ -30,3 +30,23 @@ kryphocron built in.
   persistent node id, claims a TID clock id, applies env values, follows live
   settings (including the log level) and shuts down cleanly on SIGTERM.
 - Job run bookkeeping (last run, last success, next run, last error).
+- Repo engine: every record write is one transaction covering the MST
+  blocks, the repository root, the record index and the `#commit` outbox
+  event. The MST loads lazily from stored blocks, so a write reads only the
+  paths it changes. Writes are checked in order against the record index
+  (swapCommit and swapRecord, and create/update/delete conflicts return 400
+  rather than 500). Every commit verifies, from the changed nodes alone, that
+  the tree changed exactly as the writes say before anything is stored.
+- Commits are signed v3 commits with `prev: null`; revs strictly increase per
+  repository, even across clock steps.
+- `#commit` events carry `since`, `prevData`, per-op `prev`, and a CAR with
+  the commit, new MST nodes, written records and covering proofs, so
+  consumers can check every op; writes whose event would exceed 2 MB are
+  refused.
+- Reference-counted repo blocks, collected by a leased GC job once
+  unreferenced for 10 minutes.
+
+### Changed
+
+- proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
+  which adds the lazily loaded MST.

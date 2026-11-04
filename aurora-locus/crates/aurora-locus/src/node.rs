@@ -91,7 +91,54 @@ impl Node {
             .push(node.settings.spawn_watcher(node.cancel.clone()));
         node.spawn_log_level(log);
         node.spawn_env_recheck(env_values);
+        node.spawn_block_gc();
         Ok(node)
+    }
+
+    /// Deletes repo blocks whose reference count has been 0 for longer than
+    /// the grace period, on one node at a time.
+    fn spawn_block_gc(&mut self) {
+        const NAME: &str = "gc-blocks";
+        const GRACE_MS: i64 = 10 * 60 * 1000;
+        const EVERY: Duration = Duration::from_secs(60);
+        const BATCH: i64 = 5_000;
+        let store = self.store.clone();
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                NAME.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let store = store.clone();
+                    async move {
+                        loop {
+                            let mut total = 0;
+                            let result = loop {
+                                match store.gc_zero_blocks(GRACE_MS, BATCH).await {
+                                    Ok(n) => {
+                                        total += n;
+                                        if n < BATCH as u64 || cancel.is_cancelled() {
+                                            break Ok(());
+                                        }
+                                    }
+                                    Err(e) => break Err(e),
+                                }
+                            };
+                            if total > 0 {
+                                tracing::info!(blocks = total, "block gc");
+                            }
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = store.record_job_run(NAME, err.as_deref(), None).await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(EVERY) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// Renews the clock-id slot. Losing it means another node may mint TIDs

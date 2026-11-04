@@ -1347,11 +1347,19 @@ dependencies = [
 name = "locus-repo"
 version = "0.1.0-dev"
 dependencies = [
+ "hex",
  "locus-core",
+ "locus-store",
  "proto-blue-crypto",
  "proto-blue-lex-cbor",
  "proto-blue-lex-data",
  "proto-blue-repo",
+ "proto-blue-syntax",
+ "rand",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -1670,7 +1678,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-common"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "async-trait",
  "base64",
@@ -1697,7 +1705,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-crypto"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "base64",
  "bs58",
@@ -1714,7 +1722,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-cbor"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "ciborium",
  "proto-blue-lex-data",
@@ -1725,7 +1733,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-data"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "multibase",
  "serde",
@@ -1737,7 +1745,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-json"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "base64",
  "proto-blue-lex-data",
@@ -1748,7 +1756,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lexicon"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "proto-blue-common",
  "proto-blue-lex-data",
@@ -1761,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-repo"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "futures",
  "proto-blue-common",
@@ -1781,7 +1789,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-syntax"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 dependencies = [
  "chrono",
  "once_cell",
@@ -3294,24 +3302,24 @@ dependencies = [
 [[patch.unused]]
 name = "proto-blue-api"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 
 [[patch.unused]]
 name = "proto-blue-identity"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 
 [[patch.unused]]
 name = "proto-blue-oauth"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 
 [[patch.unused]]
 name = "proto-blue-ws"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
 
 [[patch.unused]]
 name = "proto-blue-xrpc"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=7a3fb57063594a93473deb64b1aac97450e53190#7a3fb57063594a93473deb64b1aac97450e53190"
+source = "git+https://github.com/skydeval/proto-blue?rev=a88e52e12b94daa3f6e316c2c631562b6c19e31d#a88e52e12b94daa3f6e316c2c631562b6c19e31d"
