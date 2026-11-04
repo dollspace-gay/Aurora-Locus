@@ -1,0 +1,13 @@
+[package]
+name = "locus-blob"
+description = "Blob storage (disk, S3), upload pipeline, GC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+
+[lints]
+workspace = true

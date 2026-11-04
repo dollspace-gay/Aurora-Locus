@@ -1,0 +1,93 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/aurora-locus",
+    "crates/locus-core",
+    "crates/locus-store",
+    "crates/locus-repo",
+    "crates/locus-identity",
+    "crates/locus-auth",
+    "crates/locus-kryphocron",
+    "crates/locus-blob",
+    "crates/locus-sync",
+    "crates/locus-http",
+    "crates/locus-web",
+    "crates/locus-mail",
+]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+locus-core = { path = "crates/locus-core" }
+locus-store = { path = "crates/locus-store" }
+locus-repo = { path = "crates/locus-repo" }
+locus-identity = { path = "crates/locus-identity" }
+locus-auth = { path = "crates/locus-auth" }
+locus-kryphocron = { path = "crates/locus-kryphocron" }
+locus-blob = { path = "crates/locus-blob" }
+locus-sync = { path = "crates/locus-sync" }
+locus-http = { path = "crates/locus-http" }
+locus-web = { path = "crates/locus-web" }
+locus-mail = { path = "crates/locus-mail" }
+
+# proto-blue (design 4.2). Pinned through [patch.crates-io] below, so every
+# crate that depends on proto-blue (kryphocron-lexicons included) shares one copy.
+# default-features = false everywhere: no native-tls (design 4.5).
+proto-blue-syntax = { version = "0.3", default-features = false }
+proto-blue-lex-data = { version = "0.3", default-features = false }
+proto-blue-lex-cbor = { version = "0.3", default-features = false }
+proto-blue-lex-json = { version = "0.3", default-features = false }
+proto-blue-crypto = { version = "0.3", default-features = false }
+proto-blue-lexicon = { version = "0.3", default-features = false }
+proto-blue-repo = { version = "0.3", default-features = false }
+
+# kryphocron (design 4.4), pinned exactly. kryphocron-lexicons 0.3.5 isn't on
+# crates.io, so it's pinned to its release commit through [patch.crates-io].
+kryphocron = "=0.4.5"
+kryphocron-lexicons = "0.3"
+
+# Runtime and common
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
+
+[patch.crates-io]
+# skydeval/proto-blue, level with upstream dollspace-gay/proto-blue at the
+# merge of PR #13 (MST delete fix, design 4.3). Moves to the incremental-MST
+# commit in slice 2.
+proto-blue-syntax = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-lex-data = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-lex-cbor = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-lex-json = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-common = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-crypto = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-lexicon = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-repo = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-ws = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-identity = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-xrpc = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-api = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+proto-blue-oauth = { git = "https://github.com/skydeval/proto-blue", rev = "7a3fb57063594a93473deb64b1aac97450e53190" }
+
+# kryphocron-lexicons 0.3.5 release commit ("Release 0.3.5: clear fields set by the encoder").
+kryphocron-lexicons = { git = "https://github.com/skydeval/kryphocron-lexicons", rev = "5d18e445aaef18ba0a517478c2c501353cb73393" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

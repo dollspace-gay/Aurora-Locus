@@ -1,0 +1,13 @@
+[package]
+name = "locus-identity"
+description = "PLC operations, did:web hosting, handles, resolvers, SSRF-safe fetching"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+
+[lints]
+workspace = true

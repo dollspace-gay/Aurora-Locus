@@ -1,0 +1,17 @@
+[package]
+name = "locus-repo"
+description = "Repo engine on proto-blue: commit pipeline, block storage, verification, CAR import/export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-lex-cbor.workspace = true
+proto-blue-crypto.workspace = true
+proto-blue-repo.workspace = true
+
+[lints]
+workspace = true

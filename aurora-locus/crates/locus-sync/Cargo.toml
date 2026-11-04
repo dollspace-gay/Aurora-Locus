@@ -1,0 +1,13 @@
+[package]
+name = "locus-sync"
+description = "Sequencer, outbox, firehose server, crawler notification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+
+[lints]
+workspace = true
