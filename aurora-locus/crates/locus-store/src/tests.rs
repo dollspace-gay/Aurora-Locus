@@ -446,6 +446,73 @@ async fn run_leased_runs_the_job_on_one_node_at_a_time() {
 }
 
 #[tokio::test]
+async fn secrets_are_sealed_and_a_different_master_key_is_refused() {
+    use crate::secrets::KeyCheck;
+    use locus_core::keys::{MasterKey, SourceKind};
+    for b in backends().await {
+        let s = &b.store;
+        let key = MasterKey::generate(SourceKind::File);
+        let other = MasterKey::generate(SourceKind::Env);
+
+        assert!(s.key_store_empty().await.unwrap(), "{}", b.name);
+        assert_eq!(s.check_master_key(&key).await.unwrap(), KeyCheck::Empty);
+
+        let mut tx = s.begin().await.unwrap();
+        tx.put_secret("jwt", b"hmac secret", &key).await.unwrap();
+        tx.put_signing_key("did:plc:abc", "k256", b"private bytes", &key)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(s.check_master_key(&key).await.unwrap(), KeyCheck::Matches);
+        assert_eq!(
+            s.get_secret("jwt", &key).await.unwrap().unwrap().as_slice(),
+            b"hmac secret"
+        );
+        let (kind, sk) = s
+            .get_signing_key("did:plc:abc", &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), sk.as_slice()),
+            ("k256", &b"private bytes"[..])
+        );
+
+        // The database never holds the secret in the clear.
+        let raw: Vec<u8> = match s {
+            Store::Sqlite(p) => sqlx::query_scalar("SELECT sealed FROM secret WHERE name = 'jwt'")
+                .fetch_one(p)
+                .await
+                .unwrap(),
+            Store::Postgres(p) => {
+                sqlx::query_scalar("SELECT sealed FROM secret WHERE name = 'jwt'")
+                    .fetch_one(p)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!raw.windows(11).any(|w| w == b"hmac secret"), "{}", b.name);
+
+        // A node with another key: refused at boot and on any secret write.
+        assert!(matches!(
+            s.check_master_key(&other).await,
+            Err(CoreError::Config(_))
+        ));
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.put_secret("smtp", b"x", &other).await.is_err(),
+            "{}",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+        assert!(s.get_secret("smtp", &key).await.unwrap().is_none());
+        // And it can't read the secrets either.
+        assert!(s.get_secret("jwt", &other).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn job_runs_are_recorded() {
     for b in backends().await {
         let s = &b.store;

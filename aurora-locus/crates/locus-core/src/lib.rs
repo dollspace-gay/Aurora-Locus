@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod error;
+pub mod keys;
 pub mod lease;
 pub mod settings;
 

@@ -26,6 +26,8 @@ pub struct Node {
     pub node_id: String,
     pub store: Store,
     pub settings: Arc<Settings>,
+    /// Encrypts every stored secret. The same key on every node.
+    pub master_key: Arc<locus_core::keys::MasterKey>,
     /// This node's TID clock id. Holding its slot is what makes the node live.
     pub clock_id: u32,
     clock_lease: LeaseToken,
@@ -56,7 +58,26 @@ impl Node {
             tracing::warn!("SSRF protection is OFF for user-influenced requests on this node");
         }
 
-        let store = Store::open(&bootstrap.database).await?;
+        // The master key is checked before anything is written, migrations
+        // included: a node with another install's key must not touch it.
+        let store = Store::connect(&bootstrap.database).await?;
+        let empty = store.key_store_empty().await?;
+        let generated_path = match &bootstrap.master_key {
+            locus_core::bootstrap::MasterKeySource::File { path, .. } if !path.exists() => {
+                Some(path.clone())
+            }
+            _ => None,
+        };
+        let master_key = Arc::new(locus_core::keys::load_master_key(&bootstrap, empty)?);
+        if let Some(path) = generated_path {
+            tracing::warn!(
+                path = %path.display(),
+                "generated a new master key; back it up: losing it loses every stored secret"
+            );
+        }
+        store.check_master_key(&master_key).await?;
+        tracing::info!(key_id = %master_key.key_id(), source = master_key.source().as_str(), "master key checked");
+        store.migrate().await?;
 
         let (clock_id, clock_lease) = store
             .claim_slot(CLOCK_SLOT_FAMILY, CLOCK_SLOTS, &node_id, DEFAULT_LEASE_TTL)
@@ -81,6 +102,7 @@ impl Node {
             node_id,
             store,
             settings,
+            master_key,
             clock_id,
             clock_lease,
             cancel,
@@ -216,6 +238,7 @@ impl Node {
             node_id = %self.node_id,
             clock_id = self.clock_id,
             role = ?self.bootstrap.role,
+            key_id = %self.master_key.key_id(),
             settings_version = self.settings.current().version(),
             "running"
         );

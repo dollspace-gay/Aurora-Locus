@@ -45,6 +45,12 @@ kryphocron built in.
   refused.
 - Reference-counted repo blocks, collected by a leased GC job once
   unreferenced for 10 minutes.
+- Encrypted key store: every stored secret and account signing key is sealed
+  with XChaCha20-Poly1305 under one master key per install (from a file or
+  `LOCUS_MASTER_KEY`). The key's id and a MAC are recorded in the database;
+  a node with a different key refuses to start, and every secret write checks
+  the key again. A file key is generated only on a fresh single-node SQLite
+  install with a persistent data dir.
 
 ### Changed
 
