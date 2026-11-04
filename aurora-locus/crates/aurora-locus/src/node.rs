@@ -4,9 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use locus_auth::session::LegacySessions;
 use locus_core::bootstrap::{self, Bootstrap};
 use locus_core::lease::{DEFAULT_LEASE_TTL, LeaseToken};
 use locus_core::{CoreError, CoreResult};
+use locus_http::{AppState, ServerSecrets};
+use locus_repo::{RepoEngine, TidClock};
 use locus_store::Store;
 use locus_store::env::{CLOCK_SLOT_FAMILY, collect_env};
 use locus_store::runtime::Settings;
@@ -114,7 +117,54 @@ impl Node {
         node.spawn_log_level(log);
         node.spawn_env_recheck(env_values);
         node.spawn_block_gc();
+        node.spawn_http().await?;
         Ok(node)
+    }
+
+    /// Loads the server secrets and starts serving HTTP. The port is bound
+    /// here so a busy port fails the boot rather than a background task.
+    async fn spawn_http(&mut self) -> CoreResult<()> {
+        let hostname = self
+            .bootstrap
+            .hostname
+            .clone()
+            .unwrap_or_else(|| "localhost".to_owned())
+            .to_ascii_lowercase();
+        let public_url = if bootstrap::is_local_hostname(&hostname) {
+            format!("http://{hostname}:{}", self.bootstrap.listen.port())
+        } else {
+            format!("https://{hostname}")
+        };
+        let service_did = format!("did:web:{hostname}");
+        let secrets = ServerSecrets::load_or_create(&self.store, &self.master_key).await?;
+        let sessions =
+            LegacySessions::new(self.store.clone(), secrets.jwt.clone(), service_did.clone());
+        let clock_id = u16::try_from(self.clock_id)
+            .map_err(|_| CoreError::Config(format!("clock id {} out of range", self.clock_id)))?;
+        let state = Arc::new(AppState {
+            repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id))),
+            store: self.store.clone(),
+            settings: self.settings.clone(),
+            master_key: self.master_key.clone(),
+            secrets,
+            sessions,
+            hostname,
+            public_url,
+            service_did,
+        });
+        let addr = self.bootstrap.listen;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| CoreError::Config(format!("can't listen on {addr}: {e}")))?;
+        tracing::info!(%addr, public_url = %state.public_url, "listening");
+        let cancel = self.cancel.clone();
+        self.tasks.push(tokio::spawn(async move {
+            if let Err(e) = locus_http::serve(state, listener, cancel.clone()).await {
+                tracing::error!("http server failed; stopping the node: {e}");
+                cancel.cancel();
+            }
+        }));
+        Ok(())
     }
 
     /// Deletes repo blocks whose reference count has been 0 for longer than

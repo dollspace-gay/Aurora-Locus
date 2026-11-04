@@ -102,6 +102,16 @@ pub struct CommitOutcome {
     pub outbox_id: i64,
 }
 
+/// A newly created repository.
+#[derive(Debug, Clone)]
+pub struct CreatedRepo {
+    pub commit_cid: Cid,
+    pub commit_bytes: Vec<u8>,
+    pub rev: String,
+    /// The `#commit` outbox row, when events were emitted.
+    pub commit_outbox_id: Option<i64>,
+}
+
 /// The repository engine shared by every write path.
 pub struct RepoEngine {
     store: Store,
@@ -161,8 +171,8 @@ impl RepoEngine {
         Arc::clone(locks.entry(did.to_owned()).or_default())
     }
 
-    /// Creates an account's empty repository: an empty MST and a first
-    /// signed commit, with its `#commit` event.
+    /// Creates an account's empty repository in its own transaction, with
+    /// its `#commit` event.
     pub async fn create_repo(
         &self,
         did: &str,
@@ -171,6 +181,26 @@ impl RepoEngine {
         let lock = self.repo_lock(did);
         let _held = lock.lock().await;
         let mut tx = self.store.begin().await?;
+        let created = self.create_repo_in(&mut tx, did, signer, true).await?;
+        tx.commit().await?;
+        Ok(CommitOutcome {
+            commit_cid: created.commit_cid,
+            rev: created.rev,
+            outbox_id: created.commit_outbox_id.unwrap_or_default(),
+        })
+    }
+
+    /// Creates an account's empty repository (an empty MST and a first
+    /// signed commit) inside the caller's transaction, so account creation
+    /// writes everything at once. With `emit`, the `#commit` event is written
+    /// too; an account migrating in emits nothing until it's activated.
+    pub async fn create_repo_in(
+        &self,
+        tx: &mut Tx,
+        did: &str,
+        signer: &dyn Signer,
+        emit: bool,
+    ) -> Result<CreatedRepo, CommitError> {
         tx.lock_repo(did).await?;
         if tx.repo_root(did).await?.is_some() {
             return Err(CommitError::InvalidRequest(format!(
@@ -210,7 +240,7 @@ impl RepoEngine {
         });
 
         let mut event_blocks = root_block;
-        event_blocks.set(commit_cid.clone(), commit_bytes);
+        event_blocks.set(commit_cid.clone(), commit_bytes.clone());
         let event = CommitEvent {
             repo: did.to_owned(),
             commit: commit_cid.clone(),
@@ -232,12 +262,16 @@ impl RepoEngine {
             },
         )
         .await?;
-        let outbox_id = tx.insert_outbox(did, "commit", &payload).await?;
-        tx.commit().await?;
-        Ok(CommitOutcome {
+        let commit_outbox_id = if emit {
+            Some(tx.insert_outbox(did, "commit", &payload).await?)
+        } else {
+            None
+        };
+        Ok(CreatedRepo {
             commit_cid,
+            commit_bytes,
             rev,
-            outbox_id,
+            commit_outbox_id,
         })
     }
 

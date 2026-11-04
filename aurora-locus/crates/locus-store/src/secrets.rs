@@ -201,6 +201,39 @@ impl Tx {
         .map_err(db_err)
     }
 
+    /// Seals and stores a named secret only if none exists yet (first writer
+    /// wins). Returns whether this call stored it.
+    pub async fn put_secret_if_absent(
+        &mut self,
+        name: &str,
+        plaintext: &[u8],
+        key: &MasterKey,
+    ) -> CoreResult<bool> {
+        self.ensure_master_key(key).await?;
+        let sealed = key.seal(&secret_aad(name), plaintext)?;
+        match self {
+            Tx::Sqlite(t) => sqlx::query(&format!(
+                "INSERT INTO secret (name, sealed, updated_at) VALUES (?1, ?2, {SQLITE_NOW_MS}) \
+                 ON CONFLICT (name) DO NOTHING"
+            ))
+            .bind(name)
+            .bind(&sealed)
+            .execute(&mut **t)
+            .await
+            .map(|r| r.rows_affected() == 1),
+            Tx::Postgres(t) => sqlx::query(&format!(
+                "INSERT INTO secret (name, sealed, updated_at) VALUES ($1, $2, {PG_NOW_MS}) \
+                 ON CONFLICT (name) DO NOTHING"
+            ))
+            .bind(name)
+            .bind(&sealed)
+            .execute(&mut **t)
+            .await
+            .map(|r| r.rows_affected() == 1),
+        }
+        .map_err(db_err)
+    }
+
     /// Seals and stores an account's signing key (replacing any).
     pub async fn put_signing_key(
         &mut self,

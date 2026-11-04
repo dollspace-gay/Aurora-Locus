@@ -12,6 +12,46 @@ use proto_blue_repo::block_map::BlockMap;
 use proto_blue_repo::car::blocks_to_car;
 use proto_blue_repo::error::RepoError;
 
+/// An `#identity` body: the DID, and the handle when it is known (as the
+/// reference, a PLC operation emits one without the handle).
+pub fn identity_body(did: &str, handle: Option<&str>) -> Result<Vec<u8>, RepoError> {
+    let mut m = BTreeMap::new();
+    m.insert("did".to_owned(), LexValue::String(did.to_owned()));
+    if let Some(h) = handle {
+        m.insert("handle".to_owned(), LexValue::String(h.to_owned()));
+    }
+    Ok(proto_blue_lex_cbor::encode(&LexValue::Map(m))?)
+}
+
+/// An `#account` body. `status` is set when the account isn't active
+/// (`takendown`, `suspended`, `deactivated`, `deleted`).
+pub fn account_body(did: &str, active: bool, status: Option<&str>) -> Result<Vec<u8>, RepoError> {
+    let mut m = BTreeMap::new();
+    m.insert("did".to_owned(), LexValue::String(did.to_owned()));
+    m.insert("active".to_owned(), LexValue::Bool(active));
+    if let Some(s) = status {
+        m.insert("status".to_owned(), LexValue::String(s.to_owned()));
+    }
+    Ok(proto_blue_lex_cbor::encode(&LexValue::Map(m))?)
+}
+
+/// A `#sync` body: the current commit, as a CAR holding only the commit block.
+pub fn sync_body(
+    did: &str,
+    rev: &str,
+    commit_cid: &Cid,
+    commit_bytes: &[u8],
+) -> Result<Vec<u8>, RepoError> {
+    let mut blocks = BlockMap::new();
+    blocks.set(commit_cid.clone(), commit_bytes.to_vec());
+    let car = blocks_to_car(Some(commit_cid), &blocks)?;
+    let mut m = BTreeMap::new();
+    m.insert("did".to_owned(), LexValue::String(did.to_owned()));
+    m.insert("rev".to_owned(), LexValue::String(rev.to_owned()));
+    m.insert("blocks".to_owned(), LexValue::Bytes(car));
+    Ok(proto_blue_lex_cbor::encode(&LexValue::Map(m))?)
+}
+
 /// The lexicon's limit on a `#commit` event's `blocks`.
 pub const MAX_EVENT_BLOCKS_BYTES: usize = 2_000_000;
 

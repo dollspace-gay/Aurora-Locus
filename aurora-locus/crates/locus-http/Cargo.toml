@@ -8,6 +8,28 @@ publish.workspace = true
 
 [dependencies]
 locus-core.workspace = true
+locus-store.workspace = true
+locus-repo.workspace = true
+locus-auth.workspace = true
+locus-identity.workspace = true
+proto-blue-crypto.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-repo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+hex.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+axum = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

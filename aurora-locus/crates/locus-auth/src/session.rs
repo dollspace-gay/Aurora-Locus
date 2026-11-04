@@ -159,10 +159,27 @@ impl LegacySessions {
         app_password_name: Option<&str>,
         store_refresh: bool,
     ) -> Result<Tokens, AuthError> {
+        let mut tx = self.store.begin().await?;
+        let tokens = self
+            .create_in(&mut tx, did, scope, app_password_name, store_refresh)
+            .await?;
+        tx.commit().await?;
+        Ok(tokens)
+    }
+
+    /// Opens a session inside the caller's transaction (account creation
+    /// writes the account and its first session together).
+    pub async fn create_in(
+        &self,
+        tx: &mut locus_store::Tx,
+        did: &str,
+        scope: &str,
+        app_password_name: Option<&str>,
+        store_refresh: bool,
+    ) -> Result<Tokens, AuthError> {
         let now = now_s();
         let session_id = random_id();
         let refresh_exp = now + self.refresh_ttl_s;
-        let mut tx = self.store.begin().await?;
         tx.insert_session(&Session {
             id: session_id.clone(),
             did: did.to_owned(),
@@ -187,7 +204,6 @@ impl LegacySessions {
         } else {
             None
         };
-        tx.commit().await?;
         Ok(Tokens {
             access_jwt: self.access_jwt(did, scope, &session_id, now),
             refresh_jwt,

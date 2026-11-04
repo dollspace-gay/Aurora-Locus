@@ -8,5 +8,7 @@ pub mod tid;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{Action, CommitError, CommitOutcome, CommitRequest, PreparedWrite, RepoEngine};
+pub use engine::{
+    Action, CommitError, CommitOutcome, CommitRequest, CreatedRepo, PreparedWrite, RepoEngine,
+};
 pub use tid::TidClock;

@@ -68,6 +68,20 @@ kryphocron built in.
   app-password revocation and takedown take effect on the next request.
   Refresh rotation keeps the reference's 2-hour replay grace. Passwords and
   app passwords are hashed with Argon2id.
+- HTTP server on `serve`: `describeServer`, `createAccount` (did:plc), the
+  session endpoints (`createSession`, `getSession`, `refreshSession`,
+  `deleteSession`), app passwords (create, list, revoke), `resolveHandle` for
+  local handles, `/.well-known/atproto-did` on handle hosts, the service's
+  `/.well-known/did.json`, and `/xrpc/_health`. Errors use the XRPC
+  `{error, message}` shape and the reference's error names.
+- Account creation writes the account, its signing key, the invite use, the
+  `#identity`, `#account`, `#commit` and `#sync` events, the empty repository
+  and the first session in one transaction, after the PLC directory accepts
+  the genesis operation; if the transaction fails, the new DID is tombstoned.
+- Server secrets (JWT secret, app-password pepper, PLC rotation key, service
+  signing key) are generated on first boot and kept in the key store;
+  `PDS_JWT_SECRET` and `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` are
+  imported when set.
 
 ### Changed
 

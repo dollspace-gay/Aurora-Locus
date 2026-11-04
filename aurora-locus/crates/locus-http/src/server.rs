@@ -1,0 +1,648 @@
+//! `com.atproto.server.*`: describeServer, account creation, legacy
+//! sessions and app passwords.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use locus_auth::password;
+use locus_auth::session::{
+    SCOPE_ACCESS, SCOPE_APP_PASS, SCOPE_APP_PASS_PRIVILEGED, SCOPE_TAKENDOWN, Tokens,
+};
+use locus_core::CoreError;
+use locus_identity::did_doc::DidDocument;
+use locus_identity::handle::{self, HandleError, LabelLimits};
+use locus_identity::plc::{Operation, Service};
+use locus_identity::plc_client::PlcClientError;
+use locus_repo::event::{account_body, identity_body, sync_body};
+use locus_store::accounts::{Account, AppPassword, NewAccount, SessionFilter, Status};
+use proto_blue_crypto::{ExportableKeypair, K256Keypair, Keypair};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::auth;
+use crate::error::{XrpcError, XrpcResult};
+use crate::state::AppState;
+
+/// Logins take at least this long, so timing doesn't reveal which accounts exist.
+const LOGIN_FLOOR: Duration = Duration::from_millis(350);
+
+type St = State<Arc<AppState>>;
+
+pub async fn describe_server(State(s): St) -> Json<Value> {
+    let snap = s.snapshot();
+    let mut links = serde_json::Map::new();
+    for (key, field) in [
+        ("server.privacy_policy_url", "privacyPolicy"),
+        ("server.terms_of_service_url", "termsOfService"),
+    ] {
+        let v = snap.text(key);
+        if !v.is_empty() {
+            links.insert(field.into(), v.into());
+        }
+    }
+    let mut out = json!({
+        "did": s.service_did,
+        "availableUserDomains": s.handle_domains(),
+        "inviteCodeRequired": snap.bool("accounts.invite_required"),
+        "links": links,
+    });
+    let contact = snap.text("server.contact_email");
+    if !contact.is_empty() {
+        out["contact"] = json!({ "email": contact });
+    }
+    Json(out)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAccountInput {
+    email: Option<String>,
+    handle: String,
+    did: Option<String>,
+    invite_code: Option<String>,
+    password: Option<String>,
+    recovery_key: Option<String>,
+}
+
+fn handle_error(e: HandleError) -> XrpcError {
+    match e {
+        HandleError::Invalid(m) => XrpcError::named("InvalidHandle", m),
+        HandleError::NotAvailable(m) => XrpcError::named("HandleNotAvailable", m),
+    }
+}
+
+/// Validates a new handle on one of this PDS's handle domains.
+pub fn check_new_handle(s: &AppState, raw: &str) -> XrpcResult<String> {
+    let h = handle::normalize_and_validate(raw).map_err(handle_error)?;
+    let domains = s.handle_domains();
+    if handle::service_domain(&h, &domains).is_none() {
+        return Err(XrpcError::named(
+            "UnsupportedDomain",
+            "Not a supported handle domain",
+        ));
+    }
+    handle::ensure_service_constraints(&h, &domains, LabelLimits::default(), &[], false)
+        .map_err(handle_error)?;
+    if handle::has_explicit_slur(&h) {
+        return Err(XrpcError::named(
+            "InvalidHandle",
+            "Inappropriate language in handle",
+        ));
+    }
+    if h == s.hostname {
+        return Err(XrpcError::named(
+            "HandleNotAvailable",
+            "Handle already taken",
+        ));
+    }
+    Ok(h)
+}
+
+fn check_email(raw: &str) -> XrpcResult<String> {
+    let email = raw.trim().to_ascii_lowercase();
+    let valid = email.len() <= 320
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        })
+        && !email.contains(char::is_whitespace);
+    if valid {
+        Ok(email)
+    } else {
+        Err(XrpcError::invalid_request(
+            "This email address is not supported, please use a different email.",
+        ))
+    }
+}
+
+fn status_fields(status: Status) -> (bool, Option<&'static str>) {
+    match status {
+        Status::Active => (true, None),
+        other => (false, Some(other.as_str())),
+    }
+}
+
+async fn did_doc_for(s: &AppState, account: &Account) -> XrpcResult<Option<Value>> {
+    if !s.snapshot().bool("accounts.did_doc_with_session") {
+        return Ok(None);
+    }
+    let Some((_, sk)) = s.store.get_signing_key(&account.did, &s.master_key).await? else {
+        return Ok(None);
+    };
+    let key = K256Keypair::from_private_key(&sk).map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Some(
+        DidDocument::account(&account.did, &account.handle, &key.did(), &s.public_url).to_json(),
+    ))
+}
+
+fn session_json(account: &Account, tokens: &Tokens, did_doc: Option<Value>) -> Value {
+    let (active, status) = status_fields(account.status);
+    let mut out = json!({
+        "accessJwt": tokens.access_jwt,
+        "refreshJwt": tokens.refresh_jwt,
+        "handle": account.handle,
+        "did": account.did,
+        "email": account.email,
+        "emailConfirmed": account.email_confirmed_at.is_some(),
+        "emailAuthFactor": false,
+        "active": active,
+    });
+    if let Some(s) = status {
+        out["status"] = s.into();
+    }
+    if let Some(d) = did_doc {
+        out["didDoc"] = d;
+    }
+    out
+}
+
+pub async fn create_account(
+    State(s): St,
+    Json(input): Json<CreateAccountInput>,
+) -> XrpcResult<Json<Value>> {
+    if input.did.is_some() {
+        return Err(XrpcError::invalid_request(
+            "Creating an account with an existing DID (migration) is not supported yet",
+        ));
+    }
+    let email = check_email(
+        input
+            .email
+            .as_deref()
+            .ok_or_else(|| XrpcError::invalid_request("Email is required"))?,
+    )?;
+    let handle = check_new_handle(&s, &input.handle)?;
+    let password_hash = match &input.password {
+        Some(p) if p.len() > password::MAX_NEW_PASSWORD => {
+            return Err(XrpcError::invalid_request("Password too long"));
+        }
+        Some(p) => Some(password::hash(p).map_err(XrpcError::internal)?),
+        None => None,
+    };
+    let snap = s.snapshot();
+    let invite = input.invite_code.clone();
+    if snap.bool("accounts.invite_required") && invite.is_none() {
+        return Err(XrpcError::named(
+            "InvalidInviteCode",
+            "No invite code provided",
+        ));
+    }
+    // Fail fast on taken names; the unique indexes are the real guard.
+    if s.store.account_by_handle(&handle).await?.is_some() {
+        return Err(XrpcError::named(
+            "HandleNotAvailable",
+            "Handle already taken",
+        ));
+    }
+    if s.store.account_by_email(&email).await?.is_some() {
+        return Err(XrpcError::invalid_request("Email already taken"));
+    }
+
+    // Keys and the genesis operation.
+    let signing = K256Keypair::generate();
+    let mut rotation_keys = Vec::new();
+    if let Some(k) = input.recovery_key.as_deref().filter(|k| !k.is_empty()) {
+        rotation_keys.push(k.to_owned());
+    }
+    let operator_recovery = snap.text("identity.recovery_did_key");
+    if !operator_recovery.is_empty() {
+        rotation_keys.push(operator_recovery.to_owned());
+    }
+    rotation_keys.push(s.secrets.plc_rotation_key.did());
+    let op = Operation {
+        rotation_keys,
+        verification_methods: BTreeMap::from([("atproto".to_owned(), signing.did())]),
+        also_known_as: vec![format!("at://{handle}")],
+        services: BTreeMap::from([(
+            "atproto_pds".to_owned(),
+            Service {
+                kind: "AtprotoPersonalDataServer".into(),
+                endpoint: s.public_url.clone(),
+            },
+        )]),
+        prev: None,
+    };
+    op.validate()
+        .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
+    let genesis = op
+        .sign(&s.secrets.plc_rotation_key)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let did = genesis
+        .genesis_did()
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+
+    // Register the DID. No transaction is open during the network call.
+    let plc = s.plc()?;
+    match plc.submit(&did, &genesis).await {
+        Ok(()) => {}
+        Err(PlcClientError::Refused(m)) => {
+            return Err(XrpcError::invalid_request(format!(
+                "The PLC directory refused the DID: {m}"
+            )));
+        }
+        Err(e) => {
+            // Ambiguous: it may have been applied. Check before giving up.
+            match plc.document(&did).await {
+                Ok(Some(_)) => {}
+                _ => {
+                    return Err(XrpcError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "UpstreamFailure",
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // One transaction writes the account and everything that goes with it.
+    let result: XrpcResult<(Account, Tokens)> = async {
+        let mut tx = s.store.begin().await?;
+        tx.insert_account(&NewAccount {
+            did: &did,
+            handle: &handle,
+            email: Some(&email),
+            password_hash: password_hash.as_deref(),
+            status: Status::Active,
+            did_method: "plc",
+        })
+        .await
+        .map_err(|e| match e {
+            CoreError::Conflict(m) if m.starts_with("Handle") => {
+                XrpcError::named("HandleNotAvailable", m)
+            }
+            other => other.into(),
+        })?;
+        tx.put_signing_key(&did, "k256", &signing.export_private_key(), &s.master_key)
+            .await?;
+        if let Some(code) = &invite {
+            tx.use_invite_code(code, &did).await.map_err(|e| match e {
+                CoreError::Invalid(m) => XrpcError::named("InvalidInviteCode", m),
+                other => other.into(),
+            })?;
+        }
+        // Events in the reference's order: #identity, #account, #commit, #sync.
+        let enc = |e: proto_blue_repo::error::RepoError| XrpcError::internal(e.to_string());
+        tx.insert_outbox(
+            &did,
+            "identity",
+            &identity_body(&did, Some(&handle)).map_err(enc)?,
+        )
+        .await?;
+        tx.insert_outbox(
+            &did,
+            "account",
+            &account_body(&did, true, None).map_err(enc)?,
+        )
+        .await?;
+        let repo = s
+            .repo
+            .create_repo_in(&mut tx, &did, &signing, true)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        tx.insert_outbox(
+            &did,
+            "sync",
+            &sync_body(&did, &repo.rev, &repo.commit_cid, &repo.commit_bytes).map_err(enc)?,
+        )
+        .await?;
+        let tokens = s
+            .sessions
+            .create_in(&mut tx, &did, SCOPE_ACCESS, None, true)
+            .await?;
+        tx.commit().await?;
+        let account = s
+            .store
+            .account_by_did(&did)
+            .await?
+            .ok_or_else(|| XrpcError::internal("account vanished after creation"))?;
+        Ok((account, tokens))
+    }
+    .await;
+
+    let (account, tokens) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            // Locus created this DID; tombstone it so it doesn't dangle.
+            tombstone_quietly(&s, &did, &genesis).await;
+            return Err(e);
+        }
+    };
+    let did_doc = did_doc_for(&s, &account).await?;
+    let mut out = json!({
+        "handle": account.handle,
+        "did": account.did,
+        "accessJwt": tokens.access_jwt,
+        "refreshJwt": tokens.refresh_jwt,
+    });
+    if let Some(d) = did_doc {
+        out["didDoc"] = d;
+    }
+    Ok(Json(out))
+}
+
+async fn tombstone_quietly(s: &AppState, did: &str, genesis: &locus_identity::plc::SignedOp) {
+    let Ok(prev) = genesis.cid() else { return };
+    let Ok(t) =
+        locus_identity::plc::sign_tombstone(&prev.to_string_base32(), &s.secrets.plc_rotation_key)
+    else {
+        return;
+    };
+    if let Ok(plc) = s.plc()
+        && let Err(e) = plc.submit(did, &t).await
+    {
+        tracing::warn!(
+            did,
+            "couldn't tombstone the DID of a failed account creation: {e}"
+        );
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSessionInput {
+    identifier: String,
+    password: String,
+    #[serde(default)]
+    allow_takendown: bool,
+}
+
+async fn find_account(s: &AppState, identifier: &str) -> XrpcResult<Option<Account>> {
+    let id = identifier.trim();
+    Ok(if id.starts_with("did:") {
+        s.store.account_by_did(id).await?
+    } else if id.contains('@') {
+        s.store.account_by_email(id).await?
+    } else {
+        s.store.account_by_handle(id).await?
+    })
+}
+
+/// How a login's password matched.
+enum Credential {
+    Account,
+    AppPassword { name: String, privileged: bool },
+}
+
+async fn check_password(
+    s: &AppState,
+    account: &Account,
+    pw: &str,
+) -> XrpcResult<Option<Credential>> {
+    if let Some(hash) = &account.password_hash
+        && password::verify(pw, hash)
+    {
+        return Ok(Some(Credential::Account));
+    }
+    if password::looks_like_app_password(pw) {
+        let lookup =
+            password::app_password_lookup(&s.secrets.app_password_pepper, &account.did, pw);
+        if let Some(ap) = s
+            .store
+            .app_password_by_lookup(&account.did, &lookup)
+            .await?
+            && password::verify(pw, &ap.hash)
+        {
+            return Ok(Some(Credential::AppPassword {
+                name: ap.name,
+                privileged: ap.privileged,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub async fn create_session(
+    State(s): St,
+    Json(input): Json<CreateSessionInput>,
+) -> XrpcResult<Json<Value>> {
+    let started = tokio::time::Instant::now();
+    let result = create_session_inner(&s, &input).await;
+    tokio::time::sleep_until(started + LOGIN_FLOOR).await;
+    result
+}
+
+async fn create_session_inner(s: &AppState, input: &CreateSessionInput) -> XrpcResult<Json<Value>> {
+    let invalid = || XrpcError::auth_required("Invalid identifier or password");
+    if input.password.len() > password::MAX_LOGIN_PASSWORD {
+        return Err(invalid());
+    }
+    let Some(account) = find_account(s, &input.identifier).await? else {
+        return Err(invalid());
+    };
+    if account.status == Status::Deleted {
+        return Err(invalid());
+    }
+    let Some(cred) = check_password(s, &account, &input.password).await? else {
+        return Err(invalid());
+    };
+    let taken_down = matches!(account.status, Status::Takendown | Status::Suspended);
+    let (scope, app_password, store_refresh) = match (&cred, taken_down) {
+        (Credential::AppPassword { .. }, true) => {
+            return Err(XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "AccountTakedown",
+                "Account has been taken down",
+            ));
+        }
+        (Credential::Account, true) if !input.allow_takendown => {
+            return Err(XrpcError::new(
+                StatusCode::UNAUTHORIZED,
+                "AccountTakedown",
+                "Account has been taken down",
+            ));
+        }
+        (Credential::Account, true) => (SCOPE_TAKENDOWN, None, false),
+        (Credential::Account, false) => (SCOPE_ACCESS, None, true),
+        (Credential::AppPassword { name, privileged }, false) => (
+            if *privileged {
+                SCOPE_APP_PASS_PRIVILEGED
+            } else {
+                SCOPE_APP_PASS
+            },
+            Some(name.as_str()),
+            true,
+        ),
+    };
+    let tokens = s
+        .sessions
+        .create(&account.did, scope, app_password, store_refresh)
+        .await?;
+    let did_doc = did_doc_for(s, &account).await?;
+    Ok(Json(session_json(&account, &tokens, did_doc)))
+}
+
+pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    let authed = auth::access(&s, &headers).await?;
+    let account = s.store.account_by_did(&authed.did).await?.ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "AccountNotFound",
+            "Account not found",
+        )
+    })?;
+    let (active, status) = status_fields(account.status);
+    let mut out = json!({
+        "handle": account.handle,
+        "did": account.did,
+        "email": account.email,
+        "emailConfirmed": account.email_confirmed_at.is_some(),
+        "emailAuthFactor": false,
+        "active": active,
+    });
+    if let Some(st) = status {
+        out["status"] = st.into();
+    }
+    if let Some(d) = did_doc_for(&s, &account).await? {
+        out["didDoc"] = d;
+    }
+    Ok(Json(out))
+}
+
+pub async fn refresh_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    let token = auth::bearer(&headers)?;
+    let (tokens, did) = s.sessions.refresh(token).await?;
+    let account = s.store.account_by_did(&did).await?.ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "AccountNotFound",
+            "Account not found",
+        )
+    })?;
+    let did_doc = did_doc_for(&s, &account).await?;
+    let mut out = session_json(&account, &tokens, did_doc);
+    if let Some(m) = out.as_object_mut() {
+        m.remove("email");
+        m.remove("emailConfirmed");
+        m.remove("emailAuthFactor");
+    }
+    Ok(Json(out))
+}
+
+pub async fn delete_session(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+    let token = auth::bearer(&headers)?;
+    s.sessions.delete(token).await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct CreateAppPasswordInput {
+    name: String,
+    #[serde(default)]
+    privileged: bool,
+}
+
+pub async fn create_app_password(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<CreateAppPasswordInput>,
+) -> XrpcResult<Json<Value>> {
+    let authed = auth::full_access(&s, &headers).await?;
+    let name = input.name.trim();
+    if name.is_empty() || name.len() > 32 {
+        return Err(XrpcError::invalid_request("Invalid app password name"));
+    }
+    let pw = password::new_app_password();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let row = AppPassword {
+        did: authed.did.clone(),
+        name: name.to_owned(),
+        lookup_hash: password::app_password_lookup(
+            &s.secrets.app_password_pepper,
+            &authed.did,
+            &pw,
+        ),
+        hash: password::hash(&pw).map_err(XrpcError::internal)?,
+        privileged: input.privileged,
+        created_at,
+    };
+    let mut tx = s.store.begin().await?;
+    tx.insert_app_password(&row).await.map_err(|e| match e {
+        CoreError::Conflict(m) => XrpcError::named("DuplicateName", m),
+        other => other.into(),
+    })?;
+    tx.commit().await?;
+    Ok(Json(json!({
+        "name": row.name,
+        "password": pw,
+        "createdAt": iso8601(created_at),
+        "privileged": row.privileged,
+    })))
+}
+
+pub async fn list_app_passwords(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    let authed = auth::access(&s, &headers).await?;
+    let list: Vec<Value> = s
+        .store
+        .app_passwords(&authed.did)
+        .await?
+        .into_iter()
+        .map(|p| json!({"name": p.name, "createdAt": iso8601(p.created_at), "privileged": p.privileged}))
+        .collect();
+    Ok(Json(json!({ "passwords": list })))
+}
+
+#[derive(Deserialize)]
+pub struct RevokeAppPasswordInput {
+    name: String,
+}
+
+pub async fn revoke_app_password(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<RevokeAppPasswordInput>,
+) -> XrpcResult<()> {
+    let authed = auth::access(&s, &headers).await?;
+    let mut tx = s.store.begin().await?;
+    tx.delete_app_password(&authed.did, &input.name).await?;
+    tx.revoke_sessions(&authed.did, SessionFilter::AppPassword(&input.name))
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Milliseconds since the epoch as an RFC 3339 UTC timestamp.
+fn iso8601(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iso8601;
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso8601(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(iso8601(951_782_400_000), "2000-02-29T00:00:00.000Z");
+    }
+}
