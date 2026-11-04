@@ -119,6 +119,7 @@ dependencies = [
  "locus-sync",
  "locus-web",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

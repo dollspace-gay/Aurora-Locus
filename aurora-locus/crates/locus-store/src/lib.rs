@@ -4,6 +4,7 @@
 //! [`Store`] and [`Tx`].
 
 pub mod env;
+pub mod jobs;
 pub mod lease;
 pub mod runtime;
 pub mod settings;

@@ -444,3 +444,23 @@ async fn run_leased_runs_the_job_on_one_node_at_a_time() {
         );
     }
 }
+
+#[tokio::test]
+async fn job_runs_are_recorded() {
+    for b in backends().await {
+        let s = &b.store;
+        s.record_job_run("gc", None, Some(123)).await.unwrap();
+        s.record_job_run("gc", Some("disk full"), Some(456))
+            .await
+            .unwrap();
+        let states = s.job_states().await.unwrap();
+        assert_eq!(states.len(), 1, "{}", b.name);
+        let gc = &states[0];
+        assert_eq!(gc.runs, 2, "{}", b.name);
+        assert_eq!(gc.last_error.as_deref(), Some("disk full"), "{}", b.name);
+        assert_eq!(gc.next_run_at, Some(456), "{}", b.name);
+        // The failed run doesn't erase when it last succeeded.
+        assert!(gc.last_ok_at.is_some(), "{}", b.name);
+        assert!(gc.last_run_at >= gc.last_ok_at, "{}", b.name);
+    }
+}

@@ -26,3 +26,7 @@ kryphocron built in.
 - Env values for runtime settings seed them at first boot and apply again
   when they change, once every live node agrees.
 - Fenced leases for singleton jobs: a node that loses its lease can't commit.
+- `aurora-locus serve` starts a node: opens and migrates the database, keeps a
+  persistent node id, claims a TID clock id, applies env values, follows live
+  settings (including the log level) and shuts down cleanly on SIGTERM.
+- Job run bookkeeping (last run, last success, next run, last error).
