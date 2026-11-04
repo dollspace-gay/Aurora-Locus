@@ -16,3 +16,13 @@ kryphocron built in.
   proto-blue (`skydeval/proto-blue` at `7a3fb57`), kryphocron 0.4.5 and
   kryphocron-lexicons 0.3.5. Rust 1.88.
 - `aurora-locus version` command.
+- Bootstrap configuration from `locus.toml`, `LOCUS_*` variables and the
+  reference PDS's `PDS_*` variables, including its SSRF-protection and
+  dev-mode rules.
+- Storage with SQLite and Postgres backends: embedded migrations, and a node
+  refuses to start against a database schema newer than it knows.
+- Runtime settings stored in the database, validated, audited and applied
+  live on every node (Postgres `NOTIFY` plus a 5-second poll).
+- Env values for runtime settings seed them at first boot and apply again
+  when they change, once every live node agrees.
+- Fenced leases for singleton jobs: a node that loses its lease can't commit.

@@ -1,5 +1,5 @@
 //! The aurora-locus binary: `serve` runs a node; the other subcommands are
-//! the CLI (design §19).
+//! the operator CLI.
 
 use clap::{Parser, Subcommand};
 
