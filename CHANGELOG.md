@@ -60,6 +60,14 @@ kryphocron built in.
   TLDs, the first-label length and no-dot rules on the PDS's own handle
   domains, the reference's reserved names plus operator-entered ones, and the
   reference's slur filter.
+- Accounts, sessions, app passwords and invite codes in the database, with
+  handle and email uniqueness across every account (a clash is "Handle
+  already taken" / "Email already taken", never a server error).
+- Legacy sessions with the reference's token shapes (HS256 access and
+  refresh JWTs) but checked against the database on every request: logout,
+  app-password revocation and takedown take effect on the next request.
+  Refresh rotation keeps the reference's 2-hour replay grace. Passwords and
+  app passwords are hashed with Argon2id.
 
 ### Changed
 

@@ -3,6 +3,7 @@
 //! tree and query text, so each can use its own strengths; callers only see
 //! [`Store`] and [`Tx`].
 
+pub mod accounts;
 pub mod env;
 pub mod jobs;
 pub mod lease;
