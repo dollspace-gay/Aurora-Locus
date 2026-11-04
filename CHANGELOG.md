@@ -51,6 +51,15 @@ kryphocron built in.
   a node with a different key refuses to start, and every secret write checks
   the key again. A file key is generated only on a fresh single-node SQLite
   install with a persistent data dir.
+- did:plc operations: build, sign and verify operations and tombstones, derive
+  a DID from its genesis operation, and read and write the PLC directory's
+  JSON form, checked against real directory data. Operations locus signs are
+  validated first (did:key rotation keys and verification methods, at://
+  `alsoKnownAs`, http(s) service endpoints).
+- Handle rules as the reference PDS: normalization and syntax, disallowed
+  TLDs, the first-label length and no-dot rules on the PDS's own handle
+  domains, the reference's reserved names plus operator-entered ones, and the
+  reference's slur filter.
 
 ### Changed
 

@@ -1353,7 +1353,16 @@ dependencies = [
 name = "locus-identity"
 version = "0.1.0-dev"
 dependencies = [
+ "base64",
  "locus-core",
+ "proto-blue-crypto",
+ "proto-blue-lex-cbor",
+ "proto-blue-lex-data",
+ "proto-blue-syntax",
+ "regex",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
