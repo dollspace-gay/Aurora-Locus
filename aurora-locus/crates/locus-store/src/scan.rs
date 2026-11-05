@@ -333,3 +333,34 @@ impl Store {
         .map_err(db_err)
     }
 }
+
+impl Store {
+    /// A cleared match (a false positive): no longer held or quarantined,
+    /// permanent if records use it, otherwise back to temp (collected if
+    /// nothing references it).
+    pub async fn release_quarantined_blob(&self, did: &str, cid: &str) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE blob SET review_hold = {3}, scan_status = 'allowed', state = CASE WHEN EXISTS \
+             (SELECT 1 FROM record_blob r WHERE r.did = {1} AND r.blob_cid = {2}) THEN 'permanent' ELSE 'temp' END \
+             WHERE did = {1} AND cid = {2} AND state = 'quarantined' AND takedown_ref IS NULL",
+            self.is_postgres(),
+        );
+        match self {
+            Store::Sqlite(p) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .bind(false)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            Store::Postgres(p) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .bind(false)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(db_err)
+    }
+}

@@ -647,12 +647,16 @@ pub async fn ensure_generation(
 ) -> locus_core::CoreResult<()> {
     let now = locus_core::time::now_ms();
     let period = s.snapshot().int("kryphocron.rotation_period_days") * 86_400_000;
-    let due = match s.store.current_generation().await? {
+    let current = s.store.current_generation().await?;
+    let due = match &current {
         Some((_, created)) => now - created >= period,
         None => true,
     };
     if due {
-        let mark = locus_kryphocron::rotation::new_mark(u64::try_from(now / 1000).unwrap_or(0));
+        let mark = locus_kryphocron::rotation::next_mark(
+            current.as_ref().map(|(g, _)| g.as_str()),
+            u64::try_from(now / 1000).unwrap_or(0),
+        );
         let mut tx = s.store.begin().await?;
         tx.fence(lease).await?;
         tx.add_generation(&mark, now).await?;

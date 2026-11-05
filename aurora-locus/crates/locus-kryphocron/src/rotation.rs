@@ -148,3 +148,26 @@ mod tests {
         );
     }
 }
+
+/// A new mark that sorts after `current`: dated now, or a second after
+/// `current` when that's not later (two generations in one second would
+/// otherwise compare by their random batch ids).
+#[must_use]
+pub fn next_mark(current: Option<&str>, now_secs: u64) -> String {
+    let after = current.and_then(mark_secs).map_or(0, |s| s + 1);
+    new_mark(now_secs.max(after))
+}
+
+#[cfg(test)]
+mod next_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_mark_always_sorts_after_the_current_one() {
+        let cur = new_mark(1_700_000_000);
+        for _ in 0..50 {
+            assert!(next_mark(Some(&cur), 1_700_000_000) > cur);
+        }
+        assert_eq!(mark_secs(&next_mark(None, 5)), Some(5));
+    }
+}

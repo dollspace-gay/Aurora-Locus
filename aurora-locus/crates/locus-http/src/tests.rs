@@ -8295,3 +8295,221 @@ impl Harness {
         v["accessJwt"].as_str().unwrap().to_owned()
     }
 }
+
+#[tokio::test]
+async fn the_locus_namespace_is_gated_by_role_group() {
+    let h = harness(false).await;
+    let (did, _) = h.user("abe.pds.example.com").await;
+    let viewer = format!("Bearer {}", h.operator("vee", "viewer").await);
+    let moderator = format!("Bearer {}", h.operator("mo", "moderator").await);
+    let admin = format!("Bearer {}", h.operator("ad", "admin").await);
+    let owner = format!("Bearer {}", h.operator("own", "owner").await);
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+
+    // Ungated, and by group.
+    let (st, v) = h.get(ns("describeCapabilities")).await;
+    assert_eq!((st, v["locus"].as_bool()), (StatusCode::OK, Some(true)));
+    let (st, v) = h
+        .admin_call("GET", &ns("viewer.getSettings"), &viewer, None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        v["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["key"] == "log.level")
+    );
+    assert_eq!(
+        h.admin_call("GET", &ns("viewer.getSettings"), &h.basic_admin(), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "the admin password doesn't reach locus methods"
+    );
+    let set = |level: &str| json!({"key": "log.level", "value": level});
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("admin.setSetting"),
+            &moderator,
+            Some(set("debug"))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.admin_call("POST", &ns("admin.setSetting"), &admin, Some(set("loud")))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST,
+        "validated"
+    );
+    assert_eq!(
+        h.admin_call("POST", &ns("admin.setSetting"), &admin, Some(set("debug")))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(h.state.snapshot().text("log.level"), "debug");
+    let gate = json!({"key": "kryphocron.private_media_gated", "value": true});
+    assert_eq!(
+        h.admin_call("POST", &ns("admin.setSetting"), &admin, Some(gate))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST,
+        "needs a scanner"
+    );
+    let (_, log) = h
+        .admin_call("GET", &ns("viewer.getAuditLog"), &viewer, None)
+        .await;
+    let change = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "setting.change")
+        .unwrap();
+    assert_eq!(
+        (change["actor"].as_str(), &change["detail"]["after"]),
+        (Some("operator:ad"), &json!("debug"))
+    );
+
+    // The private-tier block (moderator).
+    let block = json!({"did": did, "blocked": true});
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.setPrivateTierBlock"),
+            &viewer,
+            Some(block.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.setPrivateTierBlock"),
+            &moderator,
+            Some(block)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(h.state.store.private_tier_blocked(&did).await.unwrap());
+
+    // A cleared review releases the blob.
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.insert_temp_blob(&did, "bafyheld", "image/png", 3, "tmp/held")
+        .await
+        .unwrap();
+    tx.quarantine_match(&did, "bafyheld").await.unwrap();
+    tx.commit().await.unwrap();
+    let id = h
+        .state
+        .store
+        .add_review(&did, "bafyheld", "upload", "quarantine", None)
+        .await
+        .unwrap();
+    let (_, q) = h
+        .admin_call("GET", &ns("moderator.review.listQueue"), &moderator, None)
+        .await;
+    assert_eq!(q["reviews"].as_array().unwrap().len(), 1);
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("moderator.review.resolve"),
+            &moderator,
+            Some(json!({"id": id, "status": "cleared", "note": "a cat"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = h.state.store.blob(&did, "bafyheld").await.unwrap().unwrap();
+    assert_eq!((row.state.as_str(), row.review_hold), ("temp", false));
+
+    // Operators and tokens (owner).
+    let new_op = json!({"username": "newbie", "password": "a long password!", "role": "viewer"});
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("owner.createOperator"),
+            &admin,
+            Some(new_op.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.admin_call("POST", &ns("owner.createOperator"), &owner, Some(new_op))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, t) = h
+        .admin_call(
+            "POST",
+            &ns("owner.createApiToken"),
+            &owner,
+            Some(json!({"operator": "newbie", "name": "ci"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    let newbie = format!("Bearer {}", t["token"].as_str().unwrap());
+    assert_eq!(
+        h.admin_call("GET", &ns("viewer.listJobs"), &newbie, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    h.admin_call(
+        "POST",
+        &ns("owner.revokeApiToken"),
+        &owner,
+        Some(json!({"id": t["id"]})),
+    )
+    .await;
+    assert_eq!(
+        h.admin_call("GET", &ns("viewer.listJobs"), &newbie, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("owner.updateOperator"),
+            &owner,
+            Some(json!({"username": "own", "role": "admin"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("There must be at least one owner")
+        )
+    );
+    let (_, ops) = h
+        .admin_call("GET", &ns("owner.listOperators"), &owner, None)
+        .await;
+    assert_eq!(ops["operators"].as_array().unwrap().len(), 5);
+
+    // Kryphocron views and controls.
+    let (st, v) = h
+        .admin_call("GET", &ns("viewer.kryphocron.getStatus"), &viewer, None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let before = v["rotation"]["generation"].clone();
+    let (st, v) = h
+        .admin_call("POST", &ns("admin.kryphocron.rotateNow"), &admin, None)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, after) = h
+        .admin_call("GET", &ns("viewer.kryphocron.getStatus"), &viewer, None)
+        .await;
+    assert_ne!(after["rotation"]["generation"], before);
+}

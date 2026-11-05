@@ -189,11 +189,16 @@ pub async fn list_missing_blobs(
 pub async fn get_import_status(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
     let pds = format!("{}#atproto_pds", s.service_did);
     let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
-        Ok(p.assert_rpc("app.nearhorizon.locus.account.getImportStatus", &pds)?)
+        Ok(p.assert_rpc(locus_core::locus_nsid!("account.getImportStatus"), &pds)?)
     })
     .await?;
-    let Some(st) = s.store.latest_import(&authed.did).await? else {
-        return Ok(Json(json!({ "import": null })));
+    import_status(&s, &authed.did).await.map(Json)
+}
+
+/// An account's latest import job, as `getImportStatus` reports it.
+pub async fn import_status(s: &AppState, did: &str) -> XrpcResult<Value> {
+    let Some(st) = s.store.latest_import(did).await? else {
+        return Ok(json!({ "import": null }));
     };
     let mut out = json!({
         "id": st.id,
@@ -209,5 +214,5 @@ pub async fn get_import_status(State(s): St, headers: HeaderMap) -> XrpcResult<J
     if let Some(n) = st.notes {
         out["notes"] = json!(n);
     }
-    Ok(Json(json!({ "import": out })))
+    Ok(json!({ "import": out }))
 }

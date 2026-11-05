@@ -21,7 +21,7 @@ use crate::error::{XrpcError, XrpcResult};
 use crate::state::AppState;
 
 pub const ASSERTION_TYP: &str = "kryphocron-audience+jwt";
-pub const ASSERTION_LXM: &str = "app.nearhorizon.locus.audience.getMembershipAssertion";
+pub const ASSERTION_LXM: &str = locus_core::locus_nsid!("audience.getMembershipAssertion");
 const ASSERTION_TTL_S: i64 = 300;
 
 /// The one refusal every audience check returns.

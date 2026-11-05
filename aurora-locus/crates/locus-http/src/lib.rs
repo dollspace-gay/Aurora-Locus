@@ -14,6 +14,7 @@ pub mod identity;
 pub mod import;
 pub mod kryphocron;
 pub mod lexicon;
+pub mod locus_admin;
 pub mod media_gate;
 pub mod membership;
 pub mod oauth;
@@ -167,7 +168,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(import::list_missing_blobs),
         )
         .route(
-            "/xrpc/app.nearhorizon.locus.account.getImportStatus",
+            concat!("/xrpc/", locus_core::locus_nsid!("account.getImportStatus")),
             get(import::get_import_status),
         )
         .route(
@@ -248,7 +249,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(kryphocron::participate_private),
         )
         .route(
-            "/xrpc/app.nearhorizon.locus.audience.getMembershipAssertion",
+            concat!(
+                "/xrpc/",
+                locus_core::locus_nsid!("audience.getMembershipAssertion")
+            ),
             get(membership::get_membership_assertion),
         )
         .route(
@@ -366,6 +370,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/xrpc/app.bsky.notification.unregisterPush",
             post(raw::unregister_push),
         )
+        // Locus's operator methods.
+        .merge(locus_admin::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(
