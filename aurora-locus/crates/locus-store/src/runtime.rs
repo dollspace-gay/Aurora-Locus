@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use locus_core::lease::LeaseToken;
 use locus_core::settings::Snapshot;
@@ -135,7 +135,9 @@ impl Settings {
 
 /// Runs `job` on this node only while it holds the lease `name`, until
 /// `cancel` fires. While another node holds the lease, it waits and retries.
-/// It renews every third of `ttl`; if a renewal fails, the job's own
+/// It renews every third of `ttl`; if a renewal fails, or hasn't answered
+/// by a sixth of `ttl` before the lease would run out (counted from before
+/// each request, so never later than the store's own expiry), the job's own
 /// cancellation token fires and the runner waits for it to stop before trying
 /// to reacquire. Work the job commits must still call [`crate::Tx::fence`]
 /// with the token: a paused process can wake after its lease expired.
@@ -151,7 +153,9 @@ pub async fn run_leased<F, Fut>(
     Fut: Future<Output = CoreResult<()>> + Send + 'static,
 {
     let interval = ttl / 3;
+    let margin = ttl / 6;
     while !cancel.is_cancelled() {
+        let asked = Instant::now();
         let token = match store.try_acquire_lease(&name, &holder, ttl).await {
             Ok(Some(t)) => t,
             Ok(None) => {
@@ -169,6 +173,9 @@ pub async fn run_leased<F, Fut>(
         let job_cancel = cancel.child_token();
         let mut handle = tokio::spawn(job(token.clone(), job_cancel.clone()));
         let mut finished = None;
+        // The lease is surely ours until here: the store set its expiry
+        // after this instant.
+        let mut held_until = asked + ttl;
         loop {
             tokio::select! {
                 res = &mut handle => {
@@ -176,14 +183,20 @@ pub async fn run_leased<F, Fut>(
                     break;
                 }
                 () = tokio::time::sleep(interval) => {
-                    match store.renew_lease(&token).await {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    let sent = Instant::now();
+                    let left = held_until.saturating_duration_since(sent).saturating_sub(margin);
+                    match tokio::time::timeout(left, store.renew_lease(&token)).await {
+                        Ok(Ok(true)) => held_until = sent + ttl,
+                        Ok(Ok(false)) => {
                             tracing::warn!(lease = %name, epoch = token.epoch, "lease lost; stopping job");
                             break;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(lease = %name, "renew failed ({e}); stopping job");
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!(lease = %name, "renew didn't answer before the lease ran out; stopping job");
                             break;
                         }
                     }
