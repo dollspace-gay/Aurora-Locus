@@ -80,6 +80,27 @@ impl SafeFetcher {
     }
 }
 
+/// A client for streamed requests to targets a user can influence (proxy
+/// targets): no redirects, no overall timeout (the caller bounds the wait
+/// for headers and for each body chunk), and with SSRF protection on, the
+/// unicast-only resolver. `http2` allows HTTP/2 by ALPN; otherwise HTTP/1.1
+/// only. Check each URL with [`check_url`] (non-strict) first.
+pub fn streaming_client(ssrf_protection: bool, http2: bool) -> Result<reqwest::Client, FetchError> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("aurora-locus/", env!("CARGO_PKG_VERSION")));
+    if ssrf_protection {
+        builder = builder.dns_resolver(Arc::new(UnicastResolver));
+    }
+    if !http2 {
+        builder = builder.http1_only();
+    }
+    builder
+        .build()
+        .map_err(|e| FetchError::Other(e.to_string()))
+}
+
 /// The URL policy (applied before connecting; the resolver covers names).
 pub fn check_url(url: &Url, policy: FetchPolicy) -> Result<(), String> {
     match url.scheme() {

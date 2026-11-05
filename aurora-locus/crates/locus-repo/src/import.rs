@@ -108,7 +108,9 @@ impl<R: AsyncRead + Unpin> CarReader<R> {
         let bytes = me.exact(len).await?;
         let header: LexValue =
             proto_blue_lex_cbor::decode(&bytes).map_err(|_| invalid("Invalid CAR header"))?;
-        let map = header.as_map().ok_or_else(|| invalid("Invalid CAR header"))?;
+        let map = header
+            .as_map()
+            .ok_or_else(|| invalid("Invalid CAR header"))?;
         if map.get("version").and_then(LexValue::as_integer) != Some(1) {
             return Err(invalid("Unsupported CAR version"));
         }
@@ -117,7 +119,11 @@ impl<R: AsyncRead + Unpin> CarReader<R> {
             .and_then(LexValue::as_array)
             .ok_or_else(|| invalid("Invalid CAR header"))?
             .iter()
-            .map(|v| v.as_cid().cloned().ok_or_else(|| invalid("Invalid CAR root")))
+            .map(|v| {
+                v.as_cid()
+                    .cloned()
+                    .ok_or_else(|| invalid("Invalid CAR root"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((me, roots))
     }
@@ -173,10 +179,13 @@ impl<R: AsyncRead + Unpin> CarReader<R> {
         }
         self.blocks += 1;
         if self.blocks > MAX_BLOCKS {
-            return Err(invalid(format!("Too many blocks in CAR (max {MAX_BLOCKS})")));
+            return Err(invalid(format!(
+                "Too many blocks in CAR (max {MAX_BLOCKS})"
+            )));
         }
         let mut section = self.exact(len).await?;
-        let cid = Cid::from_bytes(&section).map_err(|e| invalid(format!("Invalid CID in CAR: {e}")))?;
+        let cid =
+            Cid::from_bytes(&section).map_err(|e| invalid(format!("Invalid CID in CAR: {e}")))?;
         let cid_len = cid.to_bytes().len();
         if cid_len > section.len() || !cid.is_dasl_compliant() {
             return Err(invalid("Invalid CID in CAR"));
@@ -478,10 +487,7 @@ impl RepoEngine {
         let commit = SignedCommit::from_lex_value(&commit_value)
             .map_err(|e| invalid(format!("Could not parse commit: {e}")))?;
         if commit.did != did {
-            return Err(invalid(format!(
-                "Commit is for {}, not {did}",
-                commit.did
-            )));
+            return Err(invalid(format!("Commit is for {}, not {did}", commit.did)));
         }
         let signature_note = match signing_key {
             Some(key) if verify_commit_sig(&commit, key).unwrap_or(false) => None,
@@ -727,7 +733,9 @@ impl RepoEngine {
         let bytes = commit
             .to_cbor()
             .map_err(|e| CoreError::Storage(e.to_string()))?;
-        let cid = commit.cid().map_err(|e| CoreError::Storage(e.to_string()))?;
+        let cid = commit
+            .cid()
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
         tx.apply_block_deltas(
             did,
             new_rev,
@@ -791,10 +799,20 @@ impl RepoEngine {
                             }],
                         )
                         .await?;
-                        tx.replace_record_blobs(did, &r.collection, &r.rkey, &import_blob_cids(&value))
-                            .await?;
-                        tx.replace_backlinks(did, &r.collection, &r.rkey, &backlinks(&r.collection, &value))
-                            .await?;
+                        tx.replace_record_blobs(
+                            did,
+                            &r.collection,
+                            &r.rkey,
+                            &import_blob_cids(&value),
+                        )
+                        .await?;
+                        tx.replace_backlinks(
+                            did,
+                            &r.collection,
+                            &r.rkey,
+                            &backlinks(&r.collection, &value),
+                        )
+                        .await?;
                     }
                     _ => {
                         tx.apply_record_changes(
@@ -806,11 +824,14 @@ impl RepoEngine {
                             }],
                         )
                         .await?;
-                        tx.replace_record_blobs(did, &r.collection, &r.rkey, &[]).await?;
-                        tx.replace_backlinks(did, &r.collection, &r.rkey, &[]).await?;
+                        tx.replace_record_blobs(did, &r.collection, &r.rkey, &[])
+                            .await?;
+                        tx.replace_backlinks(did, &r.collection, &r.rkey, &[])
+                            .await?;
                     }
                 }
-                tx.mark_import_record(&job.id, &r.collection, &r.rkey).await?;
+                tx.mark_import_record(&job.id, &r.collection, &r.rkey)
+                    .await?;
             }
             done += rows.len() as i64;
             tx.set_bulk_counts(&job.id, done.min(total), total).await?;
@@ -821,7 +842,11 @@ impl RepoEngine {
     /// Phase 5 and the end: negative deltas, blobs left unreferenced (and
     /// temp rows of the new tree's CIDs uploaded meanwhile promoted), then
     /// staging dropped and the write block cleared.
-    pub async fn import_decrements(&self, job: &BulkJob, new_rev: &str) -> Result<Vec<PendingMove>, ImportError> {
+    pub async fn import_decrements(
+        &self,
+        job: &BulkJob,
+        new_rev: &str,
+    ) -> Result<Vec<PendingMove>, ImportError> {
         let did = job.did.as_str();
         loop {
             let mut tx = self.job_tx(job).await?;
@@ -990,7 +1015,13 @@ impl RepoEngine {
             .await
         {
             // The swap is one transaction: if it failed, nothing moved.
-            if self.store().bulk_job(&job.id).await.ok().flatten().map(|j| j.phase)
+            if self
+                .store()
+                .bulk_job(&job.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|j| j.phase)
                 != Some("reindex".to_owned())
             {
                 self.roll_back_after(job, &e).await;

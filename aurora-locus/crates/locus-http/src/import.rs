@@ -71,7 +71,9 @@ pub async fn import_repo(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         .await;
     if let Err(e) = written {
         let (err, why) = match e {
-            locus_blob::BlobError::TooLarge { .. } => (too_large(), "the upload is too large".to_owned()),
+            locus_blob::BlobError::TooLarge { .. } => {
+                (too_large(), "the upload is too large".to_owned())
+            }
             other => (
                 XrpcError::invalid_request("Could not read the upload"),
                 format!("could not read the upload: {other}"),

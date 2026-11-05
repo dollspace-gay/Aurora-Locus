@@ -318,7 +318,12 @@ pub async fn resume_bulk_jobs(s: &AppState) -> locus_core::CoreResult<usize> {
                 s.store.run_delete_job(&job, DELETE_BATCH).await?;
             }
             "import" => {
-                tracing::info!(did = job.did, job = job.id, phase = job.phase, "resuming import");
+                tracing::info!(
+                    did = job.did,
+                    job = job.id,
+                    phase = job.phase,
+                    "resuming import"
+                );
                 crate::import::resume_import(s, &job).await?;
             }
             other => tracing::warn!(job = job.id, "no runner for bulk job kind {other}"),

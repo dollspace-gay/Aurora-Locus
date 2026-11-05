@@ -622,7 +622,12 @@ mod import {
     async fn check_index(b: &Backend, model: &BTreeMap<String, (Cid, Vec<u8>)>, what: &str) {
         let mut got = BTreeMap::new();
         for c in COLLS {
-            for (rkey, cid) in b.store.list_records(DID, c, 10_000, None, false).await.unwrap() {
+            for (rkey, cid) in b
+                .store
+                .list_records(DID, c, 10_000, None, false)
+                .await
+                .unwrap()
+            {
                 got.insert(format!("{c}/{rkey}"), cid);
             }
         }
@@ -633,7 +638,11 @@ mod import {
         assert_eq!(got, want, "{} {what}: record index", b.name);
     }
 
-    fn mutate(rng: &mut Rng, model: &BTreeMap<String, (Cid, Vec<u8>)>, n: usize) -> BTreeMap<String, (Cid, Vec<u8>)> {
+    fn mutate(
+        rng: &mut Rng,
+        model: &BTreeMap<String, (Cid, Vec<u8>)>,
+        n: usize,
+    ) -> BTreeMap<String, (Cid, Vec<u8>)> {
         let mut next = model.clone();
         for _ in 0..n {
             let coll = COLLS[rng.below(3) as usize];
@@ -679,7 +688,9 @@ mod import {
                         let (c, r) = p.split_once('/').unwrap();
                         match model.get(p) {
                             None => writes.push(write(Action::Create, c, r, None)),
-                            Some(old) if old.0 != v.0 => writes.push(write(Action::Update, c, r, None)),
+                            Some(old) if old.0 != v.0 => {
+                                writes.push(write(Action::Update, c, r, None))
+                            }
                             Some(_) => continue,
                         }
                         writes.last_mut().unwrap().record = Some(v.clone());
@@ -703,8 +714,8 @@ mod import {
                     }
                 }
                 let target = match round {
-                    5 => model.clone(),     // the same repo again
-                    11 => BTreeMap::new(),  // everything removed
+                    5 => model.clone(),    // the same repo again
+                    11 => BTreeMap::new(), // everything removed
                     _ => {
                         let n = 1 + rng.below(30) as usize;
                         mutate(&mut rng, &model, n)
@@ -712,8 +723,12 @@ mod import {
                 };
                 // An old rev, so the import's rev must come from the stored one.
                 let foreign = round % 2 == 0;
-                let (root, mut blocks) =
-                    model_blocks(&target, DID, "2222222222222", if foreign { &other } else { &key });
+                let (root, mut blocks) = model_blocks(
+                    &target,
+                    DID,
+                    "2222222222222",
+                    if foreign { &other } else { &key },
+                );
                 // Leave out about half the blocks the current repo already has.
                 let live = b.store.repo_block_counts(DID).await.unwrap();
                 let omit: Vec<Cid> = blocks
@@ -732,8 +747,17 @@ mod import {
                 check_index(&b, &model, &format!("round {round}")).await;
                 let st = b.store.latest_import(DID).await.unwrap().unwrap();
                 assert_eq!((st.id.as_str(), st.phase.as_str()), (job.as_str(), "done"));
-                assert_eq!(st.notes.is_some(), foreign, "{} round {round}: signature note", b.name);
-                assert_eq!(b.store.import_record_count(&job).await.unwrap(), 0, "staging dropped");
+                assert_eq!(
+                    st.notes.is_some(),
+                    foreign,
+                    "{} round {round}: signature note",
+                    b.name
+                );
+                assert_eq!(
+                    b.store.import_record_count(&job).await.unwrap(),
+                    0,
+                    "staging dropped"
+                );
                 let rev = root_of(&b.store).await.rev;
                 assert!(rev > last_rev, "{} round {round}: rev went forward", b.name);
                 last_rev = rev;
@@ -765,7 +789,11 @@ mod import {
         let entries = entries
             .into_iter()
             .map(|(k, value, tree)| {
-                let p = last.bytes().zip(k.bytes()).take_while(|(a, b)| a == b).count();
+                let p = last
+                    .bytes()
+                    .zip(k.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 let e = TreeEntry {
                     prefix_len: p,
                     key_suffix: k.as_bytes()[p..].to_vec(),
@@ -776,7 +804,8 @@ mod import {
                 e
             })
             .collect();
-        let bytes = proto_blue_lex_cbor::encode(&serialize_node_data(&NodeData { left, entries })).unwrap();
+        let bytes =
+            proto_blue_lex_cbor::encode(&serialize_node_data(&NodeData { left, entries })).unwrap();
         (Cid::for_cbor(&bytes), bytes)
     }
 
@@ -801,15 +830,19 @@ mod import {
                 model.insert(format!("{}/3m{i:011}", COLLS[0]), record(COLLS[0], i));
             }
             let (root, blocks) = model_blocks(&model, DID, "2222222222222", &key);
-            import(&engine, &car_of(&root, &blocks), None, &key).await.unwrap();
+            import(&engine, &car_of(&root, &blocks), None, &key)
+                .await
+                .unwrap();
             check_against_model(&b, &model, 0, &key).await;
 
             let (rec, rec_bytes) = record(COLLS[0], 99);
             // One subtree referenced twice.
             let (shared, shared_bytes) = node(None, vec![(key_on(0, "0"), rec.clone(), None)]);
             let top = key_on(1, "5");
-            let (dup_root, dup_root_bytes) =
-                node(Some(shared.clone()), vec![(top, rec.clone(), Some(shared.clone()))]);
+            let (dup_root, dup_root_bytes) = node(
+                Some(shared.clone()),
+                vec![(top, rec.clone(), Some(shared.clone()))],
+            );
             let mut dup = proto_blue_repo::block_map::BlockMap::new();
             dup.set(shared.clone(), shared_bytes.clone());
             dup.set(dup_root.clone(), dup_root_bytes);
@@ -839,7 +872,12 @@ mod import {
             missing.set(c3.clone(), cb3);
 
             // Another account's commit.
-            let (r4, mut other_did) = model_blocks(&model, "did:plc:someoneelse00000000000", "2222222222222", &key);
+            let (r4, mut other_did) = model_blocks(
+                &model,
+                "did:plc:someoneelse00000000000",
+                "2222222222222",
+                &key,
+            );
             let _ = &mut other_did;
 
             let mut corrupt = car_of(&root, &blocks);
@@ -847,7 +885,11 @@ mod import {
             corrupt[last] ^= 0xff;
 
             let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-                ("dup", car_of(&c, &dup), "invalid MST: node referenced more than once"),
+                (
+                    "dup",
+                    car_of(&c, &dup),
+                    "invalid MST: node referenced more than once",
+                ),
                 ("order", car_of(&c2, &bad_order), "keys out of order"),
                 ("missing", car_of(&c3, &missing), "missing block"),
                 ("did", car_of(&r4, &other_did), "not did:plc:testrepo"),
@@ -867,7 +909,11 @@ mod import {
                 assert_eq!(st.phase, "failed", "{} {name}", b.name);
                 assert!(st.error.unwrap().contains(want), "{} {name}", b.name);
                 let mut tx = b.store.begin().await.unwrap();
-                assert!(!tx.write_blocked(DID).await.unwrap(), "{} {name}: unblocked", b.name);
+                assert!(
+                    !tx.write_blocked(DID).await.unwrap(),
+                    "{} {name}: unblocked",
+                    b.name
+                );
                 tx.rollback().await.unwrap();
             }
         }
@@ -883,7 +929,9 @@ mod import {
             let mut rng = Rng(0x0dd_ba11);
             let old = mutate(&mut rng, &BTreeMap::new(), 40);
             let (root, blocks) = model_blocks(&old, DID, "2222222222222", &key);
-            import(&engine, &car_of(&root, &blocks), None, &key).await.unwrap();
+            import(&engine, &car_of(&root, &blocks), None, &key)
+                .await
+                .unwrap();
             let new = mutate(&mut rng, &old, 40);
             let (root, blocks) = model_blocks(&new, DID, "2222222222222", &key);
             let dir = tempfile::tempdir().unwrap();
@@ -893,18 +941,27 @@ mod import {
             // Stopped after increments: the resumer rolls back.
             let job = engine.start_import(DID, "test-node").await.unwrap();
             let staged = engine.stage_import(&job, &path, None).await.unwrap();
-            engine.import_increments(&job, &staged.new_rev).await.unwrap();
+            engine
+                .import_increments(&job, &staged.new_rev)
+                .await
+                .unwrap();
             let taken = b.store.bulk_job(&job.id).await.unwrap().unwrap();
             assert_eq!(taken.phase, "increments");
             engine.resume_import(&taken).await.unwrap();
             check_against_model(&b, &old, 1, &key).await;
             check_index(&b, &old, "rolled back").await;
-            assert_eq!(b.store.latest_import(DID).await.unwrap().unwrap().phase, "failed");
+            assert_eq!(
+                b.store.latest_import(DID).await.unwrap().unwrap().phase,
+                "failed"
+            );
 
             // Stopped after the swap: the resumer finishes it.
             let job = engine.start_import(DID, "test-node").await.unwrap();
             let staged = engine.stage_import(&job, &path, None).await.unwrap();
-            engine.import_increments(&job, &staged.new_rev).await.unwrap();
+            engine
+                .import_increments(&job, &staged.new_rev)
+                .await
+                .unwrap();
             engine
                 .import_swap(&job, &staged.data_cid, &staged.new_rev, &key, true)
                 .await
@@ -914,7 +971,10 @@ mod import {
             engine.resume_import(&taken).await.unwrap();
             check_against_model(&b, &new, 2, &key).await;
             check_index(&b, &new, "finished").await;
-            assert_eq!(b.store.latest_import(DID).await.unwrap().unwrap().phase, "done");
+            assert_eq!(
+                b.store.latest_import(DID).await.unwrap().unwrap().phase,
+                "done"
+            );
             let events = b.store.outbox_for(DID).await.unwrap();
             assert_eq!(events.last().unwrap().0, "sync");
         }

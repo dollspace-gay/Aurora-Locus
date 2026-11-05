@@ -435,10 +435,64 @@ pub struct GetRecordParams {
     cid: Option<String>,
 }
 
-pub async fn get_record(State(s): St, Query(p): Query<GetRecordParams>) -> XrpcResult<Json<Value>> {
-    let Some(account) = readable_account(&s, &p.repo).await? else {
-        return Err(XrpcError::invalid_request("Could not locate record"));
-    };
+/// A repo hosted here is answered locally; any other goes to the AppView,
+/// as the reference.
+pub async fn get_record(
+    State(s): St,
+    uri_in: axum::http::Uri,
+    headers: HeaderMap,
+    Query(p): Query<GetRecordParams>,
+) -> Response {
+    match readable_account(&s, &p.repo).await {
+        Ok(Some(account)) => local_record(&s, &account, &p).await.into_response(),
+        Ok(None) => remote_record(&s, &uri_in, &headers)
+            .await
+            .unwrap_or_else(|r| r),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn remote_record(
+    s: &AppState,
+    uri_in: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    use crate::pipethrough as pt;
+    if pt::appview(s).is_none() {
+        return Err(XrpcError::invalid_request("Could not locate record").into_response());
+    }
+    let lxm = "com.atproto.repo.getRecord";
+    let target = pt::target(s, headers, lxm)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let upstream = pt::send(
+        s,
+        pt::Outgoing {
+            method: axum::http::Method::GET,
+            lxm,
+            path_and_query: uri_in
+                .path_and_query()
+                .map_or(uri_in.path(), |q| q.as_str()),
+            headers,
+            body: None,
+            iss: None,
+            target: &target,
+            accept_encoding: headers
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            strict: false,
+        },
+    )
+    .await?;
+    Ok(pt::stream_back(s, upstream))
+}
+
+async fn local_record(
+    s: &AppState,
+    account: &Account,
+    p: &GetRecordParams,
+) -> XrpcResult<Json<Value>> {
     let at = uri(&account.did, &p.collection, &p.rkey);
     let not_found = || XrpcError::named("RecordNotFound", format!("Could not locate record: {at}"));
     let Some((cid, takedown)) = s
@@ -451,7 +505,7 @@ pub async fn get_record(State(s): St, Query(p): Query<GetRecordParams>) -> XrpcR
     if takedown.is_some() || p.cid.as_deref().is_some_and(|c| c != cid) {
         return Err(not_found());
     }
-    let value = record_value(&s, &account.did, &cid).await?;
+    let value = record_value(s, &account.did, &cid).await?;
     Ok(Json(json!({ "uri": at, "cid": cid, "value": value })))
 }
 

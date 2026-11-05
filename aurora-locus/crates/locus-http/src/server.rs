@@ -712,32 +712,7 @@ pub async fn revoke_app_password(
 
 use locus_core::time::iso8601;
 
-/// Methods only full access or a privileged app password can get a token
-/// for, as the reference.
-fn is_privileged_method(lxm: &str) -> bool {
-    lxm.starts_with("chat.bsky.") || lxm == "com.atproto.server.createAccount"
-}
-
-/// Account-management methods that are used directly, never through
-/// service auth, as the reference.
-const PROTECTED_METHODS: &[&str] = &[
-    "com.atproto.admin.sendEmail",
-    "com.atproto.identity.requestPlcOperationSignature",
-    "com.atproto.identity.signPlcOperation",
-    "com.atproto.identity.updateHandle",
-    "com.atproto.server.activateAccount",
-    "com.atproto.server.confirmEmail",
-    "com.atproto.server.createAppPassword",
-    "com.atproto.server.deactivateAccount",
-    "com.atproto.server.getAccountInviteCodes",
-    "com.atproto.server.getSession",
-    "com.atproto.server.listAppPasswords",
-    "com.atproto.server.requestAccountDelete",
-    "com.atproto.server.requestEmailConfirmation",
-    "com.atproto.server.requestEmailUpdate",
-    "com.atproto.server.revokeAppPassword",
-    "com.atproto.server.updateEmail",
-];
+use crate::pipethrough::{is_privileged_method, is_protected_method};
 
 #[derive(Deserialize)]
 pub struct GetServiceAuthParams {
@@ -794,7 +769,7 @@ pub async fn get_service_auth(
         }
     }
     if let Some(m) = lxm
-        && PROTECTED_METHODS.contains(&m)
+        && is_protected_method(m)
     {
         return Err(XrpcError::invalid_request(format!(
             "cannot request a service auth token for the following protected method: {m}"

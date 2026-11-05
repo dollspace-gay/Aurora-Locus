@@ -229,6 +229,19 @@ kryphocron built in.
   made permanent at once.
 - `app.nearhorizon.locus.account.getImportStatus`: the account's latest
   import, its phase and progress, and why it failed.
+- Pipethrough: XRPC methods without a local handler go to another service,
+  as the reference. `atproto-proxy` picks the service; otherwise moderation
+  methods go to the moderation service, `createReport` to the report
+  service, and the rest to the AppView (`PDS_BSKY_APP_VIEW_*`,
+  `PDS_MOD_SERVICE_*`, `PDS_REPORT_SERVICE_*`). Requests carry a service
+  token from the account and the reference's forwarded headers; responses
+  stream back with its headers. Upstream errors keep their status and
+  name (500 becomes 502), an unreachable service is 502 `UpstreamFailure`.
+  Account-management methods are never proxied, and chat needs full access
+  or a privileged app password. Targets named by `atproto-proxy` are held
+  to the SSRF rules. Timeouts, response size, HTTP/2 and retries follow the
+  reference's `PDS_PROXY_*` settings.
+- `getRecord` for a repo not hosted here is answered by the AppView.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.

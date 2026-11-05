@@ -97,7 +97,11 @@ impl Tx {
     }
 
     /// Stores blocks read from the uploaded CAR (first copy of a CID wins).
-    pub async fn stage_car_blocks(&mut self, job: &str, blocks: &[(String, Vec<u8>)]) -> CoreResult<()> {
+    pub async fn stage_car_blocks(
+        &mut self,
+        job: &str,
+        blocks: &[(String, Vec<u8>)],
+    ) -> CoreResult<()> {
         let q = sql(
             "INSERT INTO import_block (job_id, cid, content, delta) VALUES ({1}, {2}, {3}, 0) \
              ON CONFLICT (job_id, cid) DO NOTHING",
@@ -244,7 +248,10 @@ impl Tx {
     }
 
     pub async fn set_import_rev(&mut self, job: &str, rev: &str) -> CoreResult<()> {
-        let q = sql("UPDATE bulk_job SET new_rev = {2} WHERE id = {1}", self.pg());
+        let q = sql(
+            "UPDATE bulk_job SET new_rev = {2} WHERE id = {1}",
+            self.pg(),
+        );
         on_tx!(self, q, |ex| sqlx::query(&q)
             .bind(job)
             .bind(rev)
@@ -325,11 +332,20 @@ impl Tx {
             .map_err(db_err))?;
         Ok(rows
             .into_iter()
-            .map(|(cid, content, delta)| StagedBlock { cid, content, delta })
+            .map(|(cid, content, delta)| StagedBlock {
+                cid,
+                content,
+                delta,
+            })
             .collect())
     }
 
-    pub async fn mark_import_blocks(&mut self, job: &str, cids: &[String], applied: bool) -> CoreResult<()> {
+    pub async fn mark_import_blocks(
+        &mut self,
+        job: &str,
+        cids: &[String],
+        applied: bool,
+    ) -> CoreResult<()> {
         let q = sql(
             "UPDATE import_block SET applied = {3} WHERE job_id = {1} AND cid = {2}",
             self.pg(),
@@ -390,7 +406,12 @@ impl Tx {
             .map_err(db_err))
     }
 
-    pub async fn mark_import_blob(&mut self, job: &str, cid: &str, applied: bool) -> CoreResult<()> {
+    pub async fn mark_import_blob(
+        &mut self,
+        job: &str,
+        cid: &str,
+        applied: bool,
+    ) -> CoreResult<()> {
         let q = sql(
             "UPDATE import_blob SET applied = {3} WHERE job_id = {1} AND cid = {2}",
             self.pg(),
@@ -406,32 +427,42 @@ impl Tx {
     }
 
     /// Unapplied record changes, in key order.
-    pub async fn pending_import_records(&mut self, job: &str, limit: i64) -> CoreResult<Vec<StagedRecord>> {
+    pub async fn pending_import_records(
+        &mut self,
+        job: &str,
+        limit: i64,
+    ) -> CoreResult<Vec<StagedRecord>> {
         let q = sql(
             "SELECT collection, rkey, change, new_cid, old_cid FROM import_record \
              WHERE job_id = {1} AND NOT applied ORDER BY collection, rkey LIMIT {2}",
             self.pg(),
         );
-        let rows: Vec<RecordRow> =
-            on_tx!(self, q, |ex| sqlx::query_as(&q)
-                .bind(job)
-                .bind(limit)
-                .fetch_all(ex)
-                .await
-                .map_err(db_err))?;
+        let rows: Vec<RecordRow> = on_tx!(self, q, |ex| sqlx::query_as(&q)
+            .bind(job)
+            .bind(limit)
+            .fetch_all(ex)
+            .await
+            .map_err(db_err))?;
         Ok(rows
             .into_iter()
-            .map(|(collection, rkey, change, new_cid, old_cid)| StagedRecord {
-                collection,
-                rkey,
-                change,
-                new_cid,
-                old_cid,
-            })
+            .map(
+                |(collection, rkey, change, new_cid, old_cid)| StagedRecord {
+                    collection,
+                    rkey,
+                    change,
+                    new_cid,
+                    old_cid,
+                },
+            )
             .collect())
     }
 
-    pub async fn mark_import_record(&mut self, job: &str, collection: &str, rkey: &str) -> CoreResult<()> {
+    pub async fn mark_import_record(
+        &mut self,
+        job: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> CoreResult<()> {
         let q = sql(
             "UPDATE import_record SET applied = TRUE WHERE job_id = {1} AND collection = {2} AND rkey = {3}",
             self.pg(),
@@ -447,7 +478,11 @@ impl Tx {
     }
 
     /// The staged bytes of the given blocks (those that have bytes).
-    pub async fn staged_contents(&mut self, job: &str, cids: &[String]) -> CoreResult<HashMap<String, Vec<u8>>> {
+    pub async fn staged_contents(
+        &mut self,
+        job: &str,
+        cids: &[String],
+    ) -> CoreResult<HashMap<String, Vec<u8>>> {
         let q = sql(
             "SELECT content FROM import_block WHERE job_id = {1} AND cid = {2} AND content IS NOT NULL",
             self.pg(),
@@ -498,7 +533,11 @@ impl Tx {
     }
 
     /// The active import job whose new tree references this blob, if any.
-    pub async fn active_import_for_blob(&mut self, did: &str, cid: &str) -> CoreResult<Option<String>> {
+    pub async fn active_import_for_blob(
+        &mut self,
+        did: &str,
+        cid: &str,
+    ) -> CoreResult<Option<String>> {
         let q = sql(
             &format!(
                 "SELECT j.id FROM bulk_job j JOIN import_blob b ON b.job_id = j.id \
@@ -590,7 +629,10 @@ impl Store {
     }
 
     pub async fn import_record_count(&self, job: &str) -> CoreResult<i64> {
-        let q = sql("SELECT COUNT(*) FROM import_record WHERE job_id = {1}", self.pg());
+        let q = sql(
+            "SELECT COUNT(*) FROM import_record WHERE job_id = {1}",
+            self.pg(),
+        );
         on_pool!(self, |p| sqlx::query_scalar(&q)
             .bind(job)
             .fetch_one(p)

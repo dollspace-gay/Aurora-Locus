@@ -7,6 +7,7 @@ pub mod email;
 pub mod error;
 pub mod identity;
 pub mod import;
+pub mod pipethrough;
 pub mod repo;
 pub mod routing;
 pub mod server;
@@ -143,7 +144,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(repo::describe_repo),
         )
         .route("/xrpc/com.atproto.repo.uploadBlob", post(repo::upload_blob))
-        .route("/xrpc/com.atproto.repo.importRepo", post(import::import_repo))
+        .route(
+            "/xrpc/com.atproto.repo.importRepo",
+            post(import::import_repo),
+        )
         .route(
             "/xrpc/com.atproto.repo.listMissingBlobs",
             get(import::list_missing_blobs),
@@ -205,6 +209,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        // Every other XRPC method goes to another service.
+        .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routing::limit_body,

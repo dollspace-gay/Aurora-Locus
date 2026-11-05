@@ -76,7 +76,7 @@ hmac = "0.12"
 chacha20poly1305 = "0.10"
 zeroize = "1"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2", "stream"] }
 tempfile = "3"
 url = "2"
 futures = "0.3"

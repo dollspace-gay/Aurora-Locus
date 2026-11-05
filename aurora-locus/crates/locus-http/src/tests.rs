@@ -100,11 +100,14 @@ fn plc_document(did: &str, op: &Value) -> Value {
             "controller": did,
             "publicKeyMultibase": key.strip_prefix("did:key:").unwrap_or_default(),
         }],
-        "service": [{
-            "id": "#atproto_pds",
-            "type": "AtprotoPersonalDataServer",
-            "serviceEndpoint": op["services"]["atproto_pds"]["endpoint"],
-        }],
+        "service": op["services"]
+            .as_object()
+            .map(|m| m.iter().map(|(id, svc)| json!({
+                "id": format!("#{id}"),
+                "type": svc["type"],
+                "serviceEndpoint": svc["endpoint"],
+            })).collect::<Vec<_>>())
+            .unwrap_or_default(),
     })
 }
 
@@ -2763,7 +2766,13 @@ impl Harness {
             .iter()
             .map(|r| {
                 (
-                    r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned(),
+                    r["uri"]
+                        .as_str()
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_owned(),
                     r["value"]["text"].as_str().unwrap_or_default().to_owned(),
                 )
             })
@@ -2798,7 +2807,9 @@ async fn an_exported_repo_imports_back_as_a_diff() {
     put("3m5aaaaaaaaaa", with_image).await;
     put("3m5aaaaaaaaab", post_record("two")).await;
     put("3m5aaaaaaaaac", post_record("three")).await;
-    let (_, _, car) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}")).await;
+    let (_, _, car) = h
+        .raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}"))
+        .await;
     let (_, before) = h
         .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
         .await;
@@ -2813,7 +2824,14 @@ async fn an_exported_repo_imports_back_as_a_diff() {
     put("3m5aaaaaaaaac", post_record("THREE")).await;
     put("3m5aaaaaaaaad", post_record("four")).await;
     assert!(
-        h.state.store.blob(&did, &cid).await.unwrap().unwrap().unreferenced_since.is_some(),
+        h.state
+            .store
+            .blob(&did, &cid)
+            .await
+            .unwrap()
+            .unwrap()
+            .unreferenced_since
+            .is_some(),
         "the image's record went"
     );
     let (st, v) = h.import(&access, car.clone()).await;
@@ -2830,11 +2848,16 @@ async fn an_exported_repo_imports_back_as_a_diff() {
         ]
     );
     let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
-    assert_eq!((row.state.as_str(), row.unreferenced_since), ("permanent", None));
+    assert_eq!(
+        (row.state.as_str(), row.unreferenced_since),
+        ("permanent", None)
+    );
 
     // Re-signed with a newer rev over the same data, and verifiable.
     let signing = h.state.signing_key(&did).await.unwrap().did();
-    let (_, _, now) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}")).await;
+    let (_, _, now) = h
+        .raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}"))
+        .await;
     let old = proto_blue_repo::sync::verify_repo_car(&car, Some(&did), Some(&signing)).unwrap();
     let new = proto_blue_repo::sync::verify_repo_car(&now, Some(&did), Some(&signing)).unwrap();
     assert_eq!(old.commit.data, new.commit.data);
@@ -2850,7 +2873,12 @@ async fn an_exported_repo_imports_back_as_a_diff() {
         .collect();
     assert_eq!(kinds.last().map(String::as_str), Some("sync"));
     let (_, missing) = h
-        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&access), None)
+        .call(
+            "GET",
+            "/xrpc/com.atproto.repo.listMissingBlobs",
+            Some(&access),
+            None,
+        )
         .await;
     assert_eq!(missing["blobs"], json!([]));
 
@@ -2865,7 +2893,10 @@ async fn an_exported_repo_imports_back_as_a_diff() {
     let (st, v) = h.import(&access, car).await;
     assert_eq!(
         (st, v["message"].as_str()),
-        (StatusCode::BAD_REQUEST, Some("Service is not accepting repo imports"))
+        (
+            StatusCode::BAD_REQUEST,
+            Some("Service is not accepting repo imports")
+        )
     );
 }
 
@@ -2876,7 +2907,11 @@ async fn a_repo_from_elsewhere_lists_its_missing_blobs_until_uploaded() {
     let hr = &h;
     let make = |handle: &'static str| async move {
         let a = hr
-            .create_account(&format!("{handle}.pds.example.com"), &format!("{handle}@example.com"), "pw")
+            .create_account(
+                &format!("{handle}.pds.example.com"),
+                &format!("{handle}@example.com"),
+                "pw",
+            )
             .await;
         (
             a["did"].as_str().unwrap().to_owned(),
@@ -2899,11 +2934,14 @@ async fn a_repo_from_elsewhere_lists_its_missing_blobs_until_uploaded() {
     .await;
 
     // The source's repo, re-signed for the destination by some other key.
-    let (_, _, car) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={src}")).await;
+    let (_, _, car) = h
+        .raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={src}"))
+        .await;
     let (root, mut blocks) = proto_blue_repo::car::read_car_with_root(&car).unwrap();
-    let commit =
-        SignedCommit::from_lex_value(&proto_blue_lex_cbor::decode(blocks.get(&root).unwrap()).unwrap())
-            .unwrap();
+    let commit = SignedCommit::from_lex_value(
+        &proto_blue_lex_cbor::decode(blocks.get(&root).unwrap()).unwrap(),
+    )
+    .unwrap();
     let resigned = sign_commit(
         &UnsignedCommit::new(dst.clone(), commit.data.clone(), commit.rev.clone(), None),
         &proto_blue_crypto::K256Keypair::generate(),
@@ -2922,13 +2960,21 @@ async fn a_repo_from_elsewhere_lists_its_missing_blobs_until_uploaded() {
     assert_eq!(st, StatusCode::OK, "{v}");
     let status = h.import_finished(&dst_access).await;
     assert_eq!(status["phase"], "done");
-    assert!(status["notes"].as_str().unwrap().contains("re-signed"), "{status}");
+    assert!(
+        status["notes"].as_str().unwrap().contains("re-signed"),
+        "{status}"
+    );
     assert_eq!(
         h.post_rkeys(&dst).await,
         vec![("3m6aaaaaaaaaa".to_owned(), "moved".to_owned())]
     );
     let (_, missing) = h
-        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&dst_access), None)
+        .call(
+            "GET",
+            "/xrpc/com.atproto.repo.listMissingBlobs",
+            Some(&dst_access),
+            None,
+        )
         .await;
     assert_eq!(
         missing,
@@ -2942,13 +2988,378 @@ async fn a_repo_from_elsewhere_lists_its_missing_blobs_until_uploaded() {
     h.upload(&dst_access, &png, "image/png").await;
     let row = h.state.store.blob(&dst, &cid).await.unwrap().unwrap();
     assert_eq!(row.state, "permanent");
-    assert!(row.storage_key.starts_with(&format!("blobs/{dst}/")), "{}", row.storage_key);
+    assert!(
+        row.storage_key.starts_with(&format!("blobs/{dst}/")),
+        "{}",
+        row.storage_key
+    );
     let (_, missing) = h
-        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&dst_access), None)
+        .call(
+            "GET",
+            "/xrpc/com.atproto.repo.listMissingBlobs",
+            Some(&dst_access),
+            None,
+        )
         .await;
     assert_eq!(missing["blobs"], json!([]));
     let (st, _, body) = h
-        .raw_get(format!("/xrpc/com.atproto.sync.getBlob?did={dst}&cid={cid}"))
+        .raw_get(format!(
+            "/xrpc/com.atproto.sync.getBlob?did={dst}&cid={cid}"
+        ))
         .await;
     assert_eq!((st, body), (StatusCode::OK, png.to_vec()));
+}
+
+/// What a mock upstream service saw.
+#[derive(Debug, Clone)]
+struct Seen {
+    method: String,
+    uri: String,
+    headers: axum::http::HeaderMap,
+    body: Vec<u8>,
+}
+
+type SeenLog = Arc<Mutex<Vec<Seen>>>;
+
+/// A service that records requests and answers by method name.
+async fn mock_service() -> (String, SeenLog) {
+    let log: SeenLog = Arc::default();
+    let app = Router::new()
+        .route(
+            "/xrpc/{nsid}",
+            axum::routing::any(
+                |State(log): State<SeenLog>,
+                 Path(nsid): Path<String>,
+                 req: Request<Body>| async move {
+                    let (parts, body) = req.into_parts();
+                    let body = body.collect().await.unwrap().to_bytes().to_vec();
+                    log.lock().unwrap().push(Seen {
+                        method: parts.method.to_string(),
+                        uri: parts.uri.to_string(),
+                        headers: parts.headers.clone(),
+                        body: body.clone(),
+                    });
+                    let mut res = match nsid.as_str() {
+                        "app.bsky.fail.boom" => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": "Boom", "message": "it broke"})),
+                        )
+                            .into_response(),
+                        "app.bsky.fail.slow" => {
+                            let mut r = (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                axum::Json(json!({"error": "RateLimitExceeded", "message": "slow down"})),
+                            )
+                                .into_response();
+                            r.headers_mut().insert("retry-after", "5".parse().unwrap());
+                            r
+                        }
+                        "app.bsky.fail.plain" => (StatusCode::NOT_FOUND, "nope").into_response(),
+                        _ if parts.method == "POST" => (
+                            [("content-type", "application/json")],
+                            body,
+                        )
+                            .into_response(),
+                        _ => axum::Json(json!({"served": nsid})).into_response(),
+                    };
+                    res.headers_mut().insert("atproto-repo-rev", "3mrev".parse().unwrap());
+                    res.headers_mut().insert("x-internal", "secret".parse().unwrap());
+                    res
+                },
+            ),
+        )
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), log)
+}
+
+#[tokio::test]
+async fn unknown_methods_are_piped_through_to_the_configured_services() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("pia.pds.example.com", "pia@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let timeline = "/xrpc/app.bsky.feed.getTimeline?limit=5&cursor=a%20b";
+
+    // Nothing configured yet.
+    let (st, v) = h.call("GET", timeline, Some(&access), None).await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("No service configured for app.bsky.feed.getTimeline")
+        )
+    );
+
+    let (url, seen) = mock_service().await;
+    for (k, v) in [
+        ("appview.url", url.as_str()),
+        ("appview.did", "did:web:appview.test"),
+    ] {
+        h.state.settings.set(k, json!(v), "test").await.unwrap();
+    }
+
+    // Forwarded with a service token from the account, and only the
+    // reference's headers each way.
+    let (st, headers, body) = h
+        .raw(
+            "GET",
+            timeline,
+            Some(&access),
+            vec![],
+            &[
+                ("accept-language", "fr"),
+                ("x-atproto-thing", "kept"),
+                ("x-private", "dropped"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"served": "app.bsky.feed.getTimeline"})
+    );
+    assert_eq!(headers["atproto-repo-rev"], "3mrev");
+    assert!(headers.get("x-internal").is_none());
+    let req = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(req.uri, timeline);
+    assert_eq!(req.headers["accept-language"], "fr");
+    assert_eq!(req.headers["x-atproto-thing"], "kept");
+    assert!(req.headers.get("x-private").is_none());
+    assert_eq!(req.headers["accept-encoding"], "identity");
+    let token = req.headers["authorization"]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .to_owned();
+    let jwt = locus_auth::service_jwt::parse(
+        &token,
+        Some("app.bsky.feed.getTimeline"),
+        locus_core::time::now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(
+        (jwt.iss.as_str(), jwt.aud.as_str()),
+        (did.as_str(), "did:web:appview.test")
+    );
+    let signing = h.state.signing_key(&did).await.unwrap().did();
+    assert!(jwt.verifies_with(&signing));
+
+    // Authentication is required; protected methods never leave.
+    let (st, _) = h.call("GET", timeline, None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.GETSESSION",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidToken"))
+    );
+
+    // Upstream errors: 500 becomes 502 with the upstream's name; others
+    // pass through with retry-after.
+    let (st, v) = h
+        .call("GET", "/xrpc/app.bsky.fail.boom", Some(&access), None)
+        .await;
+    assert_eq!(
+        (st, v),
+        (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "Boom", "message": "it broke"})
+        )
+    );
+    let (st, headers, _) = h
+        .raw(
+            "GET",
+            "/xrpc/app.bsky.fail.slow",
+            Some(&access),
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["retry-after"].to_str().unwrap()),
+        (StatusCode::TOO_MANY_REQUESTS, "5")
+    );
+    let (st, v) = h
+        .call("GET", "/xrpc/app.bsky.fail.plain", Some(&access), None)
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("XRPCNotSupported"))
+    );
+
+    // Procedures stream their body; chat needs a privileged credential.
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/chat.bsky.convo.sendMessage",
+            Some(&access),
+            Some(json!({"convoId": "c1", "message": {"text": "hi"}})),
+        )
+        .await;
+    assert_eq!((st, v["convoId"].as_str()), (StatusCode::OK, Some("c1")));
+    let req = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (
+            req.method.as_str(),
+            req.headers["content-type"].to_str().unwrap()
+        ),
+        ("POST", "application/json")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&req.body).unwrap()["message"]["text"],
+        "hi"
+    );
+    let (_, pw) = h
+        .post(
+            "com.atproto.server.createAppPassword",
+            Some(&access),
+            json!({"name": "plain"}),
+        )
+        .await;
+    let (_, sess) = h
+        .post(
+            "com.atproto.server.createSession",
+            None,
+            json!({"identifier": did, "password": pw["password"]}),
+        )
+        .await;
+    let app_access = sess["accessJwt"].as_str().unwrap().to_owned();
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/chat.bsky.convo.sendMessage",
+            Some(&app_access),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("Bad token method"))
+    );
+    let (st, _) = h.call("GET", timeline, Some(&app_access), None).await;
+    assert_eq!(st, StatusCode::OK, "app passwords reach the AppView");
+
+    // atproto-proxy: the configured AppView by name, a malformed header, and
+    // a DID whose endpoint is plain HTTP (refused by the SSRF rules).
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            timeline,
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", "did:web:appview.test#bsky_appview")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = h
+        .raw(
+            "GET",
+            timeline,
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", "did:web:appview.test")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["message"],
+        "no service id specified in proxy header"
+    );
+    let svc = "did:plc:svcsvcsvcsvcsvcsvcsvcsvc";
+    h.plc.lock().unwrap().log.insert(
+        svc.into(),
+        vec![json!({
+            "type": "plc_operation",
+            "alsoKnownAs": [],
+            "verificationMethods": {"atproto": proto_blue_crypto::K256Keypair::generate().did()},
+            "services": {"labeler": {"type": "AtprotoLabeler", "endpoint": url}},
+        })],
+    );
+    let (st, _, body) = h
+        .raw(
+            "GET",
+            timeline,
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", &format!("{svc}#labeler"))],
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            timeline,
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", &format!("{svc}#nothing"))],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // getRecord: local repos here, others from the AppView (no token).
+    let (st, v) = h
+        .get(
+            "/xrpc/com.atproto.repo.getRecord?repo=did:plc:elsewhereelsewhereelse&collection=app.bsky.feed.post&rkey=x"
+                .to_owned(),
+        )
+        .await;
+    assert_eq!(
+        (st, v["served"].as_str()),
+        (StatusCode::OK, Some("com.atproto.repo.getRecord"))
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .headers
+            .get("authorization")
+            .is_none()
+    );
+    let (st, v) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey=x"
+        ))
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RecordNotFound"))
+    );
+
+    // An AppView that doesn't answer.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    h.state
+        .settings
+        .set("appview.url", json!(dead), "test")
+        .await
+        .unwrap();
+    let (st, v) = h.call("GET", timeline, Some(&access), None).await;
+    assert_eq!(
+        (st, v),
+        (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "UpstreamFailure", "message": "Upstream service unreachable"})
+        )
+    );
 }
