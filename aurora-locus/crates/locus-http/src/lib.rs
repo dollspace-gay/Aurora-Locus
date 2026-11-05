@@ -8,6 +8,7 @@ pub mod email;
 pub mod error;
 pub mod identity;
 pub mod import;
+pub mod kryphocron;
 pub mod lexicon;
 pub mod oauth;
 pub mod oauth_ui;
@@ -161,6 +162,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/app.nearhorizon.locus.account.getImportStatus",
             get(import::get_import_status),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.feed.createPostPrivate",
+            post(kryphocron::create_post_private),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.feed.updatePostPrivate",
+            post(kryphocron::update_post_private),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.feed.deletePostPrivate",
+            post(kryphocron::delete_post_private),
         )
         .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
         .route(

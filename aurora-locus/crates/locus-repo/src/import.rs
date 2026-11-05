@@ -813,6 +813,10 @@ impl RepoEngine {
                             &backlinks(&r.collection, &value),
                         )
                         .await?;
+                        let private =
+                            crate::records::private_entry(did, &r.collection, &r.rkey, &value);
+                        tx.replace_private_record(did, &r.collection, &r.rkey, private.as_ref())
+                            .await?;
                     }
                     _ => {
                         tx.apply_record_changes(
@@ -827,6 +831,8 @@ impl RepoEngine {
                         tx.replace_record_blobs(did, &r.collection, &r.rkey, &[])
                             .await?;
                         tx.replace_backlinks(did, &r.collection, &r.rkey, &[])
+                            .await?;
+                        tx.replace_private_record(did, &r.collection, &r.rkey, None)
                             .await?;
                     }
                 }

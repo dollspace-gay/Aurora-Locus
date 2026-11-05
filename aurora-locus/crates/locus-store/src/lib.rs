@@ -12,6 +12,7 @@ pub mod identity;
 pub mod import;
 pub mod invites;
 pub mod jobs;
+pub mod kryphocron;
 pub mod lease;
 pub mod oauth;
 pub mod prefs;

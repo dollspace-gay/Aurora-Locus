@@ -10,6 +10,18 @@ publish.workspace = true
 locus-core.workspace = true
 kryphocron.workspace = true
 kryphocron-lexicons.workspace = true
+proto-blue-syntax.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-lex-json.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+smallvec = "1.13"
 
 [lints]
 workspace = true

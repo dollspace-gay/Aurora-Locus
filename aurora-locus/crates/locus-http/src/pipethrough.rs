@@ -219,7 +219,7 @@ pub async fn parse_proxy_header(s: &AppState, value: &str) -> XrpcResult<Target>
 type Clients = Mutex<HashMap<(bool, bool, bool), reqwest::Client>>;
 
 /// One client per (user-influenced, HTTP/2) pair, built on first use.
-fn client(s: &AppState, user_influenced: bool) -> XrpcResult<reqwest::Client> {
+pub(crate) fn client(s: &AppState, user_influenced: bool) -> XrpcResult<reqwest::Client> {
     static CLIENTS: OnceLock<Clients> = OnceLock::new();
     let http2 = s.snapshot().bool("proxy.allow_http2");
     // Operator-configured services may be private addresses (§ outbound
@@ -372,7 +372,12 @@ fn unreachable() -> XrpcError {
     )
 }
 
-async fn service_token(s: &AppState, iss: &str, aud: &str, lxm: &str) -> XrpcResult<String> {
+pub(crate) async fn service_token(
+    s: &AppState,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+) -> XrpcResult<String> {
     let key = s.signing_key(iss).await?;
     let now = locus_core::time::now_ms() / 1000;
     locus_auth::service_jwt::create(&key, iss, aud, None, Some(lxm), now)

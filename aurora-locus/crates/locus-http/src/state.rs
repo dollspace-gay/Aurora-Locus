@@ -24,6 +24,7 @@ pub mod secret_names {
     pub const SERVICE_KEY: &str = "service_signing_key";
     pub const OAUTH_KEY: &str = "oauth_signing_key";
     pub const DPOP_SECRET: &str = "dpop_secret";
+    pub const CORRELATION_KEY: &str = "kryphocron_correlation_key";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -38,6 +39,8 @@ pub struct ServerSecrets {
     pub oauth_key: locus_auth::oauth::jose::Es256Key,
     /// DPoP nonces, from a secret every node shares.
     pub dpop_nonces: locus_auth::oauth::dpop::Nonces,
+    /// Keys correlation ids in kryphocron audit rows.
+    pub correlation_key: [u8; 32],
 }
 
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
@@ -178,6 +181,13 @@ impl ServerSecrets {
                 .unwrap_or_else(|| rand::random::<[u8; 32]>().to_vec())
         })
         .await?;
+        let correlation = load_or(store, key, secret_names::CORRELATION_KEY, || {
+            rand::random::<[u8; 32]>().to_vec()
+        })
+        .await?;
+        let correlation_key: [u8; 32] = correlation.as_slice().try_into().map_err(|_| {
+            CoreError::Config("stored kryphocron correlation key isn't 32 bytes".into())
+        })?;
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -188,6 +198,7 @@ impl ServerSecrets {
             service_key: keypair(&service, "service key")?,
             oauth_key,
             dpop_nonces: locus_auth::oauth::dpop::Nonces::new(&dpop),
+            correlation_key,
             jwt,
             app_password_pepper,
             email_token_pepper,
@@ -243,6 +254,8 @@ pub struct AppState {
     pub limits: crate::ratelimit::Limiter,
     /// Fetched OAuth client metadata and keys.
     pub oauth_clients: crate::oauth::ClientCache,
+    /// The kryphocron codec, rotation oracle and audit sinks.
+    pub kr: Arc<crate::kryphocron::Kr>,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

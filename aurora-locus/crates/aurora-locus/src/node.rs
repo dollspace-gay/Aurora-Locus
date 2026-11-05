@@ -150,6 +150,13 @@ impl Node {
         self.tasks.push(tokio::spawn(
             Arc::clone(&firehose).run_tail(self.cancel.clone(), Duration::from_millis(250)),
         ));
+        let (kr, audit_rx) = locus_http::kryphocron::Kr::new(secrets.correlation_key);
+        self.tasks
+            .push(tokio::spawn(locus_http::kryphocron::run_audit_writer(
+                self.store.clone(),
+                audit_rx,
+                self.cancel.clone(),
+            )));
         let state = Arc::new(AppState {
             repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id))),
             store: self.store.clone(),
@@ -168,7 +175,11 @@ impl Node {
             resolvers: ResolverCache::default(),
             limits: locus_http::ratelimit::Limiter::default(),
             oauth_clients: locus_http::oauth::ClientCache::default(),
+            kr,
         });
+        // Encodes need the current generation: read it before serving.
+        locus_http::kryphocron::refresh_oracle(&state).await?;
+        self.spawn_oracle_refresh(Arc::clone(&state));
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
         self.spawn_blob_jobs(Arc::clone(&state));
@@ -478,6 +489,24 @@ impl Node {
                     },
                 )));
         }
+    }
+
+    /// Every node re-reads the current rotation generation every 30 s; a
+    /// node that can't for 5 minutes refuses private-post encodes (they
+    /// fail closed) until it can again.
+    fn spawn_oracle_refresh(&mut self, state: Arc<AppState>) {
+        let cancel = self.cancel.clone();
+        self.tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(locus_kryphocron::rotation::REFRESH_INTERVAL) => {}
+                }
+                if let Err(e) = locus_http::kryphocron::refresh_oracle(&state).await {
+                    tracing::warn!("rotation generation refresh failed: {e}");
+                }
+            }
+        }));
     }
 
     /// Retries identity changes that didn't finish (handle changes after an

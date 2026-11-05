@@ -1953,6 +1953,7 @@ dependencies = [
  "locus-blob",
  "locus-core",
  "locus-identity",
+ "locus-kryphocron",
  "locus-mail",
  "locus-repo",
  "locus-store",
@@ -2012,9 +2013,21 @@ dependencies = [
 name = "locus-kryphocron"
 version = "0.1.0-dev"
 dependencies = [
+ "hex",
+ "hmac",
  "kryphocron",
  "kryphocron-lexicons",
  "locus-core",
+ "proto-blue-lex-data",
+ "proto-blue-lex-json",
+ "proto-blue-syntax",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

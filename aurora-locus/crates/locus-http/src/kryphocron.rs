@@ -1,0 +1,586 @@
+//! Kryphocron on the write paths: registry routing, host rules, the
+//! private-tier gates, the `feed.postPrivate` pipeline, the dedicated
+//! procedures, and the audit writer and rotation oracle refresh.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use locus_kryphocron::audit::{AuditEvent, AuditSinks};
+use locus_kryphocron::{Encoder, Kind, PipelineError, SharedOracle, nsid, rules};
+use locus_repo::Action;
+use locus_repo::records;
+use locus_store::kryphocron::{PermissionRow, SOURCE_MEMBERSHIP, SOURCE_PROBE};
+use proto_blue_lex_data::LexValue;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{XrpcError, XrpcResult};
+use crate::repo;
+use crate::state::AppState;
+
+/// The codec, rotation oracle and audit sinks one node shares.
+pub struct Kr {
+    pub encoder: Encoder,
+    pub audit: AuditSinks,
+}
+
+impl std::fmt::Debug for Kr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kr").finish_non_exhaustive()
+    }
+}
+
+impl Kr {
+    /// The node's kryphocron state and the audit events its writer drains.
+    #[must_use]
+    pub fn new(correlation_key: [u8; 32]) -> (Arc<Self>, mpsc::Receiver<AuditEvent>) {
+        let (audit, rx) = AuditSinks::new(correlation_key);
+        let kr = Self {
+            encoder: Encoder::new(Arc::new(SharedOracle::default())),
+            audit,
+        };
+        (Arc::new(kr), rx)
+    }
+}
+
+// ---------------------------------------------------------------- errors
+
+fn unsupported() -> XrpcError {
+    XrpcError::named(
+        "UnsupportedNamespace",
+        "This server doesn't have the private tier enabled",
+    )
+}
+
+fn forbidden() -> XrpcError {
+    XrpcError::new(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "This account may not make private-tier writes",
+    )
+}
+
+/// A retryable refusal.
+fn retry(message: impl Into<String>) -> XrpcError {
+    XrpcError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "TemporarilyUnavailable",
+        message,
+    )
+}
+
+fn pipeline_error(e: PipelineError) -> XrpcError {
+    match e {
+        PipelineError::Invalid(m) => XrpcError::invalid_request(m),
+        PipelineError::Retry(m) => retry(m),
+    }
+}
+
+// ---------------------------------------------------------------- the gate
+
+/// What prism said, or why it said nothing.
+#[derive(Debug)]
+enum PrismAnswer {
+    Membership {
+        status: String,
+        private_indexed: bool,
+        private_read: bool,
+        valid_for_secs: i64,
+    },
+    /// A named error answer (`AccountTakedown`, `NotEnrolled`, ...).
+    Refused(String),
+    /// The call reached nothing (connection refused, DNS): an outage.
+    Unreachable,
+    /// An answer that maps to nothing (429, 5xx, timeout).
+    Unmapped(String),
+}
+
+/// `app.nearhorizon.actor.getMembership`, as the account (it answers for
+/// the caller only, and may enrol an eligible caller, so it's called only
+/// when the account itself starts a private-tier action).
+async fn get_membership(s: &AppState, did: &str, appview: &(String, String)) -> PrismAnswer {
+    const LXM: &str = "app.nearhorizon.actor.getMembership";
+    let (url, aud) = appview;
+    let token = match crate::pipethrough::service_token(s, did, aud, LXM).await {
+        Ok(t) => t,
+        Err(e) => return PrismAnswer::Unmapped(e.message),
+    };
+    let client = match crate::pipethrough::client(s, false) {
+        Ok(c) => c,
+        Err(e) => return PrismAnswer::Unmapped(e.message),
+    };
+    let timeout = Duration::from_millis(
+        u64::try_from(s.snapshot().int("kryphocron.prism_request_timeout_ms")).unwrap_or(10_000),
+    );
+    let req = client
+        .get(format!("{}/xrpc/{LXM}", url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .timeout(timeout);
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return PrismAnswer::Unreachable,
+        Err(e) => return PrismAnswer::Unmapped(e.to_string()),
+    };
+    let status = res.status();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        return PrismAnswer::Membership {
+            status: body["status"].as_str().unwrap_or("notEligible").to_owned(),
+            private_indexed: body["permissions"]["privateIndexed"].as_bool() == Some(true),
+            private_read: body["permissions"]["privateRead"].as_bool() == Some(true),
+            valid_for_secs: body["validForSecs"].as_i64().unwrap_or(60).clamp(5, 3600),
+        };
+    }
+    match body["error"].as_str() {
+        Some(name @ ("AccountTakedown" | "NotEnrolled" | "NotReady" | "Reindexing"))
+            if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE =>
+        {
+            PrismAnswer::Refused(name.to_owned())
+        }
+        _ => PrismAnswer::Unmapped(format!("prism answered {status}")),
+    }
+}
+
+/// `AccountTakedown` from any prism call: both rows say `takedown` for an
+/// hour, so the write gate refuses too.
+async fn record_takedown(s: &AppState, did: &str, prism_did: &str) -> XrpcResult<()> {
+    let now = locus_core::time::now_ms();
+    for source in [SOURCE_MEMBERSHIP, SOURCE_PROBE] {
+        s.store
+            .put_kr_permission(&PermissionRow {
+                did: did.to_owned(),
+                source: source.to_owned(),
+                prism_did: prism_did.to_owned(),
+                status: "takedown".into(),
+                private_indexed: false,
+                private_read: false,
+                expires_at: now + 3_600_000,
+                checked_at: now,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// The private-tier gates for a non-delete write: an AppView configured
+/// and the host switch on (else `UnsupportedNamespace`), no local block,
+/// and the AppView's permission (`privateIndexed`), else `Forbidden`.
+pub(crate) async fn gate(s: &AppState, did: &str) -> XrpcResult<()> {
+    let Some(appview) = crate::pipethrough::appview(s) else {
+        return Err(unsupported());
+    };
+    if !s.snapshot().bool("kryphocron.private_tier_enabled") {
+        return Err(unsupported());
+    }
+    if s.store.private_tier_blocked(did).await? {
+        return Err(forbidden());
+    }
+    let prism_did = appview.1.clone();
+    let now = locus_core::time::now_ms();
+    let last = s
+        .store
+        .kr_permission(did, SOURCE_MEMBERSHIP)
+        .await?
+        .filter(|r| r.prism_did == prism_did);
+    let row = match last {
+        Some(r) if r.expires_at > now => r,
+        last => match get_membership(s, did, &appview).await {
+            PrismAnswer::Membership {
+                status,
+                private_indexed,
+                private_read,
+                valid_for_secs,
+            } => {
+                let row = PermissionRow {
+                    did: did.to_owned(),
+                    source: SOURCE_MEMBERSHIP.to_owned(),
+                    prism_did,
+                    status,
+                    private_indexed,
+                    private_read,
+                    expires_at: now + valid_for_secs * 1000,
+                    checked_at: now,
+                };
+                s.store.put_kr_permission(&row).await?;
+                row
+            }
+            PrismAnswer::Refused(name) if name == "AccountTakedown" => {
+                record_takedown(s, did, &prism_did).await?;
+                return Err(forbidden());
+            }
+            PrismAnswer::Refused(_) => return Err(forbidden()),
+            // During an outage the last answer stands, expired or not.
+            PrismAnswer::Unreachable => last.ok_or_else(forbidden)?,
+            PrismAnswer::Unmapped(why) => {
+                tracing::info!(did, "getMembership gave no answer: {why}");
+                return Err(retry(
+                    "The AppView couldn't confirm private-tier access; try again",
+                ));
+            }
+        },
+    };
+    if row.status == "takedown" || !row.private_indexed {
+        return Err(forbidden());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- writes
+
+/// What a write does, for the gates (deletes are never gated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Op {
+    Write,
+    Delete,
+}
+
+/// Checks a plaintext post against the lexicon (the stored, encoded form
+/// can't show what the content was).
+fn validate_plain(
+    rkey: &str,
+) -> impl Fn(&BTreeMap<String, LexValue>) -> Result<(), String> + Sync + '_ {
+    move |plain| {
+        records::prepare_record(
+            nsid::POST_PRIVATE,
+            rkey,
+            LexValue::Map(plain.clone()),
+            Some(true),
+            usize::MAX,
+        )
+        .map(|_| ())
+        .map_err(|e| e.0)
+    }
+}
+
+/// The audience a private post names must be one of the writer's own, held
+/// in the private audience store.
+async fn check_audience(
+    s: &AppState,
+    did: &str,
+    record: &BTreeMap<String, LexValue>,
+) -> XrpcResult<()> {
+    let uri = record
+        .get("audienceList")
+        .and_then(LexValue::as_str)
+        .unwrap_or_default();
+    let rkey = rules::split_uri(uri).map_or("", |(_, _, r)| r);
+    if s.store.kr_audience(did, rkey).await?.is_none() {
+        return Err(XrpcError::invalid_request(
+            "audienceList doesn't name one of the writer's audiences",
+        ));
+    }
+    Ok(())
+}
+
+/// Every write path's kryphocron step, before the record is prepared:
+/// unregistered collections refused; for creates and updates the host
+/// rules, the private-tier gates and, for `feed.postPrivate`, the encode
+/// pipeline. Returns the record to store.
+pub(crate) async fn prepare_write(
+    s: &AppState,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    value: Option<LexValue>,
+    op: Op,
+) -> XrpcResult<Option<LexValue>> {
+    let private = match locus_kryphocron::classify(collection) {
+        Kind::Other => return Ok(value),
+        Kind::Unregistered => {
+            return Err(XrpcError::invalid_request(format!(
+                "Unknown kryphocron collection: {collection}"
+            )));
+        }
+        Kind::Record { private } => private,
+    };
+    if op == Op::Delete {
+        return Ok(value);
+    }
+    if collection == nsid::AUDIENCE {
+        return Err(XrpcError::invalid_request(
+            "Audiences aren't stored in repositories; use tools.kryphocron.policy.manageAudience",
+        ));
+    }
+    let Some(LexValue::Map(map)) = value else {
+        return Err(XrpcError::invalid_request(
+            "Invalid record: expected an object",
+        ));
+    };
+    rules::check_record(did, collection, rkey, &map)
+        .map_err(|e| XrpcError::invalid_request(e.0))?;
+    if private {
+        gate(s, did).await?;
+    }
+    if collection != nsid::POST_PRIVATE {
+        return Ok(Some(LexValue::Map(map)));
+    }
+    if map.contains_key("reply") {
+        return Err(XrpcError::invalid_request(
+            "Replies to private posts are written with tools.kryphocron.actor.participatePrivate",
+        ));
+    }
+    check_audience(s, did, &map).await?;
+    let validate = validate_plain(rkey);
+    let out =
+        s.kr.encoder
+            .prepare_post(&s.kr.audit, did, rkey, map, &validate)
+            .await
+            .map_err(pipeline_error)?;
+    Ok(Some(LexValue::Map(out)))
+}
+
+// ---------------------------------------------------------------- procedures
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePostPrivateInput {
+    repo: String,
+    rkey: Option<String>,
+    validate: Option<bool>,
+    record: Value,
+}
+
+type St = State<Arc<AppState>>;
+
+/// `tools.kryphocron.feed.createPostPrivate`: a private post in the
+/// writer's own repo, under one of the writer's own audiences.
+pub async fn create_post_private(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<CreatePostPrivateInput>,
+) -> XrpcResult<Json<Value>> {
+    let account = repo::writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(nsid::POST_PRIVATE, "create")
+    })
+    .await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 3).await?;
+    let rkey = input.rkey.clone().unwrap_or_else(|| s.repo.tids().next());
+    let value = records::parse_json(&input.record).map_err(|e| XrpcError::invalid_request(e.0))?;
+    let value = prepare_write(
+        &s,
+        &account.did,
+        nsid::POST_PRIVATE,
+        &rkey,
+        Some(value),
+        Op::Write,
+    )
+    .await?
+    .expect("a write keeps its record");
+    let rec = records::prepare_record(
+        nsid::POST_PRIVATE,
+        &rkey,
+        value,
+        input.validate,
+        repo::record_limit(&s),
+    )
+    .map_err(|e| XrpcError::invalid_request(e.0))?;
+    let write = repo::prepared(Action::Create, nsid::POST_PRIVATE, &rkey, Some(&rec), None);
+    repo::commit(&s, &account, vec![write], None, false).await?;
+    Ok(Json(json!({
+        "uri": repo::uri(&account.did, nsid::POST_PRIVATE, &rkey),
+        "cid": rec.cid.to_string_base32(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePostPrivateInput {
+    repo: String,
+    rkey: String,
+    audience_list: String,
+    swap_record: Option<String>,
+}
+
+/// `tools.kryphocron.feed.updatePostPrivate`: changes only `audienceList`.
+/// The seed doesn't include the audience, so `encodedContent` is kept byte
+/// for byte; only the CID changes. Replies are refused.
+pub async fn update_post_private(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<UpdatePostPrivateInput>,
+) -> XrpcResult<Json<Value>> {
+    let account = repo::writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(nsid::POST_PRIVATE, "update")
+    })
+    .await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 2).await?;
+    let missing = || XrpcError::invalid_request("The post doesn't exist");
+    let (cid, _) = s
+        .store
+        .record_entry(&account.did, nsid::POST_PRIVATE, &input.rkey)
+        .await?
+        .ok_or_else(missing)?;
+    if let Some(swap) = &input.swap_record
+        && *swap != cid
+    {
+        return Err(XrpcError::named(
+            "InvalidSwap",
+            format!("Record was at {cid}"),
+        ));
+    }
+    let bytes = s
+        .store
+        .block(&account.did, &cid)
+        .await?
+        .ok_or_else(|| XrpcError::internal("a record's block is missing"))?;
+    let Ok(LexValue::Map(mut map)) = proto_blue_lex_cbor::decode(&bytes) else {
+        return Err(XrpcError::internal("a stored record doesn't decode"));
+    };
+    if map.contains_key("reply") {
+        return Err(XrpcError::invalid_request(
+            "A reply's audience is its thread's; it can't be changed",
+        ));
+    }
+    map.insert(
+        "audienceList".into(),
+        LexValue::String(input.audience_list.clone()),
+    );
+    rules::check_record(&account.did, nsid::POST_PRIVATE, &input.rkey, &map)
+        .map_err(|e| XrpcError::invalid_request(e.0))?;
+    gate(&s, &account.did).await?;
+    check_audience(&s, &account.did, &map).await?;
+    let rec = records::prepare_record(
+        nsid::POST_PRIVATE,
+        &input.rkey,
+        LexValue::Map(map),
+        None,
+        repo::record_limit(&s),
+    )
+    .map_err(|e| XrpcError::invalid_request(e.0))?;
+    let current = proto_blue_lex_data::Cid::from_str_multibase(&cid)
+        .map_err(|_| XrpcError::internal("a stored CID doesn't parse"))?;
+    let write = repo::prepared(
+        Action::Update,
+        nsid::POST_PRIVATE,
+        &input.rkey,
+        Some(&rec),
+        Some(Some(current)),
+    );
+    match repo::commit(&s, &account, vec![write], None, false).await {
+        Ok(_) => {}
+        Err(e) if e.message == "no changes" => {}
+        Err(e) => return Err(e),
+    }
+    Ok(Json(json!({
+        "uri": repo::uri(&account.did, nsid::POST_PRIVATE, &input.rkey),
+        "cid": rec.cid.to_string_base32(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletePostPrivateInput {
+    repo: String,
+    rkey: String,
+}
+
+/// `tools.kryphocron.feed.deletePostPrivate`: never gated, so a user can
+/// always delete their own private posts.
+pub async fn delete_post_private(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<DeletePostPrivateInput>,
+) -> XrpcResult<Json<Value>> {
+    let account = repo::writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(nsid::POST_PRIVATE, "delete")
+    })
+    .await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 1).await?;
+    let write = repo::prepared(
+        Action::DeleteIfPresent,
+        nsid::POST_PRIVATE,
+        &input.rkey,
+        None,
+        None,
+    );
+    match repo::commit(&s, &account, vec![write], None, false).await {
+        Ok(_) => Ok(Json(json!({}))),
+        Err(e) if e.message == "no changes" => Ok(Json(json!({}))),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------- background
+
+/// Drains audit events into `kr_audit`, in batches.
+pub async fn run_audit_writer(
+    store: locus_store::Store,
+    mut rx: mpsc::Receiver<AuditEvent>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let first = tokio::select! {
+            () = cancel.cancelled() => None,
+            e = rx.recv() => e,
+        };
+        let Some(first) = first else {
+            // Drain what's left before stopping.
+            let mut rest = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                rest.push(row(e));
+            }
+            if !rest.is_empty()
+                && let Err(e) = store.append_kr_audit(&rest).await
+            {
+                tracing::error!("kryphocron audit rows lost at shutdown: {e}");
+            }
+            return;
+        };
+        let mut batch = vec![row(first)];
+        while batch.len() < 500 {
+            match rx.try_recv() {
+                Ok(e) => batch.push(row(e)),
+                Err(_) => break,
+            }
+        }
+        if let Err(e) = store.append_kr_audit(&batch).await {
+            // The fallback: the log, which can't fail.
+            for r in &batch {
+                tracing::warn!(
+                    sink = r.sink,
+                    event = r.event,
+                    "kryphocron audit row not stored: {e}"
+                );
+            }
+        }
+    }
+}
+
+fn row(e: AuditEvent) -> locus_store::kryphocron::AuditRow {
+    locus_store::kryphocron::AuditRow {
+        at: e.at,
+        sink: e.sink.to_owned(),
+        event: e.event,
+        correlation_id: e.correlation_id,
+        detail_json: serde_json::to_string(&e.detail).unwrap_or_else(|_| "\"\"".into()),
+    }
+}
+
+/// Reads the current generation into this node's oracle. A fresh install
+/// gets its first generation here (nodes racing to make it each add one;
+/// the newest is current for all of them).
+pub async fn refresh_oracle(s: &AppState) -> locus_core::CoreResult<()> {
+    let mark = match s.store.current_generation().await? {
+        Some((mark, _)) => mark,
+        None => {
+            let now = locus_core::time::now_ms();
+            let secs = u64::try_from(now / 1000).unwrap_or(0);
+            s.store
+                .add_generation(&locus_kryphocron::rotation::new_mark(secs), now)
+                .await?;
+            s.store
+                .current_generation()
+                .await?
+                .map(|(m, _)| m)
+                .ok_or_else(|| locus_core::CoreError::Storage("no rotation generation".into()))?
+        }
+    };
+    s.kr.encoder.oracle().set(&mark);
+    Ok(())
+}

@@ -263,6 +263,10 @@ impl Tx {
              (SELECT blob_cid, collection, rkey FROM record_blob WHERE did = {1} LIMIT {2})",
             "DELETE FROM backlink WHERE did = {1} AND (collection, rkey, path) IN \
              (SELECT collection, rkey, path FROM backlink WHERE did = {1} LIMIT {2})",
+            "DELETE FROM kr_private_record WHERE did = {1} AND (collection, rkey) IN \
+             (SELECT collection, rkey FROM kr_private_record WHERE did = {1} LIMIT {2})",
+            "DELETE FROM kr_audience WHERE did = {1} AND rkey IN \
+             (SELECT rkey FROM kr_audience WHERE did = {1} LIMIT {2})",
         ];
         for template in sliced {
             let sqlite = template.replace("{1}", "?1").replace("{2}", "?2");
@@ -294,6 +298,7 @@ impl Tx {
             "oauth_token WHERE did",
             "oauth_account_device WHERE did",
             "oauth_authorized_client WHERE did",
+            "kr_permission WHERE did",
         ] {
             let close = if table_col.contains("(SELECT") {
                 ")"

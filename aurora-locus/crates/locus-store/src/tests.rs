@@ -938,3 +938,235 @@ async fn oauth_requests_tokens_and_refresh_rotation() {
         );
     }
 }
+
+#[tokio::test]
+async fn kryphocron_tables_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, AuditRow, PermissionRow, PrivateRecord};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+
+        // Permission rows, one per source.
+        let row = PermissionRow {
+            did: "did:plc:a".into(),
+            source: "membership".into(),
+            prism_did: "did:web:prism".into(),
+            status: "member".into(),
+            private_indexed: true,
+            private_read: false,
+            expires_at: 10,
+            checked_at: 1,
+        };
+        s.put_kr_permission(&row).await.unwrap();
+        s.put_kr_permission(&PermissionRow {
+            status: "indexing".into(),
+            ..row.clone()
+        })
+        .await
+        .unwrap();
+        let got = s
+            .kr_permission("did:plc:a", "membership")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (got.status.as_str(), got.private_indexed, got.private_read),
+            ("indexing", true, false),
+            "{n}"
+        );
+        assert!(
+            s.kr_permission("did:plc:a", "probe")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert_eq!(
+            s.delete_kr_permissions_not_from("did:web:prism")
+                .await
+                .unwrap(),
+            0,
+            "{n}"
+        );
+        assert_eq!(
+            s.delete_kr_permissions_not_from("did:web:other")
+                .await
+                .unwrap(),
+            1,
+            "{n}"
+        );
+        assert!(
+            !s.private_tier_blocked("did:plc:nobody").await.unwrap(),
+            "{n}"
+        );
+
+        // Audiences: a pending delete counts as missing.
+        let aud = AudienceRow {
+            did: "did:plc:a".into(),
+            rkey: "3m6aaaaaaaaaa".into(),
+            name: Some("friends".into()),
+            mode: "list".into(),
+            members_json: "[]".into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-01T00:00:00.000Z".into(),
+            origin: "prism".into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: None,
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: "none".into(),
+            row_version: 1,
+        };
+        s.put_kr_audience(&aud).await.unwrap();
+        s.put_kr_audience(&aud).await.unwrap();
+        let got = s
+            .kr_audience("did:plc:a", "3m6aaaaaaaaaa")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.row_version, 2, "{n}: bumped on every write");
+        s.put_kr_audience(&AudienceRow {
+            pending: "delete".into(),
+            ..aud.clone()
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.kr_audience("did:plc:a", "3m6aaaaaaaaaa")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+
+        // The private-record index and rotation selection.
+        let entry = |rkey: &str, generation: Option<&str>, legacy: bool| PrivateRecord {
+            did: "did:plc:a".into(),
+            collection: "tools.kryphocron.feed.postPrivate".into(),
+            rkey: rkey.into(),
+            generation: generation.map(str::to_owned),
+            legacy_text: legacy,
+            flagged: None,
+            audience_did: Some("did:plc:a".into()),
+            audience_rkey: Some("3m6aaaaaaaaaa".into()),
+        };
+        let mut tx = s.begin().await.unwrap();
+        for e in [
+            entry(
+                "3m6aaaaaaaaa2",
+                Some("laquna/00000000000000000001/aa"),
+                false,
+            ),
+            entry(
+                "3m6aaaaaaaaa3",
+                Some("laquna/00000000000000000003/aa"),
+                false,
+            ),
+            entry("3m6aaaaaaaaa4", None, true),
+            entry(
+                "3m6aaaaaaaaa5",
+                Some("laquna/00000000000000000009/aa"),
+                false,
+            ),
+        ] {
+            tx.replace_private_record("did:plc:a", &e.collection, &e.rkey, Some(&e))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let current = "laquna/00000000000000000002/aa";
+        let due: Vec<String> = s
+            .rotation_due_records("did:plc:a", current, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.rkey)
+            .collect();
+        assert_eq!(
+            due,
+            ["3m6aaaaaaaaa2", "3m6aaaaaaaaa4"],
+            "{n}: older, or legacy text"
+        );
+        assert_eq!(
+            s.rotation_due_accounts(current, "", 10).await.unwrap(),
+            ["did:plc:a"],
+            "{n}"
+        );
+        let future = s
+            .rotation_future_dated("did:plc:a", "laquna/00000000000000000005/ff", 10)
+            .await
+            .unwrap();
+        assert_eq!(future.len(), 1, "{n}");
+        s.flag_private_record(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa2",
+            "undecodable",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.rotation_due_records("did:plc:a", current, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{n}: flagged skipped"
+        );
+        assert_eq!(s.flagged_private_records(10).await.unwrap().len(), 1, "{n}");
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_private_record(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa4",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            s.private_record(
+                "did:plc:a",
+                "tools.kryphocron.feed.postPrivate",
+                "3m6aaaaaaaaa4"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // Generations: the newest is current.
+        assert!(s.current_generation().await.unwrap().is_none(), "{n}");
+        s.add_generation("laquna/00000000000000000001/aa", 1)
+            .await
+            .unwrap();
+        s.add_generation("laquna/00000000000000000002/bb", 2)
+            .await
+            .unwrap();
+        s.add_generation("laquna/00000000000000000002/bb", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.current_generation().await.unwrap(),
+            Some(("laquna/00000000000000000002/bb".to_owned(), 2)),
+            "{n}"
+        );
+
+        // Audit rows, appended and pruned by age.
+        let ev = |at: i64| AuditRow {
+            at,
+            sink: "user".into(),
+            event: "ContentEncoded".into(),
+            correlation_id: Some("abc".into()),
+            detail_json: "\"x\"".into(),
+        };
+        s.append_kr_audit(&[ev(1), ev(100)]).await.unwrap();
+        assert_eq!(
+            s.kr_audit(10).await.unwrap()[0].at,
+            100,
+            "{n}: newest first"
+        );
+        assert_eq!(s.prune_kr_audit(50, 100).await.unwrap(), 1, "{n}");
+        assert_eq!(s.kr_audit(10).await.unwrap().len(), 1, "{n}");
+    }
+}

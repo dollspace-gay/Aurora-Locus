@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth;
 use crate::error::{XrpcError, XrpcResult};
+use crate::kryphocron as kr;
 use crate::state::AppState;
 
 type St = State<Arc<AppState>>;
@@ -43,7 +44,7 @@ fn commit_error(e: CommitError) -> XrpcError {
     }
 }
 
-fn record_limit(s: &AppState) -> usize {
+pub(crate) fn record_limit(s: &AppState) -> usize {
     usize::try_from(s.snapshot().int("limits.record_size")).unwrap_or(usize::MAX)
 }
 
@@ -71,12 +72,12 @@ async fn local_account(s: &AppState, repo: &str) -> XrpcResult<Option<Account>> 
 /// A write's caller and target, as the reference: the token's account must
 /// be `repo`, and active (not deactivated or taken down).
 /// What an OAuth token must allow for a write (legacy tokens skip it).
-type RepoCheck<'a> = &'a (
+pub(crate) type RepoCheck<'a> = &'a (
         dyn Fn(&locus_auth::scopes::Permissions) -> Result<(), locus_auth::scopes::ScopeMissing>
             + Sync
     );
 
-async fn writer(
+pub(crate) async fn writer(
     s: &AppState,
     headers: &HeaderMap,
     repo: &str,
@@ -94,7 +95,7 @@ async fn writer(
     Ok(account)
 }
 
-fn prepared(
+pub(crate) fn prepared(
     action: Action,
     collection: &str,
     rkey: &str,
@@ -114,13 +115,29 @@ fn prepared(
     }
 }
 
+/// A create or update's record after kryphocron's step (host rules, gates,
+/// the private-post pipeline); other collections pass through.
+async fn kr_value(
+    s: &AppState,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    value: proto_blue_lex_data::LexValue,
+) -> XrpcResult<proto_blue_lex_data::LexValue> {
+    Ok(
+        kr::prepare_write(s, did, collection, rkey, Some(value), kr::Op::Write)
+            .await?
+            .expect("a write keeps its record"),
+    )
+}
+
 fn check_collection(collection: &str) -> XrpcResult<()> {
     proto_blue_syntax::Nsid::new(collection)
         .map(|_| ())
         .map_err(|_| XrpcError::invalid_request(format!("Invalid collection: {collection}")))
 }
 
-async fn commit(
+pub(crate) async fn commit(
     s: &AppState,
     account: &Account,
     writes: Vec<PreparedWrite>,
@@ -164,7 +181,7 @@ fn commit_json(o: &CommitOutcome) -> Value {
     json!({ "cid": o.commit_cid.to_string_base32(), "rev": o.rev })
 }
 
-fn uri(did: &str, collection: &str, rkey: &str) -> String {
+pub(crate) fn uri(did: &str, collection: &str, rkey: &str) -> String {
     format!("at://{did}/{collection}/{rkey}")
 }
 
@@ -198,10 +215,18 @@ pub async fn create_record(
     crate::ratelimit::limit_repo_write(&s, &account.did, 3).await?;
     check_collection(&input.collection)?;
     let rkey = input.rkey.clone().unwrap_or_else(|| s.repo.tids().next());
-    let rec = records::prepare_record(
+    let value = kr_value(
+        &s,
+        &account.did,
         &input.collection,
         &rkey,
         records::parse_json(&input.record).map_err(invalid_record)?,
+    )
+    .await?;
+    let rec = records::prepare_record(
+        &input.collection,
+        &rkey,
+        value,
         input.validate,
         record_limit(&s),
     )
@@ -261,10 +286,18 @@ pub async fn put_record(
     .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 2).await?;
     check_collection(&input.collection)?;
-    let rec = records::prepare_record(
+    let value = kr_value(
+        &s,
+        &account.did,
         &input.collection,
         &input.rkey,
         records::parse_json(&input.record).map_err(invalid_record)?,
+    )
+    .await?;
+    let rec = records::prepare_record(
+        &input.collection,
+        &input.rkey,
+        value,
         input.validate,
         record_limit(&s),
     )
@@ -319,6 +352,15 @@ pub async fn delete_record(
     .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 1).await?;
     check_collection(&input.collection)?;
+    kr::prepare_write(
+        &s,
+        &account.did,
+        &input.collection,
+        &input.rkey,
+        None,
+        kr::Op::Delete,
+    )
+    .await?;
     let swap = input
         .swap_record
         .as_deref()
@@ -413,6 +455,7 @@ pub async fn apply_writes(
                     }
                 };
                 let value = records::parse_json(&w["value"]).map_err(invalid_record)?;
+                let value = kr_value(&s, &account.did, collection, &rkey, value).await?;
                 let rec = records::prepare_record(
                     collection,
                     &rkey,
@@ -440,6 +483,7 @@ pub async fn apply_writes(
                 let rkey = rkey_given.ok_or_else(|| {
                     XrpcError::invalid_request(format!("writes[{i}]: missing rkey"))
                 })?;
+                kr::prepare_write(&s, &account.did, collection, rkey, None, kr::Op::Delete).await?;
                 writes.push(prepared(Action::Delete, collection, rkey, None, None));
                 results.push(json!({ "$type": "com.atproto.repo.applyWrites#deleteResult" }));
             }

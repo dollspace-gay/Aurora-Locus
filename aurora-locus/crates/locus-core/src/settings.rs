@@ -648,6 +648,47 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Days to keep a deleted account's firehose history before removing it. 0 removes it at once.",
     },
+    Def {
+        key: "kryphocron.private_tier_enabled",
+        kind: Kind::Bool,
+        default: "true",
+        env: None,
+        description: "Private-tier writes (private posts, blocks, mutes, audiences). Effective only with an AppView configured.",
+    },
+    Def {
+        key: "kryphocron.rotation_period_days",
+        kind: Kind::Int { min: 30, max: 90 },
+        default: "60",
+        env: None,
+        description: "Days between rotation generations; private posts are re-encoded under each new one. Applies from the next generation.",
+    },
+    Def {
+        key: "kryphocron.rotation_max_commits_per_minute",
+        kind: Kind::Int {
+            min: 1,
+            max: 10_000,
+        },
+        default: "120",
+        env: None,
+        description: "Most rotation commits per minute, install-wide.",
+    },
+    Def {
+        key: "kryphocron.audit_retention_days",
+        kind: Kind::Int { min: 1, max: 3650 },
+        default: "365",
+        env: None,
+        description: "Days to keep kryphocron audit events.",
+    },
+    Def {
+        key: "kryphocron.prism_request_timeout_ms",
+        kind: Kind::Int {
+            min: 1000,
+            max: 60_000,
+        },
+        default: "10000",
+        env: None,
+        description: "The bound on every call to the AppView's private-tier methods, in milliseconds.",
+    },
 ];
 
 /// Looks up a setting definition.

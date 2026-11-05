@@ -226,7 +226,7 @@ pub fn backlinks(collection: &str, value: &LexValue) -> Vec<(String, String)> {
         return Vec::new();
     };
     match collection {
-        "app.bsky.graph.follow" | "app.bsky.graph.block" => map
+        "app.bsky.graph.follow" | "app.bsky.graph.block" | "tools.kryphocron.graph.block" => map
             .get("subject")
             .and_then(LexValue::as_str)
             .filter(|s| proto_blue_syntax::Did::new(s).is_ok())
@@ -242,6 +242,47 @@ pub fn backlinks(collection: &str, value: &LexValue) -> Vec<(String, String)> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+/// The collection whose records are indexed for rotation and re-pointing.
+pub const POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
+
+/// A private post's index entry: its generation mark, whether it still
+/// carries `text`, and its audience. Other collections have none.
+#[must_use]
+pub fn private_entry(
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    value: &LexValue,
+) -> Option<locus_store::kryphocron::PrivateRecord> {
+    if collection != POST_PRIVATE {
+        return None;
+    }
+    let map = value.as_map()?;
+    let audience = map
+        .get("audienceList")
+        .and_then(LexValue::as_str)
+        .and_then(|u| u.strip_prefix("at://"))
+        .map(|rest| {
+            let mut parts = rest.splitn(3, '/');
+            let did = parts.next().unwrap_or("").to_owned();
+            let _collection = parts.next();
+            (did, parts.next().unwrap_or("").to_owned())
+        });
+    Some(locus_store::kryphocron::PrivateRecord {
+        did: did.to_owned(),
+        collection: collection.to_owned(),
+        rkey: rkey.to_owned(),
+        generation: map
+            .get("encodedContentGeneration")
+            .and_then(LexValue::as_str)
+            .map(str::to_owned),
+        legacy_text: map.contains_key("text"),
+        flagged: None,
+        audience_did: audience.as_ref().map(|(d, _)| d.clone()),
+        audience_rkey: audience.map(|(_, r)| r),
+    })
 }
 
 /// Every blob the record references (typed refs anywhere in it, deduped).

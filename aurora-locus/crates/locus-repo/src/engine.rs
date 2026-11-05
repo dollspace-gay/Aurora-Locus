@@ -97,6 +97,31 @@ impl PreparedWrite {
     }
 }
 
+/// Keeps the private-record index with the record index, in the commit's
+/// transaction.
+async fn index_private(
+    tx: &mut locus_store::Tx,
+    did: &str,
+    writes: &[PreparedWrite],
+) -> Result<(), CommitError> {
+    for w in writes
+        .iter()
+        .filter(|w| w.collection == crate::records::POST_PRIVATE)
+    {
+        let entry = match &w.record {
+            Some((_, bytes)) => {
+                let value = proto_blue_lex_cbor::decode(bytes)
+                    .map_err(|e| CommitError::InvalidRequest(format!("Invalid record: {e}")))?;
+                crate::records::private_entry(did, &w.collection, &w.rkey, &value)
+            }
+            None => None,
+        };
+        tx.replace_private_record(did, &w.collection, &w.rkey, entry.as_ref())
+            .await?;
+    }
+    Ok(())
+}
+
 /// A commit request.
 pub struct CommitRequest<'a> {
     pub did: &'a str,
@@ -676,6 +701,7 @@ impl RepoEngine {
         tx.apply_block_deltas(did, &rev, &net_deltas(deltas))
             .await?;
         tx.apply_record_changes(did, &rev, &record_changes).await?;
+        index_private(&mut tx, did, &writes).await?;
         let moves = apply_references(&mut tx, did, &writes, &paths).await?;
         tx.set_repo_root(
             did,

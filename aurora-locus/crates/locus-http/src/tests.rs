@@ -161,6 +161,12 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         )
     };
     let firehose = locus_sync::Firehose::new(store.clone(), 500);
+    let (kr, audit_rx) = crate::kryphocron::Kr::new(secrets.correlation_key);
+    tokio::spawn(crate::kryphocron::run_audit_writer(
+        store.clone(),
+        audit_rx,
+        tokio_util::sync::CancellationToken::new(),
+    ));
     let state = Arc::new(AppState {
         repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0))),
         store,
@@ -179,7 +185,9 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         resolvers: crate::state::ResolverCache::default(),
         limits: crate::ratelimit::Limiter::default(),
         oauth_clients: crate::oauth::ClientCache::default(),
+        kr,
     });
+    crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
         app: crate::router(state.clone()),
         state,
@@ -5368,4 +5376,448 @@ async fn the_sign_in_pages_take_a_user_from_par_to_a_code() {
         )
         .await;
     assert!(html.contains("wants access"), "{html}");
+}
+
+// ---------------------------------------------------------------- kryphocron
+
+const POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
+
+impl Harness {
+    /// An audience in `did`'s private audience store.
+    async fn add_audience(&self, did: &str, rkey: &str) -> String {
+        self.state
+            .store
+            .put_kr_audience(&locus_store::kryphocron::AudienceRow {
+                did: did.into(),
+                rkey: rkey.into(),
+                name: None,
+                mode: "list".into(),
+                members_json: "[]".into(),
+                created_at: "2024-01-01T00:00:00.000Z".into(),
+                updated_at: "2024-01-01T00:00:00.000Z".into(),
+                origin: "prism".into(),
+                prism_did: "did:web:prism.test".into(),
+                prism_cid: Some("3m6prismcid22".into()),
+                local_cid: "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm".into(),
+                value_cbor: vec![0xa0],
+                pending: "none".into(),
+                row_version: 1,
+            })
+            .await
+            .unwrap();
+        format!("at://{did}/tools.kryphocron.policy.audience/{rkey}")
+    }
+
+    /// A configured prism that admits every caller to the private tier.
+    async fn with_prism(&self) -> (Script, SeenLog) {
+        let (url, script, seen) = scripted_appview().await;
+        for (k, v) in [
+            ("appview.url", url.as_str()),
+            ("appview.did", "did:web:prism.test"),
+        ] {
+            self.state.settings.set(k, json!(v), "test").await.unwrap();
+        }
+        script.lock().unwrap().insert(
+            "app.nearhorizon.actor.getMembership".into(),
+            (
+                200,
+                vec![],
+                json!({"status": "member", "features": [], "validForSecs": 3600,
+                       "permissions": {"privateIndexed": true, "privateRead": true}}),
+            ),
+        );
+        (script, seen)
+    }
+}
+
+fn private_post(text: &str, audience: &str) -> Value {
+    json!({"$type": POST_PRIVATE, "text": text, "createdAt": "2024-01-01T00:00:00.000Z", "audienceList": audience})
+}
+
+#[tokio::test]
+async fn private_posts_are_gated_encoded_and_indexed() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("kira.pds.example.com", "kira@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let audience = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let create = |record: Value| {
+        let (h, access, did) = (&h, access.clone(), did.clone());
+        async move {
+            h.post(
+                "tools.kryphocron.feed.createPostPrivate",
+                Some(&access),
+                json!({"repo": did, "record": record}),
+            )
+            .await
+        }
+    };
+
+    // No AppView: the private tier is off.
+    let (st, v) = create(private_post("hi", &audience)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("UnsupportedNamespace")),
+        "{v}"
+    );
+
+    let (_script, seen) = h.with_prism().await;
+    let mention = json!([{"index": {"byteStart": 0, "byteEnd": 5},
+        "features": [{"$type": "app.bsky.richtext.facet#mention", "did": "did:plc:friendfriendfriend"}]}]);
+    let mut rec = private_post("@kira the private sentinel", &audience);
+    rec["facets"] = mention;
+    rec["mentionDids"] = json!(["did:plc:claimedbutfalse"]);
+    let (st, v) = create(rec).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let uri = v["uri"].as_str().unwrap().to_owned();
+    let rkey = uri.rsplit('/').next().unwrap().to_owned();
+
+    // Stored encoded: no text, derived clear fields, a generation mark.
+    let (st, got) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection={POST_PRIVATE}&rkey={rkey}"
+        ))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let value = &got["value"];
+    assert!(
+        value.get("text").is_none() && value.get("facets").is_none(),
+        "{value}"
+    );
+    assert_eq!(value["encodedContentCodec"], "laquna/0.2");
+    assert!(
+        value["encodedContentGeneration"]
+            .as_str()
+            .unwrap()
+            .starts_with("laquna/")
+    );
+    assert_eq!(value["mentionDids"], json!(["did:plc:friendfriendfriend"]));
+    assert!(value["encodedContent"]["$bytes"].is_string());
+    let block = h
+        .state
+        .store
+        .block(&did, got["cid"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !block.windows(8).any(|w| w == b"sentinel"),
+        "no plaintext in the repo"
+    );
+    for (_, event) in h.state.store.outbox_for(&did).await.unwrap() {
+        assert!(
+            !event.windows(8).any(|w| w == b"sentinel"),
+            "nor on the firehose"
+        );
+    }
+
+    // Indexed for rotation, with its audience.
+    let entry = h
+        .state
+        .store
+        .private_record(&did, POST_PRIVATE, &rkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entry.generation.as_deref(),
+        value["encodedContentGeneration"].as_str()
+    );
+    assert_eq!(
+        (entry.audience_rkey.as_deref(), entry.legacy_text),
+        (Some("3m6aaaaaaaaaa"), false)
+    );
+
+    // The generic endpoints run the same pipeline.
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": POST_PRIVATE, "record": private_post("generic", &audience)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let generic_rkey = v["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let (_, got) = h
+        .get(format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection={POST_PRIVATE}&rkey={generic_rkey}"))
+        .await;
+    assert!(got["value"].get("text").is_none() && got["value"]["encodedContent"].is_object());
+
+    // getMembership was asked once; its answer is cached.
+    let asked = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.uri.contains("getMembership"))
+        .count();
+    assert_eq!(asked, 1);
+
+    // Host rules.
+    let (st, v) = create(private_post(
+        "x",
+        &format!("at://{did}/tools.kryphocron.policy.audience/3m6zzzzzzzzzz"),
+    ))
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "an audience the store doesn't hold: {v}"
+    );
+    let (st, _) = create(private_post(
+        "x",
+        "at://did:plc:someoneelse/tools.kryphocron.policy.audience/3m6aaaaaaaaaa",
+    ))
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "someone else's audience");
+    let mut both = private_post("x", &audience);
+    both["encodedContent"] = json!({"$bytes": "AAAA"});
+    both["encodedContentCodec"] = json!("laquna/0.2");
+    assert_eq!(
+        create(both).await.0,
+        StatusCode::BAD_REQUEST,
+        "text and encodedContent"
+    );
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "tools.kryphocron.feed.nothing", "record": {"createdAt": "2024-01-01T00:00:00.000Z"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "unregistered: {v}");
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.putRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "tools.kryphocron.graph.block", "rkey": "self",
+                   "record": {"subject": "did:plc:someoneelse", "createdAt": "2024-01-01T00:00:00.000Z"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "kryphocron keys are TIDs");
+
+    // updatePostPrivate changes only the audience.
+    let other = h.add_audience(&did, "3m6bbbbbbbbbb").await;
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.updatePostPrivate",
+            Some(&access),
+            json!({"repo": did, "rkey": rkey, "audienceList": other, "swapRecord": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidSwap"))
+    );
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.updatePostPrivate",
+            Some(&access),
+            json!({"repo": did, "rkey": rkey, "audienceList": other, "swapRecord": got_cid(&h, &did, &rkey).await}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, after) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection={POST_PRIVATE}&rkey={rkey}"
+        ))
+        .await;
+    assert_eq!(
+        after["value"]["encodedContent"], value["encodedContent"],
+        "content kept byte for byte"
+    );
+    assert_eq!(after["value"]["audienceList"], json!(other));
+    assert_ne!(after["cid"], json!(got_cid_value(&got)));
+
+    // The local block, and the host switch.
+    h.state
+        .store
+        .set_private_tier_blocked(&did, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        create(private_post("x", &audience)).await.0,
+        StatusCode::FORBIDDEN
+    );
+    h.state
+        .store
+        .set_private_tier_blocked(&did, false)
+        .await
+        .unwrap();
+    h.state
+        .settings
+        .set("kryphocron.private_tier_enabled", json!(false), "test")
+        .await
+        .unwrap();
+    let (_, v) = create(private_post("x", &audience)).await;
+    assert_eq!(v["error"], "UnsupportedNamespace");
+
+    // Deletes are never gated.
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.feed.deletePostPrivate",
+            Some(&access),
+            json!({"repo": did, "rkey": rkey}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h.state
+            .store
+            .private_record(&did, POST_PRIVATE, &rkey)
+            .await
+            .unwrap()
+            .is_none(),
+        "unindexed"
+    );
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.deleteRecord",
+            Some(&access),
+            json!({"repo": did, "collection": POST_PRIVATE, "rkey": generic_rkey}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Audit: the encodes were recorded.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let audit = h.state.store.kr_audit(50).await.unwrap();
+    assert!(
+        audit.iter().any(|r| r.event == "ContentEncoded"),
+        "{audit:?}"
+    );
+}
+
+async fn got_cid(h: &Harness, did: &str, rkey: &str) -> String {
+    h.state
+        .store
+        .record_entry(did, POST_PRIVATE, rkey)
+        .await
+        .unwrap()
+        .unwrap()
+        .0
+}
+
+fn got_cid_value(got: &Value) -> String {
+    got["cid"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn the_appview_decides_who_may_write_private_posts() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("noor.pds.example.com", "noor@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let audience = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let (script, _) = h.with_prism().await;
+    let set = |status: u16, body: Value| {
+        script.lock().unwrap().insert(
+            "app.nearhorizon.actor.getMembership".into(),
+            (status, vec![], body),
+        );
+    };
+    let create = || {
+        let (h, access, did, audience) = (&h, access.clone(), did.clone(), audience.clone());
+        async move {
+            h.post(
+                "tools.kryphocron.feed.createPostPrivate",
+                Some(&access),
+                json!({"repo": did, "record": private_post("x", &audience)}),
+            )
+            .await
+        }
+    };
+    set(
+        200,
+        json!({"status": "notEligible", "validForSecs": 5, "permissions": {"privateIndexed": false, "privateRead": false}}),
+    );
+    assert_eq!(create().await.0, StatusCode::FORBIDDEN);
+    // The refusal is cached for its validForSecs; let it lapse.
+    let mut row = h
+        .state
+        .store
+        .kr_permission(&did, "membership")
+        .await
+        .unwrap()
+        .unwrap();
+    row.expires_at = 0;
+    h.state.store.put_kr_permission(&row).await.unwrap();
+    set(503, json!({"error": "Unavailable"}));
+    let (st, v) = create().await;
+    assert_eq!(
+        st,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no answer is retryable: {v}"
+    );
+    set(400, json!({"error": "AccountTakedown"}));
+    assert_eq!(create().await.0, StatusCode::FORBIDDEN);
+    let probe = h
+        .state
+        .store
+        .kr_permission(&did, "probe")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.status, "takedown", "a takedown writes both rows");
+    // Indexing members may write (privateIndexed), once the takedown lapses.
+    for source in ["membership", "probe"] {
+        let mut row = h
+            .state
+            .store
+            .kr_permission(&did, source)
+            .await
+            .unwrap()
+            .unwrap();
+        row.expires_at = 0;
+        h.state.store.put_kr_permission(&row).await.unwrap();
+    }
+    set(
+        200,
+        json!({"status": "indexing", "validForSecs": 5, "permissions": {"privateIndexed": true, "privateRead": false}}),
+    );
+    assert_eq!(create().await.0, StatusCode::OK);
+
+    // An unreachable prism: the last answer stands, expired or not.
+    let mut row = h
+        .state
+        .store
+        .kr_permission(&did, "membership")
+        .await
+        .unwrap()
+        .unwrap();
+    row.expires_at = 0;
+    h.state.store.put_kr_permission(&row).await.unwrap();
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    h.state
+        .settings
+        .set("appview.url", json!(dead), "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        create().await.0,
+        StatusCode::OK,
+        "outage: the last answer stands"
+    );
+    h.state.store.delete_kr_permissions(&did).await.unwrap();
+    assert_eq!(
+        create().await.0,
+        StatusCode::FORBIDDEN,
+        "outage with no answer at all"
+    );
 }
