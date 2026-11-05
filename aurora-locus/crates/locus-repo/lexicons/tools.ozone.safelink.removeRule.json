@@ -1,0 +1,58 @@
+{
+  "defs": {
+    "main": {
+      "description": "Remove an existing URL safety rule",
+      "errors": [
+        {
+          "description": "No active rule found for this URL/domain",
+          "name": "RuleNotFound"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "comment": {
+              "description": "Optional comment about why the rule is being removed",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Optional DID of the user. Only respected when using admin auth.",
+              "format": "did",
+              "type": "string"
+            },
+            "pattern": {
+              "ref": "tools.ozone.safelink.defs#patternType",
+              "type": "ref"
+            },
+            "source": {
+              "default": "ozone/default",
+              "description": "Source of the rule to remove",
+              "maxLength": 128,
+              "type": "string"
+            },
+            "url": {
+              "description": "The URL or domain to remove the rule for",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.safelink.defs#event",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.safelink.removeRule",
+  "lexicon": 1
+}

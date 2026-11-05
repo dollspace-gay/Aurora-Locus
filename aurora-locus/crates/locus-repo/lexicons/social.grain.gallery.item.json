@@ -1,0 +1,37 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "key": "tid",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "gallery": {
+            "format": "at-uri",
+            "type": "string"
+          },
+          "item": {
+            "format": "at-uri",
+            "type": "string"
+          },
+          "position": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "createdAt",
+          "gallery",
+          "item"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "social.grain.gallery.item",
+  "lexicon": 1
+}

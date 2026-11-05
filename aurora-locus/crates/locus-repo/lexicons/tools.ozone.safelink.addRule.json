@@ -1,0 +1,76 @@
+{
+  "defs": {
+    "main": {
+      "description": "Add a new URL safety rule",
+      "errors": [
+        {
+          "description": "The provided URL is invalid",
+          "name": "InvalidUrl"
+        },
+        {
+          "description": "A rule for this URL/domain already exists",
+          "name": "RuleAlreadyExists"
+        },
+        {
+          "description": "A rule for this URL/domain is owned by another source",
+          "name": "RuleSourceConflict"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "action": {
+              "ref": "tools.ozone.safelink.defs#actionType",
+              "type": "ref"
+            },
+            "comment": {
+              "description": "Optional comment about the decision",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Author DID. Only respected when using admin auth",
+              "format": "did",
+              "type": "string"
+            },
+            "pattern": {
+              "ref": "tools.ozone.safelink.defs#patternType",
+              "type": "ref"
+            },
+            "reason": {
+              "ref": "tools.ozone.safelink.defs#reasonType",
+              "type": "ref"
+            },
+            "source": {
+              "default": "ozone/default",
+              "description": "Source of the rule",
+              "maxLength": 128,
+              "type": "string"
+            },
+            "url": {
+              "description": "The URL or domain to apply the rule to",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "pattern",
+            "action",
+            "reason"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.safelink.defs#event",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.safelink.addRule",
+  "lexicon": 1
+}

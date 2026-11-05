@@ -1,0 +1,151 @@
+{
+  "defs": {
+    "actionType": {
+      "knownValues": [
+        "block",
+        "warn",
+        "whitelist"
+      ],
+      "type": "string"
+    },
+    "event": {
+      "description": "An event for URL safety decisions",
+      "properties": {
+        "action": {
+          "ref": "#actionType",
+          "type": "ref"
+        },
+        "comment": {
+          "description": "Optional comment about the decision",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "createdBy": {
+          "description": "DID of the user who created this rule",
+          "format": "did",
+          "type": "string"
+        },
+        "eventType": {
+          "ref": "#eventType",
+          "type": "ref"
+        },
+        "id": {
+          "description": "Auto-incrementing row ID",
+          "type": "integer"
+        },
+        "pattern": {
+          "ref": "#patternType",
+          "type": "ref"
+        },
+        "reason": {
+          "ref": "#reasonType",
+          "type": "ref"
+        },
+        "source": {
+          "default": "ozone/default",
+          "description": "Source of the decision",
+          "type": "string"
+        },
+        "url": {
+          "description": "The URL that this rule applies to",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "eventType",
+        "url",
+        "pattern",
+        "action",
+        "reason",
+        "createdBy",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "eventType": {
+      "knownValues": [
+        "addRule",
+        "updateRule",
+        "removeRule"
+      ],
+      "type": "string"
+    },
+    "patternType": {
+      "knownValues": [
+        "domain",
+        "url"
+      ],
+      "type": "string"
+    },
+    "reasonType": {
+      "knownValues": [
+        "csam",
+        "spam",
+        "phishing",
+        "none"
+      ],
+      "type": "string"
+    },
+    "urlRule": {
+      "description": "An active URL safety rule",
+      "properties": {
+        "action": {
+          "ref": "#actionType",
+          "type": "ref"
+        },
+        "comment": {
+          "description": "Optional comment about the decision",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "Timestamp when the rule was created",
+          "format": "datetime",
+          "type": "string"
+        },
+        "createdBy": {
+          "description": "DID of the user added the rule.",
+          "format": "did",
+          "type": "string"
+        },
+        "pattern": {
+          "ref": "#patternType",
+          "type": "ref"
+        },
+        "reason": {
+          "ref": "#reasonType",
+          "type": "ref"
+        },
+        "source": {
+          "default": "ozone/default",
+          "description": "Source of the rule",
+          "type": "string"
+        },
+        "updatedAt": {
+          "description": "Timestamp when the rule was last updated",
+          "format": "datetime",
+          "type": "string"
+        },
+        "url": {
+          "description": "The URL or domain to apply the rule to",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "pattern",
+        "action",
+        "reason",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.safelink.defs",
+  "lexicon": 1
+}

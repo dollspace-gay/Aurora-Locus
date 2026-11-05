@@ -1,0 +1,49 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Get information about a feed generator. Implemented by AppView.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "isOnline": {
+              "description": "Indicates whether the feed generator service has been online recently, or else seems to be inactive.",
+              "type": "boolean"
+            },
+            "isValid": {
+              "description": "Indicates whether the feed generator service is compatible with the record declaration.",
+              "type": "boolean"
+            },
+            "view": {
+              "ref": "app.bsky.feed.defs#generatorView",
+              "type": "ref"
+            }
+          },
+          "required": [
+            "view",
+            "isOnline",
+            "isValid"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "feed": {
+            "description": "AT-URI of the feed generator record.",
+            "format": "at-uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "feed"
+        ],
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "app.bsky.feed.getFeedGenerator",
+  "lexicon": 1
+}

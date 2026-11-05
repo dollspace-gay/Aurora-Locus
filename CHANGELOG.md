@@ -161,6 +161,13 @@ kryphocron built in.
 - Disposable email addresses are refused at sign-up and email change, with
   the reference's list (`scripts/update-disposable-domains.sh` refreshes
   it) plus the operator's `accounts.disposable_email_domains`.
+- Record validation against the reference's curated known-schema list
+  (217 lexicons, vendored by `scripts/vendor-lexicons.py`) and the
+  `tools.kryphocron.*` lexicons, as the reference: `validate: false` skips
+  it, unset validates known types and accepts unknown ones, `true` refuses
+  unknown ones. `$type` must match the collection, record keys must match
+  the schema's key type and pass the slur filter, records are strict data
+  model (no floats, safe integers), and legacy blob refs are refused.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

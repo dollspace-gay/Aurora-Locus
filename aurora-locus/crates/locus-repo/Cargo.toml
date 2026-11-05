@@ -14,6 +14,11 @@ proto-blue-lex-data.workspace = true
 proto-blue-lex-cbor.workspace = true
 proto-blue-crypto.workspace = true
 proto-blue-repo.workspace = true
+proto-blue-lexicon.workspace = true
+proto-blue-lex-json.workspace = true
+kryphocron-lexicons.workspace = true
+locus-identity.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 

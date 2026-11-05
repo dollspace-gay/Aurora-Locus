@@ -1,0 +1,1612 @@
+{
+  "defs": {
+    "accountEvent": {
+      "description": "Logs account status related events on a repo subject. Normally captured by automod from the firehose and emitted to ozone for historical tracking.",
+      "properties": {
+        "active": {
+          "description": "Indicates that the account has a repository which can be fetched from the host that emitted this event.",
+          "type": "boolean"
+        },
+        "comment": {
+          "type": "string"
+        },
+        "status": {
+          "knownValues": [
+            "unknown",
+            "deactivated",
+            "deleted",
+            "takendown",
+            "suspended",
+            "tombstoned"
+          ],
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp",
+        "active"
+      ],
+      "type": "object"
+    },
+    "accountHosting": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "deactivatedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "deletedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "reactivatedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "status": {
+          "knownValues": [
+            "takendown",
+            "suspended",
+            "deleted",
+            "deactivated",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "accountStats": {
+      "description": "Statistics about a particular account subject",
+      "properties": {
+        "appealCount": {
+          "description": "Total number of appeals against a moderation action on the account",
+          "type": "integer"
+        },
+        "escalateCount": {
+          "description": "Number of times the account was escalated",
+          "type": "integer"
+        },
+        "reportCount": {
+          "description": "Total number of reports on the account",
+          "type": "integer"
+        },
+        "suspendCount": {
+          "description": "Number of times the account was suspended",
+          "type": "integer"
+        },
+        "takedownCount": {
+          "description": "Number of times the account was taken down",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "accountStrike": {
+      "description": "Strike information for an account",
+      "properties": {
+        "activeStrikeCount": {
+          "description": "Current number of active strikes (excluding expired strikes)",
+          "type": "integer"
+        },
+        "firstStrikeAt": {
+          "description": "Timestamp of the first strike received",
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastStrikeAt": {
+          "description": "Timestamp of the most recent strike received",
+          "format": "datetime",
+          "type": "string"
+        },
+        "totalStrikeCount": {
+          "description": "Total number of strikes ever received (including expired strikes)",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ageAssuranceEvent": {
+      "description": "Age assurance info coming directly from users. Only works on DID subjects.",
+      "properties": {
+        "access": {
+          "ref": "app.bsky.ageassurance.defs#access",
+          "type": "ref"
+        },
+        "attemptId": {
+          "description": "The unique identifier for this instance of the age assurance flow, in UUID format.",
+          "type": "string"
+        },
+        "completeIp": {
+          "description": "The IP address used when completing the AA flow.",
+          "type": "string"
+        },
+        "completeUa": {
+          "description": "The user agent used when completing the AA flow.",
+          "type": "string"
+        },
+        "countryCode": {
+          "description": "The ISO 3166-1 alpha-2 country code provided when beginning the Age Assurance flow.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "The date and time of this write operation.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "initIp": {
+          "description": "The IP address used when initiating the AA flow.",
+          "type": "string"
+        },
+        "initUa": {
+          "description": "The user agent used when initiating the AA flow.",
+          "type": "string"
+        },
+        "regionCode": {
+          "description": "The ISO 3166-2 region code provided when beginning the Age Assurance flow.",
+          "type": "string"
+        },
+        "status": {
+          "description": "The status of the Age Assurance process.",
+          "knownValues": [
+            "unknown",
+            "pending",
+            "assured"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "status",
+        "attemptId"
+      ],
+      "type": "object"
+    },
+    "ageAssuranceOverrideEvent": {
+      "description": "Age assurance status override by moderators. Only works on DID subjects.",
+      "properties": {
+        "access": {
+          "ref": "app.bsky.ageassurance.defs#access",
+          "type": "ref"
+        },
+        "comment": {
+          "description": "Comment describing the reason for the override.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "description": "The status to be set for the user decided by a moderator, overriding whatever value the user had previously. Use reset to default to original state.",
+          "knownValues": [
+            "assured",
+            "reset",
+            "blocked"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "comment",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ageAssurancePurgeEvent": {
+      "description": "Purges all age assurance events for the subject. Only works on DID subjects. Moderator-only.",
+      "properties": {
+        "comment": {
+          "description": "Comment describing the reason for the purge.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "comment"
+      ],
+      "type": "object"
+    },
+    "blobView": {
+      "properties": {
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "details": {
+          "refs": [
+            "#imageDetails",
+            "#videoDetails"
+          ],
+          "type": "union"
+        },
+        "mimeType": {
+          "type": "string"
+        },
+        "moderation": {
+          "ref": "#moderation",
+          "type": "ref"
+        },
+        "size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cid",
+        "mimeType",
+        "size",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "cancelScheduledTakedownEvent": {
+      "description": "Logs cancellation of a scheduled takedown action for an account.",
+      "properties": {
+        "comment": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "convoView": {
+      "properties": {
+        "convoId": {
+          "type": "string"
+        },
+        "did": {
+          "format": "did",
+          "type": "string"
+        }
+      },
+      "required": [
+        "did",
+        "convoId"
+      ],
+      "type": "object"
+    },
+    "identityEvent": {
+      "description": "Logs identity related events on a repo subject. Normally captured by automod from the firehose and emitted to ozone for historical tracking.",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "handle": {
+          "format": "handle",
+          "type": "string"
+        },
+        "pdsHost": {
+          "format": "uri",
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "tombstone": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "imageDetails": {
+      "properties": {
+        "height": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "modEventAcknowledge": {
+      "properties": {
+        "acknowledgeAccountSubjects": {
+          "description": "If true, all other reports on content authored by this account will be resolved (acknowledged).",
+          "type": "boolean"
+        },
+        "comment": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventComment": {
+      "description": "Add a comment to a subject. An empty comment will clear any previously set sticky comment.",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "sticky": {
+          "description": "Make the comment persistent on the subject",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "modEventDivert": {
+      "description": "Divert a record's blobs to a 3rd party service for further scanning/tagging",
+      "properties": {
+        "comment": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventEmail": {
+      "description": "Keep a log of outgoing email to a user",
+      "properties": {
+        "comment": {
+          "description": "Additional comment about the outgoing comm.",
+          "type": "string"
+        },
+        "content": {
+          "description": "The content of the email sent to the user.",
+          "type": "string"
+        },
+        "isDelivered": {
+          "description": "Indicates whether the email was successfully delivered to the user's inbox.",
+          "type": "boolean"
+        },
+        "policies": {
+          "description": "Names/Keywords of the policies that necessitated the email.",
+          "items": {
+            "type": "string"
+          },
+          "maxLength": 5,
+          "type": "array"
+        },
+        "severityLevel": {
+          "description": "Severity level of the violation. Normally 'sev-1' that adds strike on repeat offense",
+          "type": "string"
+        },
+        "strikeCount": {
+          "description": "Number of strikes to assign to the user for this violation. Normally 0 as an indicator of a warning and only added as a strike on a repeat offense.",
+          "type": "integer"
+        },
+        "strikeExpiresAt": {
+          "description": "When the strike should expire. If not provided, the strike never expires.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "subjectLine": {
+          "description": "The subject line of the email sent to the user.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subjectLine"
+      ],
+      "type": "object"
+    },
+    "modEventEscalate": {
+      "properties": {
+        "comment": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventLabel": {
+      "description": "Apply/Negate labels on a subject",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "createLabelVals": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "durationInHours": {
+          "description": "Indicates how long the label will remain on the subject. Only applies on labels that are being added.",
+          "type": "integer"
+        },
+        "negateLabelVals": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "createLabelVals",
+        "negateLabelVals"
+      ],
+      "type": "object"
+    },
+    "modEventMute": {
+      "description": "Mute incoming reports on a subject",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "durationInHours": {
+          "description": "Indicates how long the subject should remain muted.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "durationInHours"
+      ],
+      "type": "object"
+    },
+    "modEventMuteReporter": {
+      "description": "Mute incoming reports from an account",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "durationInHours": {
+          "description": "Indicates how long the account should remain muted. Falsy value here means a permanent mute.",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "modEventPriorityScore": {
+      "description": "Set priority score of the subject. Higher score means higher priority.",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "score": {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "score"
+      ],
+      "type": "object"
+    },
+    "modEventReport": {
+      "description": "Report a subject",
+      "properties": {
+        "appealActionId": {
+          "type": "integer"
+        },
+        "appealActionType": {
+          "description": "Action reference type recorded when this appeal was submitted.",
+          "type": "string"
+        },
+        "appealLabel": {
+          "type": "string"
+        },
+        "appealSubmittedBy": {
+          "description": "Moderator who submitted this appeal on behalf of the affected account. Returned by moderator event APIs.",
+          "format": "did",
+          "type": "string"
+        },
+        "comment": {
+          "type": "string"
+        },
+        "isReporterMuted": {
+          "description": "Set to true if the reporter was muted from reporting at the time of the event. These reports won't impact the reviewState of the subject.",
+          "type": "boolean"
+        },
+        "reportType": {
+          "ref": "com.atproto.moderation.defs#reasonType",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "reportType"
+      ],
+      "type": "object"
+    },
+    "modEventResolveAppeal": {
+      "description": "Resolve appeal on a subject",
+      "properties": {
+        "comment": {
+          "description": "Describe resolution.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventReverseTakedown": {
+      "description": "Revert take down action on a subject",
+      "properties": {
+        "comment": {
+          "description": "Describe reasoning behind the reversal.",
+          "type": "string"
+        },
+        "policies": {
+          "description": "Names/Keywords of the policy infraction for which takedown is being reversed.",
+          "items": {
+            "type": "string"
+          },
+          "maxLength": 5,
+          "type": "array"
+        },
+        "severityLevel": {
+          "description": "Severity level of the violation. Usually set from the last policy infraction's severity.",
+          "type": "string"
+        },
+        "strikeCount": {
+          "description": "Number of strikes to subtract from the user's strike count. Usually set from the last policy infraction's severity.",
+          "type": "integer"
+        },
+        "strikeExpiresAt": {
+          "description": "When the strike should expire. If not provided, the strike never expires.",
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventTag": {
+      "description": "Add/Remove a tag on a subject",
+      "properties": {
+        "add": {
+          "description": "Tags to be added to the subject. If already exists, won't be duplicated.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "comment": {
+          "description": "Additional comment about added/removed tags.",
+          "type": "string"
+        },
+        "durationInHours": {
+          "description": "Indicates how long the tags being added should remain before automatically being removed. Only applies to tags being added.",
+          "type": "integer"
+        },
+        "remove": {
+          "description": "Tags to be removed to the subject. Ignores a tag If it doesn't exist, won't be duplicated.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "add",
+        "remove"
+      ],
+      "type": "object"
+    },
+    "modEventTakedown": {
+      "description": "Take down a subject permanently or temporarily",
+      "properties": {
+        "acknowledgeAccountSubjects": {
+          "description": "If true, all other reports on content authored by this account will be resolved (acknowledged).",
+          "type": "boolean"
+        },
+        "comment": {
+          "type": "string"
+        },
+        "durationInHours": {
+          "description": "Indicates how long the takedown should be in effect before automatically expiring.",
+          "type": "integer"
+        },
+        "policies": {
+          "description": "Names/Keywords of the policies that drove the decision.",
+          "items": {
+            "type": "string"
+          },
+          "maxLength": 5,
+          "type": "array"
+        },
+        "severityLevel": {
+          "description": "Severity level of the violation (e.g., 'sev-0', 'sev-1', 'sev-2', etc.).",
+          "type": "string"
+        },
+        "strikeCount": {
+          "description": "Number of strikes to assign to the user for this violation.",
+          "type": "integer"
+        },
+        "strikeExpiresAt": {
+          "description": "When the strike should expire. If not provided, the strike never expires.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "targetServices": {
+          "description": "List of services where the takedown should be applied. If empty or not provided, takedown is applied on all configured services.",
+          "items": {
+            "knownValues": [
+              "appview",
+              "pds"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "modEventUnmute": {
+      "description": "Unmute action on a subject",
+      "properties": {
+        "comment": {
+          "description": "Describe reasoning behind the reversal.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventUnmuteReporter": {
+      "description": "Unmute incoming reports from an account",
+      "properties": {
+        "comment": {
+          "description": "Describe reasoning behind the reversal.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "modEventView": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "createdBy": {
+          "format": "did",
+          "type": "string"
+        },
+        "creatorHandle": {
+          "type": "string"
+        },
+        "event": {
+          "refs": [
+            "#modEventTakedown",
+            "#modEventReverseTakedown",
+            "#modEventComment",
+            "#modEventReport",
+            "#modEventLabel",
+            "#modEventAcknowledge",
+            "#modEventEscalate",
+            "#modEventMute",
+            "#modEventUnmute",
+            "#modEventMuteReporter",
+            "#modEventUnmuteReporter",
+            "#modEventEmail",
+            "#modEventResolveAppeal",
+            "#modEventDivert",
+            "#modEventTag",
+            "#accountEvent",
+            "#identityEvent",
+            "#recordEvent",
+            "#modEventPriorityScore",
+            "#ageAssuranceEvent",
+            "#ageAssuranceOverrideEvent",
+            "#ageAssurancePurgeEvent",
+            "#revokeAccountCredentialsEvent",
+            "#scheduleTakedownEvent",
+            "#cancelScheduledTakedownEvent"
+          ],
+          "type": "union"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "modTool": {
+          "ref": "#modTool",
+          "type": "ref"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef",
+            "chat.bsky.convo.defs#messageRef",
+            "chat.bsky.convo.defs#convoRef"
+          ],
+          "type": "union"
+        },
+        "subjectBlobCids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subjectHandle": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "event",
+        "subject",
+        "subjectBlobCids",
+        "createdBy",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "modEventViewDetail": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "createdBy": {
+          "format": "did",
+          "type": "string"
+        },
+        "event": {
+          "refs": [
+            "#modEventTakedown",
+            "#modEventReverseTakedown",
+            "#modEventComment",
+            "#modEventReport",
+            "#modEventLabel",
+            "#modEventAcknowledge",
+            "#modEventEscalate",
+            "#modEventMute",
+            "#modEventUnmute",
+            "#modEventMuteReporter",
+            "#modEventUnmuteReporter",
+            "#modEventEmail",
+            "#modEventResolveAppeal",
+            "#modEventDivert",
+            "#modEventTag",
+            "#accountEvent",
+            "#identityEvent",
+            "#recordEvent",
+            "#modEventPriorityScore",
+            "#ageAssuranceEvent",
+            "#ageAssuranceOverrideEvent",
+            "#ageAssurancePurgeEvent",
+            "#revokeAccountCredentialsEvent",
+            "#scheduleTakedownEvent",
+            "#cancelScheduledTakedownEvent"
+          ],
+          "type": "union"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "modTool": {
+          "ref": "#modTool",
+          "type": "ref"
+        },
+        "subject": {
+          "refs": [
+            "#repoView",
+            "#repoViewNotFound",
+            "#recordView",
+            "#recordViewNotFound",
+            "#convoView"
+          ],
+          "type": "union"
+        },
+        "subjectBlobs": {
+          "items": {
+            "ref": "#blobView",
+            "type": "ref"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "event",
+        "subject",
+        "subjectBlobs",
+        "createdBy",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "modTool": {
+      "description": "Moderation tool information for tracing the source of the action",
+      "properties": {
+        "meta": {
+          "description": "Additional arbitrary metadata about the source",
+          "type": "unknown"
+        },
+        "name": {
+          "description": "Name/identifier of the source (e.g., 'automod', 'ozone/workspace')",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "moderation": {
+      "properties": {
+        "subjectStatus": {
+          "ref": "#subjectStatusView",
+          "type": "ref"
+        }
+      },
+      "type": "object"
+    },
+    "moderationDetail": {
+      "properties": {
+        "subjectStatus": {
+          "ref": "#subjectStatusView",
+          "type": "ref"
+        }
+      },
+      "type": "object"
+    },
+    "recordEvent": {
+      "description": "Logs lifecycle event on a record subject. Normally captured by automod from the firehose and emitted to ozone for historical tracking.",
+      "properties": {
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "comment": {
+          "type": "string"
+        },
+        "op": {
+          "knownValues": [
+            "create",
+            "update",
+            "delete"
+          ],
+          "type": "string"
+        },
+        "timestamp": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp",
+        "op"
+      ],
+      "type": "object"
+    },
+    "recordHosting": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "deletedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "status": {
+          "knownValues": [
+            "deleted",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "recordView": {
+      "properties": {
+        "blobCids": {
+          "items": {
+            "format": "cid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "moderation": {
+          "ref": "#moderation",
+          "type": "ref"
+        },
+        "repo": {
+          "ref": "#repoView",
+          "type": "ref"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        },
+        "value": {
+          "type": "unknown"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "value",
+        "blobCids",
+        "indexedAt",
+        "moderation",
+        "repo"
+      ],
+      "type": "object"
+    },
+    "recordViewDetail": {
+      "properties": {
+        "blobs": {
+          "items": {
+            "ref": "#blobView",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "ref": "com.atproto.label.defs#label",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "moderation": {
+          "ref": "#moderationDetail",
+          "type": "ref"
+        },
+        "repo": {
+          "ref": "#repoView",
+          "type": "ref"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        },
+        "value": {
+          "type": "unknown"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "value",
+        "blobs",
+        "indexedAt",
+        "moderation",
+        "repo"
+      ],
+      "type": "object"
+    },
+    "recordViewNotFound": {
+      "properties": {
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "recordsStats": {
+      "description": "Statistics about a set of record subject items",
+      "properties": {
+        "appealedCount": {
+          "description": "Number of items that were appealed at least once",
+          "type": "integer"
+        },
+        "escalatedCount": {
+          "description": "Number of items that were escalated at least once",
+          "type": "integer"
+        },
+        "pendingCount": {
+          "description": "Number of item currently in \"reviewOpen\" or \"reviewEscalated\" state",
+          "type": "integer"
+        },
+        "processedCount": {
+          "description": "Number of item currently in \"reviewNone\" or \"reviewClosed\" state",
+          "type": "integer"
+        },
+        "reportedCount": {
+          "description": "Number of items that were reported at least once",
+          "type": "integer"
+        },
+        "subjectCount": {
+          "description": "Total number of item in the set",
+          "type": "integer"
+        },
+        "takendownCount": {
+          "description": "Number of item currently taken down",
+          "type": "integer"
+        },
+        "totalReports": {
+          "description": "Cumulative sum of the number of reports on the items in the set",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "repoView": {
+      "properties": {
+        "deactivatedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "did": {
+          "format": "did",
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "handle": {
+          "format": "handle",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "inviteNote": {
+          "type": "string"
+        },
+        "invitedBy": {
+          "ref": "com.atproto.server.defs#inviteCode",
+          "type": "ref"
+        },
+        "invitesDisabled": {
+          "type": "boolean"
+        },
+        "moderation": {
+          "ref": "#moderation",
+          "type": "ref"
+        },
+        "relatedRecords": {
+          "items": {
+            "type": "unknown"
+          },
+          "type": "array"
+        },
+        "threatSignatures": {
+          "items": {
+            "ref": "com.atproto.admin.defs#threatSignature",
+            "type": "ref"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "did",
+        "handle",
+        "relatedRecords",
+        "indexedAt",
+        "moderation"
+      ],
+      "type": "object"
+    },
+    "repoViewDetail": {
+      "properties": {
+        "deactivatedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "did": {
+          "format": "did",
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "emailConfirmedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "handle": {
+          "format": "handle",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "inviteNote": {
+          "type": "string"
+        },
+        "invitedBy": {
+          "ref": "com.atproto.server.defs#inviteCode",
+          "type": "ref"
+        },
+        "invites": {
+          "items": {
+            "ref": "com.atproto.server.defs#inviteCode",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "invitesDisabled": {
+          "type": "boolean"
+        },
+        "labels": {
+          "items": {
+            "ref": "com.atproto.label.defs#label",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "moderation": {
+          "ref": "#moderationDetail",
+          "type": "ref"
+        },
+        "relatedRecords": {
+          "items": {
+            "type": "unknown"
+          },
+          "type": "array"
+        },
+        "threatSignatures": {
+          "items": {
+            "ref": "com.atproto.admin.defs#threatSignature",
+            "type": "ref"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "did",
+        "handle",
+        "relatedRecords",
+        "indexedAt",
+        "moderation"
+      ],
+      "type": "object"
+    },
+    "repoViewNotFound": {
+      "properties": {
+        "did": {
+          "format": "did",
+          "type": "string"
+        }
+      },
+      "required": [
+        "did"
+      ],
+      "type": "object"
+    },
+    "reporterStats": {
+      "properties": {
+        "accountReportCount": {
+          "description": "The total number of reports made by the user on accounts.",
+          "type": "integer"
+        },
+        "did": {
+          "format": "did",
+          "type": "string"
+        },
+        "labeledAccountCount": {
+          "description": "The total number of accounts labeled as a result of the user's reports.",
+          "type": "integer"
+        },
+        "labeledRecordCount": {
+          "description": "The total number of records labeled as a result of the user's reports.",
+          "type": "integer"
+        },
+        "recordReportCount": {
+          "description": "The total number of reports made by the user on records.",
+          "type": "integer"
+        },
+        "reportedAccountCount": {
+          "description": "The total number of accounts reported by the user.",
+          "type": "integer"
+        },
+        "reportedRecordCount": {
+          "description": "The total number of records reported by the user.",
+          "type": "integer"
+        },
+        "takendownAccountCount": {
+          "description": "The total number of accounts taken down as a result of the user's reports.",
+          "type": "integer"
+        },
+        "takendownRecordCount": {
+          "description": "The total number of records taken down as a result of the user's reports.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "did",
+        "accountReportCount",
+        "recordReportCount",
+        "reportedAccountCount",
+        "reportedRecordCount",
+        "takendownAccountCount",
+        "takendownRecordCount",
+        "labeledAccountCount",
+        "labeledRecordCount"
+      ],
+      "type": "object"
+    },
+    "reviewClosed": {
+      "description": "Moderator review status of a subject: Closed. Indicates that the subject was already reviewed and resolved by a moderator",
+      "type": "token"
+    },
+    "reviewEscalated": {
+      "description": "Moderator review status of a subject: Escalated. Indicates that the subject was escalated for review by a moderator",
+      "type": "token"
+    },
+    "reviewNone": {
+      "description": "Moderator review status of a subject: Unnecessary. Indicates that the subject does not need a review at the moment but there is probably some moderation related metadata available for it",
+      "type": "token"
+    },
+    "reviewOpen": {
+      "description": "Moderator review status of a subject: Open. Indicates that the subject needs to be reviewed by a moderator",
+      "type": "token"
+    },
+    "revokeAccountCredentialsEvent": {
+      "description": "Account credentials revocation by moderators. Only works on DID subjects.",
+      "properties": {
+        "comment": {
+          "description": "Comment describing the reason for the revocation.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "comment"
+      ],
+      "type": "object"
+    },
+    "scheduleTakedownEvent": {
+      "description": "Logs a scheduled takedown action for an account.",
+      "properties": {
+        "comment": {
+          "type": "string"
+        },
+        "executeAfter": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "executeAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "executeUntil": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "scheduledActionView": {
+      "description": "View of a scheduled moderation action",
+      "properties": {
+        "action": {
+          "description": "Type of action to be executed",
+          "knownValues": [
+            "takedown"
+          ],
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "When the scheduled action was created",
+          "format": "datetime",
+          "type": "string"
+        },
+        "createdBy": {
+          "description": "DID of the user who created this scheduled action",
+          "format": "did",
+          "type": "string"
+        },
+        "did": {
+          "description": "Subject DID for the action",
+          "format": "did",
+          "type": "string"
+        },
+        "eventData": {
+          "description": "Serialized event object that will be propagated to the event when performed",
+          "type": "unknown"
+        },
+        "executeAfter": {
+          "description": "Earliest time to execute the action (for randomized scheduling)",
+          "format": "datetime",
+          "type": "string"
+        },
+        "executeAt": {
+          "description": "Exact time to execute the action",
+          "format": "datetime",
+          "type": "string"
+        },
+        "executeUntil": {
+          "description": "Latest time to execute the action (for randomized scheduling)",
+          "format": "datetime",
+          "type": "string"
+        },
+        "executionEventId": {
+          "description": "ID of the moderation event created when action was successfully executed",
+          "type": "integer"
+        },
+        "id": {
+          "description": "Auto-incrementing row ID",
+          "type": "integer"
+        },
+        "lastExecutedAt": {
+          "description": "When the action was last attempted to be executed",
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastFailureReason": {
+          "description": "Reason for the last execution failure",
+          "type": "string"
+        },
+        "randomizeExecution": {
+          "description": "Whether execution time should be randomized within the specified range",
+          "type": "boolean"
+        },
+        "status": {
+          "description": "Current status of the scheduled action",
+          "knownValues": [
+            "pending",
+            "executed",
+            "cancelled",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "description": "When the scheduled action was last updated",
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "did",
+        "createdBy",
+        "createdAt",
+        "status"
+      ],
+      "type": "object"
+    },
+    "subjectReviewState": {
+      "knownValues": [
+        "tools.ozone.moderation.defs#reviewOpen",
+        "tools.ozone.moderation.defs#reviewEscalated",
+        "tools.ozone.moderation.defs#reviewClosed",
+        "tools.ozone.moderation.defs#reviewNone"
+      ],
+      "type": "string"
+    },
+    "subjectStatusView": {
+      "properties": {
+        "accountStats": {
+          "description": "Statistics related to the account subject",
+          "ref": "#accountStats",
+          "type": "ref"
+        },
+        "accountStrike": {
+          "description": "Strike information for the account (account-level only)",
+          "ref": "#accountStrike",
+          "type": "ref"
+        },
+        "ageAssuranceState": {
+          "description": "Current age assurance state of the subject.",
+          "knownValues": [
+            "pending",
+            "assured",
+            "unknown",
+            "reset",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "ageAssuranceUpdatedBy": {
+          "description": "Whether or not the last successful update to age assurance was made by the user or admin.",
+          "knownValues": [
+            "admin",
+            "user"
+          ],
+          "type": "string"
+        },
+        "appealed": {
+          "description": "True indicates that the a previously taken moderator action was appealed against, by the author of the content. False indicates last appeal was resolved by moderators.",
+          "type": "boolean"
+        },
+        "comment": {
+          "description": "Sticky comment on the subject.",
+          "type": "string"
+        },
+        "createdAt": {
+          "description": "Timestamp referencing the first moderation status impacting event was emitted on the subject",
+          "format": "datetime",
+          "type": "string"
+        },
+        "hosting": {
+          "refs": [
+            "#accountHosting",
+            "#recordHosting"
+          ],
+          "type": "union"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "lastAppealedAt": {
+          "description": "Timestamp referencing when the author of the subject appealed a moderation action",
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastReportedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastReviewedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastReviewedBy": {
+          "format": "did",
+          "type": "string"
+        },
+        "muteReportingUntil": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "muteUntil": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "priorityScore": {
+          "description": "Numeric value representing the level of priority. Higher score means higher priority.",
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recordsStats": {
+          "description": "Statistics related to the record subjects authored by the subject's account",
+          "ref": "#recordsStats",
+          "type": "ref"
+        },
+        "reviewState": {
+          "ref": "#subjectReviewState",
+          "type": "ref"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef",
+            "chat.bsky.convo.defs#messageRef",
+            "chat.bsky.convo.defs#convoRef"
+          ],
+          "type": "union"
+        },
+        "subjectBlobCids": {
+          "items": {
+            "format": "cid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subjectRepoHandle": {
+          "type": "string"
+        },
+        "suspendUntil": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "takendown": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "description": "Timestamp referencing when the last update was made to the moderation status of the subject",
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "subject",
+        "createdAt",
+        "updatedAt",
+        "reviewState"
+      ],
+      "type": "object"
+    },
+    "subjectView": {
+      "description": "Detailed view of a subject. For record subjects, the author's repo and profile will be returned.",
+      "properties": {
+        "profile": {
+          "refs": [],
+          "type": "union"
+        },
+        "record": {
+          "ref": "#recordViewDetail",
+          "type": "ref"
+        },
+        "repo": {
+          "ref": "#repoViewDetail",
+          "type": "ref"
+        },
+        "status": {
+          "ref": "#subjectStatusView",
+          "type": "ref"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "type": {
+          "ref": "com.atproto.moderation.defs#subjectType",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "type",
+        "subject"
+      ],
+      "type": "object"
+    },
+    "timelineEventPlcCreate": {
+      "description": "Moderation event timeline event for a PLC create operation",
+      "type": "token"
+    },
+    "timelineEventPlcOperation": {
+      "description": "Moderation event timeline event for generic PLC operation",
+      "type": "token"
+    },
+    "timelineEventPlcTombstone": {
+      "description": "Moderation event timeline event for a PLC tombstone operation",
+      "type": "token"
+    },
+    "videoDetails": {
+      "properties": {
+        "height": {
+          "type": "integer"
+        },
+        "length": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "length"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.moderation.defs",
+  "lexicon": 1
+}

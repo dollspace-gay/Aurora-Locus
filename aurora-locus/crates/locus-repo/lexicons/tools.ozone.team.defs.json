@@ -1,0 +1,62 @@
+{
+  "defs": {
+    "member": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "did": {
+          "format": "did",
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "lastUpdatedBy": {
+          "type": "string"
+        },
+        "profile": {
+          "ref": "app.bsky.actor.defs#profileViewDetailed",
+          "type": "ref"
+        },
+        "role": {
+          "knownValues": [
+            "tools.ozone.team.defs#roleAdmin",
+            "tools.ozone.team.defs#roleModerator",
+            "tools.ozone.team.defs#roleTriage",
+            "tools.ozone.team.defs#roleVerifier"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "did",
+        "role"
+      ],
+      "type": "object"
+    },
+    "roleAdmin": {
+      "description": "Admin role. Highest level of access, can perform all actions.",
+      "type": "token"
+    },
+    "roleModerator": {
+      "description": "Moderator role. Can perform most actions.",
+      "type": "token"
+    },
+    "roleTriage": {
+      "description": "Triage role. Mostly intended for monitoring and escalating issues.",
+      "type": "token"
+    },
+    "roleVerifier": {
+      "description": "Verifier role. Only allowed to issue verifications.",
+      "type": "token"
+    }
+  },
+  "id": "tools.ozone.team.defs",
+  "lexicon": 1
+}

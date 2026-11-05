@@ -1,0 +1,39 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "key": "tid",
+      "record": {
+        "properties": {
+          "alt": {
+            "description": "Alt text description of the image, for accessibility.",
+            "type": "string"
+          },
+          "aspectRatio": {
+            "ref": "social.grain.defs#aspectRatio",
+            "type": "ref"
+          },
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "photo": {
+            "accept": [
+              "image/*"
+            ],
+            "maxSize": 1000000,
+            "type": "blob"
+          }
+        },
+        "required": [
+          "photo",
+          "alt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "social.grain.photo",
+  "lexicon": 1
+}

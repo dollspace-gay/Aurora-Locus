@@ -1,0 +1,93 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "image": {
+      "properties": {
+        "alt": {
+          "description": "Alt text description of the image, for accessibility.",
+          "type": "string"
+        },
+        "aspectRatio": {
+          "ref": "app.bsky.embed.defs#aspectRatio",
+          "type": "ref"
+        },
+        "image": {
+          "accept": [
+            "image/*"
+          ],
+          "description": "The raw image file. May be up to 2 MB, formerly limited to 1 MB.",
+          "maxSize": 2000000,
+          "type": "blob"
+        }
+      },
+      "required": [
+        "image",
+        "alt"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "properties": {
+        "images": {
+          "items": {
+            "ref": "#image",
+            "type": "ref"
+          },
+          "maxLength": 4,
+          "type": "array"
+        }
+      },
+      "required": [
+        "images"
+      ],
+      "type": "object"
+    },
+    "view": {
+      "properties": {
+        "images": {
+          "items": {
+            "ref": "#viewImage",
+            "type": "ref"
+          },
+          "maxLength": 4,
+          "type": "array"
+        }
+      },
+      "required": [
+        "images"
+      ],
+      "type": "object"
+    },
+    "viewImage": {
+      "properties": {
+        "alt": {
+          "description": "Alt text description of the image, for accessibility.",
+          "type": "string"
+        },
+        "aspectRatio": {
+          "ref": "app.bsky.embed.defs#aspectRatio",
+          "type": "ref"
+        },
+        "fullsize": {
+          "description": "Fully-qualified URL where a large version of the image can be fetched. May or may not be the exact original blob. For example, CDN location provided by the App View.",
+          "format": "uri",
+          "type": "string"
+        },
+        "thumb": {
+          "description": "Fully-qualified URL where a thumbnail of the image can be fetched. For example, CDN location provided by the App View.",
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thumb",
+        "fullsize",
+        "alt"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "A set of images embedded in a Bluesky record (eg, a post).",
+  "id": "app.bsky.embed.images",
+  "lexicon": 1
+}

@@ -3,6 +3,8 @@
 
 pub mod engine;
 pub mod event;
+mod known_lexicons;
+pub mod records;
 pub mod tid;
 
 #[cfg(test)]

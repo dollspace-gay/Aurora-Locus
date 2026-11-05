@@ -1,0 +1,35 @@
+{
+  "defs": {
+    "main": {
+      "description": "Delete a member from ozone team. Requires admin role.",
+      "errors": [
+        {
+          "description": "The member being deleted does not exist",
+          "name": "MemberNotFound"
+        },
+        {
+          "description": "You can not delete yourself from the team",
+          "name": "CannotDeleteSelf"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "did": {
+              "format": "did",
+              "type": "string"
+            }
+          },
+          "required": [
+            "did"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.team.deleteMember",
+  "lexicon": 1
+}

@@ -1,0 +1,36 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "properties": {
+        "code": {
+          "description": "The join link code.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "view": {
+      "properties": {
+        "joinLinkPreview": {
+          "refs": [
+            "chat.bsky.group.defs#joinLinkPreviewView",
+            "chat.bsky.group.defs#disabledJoinLinkPreviewView",
+            "chat.bsky.group.defs#invalidJoinLinkPreviewView"
+          ],
+          "type": "union"
+        }
+      },
+      "required": [
+        "joinLinkPreview"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "A join link embedded in a chat message.",
+  "id": "chat.bsky.embed.joinLink",
+  "lexicon": 1
+}

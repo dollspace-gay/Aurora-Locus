@@ -1,0 +1,24 @@
+{
+  "defs": {
+    "main": {
+      "description": "Delete a communication template.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.communication.deleteTemplate",
+  "lexicon": 1
+}

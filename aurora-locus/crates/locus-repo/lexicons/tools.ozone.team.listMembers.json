@@ -1,0 +1,57 @@
+{
+  "defs": {
+    "main": {
+      "description": "List all members with access to the ozone service.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "members": {
+              "items": {
+                "ref": "tools.ozone.team.defs#member",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "members"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "q": {
+            "type": "string"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.team.listMembers",
+  "lexicon": 1
+}
