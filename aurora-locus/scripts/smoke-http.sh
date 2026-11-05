@@ -45,6 +45,7 @@ x() { echo "> $1 $2"; shift 2; curl -s -w ' [%{http_code} in %{time_total}s]' "$
 base="http://localhost:$port/xrpc"
 x GET health "$base/_health"
 x GET describeServer "$base/com.atproto.server.describeServer"
+echo "> rate limit headers: $(curl -s -D - -o /dev/null "$base/com.atproto.server.describeServer" | grep -i '^ratelimit-' | tr -d '\r' | tr '\n' ' ')"
 acct=$(curl -s -H 'content-type: application/json' \
   -d '{"handle":"alice.test","email":"alice@example.com","password":"smoke-pw-1"}' \
   "$base/com.atproto.server.createAccount")

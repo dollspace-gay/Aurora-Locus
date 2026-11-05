@@ -177,6 +177,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         node_id: "test-node".into(),
         ssrf_protection: true,
         resolvers: crate::state::ResolverCache::default(),
+        limits: crate::ratelimit::Limiter::default(),
     });
     Harness {
         app: crate::router(state.clone()),
@@ -2311,7 +2312,9 @@ async fn blobs_upload_get_referenced_promoted_served_and_collected() {
     tx.commit().await.unwrap();
     let (st, _, _) = h.raw("GET", &path, None, Vec::new(), &[]).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "gone");
-    // Its bytes go after the delete grace.
+    // Its bytes go after the delete grace (0 here; step past the
+    // millisecond it was queued in).
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     assert!(
         locus_blob::run_deletes(&h.state.store, &h.state.blobs, 0, 100)
             .await
@@ -3873,4 +3876,174 @@ async fn the_appview_s_answers_include_what_was_just_written_here() {
         (jwt.iss.as_str(), jwt.aud.as_str()),
         (did.as_str(), "did:web:appview.test")
     );
+}
+
+impl Harness {
+    /// A request from `peer` (as the connection's address).
+    async fn call_from(
+        &self,
+        peer: &str,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", self.state.hostname.clone());
+        if let Some(t) = auth {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let mut req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let addr: std::net::SocketAddr = format!("{peer}:40000").parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        let res = self.app.clone().oneshot(req).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+}
+
+#[tokio::test]
+async fn rate_limits_count_by_real_client_ip_and_account() {
+    for backend in ["memory", "database"] {
+        let h = harness(false).await;
+        let set = |k: &'static str, v: Value| {
+            let h = &h;
+            async move { h.state.settings.set(k, v, "test").await.unwrap() }
+        };
+        set("rate_limits.backend", json!(backend)).await;
+        set("rate_limits.global_points", json!(3)).await;
+        let describe = "/xrpc/com.atproto.server.describeServer";
+
+        // The global bucket: three requests per client, then 429.
+        for remaining in ["2", "1", "0"] {
+            let (st, headers, _) = h.call_from("203.0.113.9", "GET", describe, None, None, &[]).await;
+            assert_eq!(st, StatusCode::OK, "{backend}");
+            assert_eq!(headers["ratelimit-remaining"], remaining, "{backend}");
+            assert_eq!(headers["ratelimit-limit"], "3");
+            assert_eq!(headers["ratelimit-policy"], "3;w=300");
+        }
+        let (st, headers, v) = h.call_from("203.0.113.9", "GET", describe, None, None, &[]).await;
+        assert_eq!(
+            (st, v["error"].as_str(), v["message"].as_str()),
+            (StatusCode::TOO_MANY_REQUESTS, Some("RateLimitExceeded"), Some("Rate Limit Exceeded")),
+            "{backend}"
+        );
+        let retry: i64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=300).contains(&retry), "{retry}");
+        // Another client has its own bucket; health checks never count.
+        let (st, _, _) = h.call_from("203.0.113.10", "GET", describe, None, None, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = h.call_from("203.0.113.9", "GET", "/xrpc/_health", None, None, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Forwarded headers count only from a trusted proxy (loopback).
+        for _ in 0..3 {
+            h.call_from("127.0.0.1", "GET", describe, None, None, &[("x-forwarded-for", "198.51.100.1")])
+                .await;
+        }
+        let (st, _, _) = h
+            .call_from("127.0.0.1", "GET", describe, None, None, &[("x-forwarded-for", "198.51.100.1")])
+            .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{backend}: keyed by the forwarded client");
+        let (st, _, _) = h
+            .call_from("127.0.0.1", "GET", describe, None, None, &[("x-forwarded-for", "198.51.100.2, 127.0.0.1")])
+            .await;
+        assert_eq!(st, StatusCode::OK, "the right-most untrusted address");
+        let (st, _, _) = h
+            .call_from("203.0.113.9", "GET", describe, None, None, &[("x-forwarded-for", "198.51.100.3")])
+            .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "an untrusted peer can't pick its address");
+
+        // Bypass by header or by address.
+        set("rate_limits.bypass_key", json!("let-me-in")).await;
+        set("rate_limits.bypass_ips", json!(["203.0.113.0/24"])).await;
+        let (st, _, _) = h
+            .call_from("198.51.100.1", "GET", describe, None, None, &[("x-ratelimit-bypass", "let-me-in")])
+            .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = h.call_from("203.0.113.9", "GET", describe, None, None, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        set("rate_limits.bypass_ips", json!([])).await;
+        set("rate_limits.global_points", json!(3000)).await;
+
+        // Repo writes: points per account (create 3, put 2, delete 1).
+        set("rate_limits.repo_write_hour_points", json!(5)).await;
+        let acct = h
+            .create_account("rlu.pds.example.com", "rlu@example.com", "pw")
+            .await;
+        let (did, access) = (
+            acct["did"].as_str().unwrap().to_owned(),
+            acct["accessJwt"].as_str().unwrap().to_owned(),
+        );
+        let write = |nsid: &'static str, body: Value| {
+            let (h, access) = (&h, access.clone());
+            async move {
+                h.call_from("192.0.2.1", "POST", &format!("/xrpc/{nsid}"), Some(&access), Some(body), &[])
+                    .await
+            }
+        };
+        let rec = json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "3m6aaaaaaaaab", "record": post_record("x")});
+        let (st, h1, v) = write("com.atproto.repo.createRecord", rec.clone()).await;
+        assert_eq!((st, h1["ratelimit-remaining"].to_str().unwrap()), (StatusCode::OK, "2"), "{backend}: {v}");
+        let (st, _, _) = write("com.atproto.repo.putRecord", rec.clone()).await;
+        assert_eq!(st, StatusCode::OK);
+        let del = json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "3m6aaaaaaaaab"});
+        let (st, _, v) = write("com.atproto.repo.deleteRecord", del).await;
+        assert_eq!((st, v["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("RateLimitExceeded")), "{backend}");
+    }
+}
+
+#[tokio::test]
+async fn firehose_connections_are_limited_per_ip() {
+    let h = harness(false).await;
+    h.state
+        .settings
+        .set("sync.max_subscribers_per_ip", json!(1), "test")
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = h
+        .app
+        .clone()
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(axum::serve(listener, app).into_future());
+    let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos");
+    let req = |u: &str| {
+        let mut r = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(u).unwrap();
+        r.headers_mut().insert("host", h.state.hostname.parse().unwrap());
+        r
+    };
+    let (first, _) = tokio_tungstenite::connect_async(req(&url)).await.unwrap();
+    let second = tokio_tungstenite::connect_async(req(&url)).await;
+    match second {
+        Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
+            assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+    // A place frees when its connection closes.
+    drop(first);
+    let mut ok = false;
+    for _ in 0..50 {
+        if tokio_tungstenite::connect_async(req(&url)).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(ok, "the place was released");
 }

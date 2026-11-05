@@ -129,6 +129,15 @@ pub async fn send(
 
 pub async fn request_email_confirmation(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
     let authed = auth::access(&s, &headers).await?;
+    {
+        use crate::ratelimit::buckets::{email_day, email_hour};
+        let n = "com.atproto.server.requestEmailConfirmation-0";
+        crate::ratelimit::limit(
+            &s,
+            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+        )
+        .await?;
+    }
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let email = account
         .email
@@ -165,6 +174,15 @@ pub async fn confirm_email(
 
 pub async fn request_email_update(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
     let authed = auth::full_access(&s, &headers).await?;
+    {
+        use crate::ratelimit::buckets::{email_day, email_hour};
+        let n = "com.atproto.server.requestEmailUpdate-0";
+        crate::ratelimit::limit(
+            &s,
+            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+        )
+        .await?;
+    }
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let email = account
         .email
@@ -271,6 +289,10 @@ pub async fn request_password_reset(
     State(s): St,
     Json(input): Json<RequestPasswordResetInput>,
 ) -> XrpcResult<()> {
+    {
+        use crate::ratelimit::buckets::{REQUEST_PASSWORD_RESET_DAY, REQUEST_PASSWORD_RESET_HOUR};
+        crate::ratelimit::limit_ip(&s, &[REQUEST_PASSWORD_RESET_DAY, REQUEST_PASSWORD_RESET_HOUR]).await?;
+    }
     require_email(&s).await?;
     let email = input.email.trim().to_ascii_lowercase();
     if let Some(account) = s.store.account_by_email(&email).await?
@@ -289,6 +311,7 @@ pub struct ResetPasswordInput {
 }
 
 pub async fn reset_password(State(s): St, Json(input): Json<ResetPasswordInput>) -> XrpcResult<()> {
+    crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::RESET_PASSWORD]).await?;
     if input.password.len() > password::MAX_NEW_PASSWORD {
         return Err(XrpcError::invalid_request("Invalid password length."));
     }

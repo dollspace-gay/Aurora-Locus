@@ -132,6 +132,14 @@ pub async fn update_handle(
     Json(input): Json<UpdateHandleInput>,
 ) -> XrpcResult<()> {
     let authed = auth::access(&s, &headers).await?;
+    {
+        use crate::ratelimit::buckets::{UPDATE_HANDLE_5M, UPDATE_HANDLE_DAY};
+        crate::ratelimit::limit(
+            &s,
+            &[(UPDATE_HANDLE_5M, &authed.did, 1), (UPDATE_HANDLE_DAY, &authed.did, 1)],
+        )
+        .await?;
+    }
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let did = account.did.as_str();
     let handle = validate_handle(&s, &input.handle, Some(did)).await?;

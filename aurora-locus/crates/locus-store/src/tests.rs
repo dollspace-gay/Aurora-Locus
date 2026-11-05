@@ -768,3 +768,26 @@ fn test_master_key() -> locus_core::keys::MasterKey {
     let bytes = KEY.get_or_init(rand::random);
     locus_core::keys::MasterKey::from_bytes(*bytes, locus_core::keys::SourceKind::Env)
 }
+
+#[tokio::test]
+async fn rate_limit_counters_use_fixed_windows_and_prune() {
+    for b in backends().await {
+        let s = &b.store;
+        let (n, end) = s.consume_rate_limit("k", 2, 60_000).await.unwrap();
+        assert_eq!(n, 2, "{}", b.name);
+        let (n, end2) = s.consume_rate_limit("k", 3, 60_000).await.unwrap();
+        assert_eq!((n, end2), (5, end), "{}: same window", b.name);
+        assert_eq!(s.consume_rate_limit("other", 1, 60_000).await.unwrap().0, 1);
+        // A window that has ended starts over.
+        let (_, short_end) = s.consume_rate_limit("short", 4, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (n, end3) = s.consume_rate_limit("short", 1, 60_000).await.unwrap();
+        assert_eq!(n, 1, "{}: new window", b.name);
+        assert!(end3 > short_end);
+        // Only ended windows are pruned.
+        s.consume_rate_limit("gone", 1, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(s.prune_rate_limits(100).await.unwrap(), 1, "{}", b.name);
+        assert_eq!(s.consume_rate_limit("k", 1, 60_000).await.unwrap().0, 6);
+    }
+}

@@ -9,6 +9,7 @@ pub mod error;
 pub mod identity;
 pub mod import;
 pub mod pipethrough;
+pub mod ratelimit;
 pub mod raw;
 pub mod repo;
 pub mod routing;
@@ -252,6 +253,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            ratelimit::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             routing::by_host,
         ))
         .with_state(state)
@@ -263,7 +268,10 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(state))
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
 }

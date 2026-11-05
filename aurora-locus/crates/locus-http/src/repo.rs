@@ -180,6 +180,7 @@ pub async fn create_record(
     Json(input): Json<CreateRecordInput>,
 ) -> XrpcResult<Json<Value>> {
     let account = writer(&s, &headers, &input.repo).await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 3).await?;
     check_collection(&input.collection)?;
     let rkey = input.rkey.clone().unwrap_or_else(|| s.repo.tids().next());
     let rec = records::prepare_record(
@@ -239,6 +240,7 @@ pub async fn put_record(
     Json(input): Json<PutRecordInput>,
 ) -> XrpcResult<Json<Value>> {
     let account = writer(&s, &headers, &input.repo).await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 2).await?;
     check_collection(&input.collection)?;
     let rec = records::prepare_record(
         &input.collection,
@@ -293,6 +295,7 @@ pub async fn delete_record(
     Json(input): Json<DeleteRecordInput>,
 ) -> XrpcResult<Json<Value>> {
     let account = writer(&s, &headers, &input.repo).await?;
+    crate::ratelimit::limit_repo_write(&s, &account.did, 1).await?;
     check_collection(&input.collection)?;
     let swap = input
         .swap_record
@@ -337,6 +340,18 @@ pub async fn apply_writes(
     Json(input): Json<ApplyWritesInput>,
 ) -> XrpcResult<Json<Value>> {
     let account = writer(&s, &headers, &input.repo).await?;
+    // As the reference: creates 3 points, updates 2, deletes 1.
+    let points: i64 = input
+        .writes
+        .iter()
+        .map(|w| match w["$type"].as_str() {
+            Some("com.atproto.repo.applyWrites#create") => 3,
+            Some("com.atproto.repo.applyWrites#update") => 2,
+            Some("com.atproto.repo.applyWrites#delete") => 1,
+            _ => 0,
+        })
+        .sum();
+    crate::ratelimit::limit_repo_write(&s, &account.did, points).await?;
     if input.writes.len() > MAX_WRITES {
         return Err(XrpcError::invalid_request(format!(
             "Too many writes. Max: {MAX_WRITES}"
@@ -627,6 +642,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         auth::access(&s, &headers).await?.did
     };
     let account = auth::account_checked(&s, &did, true).await?;
+    crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::UPLOAD_BLOB]).await?;
     let limit = u64::try_from(s.snapshot().int("blobs.upload_limit")).unwrap_or(u64::MAX);
     let content_type = headers
         .get(header::CONTENT_TYPE)

@@ -153,6 +153,7 @@ pub async fn create_account(
     headers: HeaderMap,
     Json(input): Json<CreateAccountInput>,
 ) -> XrpcResult<Json<Value>> {
+    crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::CREATE_ACCOUNT]).await?;
     // Migrating in: the DID must authorize this with a service JWT, and the
     // account starts deactivated, emitting nothing until it's activated.
     let migrating = match input.did.as_deref() {
@@ -509,6 +510,13 @@ pub async fn create_session(
     State(s): St,
     Json(input): Json<CreateSessionInput>,
 ) -> XrpcResult<Json<Value>> {
+    {
+        // Keyed by identifier and IP, as the reference.
+        use crate::ratelimit::buckets::{CREATE_SESSION_5M, CREATE_SESSION_DAY};
+        let ip = crate::ratelimit::client_ip().map_or_else(|| "unknown".to_owned(), |i| i.to_string());
+        let key = format!("{}-{ip}", input.identifier);
+        crate::ratelimit::limit(&s, &[(CREATE_SESSION_DAY, &key, 1), (CREATE_SESSION_5M, &key, 1)]).await?;
+    }
     let started = tokio::time::Instant::now();
     let result = create_session_inner(&s, &input).await;
     tokio::time::sleep_until(started + LOGIN_FLOOR).await;

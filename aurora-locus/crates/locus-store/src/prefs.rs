@@ -171,3 +171,38 @@ impl Store {
         Ok(r.is_some())
     }
 }
+
+impl Store {
+    /// Adds `points` to a fixed-window counter, starting a new window when
+    /// the last one ended. Returns (consumed in this window, window end ms).
+    pub async fn consume_rate_limit(&self, key: &str, points: i64, window_ms: i64) -> CoreResult<(i64, i64)> {
+        let q = sql(
+            "INSERT INTO rate_limit (key, consumed, window_end) VALUES ({1}, {2}, {now} + {3}) \
+             ON CONFLICT (key) DO UPDATE SET \
+             consumed = CASE WHEN rate_limit.window_end <= {now} THEN excluded.consumed \
+                 ELSE rate_limit.consumed + excluded.consumed END, \
+             window_end = CASE WHEN rate_limit.window_end <= {now} THEN excluded.window_end \
+                 ELSE rate_limit.window_end END \
+             RETURNING consumed, window_end",
+            self.is_postgres(),
+        );
+        match self {
+            Store::Sqlite(p) => sqlx::query_as(&q).bind(key).bind(points).bind(window_ms).fetch_one(p).await,
+            Store::Postgres(p) => sqlx::query_as(&q).bind(key).bind(points).bind(window_ms).fetch_one(p).await,
+        }
+        .map_err(db_err)
+    }
+
+    /// Removes counters whose window has ended. Returns how many went.
+    pub async fn prune_rate_limits(&self, limit: i64) -> CoreResult<u64> {
+        let q = sql(
+            "DELETE FROM rate_limit WHERE key IN (SELECT key FROM rate_limit WHERE window_end <= {now} LIMIT {1})",
+            self.is_postgres(),
+        );
+        match self {
+            Store::Sqlite(p) => sqlx::query(&q).bind(limit).execute(p).await.map(|r| r.rows_affected()),
+            Store::Postgres(p) => sqlx::query(&q).bind(limit).execute(p).await.map(|r| r.rows_affected()),
+        }
+        .map_err(db_err)
+    }
+}

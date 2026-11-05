@@ -32,10 +32,19 @@ pub async fn subscribe_repos(
     Query(p): Query<SubscribeParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| serve(s, socket, p.cursor))
+    let place = match crate::ratelimit::subscribe(&s) {
+        Ok(g) => g,
+        Err(e) => return axum::response::IntoResponse::into_response(e),
+    };
+    ws.on_upgrade(move |socket| serve(s, socket, p.cursor, place))
 }
 
-async fn serve(s: Arc<AppState>, socket: WebSocket, cursor: Option<i64>) {
+async fn serve(
+    s: Arc<AppState>,
+    socket: WebSocket,
+    cursor: Option<i64>,
+    _place: crate::ratelimit::SubscriberGuard,
+) {
     let (mut tx, mut rx) = socket.split();
     let send = |bytes: Vec<u8>| Message::Binary(bytes.into());
     // Subscribe before reading the log, so nothing falls between.

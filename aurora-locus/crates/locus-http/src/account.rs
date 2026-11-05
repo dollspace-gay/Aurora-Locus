@@ -213,6 +213,15 @@ pub async fn check_account_status(State(s): St, headers: HeaderMap) -> XrpcResul
 
 pub async fn request_account_delete(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
     let authed = auth::full_access(&s, &headers).await?;
+    {
+        use crate::ratelimit::buckets::{email_day, email_hour};
+        let n = "com.atproto.server.requestAccountDelete-0";
+        crate::ratelimit::limit(
+            &s,
+            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+        )
+        .await?;
+    }
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let email = account
         .email
@@ -237,6 +246,7 @@ pub struct DeleteAccountInput {
 }
 
 pub async fn delete_account(State(s): St, Json(input): Json<DeleteAccountInput>) -> XrpcResult<()> {
+    crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::DELETE_ACCOUNT]).await?;
     if input.password.len() > password::MAX_LOGIN_PASSWORD {
         return Err(XrpcError::auth_required(
             "Password too long. Consider resetting your password.",

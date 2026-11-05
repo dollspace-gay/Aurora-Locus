@@ -442,6 +442,91 @@ pub static REGISTRY: &[Def] = &[
         description: "Ask proxied services for compressed responses when the PDS reads them itself.",
     },
     Def {
+        key: "http.trusted_proxies",
+        kind: Kind::TextList { max_len: 64 },
+        default: r#"["127.0.0.0/8", "::1/128"]"#,
+        env: Some("LOCUS_TRUSTED_PROXIES"),
+        description: "Proxies (CIDRs) whose X-Forwarded-For / Forwarded headers are trusted for the client IP.",
+    },
+    Def {
+        key: "rate_limits.enabled",
+        kind: Kind::Bool,
+        default: "true",
+        env: Some("PDS_RATE_LIMITS_ENABLED"),
+        description: "Apply rate limits.",
+    },
+    Def {
+        key: "rate_limits.bypass_key",
+        kind: Kind::Text { max_len: 512 },
+        default: r#""""#,
+        env: Some("PDS_RATE_LIMIT_BYPASS_KEY"),
+        description: "Requests with this x-ratelimit-bypass header skip rate limits. Empty: none.",
+    },
+    Def {
+        key: "rate_limits.bypass_ips",
+        kind: Kind::TextList { max_len: 64 },
+        default: "[]",
+        env: Some("PDS_RATE_LIMIT_BYPASS_IPS"),
+        description: "Client IPs or CIDRs that skip rate limits.",
+    },
+    Def {
+        key: "rate_limits.backend",
+        kind: Kind::Choice(&["auto", "memory", "database"]),
+        default: r#""auto""#,
+        env: None,
+        description: "Where counters live: in each node, or in the database (shared). Auto: the database on Postgres.",
+    },
+    Def {
+        key: "rate_limits.global_points",
+        kind: Kind::Int {
+            min: 1,
+            max: 100_000_000,
+        },
+        default: "3000",
+        env: None,
+        description: "XRPC requests per client IP per 5 minutes.",
+    },
+    Def {
+        key: "rate_limits.repo_write_hour_points",
+        kind: Kind::Int {
+            min: 1,
+            max: 100_000_000,
+        },
+        default: "5000",
+        env: None,
+        description: "Repo write points per account per hour (create 3, update 2, delete 1).",
+    },
+    Def {
+        key: "rate_limits.repo_write_day_points",
+        kind: Kind::Int {
+            min: 1,
+            max: 100_000_000,
+        },
+        default: "35000",
+        env: None,
+        description: "Repo write points per account per day.",
+    },
+    Def {
+        key: "sync.max_subscribers",
+        kind: Kind::Int {
+            min: 0,
+            max: 1_000_000,
+        },
+        default: "1000",
+        env: None,
+        description: "Firehose connections per node. 0: no limit.",
+    },
+    Def {
+        key: "sync.max_subscribers_per_ip",
+        kind: Kind::Int {
+            min: 0,
+            max: 1_000_000,
+        },
+        default: "20",
+        env: None,
+        description: "Firehose connections per client IP per node. 0: no limit.",
+    },
+    Def {
         key: "limits.import_size",
         kind: Kind::Int {
             min: 1024,

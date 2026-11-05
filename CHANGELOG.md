@@ -254,6 +254,21 @@ kryphocron built in.
   thread is built locally when the AppView doesn't have it.
   `appview.cdn_url_pattern` (`PDS_BSKY_APP_VIEW_CDN_URL_PATTERN`) builds
   their image URLs.
+- Rate limits, on by default (the reference's package default is off): a
+  global per-IP bucket on XRPC requests (`getRepo` has its own), the
+  reference's per-endpoint buckets (login by identifier and IP, account
+  creation, password reset, email requests, handle changes, uploads,
+  account deletion) and repo-write points per account (create 3, update 2,
+  delete 1). `RateLimit-*` headers on responses; 429 `RateLimitExceeded`
+  with `Retry-After`. Counters in each node or in the database (shared by
+  every node; the default on Postgres). Bypass by `x-ratelimit-bypass`
+  (`PDS_RATE_LIMIT_BYPASS_KEY`) or by address, with CIDR ranges honored
+  (`PDS_RATE_LIMIT_BYPASS_IPS`).
+- The client IP comes from `X-Forwarded-For` / `Forwarded` only when the
+  connection is from a trusted proxy (`http.trusted_proxies`,
+  `LOCUS_TRUSTED_PROXIES`; loopback by default).
+- Firehose connections are limited per node and per client IP
+  (`sync.max_subscribers`, `sync.max_subscribers_per_ip`).
 - `app.bsky.feed.getFeed` asks the feed generator with a token for it, and
   `registerPush`/`unregisterPush` go to the AppView or the named push
   service.

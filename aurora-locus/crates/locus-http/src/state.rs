@@ -217,6 +217,8 @@ pub struct AppState {
     /// The reference's `ssrfProtection`, fixed at boot.
     pub ssrf_protection: bool,
     pub resolvers: ResolverCache,
+    /// Rate-limit counters (in-process backend) and firehose subscriber counts.
+    pub limits: crate::ratelimit::Limiter,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

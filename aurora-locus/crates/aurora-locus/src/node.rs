@@ -166,6 +166,7 @@ impl Node {
             node_id: self.node_id.clone(),
             ssrf_protection: !self.bootstrap.ssrf_protection_disabled(),
             resolvers: ResolverCache::default(),
+            limits: locus_http::ratelimit::Limiter::default(),
         });
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
@@ -223,6 +224,44 @@ impl Node {
                             tokio::select! {
                                 () = cancel.cancelled() => return Ok(()),
                                 () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
+
+        // Expired rate-limit counters (database backend).
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "rate-limit-prune".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&st);
+                    async move {
+                        loop {
+                            let mut total = 0;
+                            let result = loop {
+                                match state.store.prune_rate_limits(5_000).await {
+                                    Ok(0) => break Ok(total),
+                                    Ok(n) => total += n,
+                                    Err(e) => break Err(e),
+                                }
+                            };
+                            if let Err(e) = &result {
+                                tracing::warn!("rate limit pruning failed: {e}");
+                            }
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state
+                                .store
+                                .record_job_run("rate-limit-prune", err.as_deref(), None)
+                                .await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(60)) => {}
                             }
                         }
                     }
