@@ -153,6 +153,14 @@ kryphocron built in.
   the reference (`PDS_INVITE_INTERVAL`, `PDS_INVITE_EPOCH`; at most 5 unused;
   admin-gifted codes don't count). `checkSignupQueue` answers activated.
   `describeServer` reports `phoneVerificationRequired: false`.
+- Routing by host: the PDS hostname and internal names (`localhost`, IP
+  addresses, single-label names, the `http.internal_hosts` setting) get
+  every route; handle hosts and hosted did:web hosts get only their
+  `/.well-known` documents; health answers on any host; other names get
+  404.
+- Disposable email addresses are refused at sign-up and email change, with
+  the reference's list (`scripts/update-disposable-domains.sh` refreshes
+  it) plus the operator's `accounts.disposable_email_domains`.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

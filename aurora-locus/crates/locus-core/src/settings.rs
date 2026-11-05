@@ -185,6 +185,13 @@ pub static REGISTRY: &[Def] = &[
         description: "Terms of service link published in describeServer.",
     },
     Def {
+        key: "http.internal_hosts",
+        kind: Kind::TextList { max_len: 253 },
+        default: "[]",
+        env: None,
+        description: "Extra names (besides localhost, IP addresses and single-label names) that get the full route set, for local tools and probes. Not a trust boundary.",
+    },
+    Def {
         key: "identity.handle_domains",
         kind: Kind::TextList { max_len: 253 },
         default: "[]",
@@ -275,6 +282,13 @@ pub static REGISTRY: &[Def] = &[
         default: "0",
         env: Some("PDS_INVITE_EPOCH"),
         description: "Earned invite codes count from this time (ms since the epoch).",
+    },
+    Def {
+        key: "accounts.disposable_email_domains",
+        kind: Kind::TextList { max_len: 253 },
+        default: "[]",
+        env: None,
+        description: "Email domains refused at sign-up and email change, on top of the built-in disposable-address list.",
     },
     Def {
         key: "accounts.did_doc_with_session",

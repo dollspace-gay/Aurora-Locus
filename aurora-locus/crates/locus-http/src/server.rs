@@ -70,8 +70,21 @@ pub struct CreateAccountInput {
     locus_did_method: Option<String>,
 }
 
-pub(crate) fn check_email(raw: &str) -> XrpcResult<String> {
+/// Disposable-address domains (the list the reference uses, CC0;
+/// refreshed with `scripts/update-disposable-domains.sh`).
+static DISPOSABLE_DOMAINS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        include_str!("../data/disposable_email_domains.txt")
+            .lines()
+            .collect()
+    });
+
+/// Validates and lowercases an email address, refusing disposable domains
+/// (the vendored list plus `accounts.disposable_email_domains`), as the
+/// reference.
+pub(crate) fn check_email(s: &AppState, raw: &str) -> XrpcResult<String> {
     let email = raw.trim().to_ascii_lowercase();
+    let domain = email.rsplit('@').next().unwrap_or_default();
     let valid = email.len() <= 320
         && email.split_once('@').is_some_and(|(local, domain)| {
             !local.is_empty()
@@ -80,7 +93,12 @@ pub(crate) fn check_email(raw: &str) -> XrpcResult<String> {
                 && !domain.ends_with('.')
         })
         && !email.contains(char::is_whitespace);
-    if valid {
+    let disposable = DISPOSABLE_DOMAINS.contains(domain)
+        || s.snapshot()
+            .list("accounts.disposable_email_domains")
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(domain));
+    if valid && !disposable {
         Ok(email)
     } else {
         Err(XrpcError::invalid_request(
@@ -160,6 +178,7 @@ pub async fn create_account(
         None => None,
     };
     let email = check_email(
+        &s,
         input
             .email
             .as_deref()

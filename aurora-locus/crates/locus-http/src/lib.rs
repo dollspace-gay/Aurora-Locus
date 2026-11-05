@@ -6,6 +6,7 @@ pub mod auth;
 pub mod email;
 pub mod error;
 pub mod identity;
+pub mod routing;
 pub mod server;
 pub mod state;
 
@@ -145,6 +146,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            routing::by_host,
+        ))
         .with_state(state)
 }
 

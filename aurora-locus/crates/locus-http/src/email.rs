@@ -245,7 +245,7 @@ pub async fn update_email(
         Some(false) | None => {}
     }
 
-    crate::server::check_email(&email)?;
+    crate::server::check_email(&s, &email)?;
     if let Some(token) = token {
         check(&s, did, TokenPurpose::UpdateEmail, token).await?;
     } else if account.email_confirmed_at.is_some() {

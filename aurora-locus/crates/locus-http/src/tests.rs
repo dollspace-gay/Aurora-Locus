@@ -1803,3 +1803,75 @@ async fn accounts_earn_invite_codes_on_an_interval() {
         "used codes hidden without includeUsed"
     );
 }
+
+#[tokio::test]
+async fn routes_depend_on_the_host() {
+    let h = harness(false).await;
+    h.create_account("yan.pds.example.com", "yan@example.com", "pw")
+        .await;
+    let describe = "/xrpc/com.atproto.server.describeServer";
+    for (host, expected) in [
+        ("pds.example.com", StatusCode::OK),
+        ("localhost", StatusCode::OK),
+        ("127.0.0.1", StatusCode::OK),
+        ("locus", StatusCode::OK),
+        ("yan.pds.example.com", StatusCode::NOT_FOUND),
+        ("evil.example.net", StatusCode::NOT_FOUND),
+    ] {
+        let (st, _) = h.call_host("GET", describe, None, None, host).await;
+        assert_eq!(st, expected, "{host}");
+    }
+    // A handle host gets its identity documents; health answers anywhere.
+    let (st, _) = h
+        .call_host(
+            "GET",
+            "/.well-known/atproto-did",
+            None,
+            None,
+            "yan.pds.example.com",
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .call_host("GET", "/xrpc/_health", None, None, "evil.example.net")
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    // Listed internal names get everything.
+    h.state
+        .settings
+        .set("http.internal_hosts", json!(["pds.internal.lan"]), "test")
+        .await
+        .unwrap();
+    let (st, _) = h
+        .call_host("GET", describe, None, None, "pds.internal.lan")
+        .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn disposable_addresses_are_refused() {
+    let h = harness(false).await;
+    let create = |handle: &'static str, email: &'static str| {
+        h.post(
+            "com.atproto.server.createAccount",
+            None,
+            json!({"handle": handle, "email": email, "password": "pw"}),
+        )
+    };
+    let (st, v) = create("zed.pds.example.com", "zed@0-mail.com").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("not supported"));
+    h.state
+        .settings
+        .set(
+            "accounts.disposable_email_domains",
+            json!(["throwaway.example.net"]),
+            "test",
+        )
+        .await
+        .unwrap();
+    let (st, _) = create("zed.pds.example.com", "zed@throwaway.example.net").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "operator-added domains too");
+    let (st, v) = create("zed.pds.example.com", "zed@example.net").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
