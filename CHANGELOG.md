@@ -302,6 +302,35 @@ kryphocron built in.
   strict Content-Security-Policy. Responses follow the request's
   `response_mode` (query, fragment or form post).
 - Password resets and account deletion revoke the account's OAuth grants.
+- Kryphocron: every `tools.kryphocron.*` record write is checked against
+  the kryphocron registry (unregistered collections are refused) and its
+  host rules (TID keys; a private post's `audienceList` and
+  `publicCompanion` point into the writer's repo; a threadgate's key is
+  its post's and its list rules name `app.bsky.graph.list` lists).
+- The private tier needs an AppView and `kryphocron.private_tier_enabled`
+  (else `UnsupportedNamespace`), and the AppView's permission for the
+  account, asked with `app.nearhorizon.actor.getMembership` as the account
+  and cached for its `validForSecs` (else `Forbidden`). If the AppView is
+  unreachable, its last answer stands. An operator can block an account
+  locally. Deletes are never gated.
+- Private posts are stored encoded: plaintext submissions are encoded with
+  laquna (`laquna/0.2`); pre-encoded ones are decoded (bounded) to check
+  their content, then re-encoded. `embedBlobs`, `mentionDids`, `quote` and
+  `mediaKinds` are always derived from the content. Plaintext is never
+  stored, logged or sent.
+- `tools.kryphocron.feed.createPostPrivate`, `updatePostPrivate` (changes
+  only the audience; the encoded content is kept byte for byte) and
+  `deletePostPrivate`; `createRecord`, `putRecord` and `applyWrites` run
+  the same checks for kryphocron collections.
+- Rotation: a new generation every `kryphocron.rotation_period_days` (60;
+  30–90), shared by every node. A leased job re-encodes private posts
+  under it in batched commits that never overwrite a concurrent write,
+  spread over the period and limited by
+  `kryphocron.rotation_max_commits_per_minute`. Imported plaintext posts
+  are encoded on the next pass; records that can't be decoded are flagged
+  and skipped.
+- Kryphocron audit events are stored, with correlation ids keyed by an
+  install secret, and kept for `kryphocron.audit_retention_days` (365).
 
 ### Changed
 
