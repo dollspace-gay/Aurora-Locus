@@ -331,6 +331,43 @@ kryphocron built in.
   and skipped.
 - Kryphocron audit events are stored, with correlation ids keyed by an
   install secret, and kept for `kryphocron.audit_retention_days` (365).
+- Private audiences are kept off the network: never in a repo, the
+  firehose or a CAR, readable only by their owner. Locus keeps a hidden
+  copy of the AppView's audiences, refreshed by polling (within
+  `kryphocron.prism_call_budget`) and on use; a private post naming an
+  audience the copy lacks refreshes it first.
+- `tools.kryphocron.policy.manageAudience` and `deleteAudience`, and
+  `createRecord`/`putRecord`/`deleteRecord`/`applyWrites` on the audience
+  collection, write through to the AppView, which mints audience keys.
+  Locus applies the AppView's checks first (modes, at most
+  `kryphocron.audience_max_members` members and
+  `kryphocron.audience_max_per_account` audiences). Deletes are never
+  gated. A create whose answer never comes is matched to the audience it
+  made, never retried blindly.
+- During an AppView outage the copy is the authority: audiences can be
+  created (with locus-minted keys), edited and deleted, posts and replies
+  keep working where the copy can answer, and the account's proxied
+  `app.nearhorizon.private.*Audience` calls are answered locally. When the
+  AppView is back, queued edits are synced (the newer `updatedAt` wins),
+  outage audiences are created there, and posts naming them are re-pointed
+  to the AppView's URI.
+- `tools.kryphocron.actor.participatePrivate`: a private reply under the
+  parent's audience, refused (always the same `Forbidden`) unless the
+  writer is in it, neither side blocks the other, and the root's
+  threadgate allows it. Membership is answered from the copy for list
+  audiences and by the AppView for the others.
+- `app.nearhorizon.locus.audience.getMembershipAssertion`: short-lived
+  signed assertions that the asker is in an audience owned here, signed
+  with a dedicated `#kryphocron_audience` key; locus verifies them from
+  other hosts when one of its accounts replies under their audiences.
+- Uploads go through a scanner when one is configured (`blobs.scanner`,
+  an HTTP webhook at `blobs.scanner_url`). A match is refused, kept and
+  queued for review. When the scanner is down, `blobs.scan_unavailable`
+  refuses uploads or stores them to scan later.
+- The private media gate (`kryphocron.private_media_gated`, off; needs a
+  scanner): media only private posts use is served only to the owner,
+  audience members and `kryphocron.media_trusted_services`, never cached;
+  to anyone else it looks like a missing blob.
 
 ### Changed
 
