@@ -3,6 +3,7 @@
 
 pub mod jwt;
 pub mod password;
+pub mod scopes;
 pub mod service_jwt;
 pub mod session;
 
