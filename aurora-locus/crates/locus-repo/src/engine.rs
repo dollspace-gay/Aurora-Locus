@@ -35,6 +35,9 @@ pub enum CommitError {
     InvalidRequest(String),
     #[error("repository not found: {0}")]
     RepoNotFound(String),
+    /// A bulk job (an import or deletion) holds the account's writes; retry.
+    #[error("the repository's writes are blocked while another operation runs")]
+    WriteBlocked,
     /// The tree didn't come out as the ops say it should. Nothing was written.
     #[error("invalid MST: {0}")]
     InvalidMst(String),
@@ -306,6 +309,9 @@ impl RepoEngine {
         let _held = lock.lock().await;
         let mut tx = self.store.begin().await?;
         tx.lock_repo(did).await?;
+        if tx.write_blocked(did).await? {
+            return Err(CommitError::WriteBlocked);
+        }
         let root = tx
             .repo_root(did)
             .await?

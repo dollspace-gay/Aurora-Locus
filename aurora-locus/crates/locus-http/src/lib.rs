@@ -1,6 +1,7 @@
 //! The HTTP layer: axum routing, XRPC plumbing, pipethrough, rate limiting
 //! and every handler.
 
+pub mod account;
 pub mod auth;
 pub mod email;
 pub mod error;
@@ -82,6 +83,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/com.atproto.server.resetPassword",
             post(email::reset_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deactivateAccount",
+            post(account::deactivate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.activateAccount",
+            post(account::activate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            get(account::check_account_status),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestAccountDelete",
+            post(account::request_account_delete),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deleteAccount",
+            post(account::delete_account),
         )
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",

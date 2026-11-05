@@ -416,6 +416,24 @@ impl Store {
         Ok(rows.into_iter().collect())
     }
 
+    /// A repository's commit, rev, live block count and record count
+    /// (`checkAccountStatus`), if it has a repository.
+    pub async fn repo_stats(&self, did: &str) -> CoreResult<Option<(String, String, i64, i64)>> {
+        let sql = |p: &str| {
+            format!(
+                "SELECT r.commit_cid, r.rev, \
+                 (SELECT COUNT(*) FROM repo_block b WHERE b.did = r.did AND b.ref_count > 0), \
+                 (SELECT COUNT(*) FROM record c WHERE c.did = r.did) \
+                 FROM repo_root r WHERE r.did = {p}"
+            )
+        };
+        match self {
+            Self::Sqlite(p) => sqlx::query_as(&sql("?1")).bind(did).fetch_optional(p).await,
+            Self::Postgres(p) => sqlx::query_as(&sql("$1")).bind(did).fetch_optional(p).await,
+        }
+        .map_err(db_err)
+    }
+
     /// Every outbox payload for a repository, oldest first, for tests.
     pub async fn outbox_for(&self, did: &str) -> CoreResult<Vec<(String, Vec<u8>)>> {
         match self {

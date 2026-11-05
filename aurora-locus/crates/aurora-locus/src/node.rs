@@ -155,10 +155,12 @@ impl Node {
             hostname,
             public_url,
             service_did,
+            node_id: self.node_id.clone(),
             ssrf_protection: !self.bootstrap.ssrf_protection_disabled(),
             resolvers: ResolverCache::default(),
         });
         self.spawn_identity_repair(Arc::clone(&state));
+        self.spawn_account_jobs(Arc::clone(&state));
         let addr = self.bootstrap.listen;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -172,6 +174,50 @@ impl Node {
             }
         }));
         Ok(())
+    }
+
+    /// The bulk-job resumer (finishes deletions a stopped node started) and
+    /// the `deleteAfter` job, each on one node at a time.
+    fn spawn_account_jobs(&mut self, state: Arc<AppState>) {
+        const EVERY: Duration = Duration::from_secs(30);
+        for name in ["bulk-resumer", "delete-after"] {
+            let state = Arc::clone(&state);
+            self.tasks
+                .push(tokio::spawn(locus_store::runtime::run_leased(
+                    self.store.clone(),
+                    name.into(),
+                    self.node_id.clone(),
+                    DEFAULT_LEASE_TTL,
+                    self.cancel.clone(),
+                    move |_lease, cancel| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            loop {
+                                let result = match name {
+                                    "bulk-resumer" => {
+                                        locus_http::account::resume_bulk_jobs(&state).await
+                                    }
+                                    _ => locus_http::account::delete_due_accounts(&state).await,
+                                };
+                                match &result {
+                                    Ok(n) if *n > 0 => {
+                                        tracing::info!(job = name, accounts = n, "done")
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(job = name, "failed: {e}"),
+                                }
+                                let err = result.as_ref().err().map(ToString::to_string);
+                                let _ =
+                                    state.store.record_job_run(name, err.as_deref(), None).await;
+                                tokio::select! {
+                                    () = cancel.cancelled() => return Ok(()),
+                                    () = tokio::time::sleep(EVERY) => {}
+                                }
+                            }
+                        }
+                    },
+                )));
+        }
     }
 
     /// Retries identity changes that didn't finish (handle changes after an

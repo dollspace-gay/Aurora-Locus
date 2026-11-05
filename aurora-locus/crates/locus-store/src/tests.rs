@@ -663,3 +663,108 @@ async fn identity_tables_on_both_backends() {
         assert!(s.due_identity_repairs(10).await.unwrap().is_empty(), "{n}");
     }
 }
+
+#[tokio::test]
+async fn bulk_jobs_block_writes_fence_batches_and_are_taken_over() {
+    use crate::accounts::{NewAccount, Status};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let did = "did:plc:bulktest";
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_account(&NewAccount {
+            did,
+            handle: "bulk.test",
+            email: Some("bulk@example.com"),
+            password_hash: None,
+            status: Status::Active,
+            did_method: "plc",
+        })
+        .await
+        .unwrap();
+        tx.put_signing_key(did, "k256", b"key", &test_master_key())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = s.begin().await.unwrap();
+        let job = tx
+            .start_bulk_job("job-1", did, "delete", "deleting", "node-a")
+            .await
+            .unwrap();
+        assert!(tx.write_blocked(did).await.unwrap(), "{n}");
+        tx.commit().await.unwrap();
+        // A second job for the account is refused.
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            matches!(
+                tx.start_bulk_job("job-2", did, "import", "staging", "node-b")
+                    .await,
+                Err(CoreError::Conflict(_))
+            ),
+            "{n}"
+        );
+        tx.rollback().await.unwrap();
+
+        // Nothing to take over while the holder's lease runs.
+        assert!(
+            s.take_over_bulk_job("node-b").await.unwrap().is_none(),
+            "{n}"
+        );
+        // The holder stops; its lease runs out.
+        let expire = "UPDATE bulk_job SET expires_at = 0 WHERE id = 'job-1'";
+        match s {
+            Store::Sqlite(p) => sqlx::query(expire).execute(p).await.map(|_| ()),
+            Store::Postgres(p) => sqlx::query(expire).execute(p).await.map(|_| ()),
+        }
+        .unwrap();
+        let taken = s
+            .take_over_bulk_job("node-b")
+            .await
+            .unwrap()
+            .expect("taken over");
+        assert_eq!((taken.holder.as_str(), taken.epoch), ("node-b", 2), "{n}");
+        // The old holder can't commit a batch any more.
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            matches!(tx.fence_bulk_job(&job).await, Err(CoreError::LeaseLost(_))),
+            "{n}"
+        );
+        tx.rollback().await.unwrap();
+
+        s.run_delete_job(&taken, 1).await.unwrap();
+        assert!(s.account_by_did(did).await.unwrap().is_none(), "{n}");
+        assert!(
+            s.get_signing_key(did, &test_master_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert_eq!(
+            s.bulk_job("job-1").await.unwrap().unwrap().phase,
+            "done",
+            "{n}"
+        );
+        // The handle and email are free again.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_account(&NewAccount {
+            did: "did:plc:bulktest2",
+            handle: "bulk.test",
+            email: Some("bulk@example.com"),
+            password_hash: None,
+            status: Status::Active,
+            did_method: "plc",
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+fn test_master_key() -> locus_core::keys::MasterKey {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let bytes = KEY.get_or_init(rand::random);
+    locus_core::keys::MasterKey::from_bytes(*bytes, locus_core::keys::SourceKind::Env)
+}

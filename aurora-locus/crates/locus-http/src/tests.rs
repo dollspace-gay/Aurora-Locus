@@ -141,6 +141,7 @@ async fn harness_with(invite_required: bool, email: bool) -> Harness {
         public_url: format!("https://{hostname}"),
         hostname,
         service_did,
+        node_id: "test-node".into(),
         ssrf_protection: true,
         resolvers: crate::state::ResolverCache::default(),
     });
@@ -1339,5 +1340,219 @@ async fn plc_operations_are_recommended_signed_with_a_code_and_submitted() {
             StatusCode::BAD_REQUEST,
             Some("Rotation keys do not include server's rotation key")
         )
+    );
+}
+
+#[tokio::test]
+async fn deactivation_and_activation_check_the_did_document() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("rae.pds.example.com", "rae@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+
+    let (st, status) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{status}");
+    assert_eq!(
+        (status["activated"].as_bool(), status["validDid"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert!(status["repoBlocks"].as_i64().unwrap() >= 2, "{status}");
+    assert_eq!(status["indexedRecords"], 0);
+
+    let (st, v) = h
+        .post(
+            "com.atproto.server.deactivateAccount",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, sess) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (sess["active"].as_bool(), sess["status"].as_str()),
+        (Some(false), Some("deactivated"))
+    );
+    assert_eq!(h.outbox_kinds(&did).await.last().unwrap(), "account");
+
+    // The document must point here to come back.
+    let genesis = h.plc.lock().unwrap().last(&did).unwrap();
+    let mut moved = SignedOp::from_json(&genesis).unwrap();
+    if let SignedOp::Operation { op, .. } = &mut moved {
+        op.services.get_mut("atproto_pds").unwrap().endpoint =
+            "https://elsewhere.example.net".into();
+        op.prev = Some(
+            SignedOp::from_json(&genesis)
+                .unwrap()
+                .cid()
+                .unwrap()
+                .to_string_base32(),
+        );
+    }
+    let SignedOp::Operation { op, .. } = &moved else {
+        unreachable!()
+    };
+    let moved = op.sign(h.state.secrets.plc_keys.current()).unwrap();
+    h.plc
+        .lock()
+        .unwrap()
+        .log
+        .get_mut(&did)
+        .unwrap()
+        .push(moved.to_json());
+    let (st, v) = h
+        .post(
+            "com.atproto.server.activateAccount",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("endpoint"), "{v}");
+    let (_, status) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status["activated"].as_bool(), status["validDid"].as_bool()),
+        (Some(false), Some(false))
+    );
+
+    // Point it back; activation emits #account, #identity and #sync.
+    h.plc.lock().unwrap().log.get_mut(&did).unwrap().pop();
+    let (st, v) = h
+        .post(
+            "com.atproto.server.activateAccount",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let kinds = h.outbox_kinds(&did).await;
+    assert_eq!(&kinds[kinds.len() - 3..], ["account", "identity", "sync"]);
+    let (_, sess) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(sess["active"], true);
+}
+
+#[tokio::test]
+async fn account_deletion_runs_to_the_end_and_frees_the_handle() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("sam.pds.example.com", "sam@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    let (st, _) = h
+        .post(
+            "com.atproto.server.requestAccountDelete",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (subject, token) = h.last_mail("sam@example.com");
+    assert_eq!(subject, "Account Deletion Requested");
+
+    let (st, _) = h
+        .post(
+            "com.atproto.server.deleteAccount",
+            None,
+            json!({"did": did, "password": "nope", "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, v) = h
+        .post(
+            "com.atproto.server.deleteAccount",
+            None,
+            json!({"did": did, "password": "pw", "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // Gone at once for logins and tokens; the rest goes in the background.
+    let (st, _) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_ne!(st, StatusCode::OK);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.state.store.account_by_did(&did).await.unwrap().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "deletion never finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(h.state.store.repo_stats(&did).await.unwrap().is_none());
+    let kinds = h.outbox_kinds(&did).await;
+    assert_eq!(
+        kinds.last().unwrap(),
+        "account",
+        "#account deleted was emitted"
+    );
+    h.create_account("sam.pds.example.com", "sam@example.com", "pw2")
+        .await;
+}
+
+#[tokio::test]
+async fn delete_after_is_enforced() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("tia.pds.example.com", "tia@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let (st, v) = h
+        .post(
+            "com.atproto.server.deactivateAccount",
+            acct["accessJwt"].as_str(),
+            json!({"deleteAfter": "2000-01-01T00:00:00Z"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let other = h
+        .create_account("uma.pds.example.com", "uma@example.com", "pw")
+        .await;
+    assert_eq!(
+        crate::account::delete_due_accounts(&h.state).await.unwrap(),
+        1
+    );
+    assert!(h.state.store.account_by_did(&did).await.unwrap().is_none());
+    assert!(
+        h.state
+            .store
+            .account_by_did(other["did"].as_str().unwrap())
+            .await
+            .unwrap()
+            .is_some()
     );
 }

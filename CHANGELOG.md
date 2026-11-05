@@ -128,6 +128,20 @@ kryphocron built in.
   PDS, the account's signing key and handle). `signPlcOperation` also
   checks the fields it signs: did:key rotation keys and verification
   methods, typed http(s) services, `at://` names.
+- `deactivateAccount` (with `deleteAfter`), `activateAccount`,
+  `checkAccountStatus`, `requestAccountDelete` and `deleteAccount`.
+  Activation checks the DID document as the reference (this PDS's
+  endpoint, the account's signing key, the current PDS rotation key) and
+  emits `#account`, `#identity` and `#sync` together. Deactivating a
+  taken-down account keeps the takedown.
+- Account deletion runs as a resumable job: the first step marks the
+  account deleted, ends its sessions and emits `#account deleted`; batches
+  then remove its repository, sessions, app passwords, invites and keys,
+  and the account row last, freeing its handle and email. A node that
+  stops mid-way leaves the job to another. A deactivated account is
+  deleted once its `deleteAfter` passes.
+- Repository writes are refused (retryable `RepoWriteBlocked`) while a
+  deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.

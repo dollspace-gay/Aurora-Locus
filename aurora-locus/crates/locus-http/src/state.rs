@@ -208,6 +208,8 @@ pub struct AppState {
     pub public_url: String,
     /// `did:web:<hostname>`.
     pub service_did: String,
+    /// This node's id (holder of the bulk jobs it runs).
+    pub node_id: String,
     /// The reference's `ssrfProtection`, fixed at boot.
     pub ssrf_protection: bool,
     pub resolvers: ResolverCache,
