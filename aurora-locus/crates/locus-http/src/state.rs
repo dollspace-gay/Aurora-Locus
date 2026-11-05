@@ -139,6 +139,14 @@ impl PlcKeys {
         })
     }
 
+    /// Every held key's did:key and role.
+    pub fn held_keys(&self) -> Vec<(String, PlcKeyRole)> {
+        self.held
+            .iter()
+            .map(|(id, role, _)| (id.clone(), *role))
+            .collect()
+    }
+
     /// The held keys a document lists, in document order.
     pub fn listed(&self, rotation_keys: &[String]) -> Vec<String> {
         rotation_keys
@@ -280,6 +288,8 @@ pub struct AppState {
     pub kr: Arc<crate::kryphocron::Kr>,
     /// Whether this node is in setup mode.
     pub setup: Arc<crate::setup::Gate>,
+    /// This node's recent log lines.
+    pub logs: Arc<locus_core::logs::LogRing>,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

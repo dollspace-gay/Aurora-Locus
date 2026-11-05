@@ -42,6 +42,8 @@ pub struct Node {
     setup_done: CancellationToken,
     /// In setup mode until setup completes.
     pub setup_mode: bool,
+    /// This node's recent log lines, for the console.
+    logs: Arc<locus_core::logs::LogRing>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -229,6 +231,7 @@ impl Node {
             outer,
             cancel,
             setup_done: CancellationToken::new(),
+            logs: log.ring(),
             setup_mode,
             tasks: Vec::new(),
         };
@@ -332,6 +335,7 @@ impl Node {
             } else {
                 locus_http::setup::Gate::finished()
             }),
+            logs: Arc::clone(&self.logs),
         });
         self.setup_done = state.setup.completed.clone();
         if self.setup_mode {

@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod error;
 pub mod keys;
 pub mod lease;
+pub mod logs;
 pub mod settings;
 pub mod setup;
 pub mod time;

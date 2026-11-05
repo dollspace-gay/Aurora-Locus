@@ -475,6 +475,18 @@ fn parse_addr(s: &str) -> Option<IpAddr> {
 
 // ---------------------------------------------------------------- subscribers
 
+impl Limiter {
+    /// Firehose connections on this node: in all, and from how many
+    /// addresses.
+    pub fn subscriber_count(&self) -> (usize, usize) {
+        let map = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (map.values().sum(), map.len())
+    }
+}
+
 /// A firehose connection's place under the subscriber limits; released on
 /// drop.
 pub struct SubscriberGuard {

@@ -300,3 +300,145 @@ pub struct OperatorsPage {
     pub notice: Option<String>,
     pub errors: Vec<String>,
 }
+
+/// A card of facts.
+#[derive(Debug, Clone)]
+pub struct Card {
+    pub title: String,
+    pub facts: Vec<Fact>,
+}
+
+/// A table cell: text, optionally as code, a link or a pill.
+#[derive(Debug, Clone, Default)]
+pub struct Cell {
+    /// num, when, name, state, actions, list or text.
+    pub class: &'static str,
+    pub text: String,
+    pub code: bool,
+    pub href: String,
+    /// A pill's class ("on", "off", "amber", …); empty for plain text.
+    pub pill: &'static str,
+    /// A form button in the cell (actions).
+    pub button: Option<Button>,
+}
+
+impl Cell {
+    #[must_use]
+    pub fn new(class: &'static str, text: impl Into<String>) -> Self {
+        Self {
+            class,
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn code(mut self) -> Self {
+        self.code = true;
+        self
+    }
+
+    #[must_use]
+    pub fn link(mut self, href: impl Into<String>) -> Self {
+        self.href = href.into();
+        self
+    }
+
+    #[must_use]
+    pub fn pill(mut self, class: &'static str) -> Self {
+        self.pill = class;
+        self
+    }
+}
+
+/// A one-button form.
+#[derive(Debug, Clone)]
+pub struct Button {
+    pub action: String,
+    pub label: String,
+    pub hidden: Vec<(String, String)>,
+    pub danger: bool,
+}
+
+/// A table with a heading.
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub title: String,
+    /// (class, label) per column.
+    pub cols: Vec<(&'static str, String)>,
+    pub rows: Vec<Vec<Cell>>,
+    pub empty: String,
+}
+
+/// A field of a form.
+#[derive(Debug, Clone)]
+pub struct Input {
+    pub name: String,
+    pub label: String,
+    /// text, password, email, number, select or textarea.
+    pub kind: &'static str,
+    pub value: String,
+    pub options: Vec<Choice>,
+    pub hint: String,
+}
+
+impl Input {
+    #[must_use]
+    pub fn new(name: &str, label: &str, kind: &'static str) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            kind,
+            value: String::new(),
+            options: Vec::new(),
+            hint: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn value(mut self, v: impl Into<String>) -> Self {
+        self.value = v.into();
+        self
+    }
+
+    #[must_use]
+    pub fn hint(mut self, h: impl Into<String>) -> Self {
+        self.hint = h.into();
+        self
+    }
+}
+
+/// A form on a section page.
+#[derive(Debug, Clone)]
+pub struct Form {
+    pub title: String,
+    pub text: String,
+    pub action: String,
+    /// GET (a lookup) or POST.
+    pub get: bool,
+    pub inputs: Vec<Input>,
+    pub hidden: Vec<(String, String)>,
+    pub button: String,
+    pub danger: bool,
+}
+
+/// A console section: what it says, its facts, tables and forms, and its
+/// settings (the rarely changed folded away).
+#[derive(Template)]
+#[template(path = "console_section.html")]
+pub struct SectionPage {
+    pub shell: Shell,
+    pub csrf: String,
+    pub intro: String,
+    pub notice: Option<String>,
+    pub errors: Vec<String>,
+    pub cards: Vec<Card>,
+    pub forms: Vec<Form>,
+    pub tables: Vec<Table>,
+    pub fields: Vec<SettingField>,
+    pub advanced: Vec<SettingField>,
+    /// A block of preformatted text (a document, log lines).
+    pub pre: Option<(String, String)>,
+    pub can_edit: bool,
+    pub back: String,
+}

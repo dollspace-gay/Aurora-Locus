@@ -721,7 +721,7 @@ pub async fn well_known_did_json(State(s): St, headers: HeaderMap) -> Response {
     }
 }
 
-fn service_document(s: &AppState) -> DidDocument {
+pub(crate) fn service_document(s: &AppState) -> DidDocument {
     DidDocument {
         id: s.service_did.clone(),
         also_known_as: Vec::new(),

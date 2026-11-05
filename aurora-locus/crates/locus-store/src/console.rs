@@ -222,6 +222,15 @@ impl Store {
         Ok(exec!(self, q, operator, step)? == 1)
     }
 
+    /// Every job lease: (name, holder, expires at), by name.
+    pub async fn job_leases(&self) -> CoreResult<Vec<(String, String, i64)>> {
+        run!(
+            self,
+            "SELECT name, holder, expires_at FROM job_lease ORDER BY name",
+            fetch_all,
+        )
+    }
+
     /// An account's records, blobs and blob bytes.
     pub async fn account_stats(&self, did: &str) -> CoreResult<(i64, i64, i64)> {
         let q = sql(

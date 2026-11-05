@@ -215,6 +215,7 @@ async fn harness_build(
         } else {
             crate::setup::Gate::finished()
         }),
+        logs: Arc::new(locus_core::logs::LogRing::new(100)),
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -9914,5 +9915,182 @@ async fn console_people_pages_act_through_the_admin_api() {
             .await
             .unwrap()
             .is_none_or(|a| a.status == locus_store::accounts::Status::Deleted)
+    );
+}
+
+#[tokio::test]
+async fn every_console_page_renders_for_each_role_under_the_csp() {
+    let h = harness(false).await;
+    h.console_operator("own", "owner", "an owner password")
+        .await;
+    h.console_operator("vee", "viewer", "a viewer password!")
+        .await;
+    let (did, _) = h.user("dana.pds.example.com").await;
+    let o = Browser::default();
+    h.console_sign_in(&o, "own", "an owner password").await;
+    let v = Browser::default();
+    h.console_sign_in(&v, "vee", "a viewer password!").await;
+    for page in locus_web::console::PAGES.iter().filter(|p| p.id.built()) {
+        for (who, b, role) in [("owner", &o, "owner"), ("viewer", &v, "viewer")] {
+            let cookie = b.cookie_header();
+            let (st, headers, body) = h
+                .raw("GET", page.href, None, vec![], &[("cookie", &cookie)])
+                .await;
+            let body = String::from_utf8(body).unwrap();
+            let need = page.need;
+            let allowed = locus_web::console::Need::from_role(role) >= need;
+            if !allowed {
+                assert_eq!(st, StatusCode::FORBIDDEN, "{who} {}", page.href);
+                continue;
+            }
+            assert_eq!(st, StatusCode::OK, "{who} {}: {body}", page.href);
+            assert_eq!(
+                headers["content-security-policy"],
+                locus_web::assets::CSP,
+                "{}",
+                page.href
+            );
+            assert!(
+                body.contains(&format!("<title>{} · ", page.id.title())),
+                "{}: {body}",
+                page.href
+            );
+            assert!(
+                body.contains(&format!(r#"href="{}" aria-current="page""#, page.href)),
+                "{} is marked current",
+                page.href
+            );
+        }
+    }
+
+    // Moderation: an account taken down from the lookup.
+    let (_, _, page) = o.get(&h, &format!("/admin/moderation?subject={did}")).await;
+    assert!(page.contains("Take it down"), "{page}");
+    let csrf = hidden(&page, "csrf");
+    let (st, _, _) = o
+        .post(
+            &h,
+            "/admin/moderation/status",
+            &[
+                ("csrf", &csrf),
+                ("subject", &did),
+                ("blob", ""),
+                ("applied", "true"),
+                ("ref", "mod-7"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        locus_store::accounts::Status::Takendown
+    );
+    let (_, _, page) = o.get(&h, &format!("/admin/moderation?subject={did}")).await;
+    assert!(
+        page.contains("Reverse the takedown") && page.contains("mod-7"),
+        "{page}"
+    );
+    let vcsrf = hidden(&v.get(&h, "/admin").await.2, "csrf");
+    let (st, _, _) = v
+        .post(
+            &h,
+            "/admin/moderation/status",
+            &[
+                ("csrf", &vcsrf),
+                ("subject", &did),
+                ("blob", ""),
+                ("applied", "false"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a viewer can't");
+
+    // Email: a test email's code confirms delivery.
+    let (st, _, page) = o
+        .post(
+            &h,
+            "/admin/email/test",
+            &[("csrf", &csrf), ("to", "ops@example.com")],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("Sent to ops@example.com"),
+        "{page}"
+    );
+    let sent = h.mail.lock().unwrap().last().cloned().unwrap();
+    let code = sent
+        .email
+        .text
+        .split_whitespace()
+        .find(|w| w.len() == 11 && w.as_bytes()[5] == b'-')
+        .unwrap()
+        .to_owned();
+    let (st, _, _) = o
+        .post(
+            &h,
+            "/admin/email/verify",
+            &[("csrf", &csrf), ("code", "WRONG-CODE0")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _, page) = o
+        .post(
+            &h,
+            "/admin/email/verify",
+            &[("csrf", &csrf), ("code", &code)],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("email works"),
+        "{page}"
+    );
+    let (st, _, _) = v
+        .post(
+            &h,
+            "/admin/email/test",
+            &[("csrf", &vcsrf), ("to", "x@example.com")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Logs show this node's lines; the audit log filters and exports.
+    h.state.logs.push("a line the test wrote".into());
+    let (_, _, page) = o.get(&h, "/admin/logs").await;
+    assert!(page.contains("a line the test wrote"), "{page}");
+    let (_, _, page) = o.get(&h, "/admin/audit?action=updateSubjectStatus").await;
+    assert!(
+        page.contains("operator:own") && !page.contains("email.verified</td>"),
+        "{page}"
+    );
+    let cookie = o.cookie_header();
+    let (st, headers, body) = h
+        .raw(
+            "GET",
+            "/admin/audit/export",
+            None,
+            vec![],
+            &[("cookie", &cookie)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/x-ndjson");
+    let lines: Vec<Value> = String::from_utf8(body)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines.iter().any(|l| l["action"] == "email.verified"));
+    assert_eq!(
+        h.raw("GET", "/admin/audit/export", None, vec![], &[])
+            .await
+            .0,
+        StatusCode::SEE_OTHER,
+        "signed out, no export"
     );
 }

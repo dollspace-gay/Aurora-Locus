@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+{% if !intro.is_empty() %}<p class="muted">{{ intro }}</p>{% endif %}
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+{% if !cards.is_empty() %}
+<div class="grid">
+{% for c in cards %}<div class="card">
+<h2>{{ c.title }}</h2>
+{% for f in c.facts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+{% endfor %}
+</div>
+{% endif %}
+{% if !forms.is_empty() %}
+<div class="settings-cards">
+{% for f in forms %}<div class="card">
+<h2>{{ f.title }}</h2>
+{% if !f.text.is_empty() %}<p>{{ f.text }}</p>{% endif %}
+<form class="stack" method="{% if f.get %}get{% else %}post{% endif %}" action="{{ f.action }}">
+{% if !f.get %}<input type="hidden" name="csrf" value="{{ csrf }}">{% endif %}
+{% for (k, v) in f.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">
+{% endfor %}
+{% for i in f.inputs %}
+<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
+{% if i.kind == "select" %}<select id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
+{% else if i.kind == "textarea" %}<textarea id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" rows="4" spellcheck="false">{{ i.value }}</textarea>
+{% else %}<input type="{{ i.kind }}" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false"{% if i.kind == "password" %} autocomplete="off"{% endif %}>
+{% endif %}
+{% if !i.hint.is_empty() %}<div class="hint">{{ i.hint }}</div>{% endif %}
+{% endfor %}
+<div class="row"><button type="submit"{% if f.danger %} class="danger"{% else %} class="secondary"{% endif %}>{{ f.button }}</button></div>
+</form>
+</div>
+{% endfor %}
+</div>
+{% endif %}
+{% for t in tables %}
+<h2>{{ t.title }}</h2>
+<div class="scroll"><table>
+<thead><tr>{% for (class, label) in t.cols %}<th class="{{ class }}">{{ label }}</th>{% endfor %}</tr></thead>
+<tbody>
+{% for r in t.rows %}<tr>{% for c in r %}<td class="{{ c.class }}">{% if let Some(b) = c.button %}<form class="inline" method="post" action="{{ b.action }}"><input type="hidden" name="csrf" value="{{ csrf }}">{% for (k, v) in b.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}<button type="submit" class="{% if b.danger %}danger{% else %}secondary{% endif %}">{{ b.label }}</button></form>{% else %}{% if c.class == "text" %}<div class="cell-text">{% endif %}{% if !c.href.is_empty() %}<a href="{{ c.href }}">{% endif %}{% if !c.pill.is_empty() %}<span class="pill {{ c.pill }}">{{ c.text }}</span>{% else if c.code %}<code>{{ c.text }}</code>{% else %}{{ c.text }}{% endif %}{% if !c.href.is_empty() %}</a>{% endif %}{% if c.class == "text" %}</div>{% endif %}{% endif %}</td>{% endfor %}</tr>
+{% else %}<tr><td class="text" colspan="{{ t.cols.len() }}"><div class="cell-text">{{ t.empty }}</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% endfor %}
+{% if let Some((title, text)) = pre %}<h2>{{ title }}</h2><pre>{{ text }}</pre>{% endif %}
+{% if !fields.is_empty() %}
+<h2>Settings</h2>
+<div class="settings-cards">
+{% for f in fields %}{% include "setting_field.html" %}
+{% endfor %}</div>
+{% endif %}
+{% if !advanced.is_empty() %}
+<details class="advanced"><summary>More settings</summary>
+<div class="settings-cards">
+{% for f in advanced %}{% include "setting_field.html" %}
+{% endfor %}</div>
+</details>
+{% endif %}
+{% endblock %}
