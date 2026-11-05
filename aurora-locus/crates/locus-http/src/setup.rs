@@ -119,7 +119,11 @@ pub async fn gate(State(s): St, req: Request<Body>, next: Next) -> Response {
         }
         return next.run(req).await;
     }
-    if is_setup_path(&path) || path.starts_with("/static/") || path == "/xrpc/_health" {
+    if is_setup_path(&path)
+        || path.starts_with("/static/")
+        || path == "/xrpc/_health"
+        || path == "/healthz"
+    {
         return next.run(req).await;
     }
     match path.as_str() {

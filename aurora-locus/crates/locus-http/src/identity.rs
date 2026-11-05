@@ -744,10 +744,6 @@ pub(crate) fn service_document(s: &AppState) -> DidDocument {
     }
 }
 
-pub async fn health() -> Json<Value> {
-    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::set_doc_handle;

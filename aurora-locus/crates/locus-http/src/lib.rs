@@ -2,6 +2,7 @@
 //! and every handler.
 
 pub mod account;
+pub mod acme;
 pub mod admin;
 pub mod admin_auth;
 pub mod audience;
@@ -9,11 +10,13 @@ pub mod audience_sync;
 pub mod auth;
 pub mod branding;
 pub mod bsky;
+pub mod cloudflare;
 pub mod console;
 pub mod console_people;
 pub mod console_sections;
 pub mod email;
 pub mod error;
+pub mod health;
 pub mod identity;
 pub mod import;
 pub mod kryphocron;
@@ -51,7 +54,10 @@ pub use state::{AppState, ResolverCache, ServerSecrets};
 /// Every route.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/xrpc/_health", get(identity::health))
+        .route("/xrpc/_health", get(health::health))
+        .route("/healthz", get(health::healthz))
+        .route("/readyz", get(health::readyz))
+        .route("/tls-check", get(health::tls_check))
         .route(
             "/xrpc/com.atproto.server.describeServer",
             get(server::describe_server),

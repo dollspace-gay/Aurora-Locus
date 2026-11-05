@@ -11126,3 +11126,96 @@ async fn setup_applies_on_a_database_no_node_has_started() {
         .unwrap();
     assert!(h.state.store.setup_completed().await.unwrap());
 }
+
+#[tokio::test]
+async fn health_and_the_certificate_question() {
+    let h = harness(false).await;
+    let (st, v) = h.call("GET", "/xrpc/_health", None, None).await;
+    assert_eq!((st, v["version"].is_string()), (StatusCode::OK, true));
+    assert_eq!(
+        h.call("GET", "/healthz", None, None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(h.call("GET", "/readyz", None, None).await.0, StatusCode::OK);
+    // Health answers on any host, as the probes use internal names.
+    let (st, _) = h
+        .call_host("GET", "/xrpc/_health", None, None, "unknown.example.net")
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    h.create_account("hana.pds.example.com", "hana@example.com", "hanas password")
+        .await;
+    let check = |name: &'static str| {
+        let h = &h;
+        async move {
+            h.call_host(
+                "GET",
+                &format!("/tls-check?domain={name}"),
+                None,
+                None,
+                "localhost",
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        check("pds.example.com").await,
+        StatusCode::OK,
+        "the PDS hostname"
+    );
+    assert_eq!(
+        check("PDS.Example.com.").await,
+        StatusCode::OK,
+        "in any case, with the root dot"
+    );
+    assert_eq!(
+        check("hana.pds.example.com").await,
+        StatusCode::OK,
+        "an existing handle"
+    );
+    assert_eq!(
+        check("nobody.pds.example.com").await,
+        StatusCode::NOT_FOUND,
+        "a handle no one has"
+    );
+    assert_eq!(check("www.example.com").await, StatusCode::NOT_FOUND);
+    assert_eq!(check("").await, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn behind_cloudflare_the_client_ip_comes_from_cloudflare_only() {
+    let h = harness(false).await;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-forwarded-for", "104.16.1.2".parse().unwrap());
+    headers.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
+    let caddy = Some(ip("127.0.0.1"));
+    // Not in Cloudflare mode: CF-Connecting-IP means nothing.
+    assert_eq!(
+        crate::ratelimit::real_ip(&h.state, caddy, &headers),
+        Some(ip("104.16.1.2"))
+    );
+    h.state
+        .store
+        .set_setting("deploy.proxy_mode", json!("cloudflare"), "test")
+        .await
+        .unwrap();
+    h.state.settings.refresh().await.unwrap();
+    assert_eq!(
+        crate::ratelimit::real_ip(&h.state, caddy, &headers),
+        Some(ip("203.0.113.9"))
+    );
+    // The hop before the proxy isn't Cloudflare's: the header is ignored.
+    headers.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+    assert_eq!(
+        crate::ratelimit::real_ip(&h.state, caddy, &headers),
+        Some(ip("198.51.100.7"))
+    );
+    // A client talking to locus directly can't claim to be anyone.
+    headers.insert("x-forwarded-for", "104.16.1.2".parse().unwrap());
+    assert_eq!(
+        crate::ratelimit::real_ip(&h.state, Some(ip("192.0.2.50")), &headers),
+        Some(ip("192.0.2.50"))
+    );
+}

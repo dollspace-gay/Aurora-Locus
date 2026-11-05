@@ -821,7 +821,7 @@ pub static REGISTRY: &[Def] = &[
         key: "deploy.proxy_mode",
         kind: Kind::Choice(&["caddy", "cloudflare", "other", "direct"]),
         default: r#""caddy""#,
-        env: None,
+        env: Some("LOCUS_PROXY_MODE"),
         description: "How requests reach locus: the bundled Caddy, Cloudflare's proxy in front of Caddy, another reverse proxy, or direct TLS.",
     },
 ];

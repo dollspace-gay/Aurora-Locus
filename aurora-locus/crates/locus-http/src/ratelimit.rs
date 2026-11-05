@@ -454,12 +454,25 @@ pub fn real_ip(s: &AppState, peer: Option<IpAddr>, headers: &HeaderMap) -> Optio
             }
         }
     }
-    for ip in chain.iter().rev() {
-        if !trusted(s, *ip) {
-            return Some(*ip);
-        }
+    let found = chain
+        .iter()
+        .rev()
+        .find(|ip| !trusted(s, **ip))
+        .copied()
+        .or_else(|| chain.first().copied());
+    // Behind Cloudflare the hop before our proxy is Cloudflare's; only then
+    // does its CF-Connecting-IP name the client.
+    if let Some(hop) = found
+        && s.snapshot().text("deploy.proxy_mode") == "cloudflare"
+        && crate::cloudflare::contains(hop)
+        && let Some(client) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+    {
+        return Some(client);
     }
-    chain.first().copied().or(Some(peer))
+    found.or(Some(peer))
 }
 
 fn parse_addr(s: &str) -> Option<IpAddr> {

@@ -3,6 +3,7 @@
 
 #[cfg(unix)]
 mod admin_cli;
+mod deploy;
 mod logging;
 mod node;
 mod setup_cli;
@@ -45,6 +46,9 @@ enum Command {
         #[arg(long)]
         new_token: bool,
     },
+    /// Deployment files.
+    #[command(subcommand)]
+    Deploy(DeployCmd),
     /// GET /xrpc/_health; exits 0 on 200 (the compose health check).
     Healthcheck {
         #[arg(long, default_value = "http://127.0.0.1:3000")]
@@ -55,6 +59,39 @@ enum Command {
     #[cfg(unix)]
     #[command(flatten)]
     Admin(admin_cli::AdminCmd),
+}
+
+#[derive(Subcommand)]
+enum DeployCmd {
+    /// Prints a Caddyfile for a certificate strategy.
+    Caddyfile {
+        #[arg(long, value_enum, default_value = "on-demand")]
+        strategy: deploy::Strategy,
+        /// Where Caddy reaches locus.
+        #[arg(long, default_value = "locus:3000")]
+        upstream: String,
+        /// The /tls-check URL Caddy asks before getting a certificate.
+        #[arg(long, default_value = "http://locus:3000/tls-check")]
+        ask_url: String,
+        /// The ACME account contact.
+        #[arg(long, default_value = "")]
+        email: String,
+        /// The PDS hostname (dns01 and cloudflare).
+        #[arg(long, default_value = "")]
+        hostname: String,
+        /// The handle domain for the wildcard, like example.com.
+        #[arg(long, default_value = "")]
+        wildcard: String,
+        /// Caddy's DNS provider module for dns01 (cloudflare, route53, …).
+        #[arg(long, default_value = "")]
+        dns_provider: String,
+        /// The origin certificate file (cloudflare).
+        #[arg(long, default_value = "")]
+        cert: String,
+        /// The origin key file (cloudflare).
+        #[arg(long, default_value = "")]
+        key: String,
+    },
 }
 
 fn bootstrap_or_exit() -> Bootstrap {
@@ -73,6 +110,40 @@ async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Version => println!("aurora-locus {}", env!("CARGO_PKG_VERSION")),
+        Command::Deploy(DeployCmd::Caddyfile {
+            strategy,
+            upstream,
+            ask_url,
+            email,
+            hostname,
+            wildcard,
+            dns_provider,
+            cert,
+            key,
+        }) => {
+            let opts = deploy::Options {
+                strategy,
+                upstream,
+                ask_url,
+                email,
+                hostname,
+                wildcard,
+                dns_provider,
+                cert,
+                key,
+                cloudflare_ranges: locus_http::cloudflare::BUNDLED
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+            };
+            match deploy::caddyfile(&opts) {
+                Ok(text) => print!("{text}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Command::Healthcheck { url } => std::process::exit(admin_cli::healthcheck(&url).await),
         #[cfg(unix)]
         Command::Admin(cmd) => {

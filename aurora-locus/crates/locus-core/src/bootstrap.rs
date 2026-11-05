@@ -88,7 +88,32 @@ pub struct Bootstrap {
     pub disable_ssrf_protection: Option<bool>,
     /// Read once in setup mode to complete headless setup.
     pub setup_auto: Option<String>,
+    /// Direct TLS: locus terminates TLS itself, with ACME certificates.
+    pub tls: Option<DirectTls>,
 }
+
+/// Direct TLS (`LOCUS_TLS=true`): no proxy in front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectTls {
+    /// HTTPS (`LOCUS_TLS_LISTEN`, default `0.0.0.0:443`).
+    pub listen: SocketAddr,
+    /// Plain HTTP for ACME's HTTP-01 challenges and redirects
+    /// (`LOCUS_TLS_HTTP_LISTEN`, default `0.0.0.0:80`).
+    pub http_listen: SocketAddr,
+    /// The ACME directory (`LOCUS_ACME_DIRECTORY`, default Let's Encrypt).
+    pub directory: String,
+    /// The ACME account contact (`LOCUS_ACME_EMAIL`).
+    pub email: String,
+    /// Where certificates and the ACME account are kept
+    /// (`LOCUS_TLS_CACHE`, default `<data>/tls`).
+    pub cache: PathBuf,
+    /// A CA (PEM) the ACME directory's certificate is checked against
+    /// instead of the system's (`LOCUS_ACME_CA`; a private or test ACME).
+    pub directory_ca: Option<PathBuf>,
+}
+
+/// Let's Encrypt's production directory.
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// The optional `locus.toml` file. Every field is optional; env overrides it.
 #[derive(Debug, Default, Deserialize)]
@@ -110,6 +135,12 @@ struct FileConfig {
     hostname: Option<String>,
     dev_mode: Option<bool>,
     disable_ssrf_protection: Option<bool>,
+    tls: Option<bool>,
+    tls_listen: Option<String>,
+    tls_http_listen: Option<String>,
+    acme_directory: Option<String>,
+    acme_email: Option<String>,
+    tls_cache: Option<PathBuf>,
 }
 
 const DEFAULT_PORT: u16 = 2583;
@@ -179,6 +210,47 @@ impl Bootstrap {
                 };
                 SocketAddr::from(([0, 0, 0, 0], port))
             }
+        };
+
+        let tls_on = match get("LOCUS_TLS", None) {
+            Some(v) => parse_bool("LOCUS_TLS", &v)?,
+            None => file.tls.unwrap_or(false),
+        };
+        let addr = |name: &str, v: Option<String>, default: u16| -> CoreResult<SocketAddr> {
+            match v {
+                Some(a) => a
+                    .parse()
+                    .map_err(|e| CoreError::Config(format!("{name} {a:?}: {e}"))),
+                None => Ok(SocketAddr::from(([0, 0, 0, 0], default))),
+            }
+        };
+        let tls = if tls_on {
+            let email = get("LOCUS_ACME_EMAIL", None)
+                .or(file.acme_email)
+                .unwrap_or_default();
+            Some(DirectTls {
+                listen: addr(
+                    "LOCUS_TLS_LISTEN",
+                    get("LOCUS_TLS_LISTEN", None).or(file.tls_listen),
+                    443,
+                )?,
+                http_listen: addr(
+                    "LOCUS_TLS_HTTP_LISTEN",
+                    get("LOCUS_TLS_HTTP_LISTEN", None).or(file.tls_http_listen),
+                    80,
+                )?,
+                directory: get("LOCUS_ACME_DIRECTORY", None)
+                    .or(file.acme_directory)
+                    .unwrap_or_else(|| LETS_ENCRYPT.to_owned()),
+                email,
+                cache: get("LOCUS_TLS_CACHE", None)
+                    .map(PathBuf::from)
+                    .or(file.tls_cache)
+                    .unwrap_or_else(|| data_dir.join("tls")),
+                directory_ca: get("LOCUS_ACME_CA", None).map(PathBuf::from),
+            })
+        } else {
+            None
         };
 
         let data_persistent = match get("LOCUS_DATA_PERSISTENT", None) {
@@ -273,6 +345,7 @@ impl Bootstrap {
             dev_mode,
             disable_ssrf_protection,
             setup_auto: get("LOCUS_SETUP_AUTO", None),
+            tls,
             data_dir,
         })
     }

@@ -1,0 +1,5 @@
+target
+.git
+deploy/docker/locus.env
+deploy/docker/Caddyfile
+deploy/docker/certs
