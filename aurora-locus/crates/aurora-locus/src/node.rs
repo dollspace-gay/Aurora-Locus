@@ -141,6 +141,9 @@ impl Node {
             LegacySessions::new(self.store.clone(), secrets.jwt.clone(), service_did.clone());
         let clock_id = u16::try_from(self.clock_id)
             .map_err(|_| CoreError::Config(format!("clock id {} out of range", self.clock_id)))?;
+        let mailer = locus_mail::Mailer::new(self.store.clone(), Arc::clone(&self.master_key));
+        let env: HashMap<String, String> = std::env::vars().collect();
+        mailer.import_env_and_check(&env).await?;
         let state = Arc::new(AppState {
             repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id))),
             store: self.store.clone(),
@@ -148,6 +151,7 @@ impl Node {
             master_key: self.master_key.clone(),
             secrets,
             sessions,
+            mailer,
             hostname,
             public_url,
             service_did,

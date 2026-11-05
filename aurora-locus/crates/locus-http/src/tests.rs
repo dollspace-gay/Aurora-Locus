@@ -90,10 +90,17 @@ struct Harness {
     app: Router,
     state: Arc<AppState>,
     plc: Plc,
+    /// Mail the capturing mailer recorded (empty without email).
+    mail: Arc<Mutex<Vec<locus_mail::Sent>>>,
     _dir: tempfile::TempDir,
 }
 
 async fn harness(invite_required: bool) -> Harness {
+    harness_with(invite_required, true).await
+}
+
+/// With `email` false, no sender is configured.
+async fn harness_with(invite_required: bool, email: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
         .await
@@ -115,6 +122,14 @@ async fn harness(invite_required: bool) -> Harness {
     let hostname = "pds.example.com".to_owned();
     let service_did = format!("did:web:{hostname}");
     let sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
+    let (mailer, mail) = if email {
+        locus_mail::Mailer::capturing(store.clone(), Arc::clone(&master_key))
+    } else {
+        (
+            locus_mail::Mailer::new(store.clone(), Arc::clone(&master_key)),
+            Arc::default(),
+        )
+    };
     let state = Arc::new(AppState {
         repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0))),
         store,
@@ -122,6 +137,7 @@ async fn harness(invite_required: bool) -> Harness {
         master_key,
         secrets,
         sessions,
+        mailer,
         public_url: format!("https://{hostname}"),
         hostname,
         service_did,
@@ -132,6 +148,7 @@ async fn harness(invite_required: bool) -> Harness {
         app: crate::router(state.clone()),
         state,
         plc,
+        mail,
         _dir: dir,
     }
 }
@@ -816,4 +833,364 @@ async fn did_web_accounts_are_served_here_and_their_hosts_stay_reserved() {
     );
     let (st, v) = h.update_handle(access, "wendy.pds.example.com").await;
     assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+impl Harness {
+    /// The token in the last email sent to `to`, and its subject.
+    fn last_mail(&self, to: &str) -> (String, String) {
+        let mail = self.mail.lock().unwrap();
+        let m = mail
+            .iter()
+            .rev()
+            .find(|m| m.to == to)
+            .expect("an email was sent");
+        let token = m
+            .email
+            .text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.len() == 11 && l.as_bytes()[5] == b'-')
+            .expect("the email holds a token")
+            .to_owned();
+        (m.email.subject.clone(), token)
+    }
+
+    fn mail_count(&self) -> usize {
+        self.mail.lock().unwrap().len()
+    }
+
+    async fn post(&self, path: &str, auth: Option<&str>, body: Value) -> (StatusCode, Value) {
+        self.call("POST", &format!("/xrpc/{path}"), auth, Some(body))
+            .await
+    }
+}
+
+#[tokio::test]
+async fn email_confirmation_and_change() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("lea.pds.example.com", "lea@example.com", "pw")
+        .await;
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    let (st, v) = h
+        .post(
+            "com.atproto.server.requestEmailConfirmation",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (subject, token) = h.last_mail("lea@example.com");
+    assert_eq!(subject, "Email Confirmation");
+
+    let (st, v) = h
+        .post(
+            "com.atproto.server.confirmEmail",
+            Some(&access),
+            json!({"email": "lea@example.com", "token": "AAAAA-BBBBB"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidToken"))
+    );
+    let (st, v) = h
+        .post(
+            "com.atproto.server.confirmEmail",
+            Some(&access),
+            json!({"email": "other@example.com", "token": token}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidEmail"))
+    );
+    let (st, v) = h
+        .post(
+            "com.atproto.server.confirmEmail",
+            Some(&access),
+            json!({"email": "LEA@example.com", "token": token.to_lowercase()}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, sess) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(sess["emailConfirmed"], true);
+    // A token works once.
+    let (st, _) = h
+        .post(
+            "com.atproto.server.confirmEmail",
+            Some(&access),
+            json!({"email": "lea@example.com", "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // A confirmed address must approve a change.
+    let (st, v) = h
+        .post(
+            "com.atproto.server.requestEmailUpdate",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["tokenRequired"].as_bool()),
+        (StatusCode::OK, Some(true)),
+        "{v}"
+    );
+    let (subject, token) = h.last_mail("lea@example.com");
+    assert_eq!(subject, "Email Update Requested");
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "lea2@example.com"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("TokenRequired"))
+    );
+    h.create_account("max.pds.example.com", "max@example.com", "pw")
+        .await;
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "max@example.com", "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "taken: {v}");
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "lea2@example.com", "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, sess) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (sess["email"].as_str(), sess["emailConfirmed"].as_bool()),
+        (Some("lea2@example.com"), Some(false))
+    );
+    // An unconfirmed address changes without a token.
+    let (st, v) = h
+        .post(
+            "com.atproto.server.requestEmailUpdate",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["tokenRequired"].as_bool()),
+        (StatusCode::OK, Some(false))
+    );
+    let (st, _) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "lea3@example.com"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn password_reset_by_email() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("nia.pds.example.com", "nia@example.com", "old-pw")
+        .await;
+    let (st, _) = h
+        .post(
+            "com.atproto.server.requestPasswordReset",
+            None,
+            json!({"email": "nobody@example.com"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "same answer for an unknown address");
+    assert_eq!(h.mail_count(), 0);
+    let (st, _) = h
+        .post(
+            "com.atproto.server.requestPasswordReset",
+            None,
+            json!({"email": "NIA@example.com"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (subject, token) = h.last_mail("nia@example.com");
+    assert_eq!(subject, "Password Reset Requested");
+
+    let (st, v) = h
+        .post(
+            "com.atproto.server.resetPassword",
+            None,
+            json!({"token": token, "password": "new-pw"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let login = |pw: &'static str| {
+        h.post(
+            "com.atproto.server.createSession",
+            None,
+            json!({"identifier": "nia.pds.example.com", "password": pw}),
+        )
+    };
+    assert_eq!(login("old-pw").await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(login("new-pw").await.0, StatusCode::OK);
+    let (st, _) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            acct["accessJwt"].as_str(),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "old sessions end");
+    let (st, v) = h
+        .post(
+            "com.atproto.server.resetPassword",
+            None,
+            json!({"token": token, "password": "again"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidToken"))
+    );
+}
+
+#[tokio::test]
+async fn sign_in_codes_by_email() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("ola.pds.example.com", "ola@example.com", "pw")
+        .await;
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    // The factor needs a confirmed address.
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "ola@example.com", "emailAuthFactor": true}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    h.post(
+        "com.atproto.server.requestEmailConfirmation",
+        Some(&access),
+        json!({}),
+    )
+    .await;
+    let (_, token) = h.last_mail("ola@example.com");
+    h.post(
+        "com.atproto.server.confirmEmail",
+        Some(&access),
+        json!({"email": "ola@example.com", "token": token}),
+    )
+    .await;
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "ola@example.com", "emailAuthFactor": true}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, ap) = h
+        .post(
+            "com.atproto.server.createAppPassword",
+            Some(&access),
+            json!({"name": "bot"}),
+        )
+        .await;
+
+    let login = |body: Value| h.post("com.atproto.server.createSession", None, body);
+    let (st, v) = login(json!({"identifier": "ola.pds.example.com", "password": "pw"})).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("AuthFactorTokenRequired")),
+        "{v}"
+    );
+    let (subject, code) = h.last_mail("ola@example.com");
+    assert_eq!(subject, "Sign-in Confirmation");
+    let (st, v) = login(
+        json!({"identifier": "ola.pds.example.com", "password": "pw", "authFactorToken": code}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["emailAuthFactor"], true);
+    // App passwords skip the factor, as the reference.
+    let (st, _) =
+        login(json!({"identifier": "ola.pds.example.com", "password": ap["password"]})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Turning it off takes a code from the inbox.
+    let (st, v) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "ola@example.com", "emailAuthFactor": false}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("TokenRequired"))
+    );
+    let (_, token) = h.last_mail("ola@example.com");
+    let (st, _) = h
+        .post(
+            "com.atproto.server.updateEmail",
+            Some(&access),
+            json!({"email": "ola@example.com", "emailAuthFactor": false, "token": token}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = login(json!({"identifier": "ola.pds.example.com", "password": "pw"})).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn without_email_the_features_say_so() {
+    let h = harness_with(false, false).await;
+    let acct = h
+        .create_account("pia.pds.example.com", "pia@example.com", "pw")
+        .await;
+    for (path, auth, body) in [
+        (
+            "com.atproto.server.requestEmailConfirmation",
+            acct["accessJwt"].as_str(),
+            json!({}),
+        ),
+        (
+            "com.atproto.server.requestPasswordReset",
+            None,
+            json!({"email": "pia@example.com"}),
+        ),
+    ] {
+        let (st, v) = h.post(path, auth, body).await;
+        assert_eq!(
+            (st, v["message"].as_str()),
+            (
+                StatusCode::BAD_REQUEST,
+                Some("Email is not configured on this server")
+            ),
+            "{path}"
+        );
+    }
 }

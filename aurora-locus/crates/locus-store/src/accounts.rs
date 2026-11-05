@@ -61,6 +61,8 @@ pub struct Account {
     pub delete_after: Option<i64>,
     pub invites_disabled: bool,
     pub did_method: String,
+    /// When email sign-in codes were turned on, if they are.
+    pub email_auth_factor_at: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -77,6 +79,7 @@ struct AccountRow {
     delete_after: Option<i64>,
     invites_disabled: bool,
     did_method: String,
+    email_auth_factor_at: Option<i64>,
 }
 
 impl TryFrom<AccountRow> for Account {
@@ -95,12 +98,13 @@ impl TryFrom<AccountRow> for Account {
             delete_after: r.delete_after,
             invites_disabled: r.invites_disabled,
             did_method: r.did_method,
+            email_auth_factor_at: r.email_auth_factor_at,
         })
     }
 }
 
 const ACCOUNT_COLS: &str = "did, handle, email, email_confirmed_at, password_hash, created_at, status, \
-     status_ref, deactivated_at, delete_after, invites_disabled, did_method";
+     status_ref, deactivated_at, delete_after, invites_disabled, did_method, email_auth_factor_at";
 
 /// A new account row.
 #[derive(Debug, Clone)]

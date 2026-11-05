@@ -2,6 +2,7 @@
 //! and every handler.
 
 pub mod auth;
+pub mod email;
 pub mod error;
 pub mod identity;
 pub mod server;
@@ -57,6 +58,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/com.atproto.server.revokeAppPassword",
             post(server::revoke_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestEmailConfirmation",
+            post(email::request_email_confirmation),
+        )
+        .route(
+            "/xrpc/com.atproto.server.confirmEmail",
+            post(email::confirm_email),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestEmailUpdate",
+            post(email::request_email_update),
+        )
+        .route(
+            "/xrpc/com.atproto.server.updateEmail",
+            post(email::update_email),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestPasswordReset",
+            post(email::request_password_reset),
+        )
+        .route(
+            "/xrpc/com.atproto.server.resetPassword",
+            post(email::reset_password),
         )
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",

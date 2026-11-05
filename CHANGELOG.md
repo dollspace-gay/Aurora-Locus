@@ -106,6 +106,25 @@ kryphocron built in.
   forbidden domains for documents and handle lookups.
   `PDS_DISABLE_SSRF_PROTECTION` and local dev mode relax it as the
   reference does.
+- Email over SMTP (`smtp://` with STARTTLS when offered, or `smtps://`).
+  SMTP URLs are kept in the encrypted key store; `PDS_EMAIL_SMTP_URL`,
+  `PDS_MODERATION_EMAIL_SMTP_URL`, `PDS_EMAIL_FROM_ADDRESS` and
+  `PDS_MODERATION_EMAIL_ADDRESS` are read as the reference reads them. A
+  sender works once its connect-and-auth check passes; until then, features
+  that need email say "Email is not configured on this server" instead of
+  pretending to send.
+- `requestEmailConfirmation`, `confirmEmail`, `requestEmailUpdate`,
+  `updateEmail` (including turning email sign-in codes on and off),
+  `requestPasswordReset` and `resetPassword`, with the reference's
+  `XXXXX-XXXXX` tokens (15 minutes, one per account and purpose, stored as
+  keyed hashes). `requestPasswordReset` answers the same whether or not the
+  address has an account. A password reset ends every session.
+- Email sign-in codes: `createSession` asks for `authFactorToken`
+  (`AuthFactorTokenRequired`) when the account has them on, except for app
+  passwords, as the reference.
+- Access tokens are checked for the scopes each endpoint allows, as the
+  reference: takendown and signup-queued sessions only reach the endpoints
+  meant for them.
 
 ### Changed
 

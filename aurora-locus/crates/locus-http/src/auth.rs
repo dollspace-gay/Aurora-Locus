@@ -1,7 +1,7 @@
 //! Reading credentials from requests.
 
 use axum::http::{HeaderMap, StatusCode, header};
-use locus_auth::session::{Authed, SCOPE_ACCESS};
+use locus_auth::session::{Authed, SCOPE_ACCESS, SCOPE_APP_PASS, SCOPE_APP_PASS_PRIVILEGED};
 use locus_store::accounts::{Account, Status};
 
 use crate::error::{XrpcError, XrpcResult};
@@ -32,10 +32,33 @@ pub fn bearer(headers: &HeaderMap) -> XrpcResult<&str> {
     }
 }
 
-/// A verified access token (legacy session).
-pub async fn access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
+/// The reference's scope groups for legacy access tokens.
+pub const FULL: &[&str] = &[SCOPE_ACCESS];
+pub const PRIVILEGED: &[&str] = &[SCOPE_ACCESS, SCOPE_APP_PASS_PRIVILEGED];
+pub const STANDARD: &[&str] = &[SCOPE_ACCESS, SCOPE_APP_PASS_PRIVILEGED, SCOPE_APP_PASS];
+
+/// A verified access token (legacy session) whose scope is in `scopes`
+/// or `extra` (e.g. the takendown scope, on the few endpoints the
+/// reference allows it).
+pub async fn access_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    scopes: &[&str],
+    extra: &[&str],
+) -> XrpcResult<Authed> {
     let token = bearer(headers)?;
-    Ok(state.sessions.verify_access(token).await?)
+    let authed = state.sessions.verify_access(token).await?;
+    let scope = authed.scope.as_str();
+    if scopes.contains(&scope) || extra.contains(&scope) {
+        Ok(authed)
+    } else {
+        Err(XrpcError::named("InvalidToken", "Bad token scope"))
+    }
+}
+
+/// A verified access token with a standard scope (full access or an app password).
+pub async fn access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
+    access_with(state, headers, STANDARD, &[]).await
 }
 
 /// The authenticated account, as the reference's `checkTakedown` (and,
@@ -76,9 +99,5 @@ pub async fn account_checked(
 /// A verified full-access token: no app passwords (as the reference's
 /// `ACCESS_FULL` endpoints).
 pub async fn full_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
-    let authed = access(state, headers).await?;
-    if authed.scope != SCOPE_ACCESS {
-        return Err(XrpcError::named("InvalidToken", "Bad token scope"));
-    }
-    Ok(authed)
+    access_with(state, headers, FULL, &[]).await
 }

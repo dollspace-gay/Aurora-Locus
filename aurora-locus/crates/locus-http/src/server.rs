@@ -69,7 +69,7 @@ pub struct CreateAccountInput {
     locus_did_method: Option<String>,
 }
 
-fn check_email(raw: &str) -> XrpcResult<String> {
+pub(crate) fn check_email(raw: &str) -> XrpcResult<String> {
     let email = raw.trim().to_ascii_lowercase();
     let valid = email.len() <= 320
         && email.split_once('@').is_some_and(|(local, domain)| {
@@ -117,7 +117,7 @@ fn session_json(account: &Account, tokens: &Tokens, did_doc: Option<Value>) -> V
         "did": account.did,
         "email": account.email,
         "emailConfirmed": account.email_confirmed_at.is_some(),
-        "emailAuthFactor": false,
+        "emailAuthFactor": account.email_auth_factor_at.is_some(),
         "active": active,
     });
     if let Some(s) = status {
@@ -402,6 +402,7 @@ pub struct CreateSessionInput {
     password: String,
     #[serde(default)]
     allow_takendown: bool,
+    auth_factor_token: Option<String>,
 }
 
 async fn find_account(s: &AppState, identifier: &str) -> XrpcResult<Option<Account>> {
@@ -473,6 +474,13 @@ async fn create_session_inner(s: &AppState, input: &CreateSessionInput) -> XrpcR
     let Some(cred) = check_password(s, &account, &input.password).await? else {
         return Err(invalid());
     };
+    crate::email::sign_in_factor(
+        s,
+        &account,
+        matches!(cred, Credential::AppPassword { .. }),
+        input.auth_factor_token.as_deref(),
+    )
+    .await?;
     let taken_down = matches!(account.status, Status::Takendown | Status::Suspended);
     let (scope, app_password, store_refresh) = match (&cred, taken_down) {
         (Credential::AppPassword { .. }, true) => {
@@ -510,7 +518,13 @@ async fn create_session_inner(s: &AppState, input: &CreateSessionInput) -> XrpcR
 }
 
 pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::access_with(
+        &s,
+        &headers,
+        auth::STANDARD,
+        &[locus_auth::session::SCOPE_SIGNUP_QUEUED],
+    )
+    .await?;
     let account = s.store.account_by_did(&authed.did).await?.ok_or_else(|| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
@@ -524,7 +538,7 @@ pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Va
         "did": account.did,
         "email": account.email,
         "emailConfirmed": account.email_confirmed_at.is_some(),
-        "emailAuthFactor": false,
+        "emailAuthFactor": account.email_auth_factor_at.is_some(),
         "active": active,
     });
     if let Some(st) = status {

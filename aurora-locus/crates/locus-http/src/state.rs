@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 pub mod secret_names {
     pub const JWT: &str = "jwt_secret";
     pub const APP_PASSWORD_PEPPER: &str = "app_password_pepper";
+    pub const EMAIL_TOKEN_PEPPER: &str = "email_token_pepper";
     pub const SERVICE_KEY: &str = "service_signing_key";
 }
 
@@ -27,6 +28,8 @@ pub mod secret_names {
 pub struct ServerSecrets {
     pub jwt: Zeroizing<Vec<u8>>,
     pub app_password_pepper: Zeroizing<Vec<u8>>,
+    /// Keys the hashes emailed tokens are stored as.
+    pub email_token_pepper: Zeroizing<Vec<u8>>,
     pub plc_keys: PlcKeys,
     pub service_key: K256Keypair,
 }
@@ -146,6 +149,10 @@ impl ServerSecrets {
             rand::random::<[u8; 32]>().to_vec()
         })
         .await?;
+        let email_token_pepper = load_or(store, key, secret_names::EMAIL_TOKEN_PEPPER, || {
+            rand::random::<[u8; 32]>().to_vec()
+        })
+        .await?;
         let plc_keys = PlcKeys::load_or_create(store, key).await?;
         let service = load_or(store, key, secret_names::SERVICE_KEY, || {
             K256Keypair::generate().export_private_key()
@@ -161,6 +168,7 @@ impl ServerSecrets {
             service_key: keypair(&service, "service key")?,
             jwt,
             app_password_pepper,
+            email_token_pepper,
         })
     }
 }
@@ -192,6 +200,7 @@ pub struct AppState {
     pub master_key: Arc<MasterKey>,
     pub secrets: ServerSecrets,
     pub sessions: LegacySessions,
+    pub mailer: locus_mail::Mailer,
     pub repo: RepoEngine,
     /// The PDS hostname (no scheme or port).
     pub hostname: String,

@@ -264,6 +264,20 @@ pub static REGISTRY: &[Def] = &[
         description: "Include the DID document in createAccount, createSession and getSession responses.",
     },
     Def {
+        key: "email.from_address",
+        kind: Kind::Text { max_len: 320 },
+        default: r#""""#,
+        env: Some("PDS_EMAIL_FROM_ADDRESS"),
+        description: "From address of account emails, e.g. \"PDS <noreply@example.com>\".",
+    },
+    Def {
+        key: "email.moderation_from_address",
+        kind: Kind::Text { max_len: 320 },
+        default: r#""""#,
+        env: Some("PDS_MODERATION_EMAIL_ADDRESS"),
+        description: "From address of moderation emails. Empty uses the account email address.",
+    },
+    Def {
         key: "sync.deleted_history_preservation_days",
         kind: Kind::Int { min: 0, max: 90 },
         default: "0",

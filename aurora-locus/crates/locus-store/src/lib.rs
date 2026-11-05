@@ -4,6 +4,7 @@
 //! [`Store`] and [`Tx`].
 
 pub mod accounts;
+pub mod email;
 pub mod env;
 pub mod identity;
 pub mod jobs;
