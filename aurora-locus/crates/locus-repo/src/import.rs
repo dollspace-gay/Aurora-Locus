@@ -877,6 +877,7 @@ impl RepoEngine {
             tx.commit().await?;
         }
         let mut moves = Vec::new();
+        let gate_on = self.media_gate_on();
         let mut after = String::new();
         loop {
             let mut tx = self.job_tx(job).await?;
@@ -905,6 +906,13 @@ impl RepoEngine {
                     }
                 } else {
                     tx.orphan_blob_if_unreferenced(did, &b.cid).await?;
+                }
+                // Whether it's private-only now the records are indexed, and
+                // the store that calls for.
+                tx.recompute_private_only(did, &b.cid).await?;
+                if let Some(m) = tx.place_blob(did, &b.cid, gate_on, backend.epoch).await? {
+                    moves.retain(|p| p.cid != m.cid);
+                    moves.push(m);
                 }
             }
             tx.commit().await?;

@@ -16,6 +16,12 @@ sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 infer = "0.16"
+bytes = "1"
+tokio-util = { workspace = true, features = ["io"] }
+# S3-compatible stores. No default features: the HTTP client is built here
+# with rustls on ring, like the rest of locus.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
 
 [dev-dependencies]
 tempfile.workspace = true

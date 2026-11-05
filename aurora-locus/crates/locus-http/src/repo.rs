@@ -14,7 +14,6 @@ use locus_store::accounts::{Account, Status};
 use proto_blue_lex_data::Cid;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth;
 use crate::error::{XrpcError, XrpcResult};
@@ -176,6 +175,27 @@ pub(crate) async fn finish_moves(s: &AppState, moves: &[locus_store::blob::Pendi
                 "blob move failed, will retry: {e}"
             );
         }
+    }
+}
+
+/// Moves a blob's bytes to the store its state now calls for (after a
+/// takedown, a scanner match or a release); a failure is left to the
+/// placement job.
+pub(crate) async fn place_blob(s: &AppState, did: &str, cid: &str) {
+    let started = async {
+        let mut tx = s.store.begin().await?;
+        let epoch = tx.blob_backend().await?.epoch;
+        let m = tx
+            .place_blob(did, cid, crate::media_gate::gate_on(s), epoch)
+            .await?;
+        tx.commit().await?;
+        Ok::<_, locus_core::CoreError>(m)
+    }
+    .await;
+    match started {
+        Ok(Some(m)) => finish_moves(s, &[m]).await,
+        Ok(None) => {}
+        Err(e) => tracing::warn!(did, cid, "blob placement failed, will retry: {e}"),
     }
 }
 
@@ -868,6 +888,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
 
     // Metadata under the repo lock (serialized with commits for this account).
     let mut newly_matched = false;
+    let gate_on = crate::media_gate::gate_on(&s);
     let result: XrpcResult<Vec<locus_store::blob::PendingMove>> = async {
         let (_lock, mut tx) = s.repo.locked_tx(&account.did).await.map_err(commit_error)?;
         let backend = tx.blob_backend().await?;
@@ -923,17 +944,26 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
             let import = tx.active_import_for_blob(&account.did, &cid).await?;
             if import.is_some() || tx.blob_has_records(&account.did, &cid).await? {
                 let key = locus_store::blob::permanent_key(&account.did, &cid);
-                if let Some(r) = tx
+                if tx
                     .reference_blob(&account.did, &cid, &key, backend.epoch)
                     .await?
-                    && r.pending_move.as_deref() == Some(key.as_str())
+                    .is_some()
                 {
-                    moves.push(locus_store::blob::PendingMove {
-                        did: account.did.clone(),
-                        cid: cid.clone(),
-                        from: r.storage_key,
-                        to: key,
-                    });
+                    // Whether it's private-only is decided now, and with the
+                    // gate on its bytes go straight to the gated store.
+                    tx.recompute_private_only(&account.did, &cid).await?;
+                    tx.place_blob(&account.did, &cid, gate_on, backend.epoch)
+                        .await?;
+                    if let Some(r) = tx.blob_for_update(&account.did, &cid).await?
+                        && let Some(to) = r.pending_move
+                    {
+                        moves.push(locus_store::blob::PendingMove {
+                            did: account.did.clone(),
+                            cid: cid.clone(),
+                            from: r.storage_key,
+                            to,
+                        });
+                    }
                 }
                 if let Some(job) = import {
                     tx.mark_import_blob(&job, &cid, true).await?;
@@ -950,6 +980,8 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     if let (true, Scan::Matched { result: r, reason }) = (newly_matched, &scan) {
         crate::scanner::record_match(&s, &account.did, &cid, "upload", r, reason.as_deref())
             .await?;
+        // Its bytes go to quarantine.
+        place_blob(&s, &account.did, &cid).await;
     }
     finish_moves(&s, &result?).await;
     Ok(Json(json!({
@@ -1042,12 +1074,6 @@ async fn serve_blob(
             return Err(not_found());
         }
     }
-    let mut file = s
-        .blobs
-        .open(&row.storage_key)
-        .await
-        .map_err(|e| XrpcError::internal(e.to_string()))?
-        .ok_or_else(not_found)?;
     let size = u64::try_from(row.size).unwrap_or(0);
     let (start, end) = match headers
         .get(header::RANGE)
@@ -1058,12 +1084,20 @@ async fn serve_blob(
         None => (0, size.saturating_sub(1)),
     };
     let partial = start != 0 || end + 1 != size;
-    file.seek(std::io::SeekFrom::Start(start))
+    let reader = s
+        .blobs
+        .read(&row.storage_key, partial.then_some((start, end)))
         .await
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .ok_or_else(not_found)?;
     let len = if size == 0 { 0 } else { end - start + 1 };
-    let stream = tokio_util::io::ReaderStream::new(file.take(len));
-    let mut res = Response::new(Body::from_stream(stream));
+    if reader.len != len {
+        return Err(XrpcError::internal(format!(
+            "stored copy of {cid} has {} bytes where {len} were expected",
+            reader.len
+        )));
+    }
+    let mut res = Response::new(Body::from_stream(reader.body));
     *res.status_mut() = if partial {
         StatusCode::PARTIAL_CONTENT
     } else {

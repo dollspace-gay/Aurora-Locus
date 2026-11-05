@@ -124,6 +124,16 @@ PDS_HOSTNAME=$hostname
 PDS_SERVICE_HANDLE_DOMAINS=.$parent
 LOCUS_TRUSTED_PROXIES=$caddy_ip/32
 LOCUS_PROXY_MODE=$proxy_mode
+# Blobs in an S3-compatible bucket instead of the data volume (set these
+# before the first start; an install with blobs on disk moves them with
+# \`aurora-locus migrate blobs\`):
+# PDS_BLOBSTORE_S3_BUCKET=
+# PDS_BLOBSTORE_S3_REGION=
+# PDS_BLOBSTORE_S3_ENDPOINT=
+# PDS_BLOBSTORE_S3_FORCE_PATH_STYLE=true
+# PDS_BLOBSTORE_S3_ACCESS_KEY_ID=
+# PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY=
+# LOCUS_BLOBSTORE_S3_GATED_BUCKET=
 EOF
 umask 022
 # Caddy's address on the network, to match LOCUS_TRUSTED_PROXIES.

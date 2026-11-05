@@ -85,6 +85,59 @@ pub fn temp_key() -> String {
     format!("tmp/{}", new_generation())
 }
 
+/// The store a blob's bytes belong in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// An upload not yet used: `tmp/`.
+    Temp,
+    /// `blobs/` (or an in-place imported key).
+    Normal,
+    /// Private-only media while the gate is on: `gated/`.
+    Gated,
+    /// Taken down or matched by the scanner: `quarantine/`.
+    Quarantine,
+}
+
+impl Place {
+    /// Where a row with this state belongs. Quarantine wins, then temp,
+    /// then the gate.
+    #[must_use]
+    pub fn of(state: &str, taken_down: bool, gated: bool, gate_on: bool) -> Self {
+        if taken_down || state == "quarantined" {
+            Self::Quarantine
+        } else if state == "temp" {
+            Self::Temp
+        } else if gated && gate_on {
+            Self::Gated
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// Whether `key` is in this store.
+    #[must_use]
+    pub fn holds(self, key: &str) -> bool {
+        let special = key.starts_with("gated/") || key.starts_with("quarantine/");
+        match self {
+            Self::Quarantine => key.starts_with("quarantine/"),
+            Self::Gated => key.starts_with("gated/"),
+            Self::Temp => !special,
+            Self::Normal => !special && !key.starts_with("tmp/"),
+        }
+    }
+
+    /// A fresh key in this store.
+    #[must_use]
+    pub fn new_key(self, did: &str, cid: &str) -> String {
+        match self {
+            Self::Temp => temp_key(),
+            Self::Normal => permanent_key(did, cid),
+            Self::Gated => format!("gated/{did}/{cid}.{}", new_generation()),
+            Self::Quarantine => format!("quarantine/{did}/{cid}.{}", new_generation()),
+        }
+    }
+}
+
 /// A blob move a commit or upload left to finish after its transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingMove {
@@ -478,7 +531,8 @@ impl Tx {
             Some(r) if r.pending_move.as_deref() == Some(to) => {
                 let seq = self.next_key_seq().await?;
                 let q = sql(
-                    "UPDATE blob SET storage_key = {3}, pending_move = NULL, move_epoch = NULL, key_seq = {4} \
+                    "UPDATE blob SET storage_key = {3}, pending_move = NULL, move_epoch = NULL, key_seq = {4}, \
+                     store = CASE WHEN {3} LIKE 'gated/%' THEN 'gated' ELSE 'normal' END \
                      WHERE did = {1} AND cid = {2}",
                     self.is_pg(),
                 );
@@ -499,6 +553,62 @@ impl Tx {
                 Ok(false)
             }
         }
+    }
+
+    /// Step 1 of a move to the store the row's state calls for (`Place`),
+    /// if its current key (or the key a move in flight is heading to) is
+    /// elsewhere. A newer move supersedes one in flight.
+    /// Returns the move to finish after commit.
+    pub async fn place_blob(
+        &mut self,
+        did: &str,
+        cid: &str,
+        gate_on: bool,
+        epoch: i64,
+    ) -> CoreResult<Option<PendingMove>> {
+        let pg = self.is_pg();
+        let q = sql(
+            &format!(
+                "SELECT state, takedown_ref IS NOT NULL, gated, storage_key, pending_move FROM blob \
+                 WHERE did = {{1}} AND cid = {{2}}{}",
+                if pg { " FOR UPDATE" } else { "" }
+            ),
+            pg,
+        );
+        let r: Option<(String, bool, bool, String, Option<String>)> =
+            on_tx!(self, q, q, |q, ex| sqlx::query_as(q)
+                .bind(did)
+                .bind(cid)
+                .fetch_optional(ex)
+                .await
+                .map_err(db_err))?;
+        let Some((state, taken_down, gated, key, pending)) = r else {
+            return Ok(None);
+        };
+        let place = Place::of(&state, taken_down, gated, gate_on);
+        if place.holds(pending.as_deref().unwrap_or(&key)) {
+            return Ok(None);
+        }
+        let to = place.new_key(did, cid);
+        let q = sql(
+            "UPDATE blob SET pending_move = {3}, move_epoch = {4} WHERE did = {1} AND cid = {2}",
+            pg,
+        );
+        on_tx!(self, q, q, |q, ex| sqlx::query(q)
+            .bind(did)
+            .bind(cid)
+            .bind(&to)
+            .bind(epoch)
+            .execute(ex)
+            .await
+            .map(|_| ())
+            .map_err(db_err))?;
+        Ok(Some(PendingMove {
+            did: did.to_owned(),
+            cid: cid.to_owned(),
+            from: key,
+            to,
+        }))
     }
 
     /// One GC batch: deletes temp blobs never referenced within `temp_ttl_ms`
@@ -618,6 +728,25 @@ impl Store {
         })
     }
 
+    /// Makes `active` the backend of an install that has stored nothing
+    /// yet (no blob or branding rows, nothing queued for deletion). Returns
+    /// whether it did.
+    pub async fn adopt_blob_backend_if_empty(&self, active: &str) -> CoreResult<bool> {
+        let q = sql(
+            "UPDATE blob_backend SET active = {1} WHERE id = 1 AND active <> {1} \
+             AND NOT EXISTS (SELECT 1 FROM blob) AND NOT EXISTS (SELECT 1 FROM branding_asset) \
+             AND NOT EXISTS (SELECT 1 FROM blob_delete) AND migration_job IS NULL",
+            self.is_pg_store(),
+        );
+        let n = on_pool!(self, q, q, |q, p| sqlx::query(q)
+            .bind(active)
+            .execute(p)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(db_err))?;
+        Ok(n == 1)
+    }
+
     /// Moves not finished (oldest first), for the mover job.
     pub async fn pending_blob_moves(&self, limit: i64) -> CoreResult<Vec<PendingMove>> {
         let q = sql(
@@ -655,10 +784,58 @@ impl Store {
             .map_err(db_err))
     }
 
-    /// Whether any row's current key or pending move names `key`.
+    /// Blobs whose bytes may not be in the store their state calls for
+    /// (`Place`), with no move in flight: up to `limit` of each kind (into
+    /// and out of the gated store and quarantine). Each is re-checked under
+    /// its row lock by `Tx::place_blob`.
+    pub async fn misplaced_blobs(
+        &self,
+        gate_on: bool,
+        limit: i64,
+    ) -> CoreResult<Vec<(String, String)>> {
+        let mut wheres = vec![
+            "storage_key LIKE 'gated/%' AND pending_move IS NULL \
+             AND NOT (gated AND {2} AND state = 'permanent' AND takedown_ref IS NULL)",
+            "(takedown_ref IS NOT NULL OR state = 'quarantined') AND pending_move IS NULL \
+             AND storage_key NOT LIKE 'quarantine/%'",
+            "storage_key LIKE 'quarantine/%' AND pending_move IS NULL \
+             AND takedown_ref IS NULL AND state <> 'quarantined'",
+        ];
+        if gate_on {
+            wheres.push(
+                "gated AND state = 'permanent' AND takedown_ref IS NULL AND pending_move IS NULL \
+                 AND storage_key NOT LIKE 'gated/%'",
+            );
+        }
+        let mut out: Vec<(String, String)> = Vec::new();
+        for w in wheres {
+            let q = sql(
+                &format!("SELECT did, cid FROM blob WHERE {w} LIMIT {{1}}"),
+                self.is_pg_store(),
+            );
+            let uses_gate = w.contains("{2}");
+            let rows: Vec<(String, String)> = on_pool!(self, q, q, |q, p| {
+                let mut query = sqlx::query_as(q).bind(limit);
+                if uses_gate {
+                    query = query.bind(gate_on);
+                }
+                query.fetch_all(p).await.map_err(db_err)
+            })?;
+            for r in rows {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether any blob row's current key or pending move, or any branding
+    /// upload's key, names `key`.
     pub async fn blob_key_in_use(&self, key: &str) -> CoreResult<bool> {
         let q = sql(
-            "SELECT 1 FROM blob WHERE storage_key = {1} OR pending_move = {1} LIMIT 1",
+            "SELECT 1 FROM blob WHERE storage_key = {1} OR pending_move = {1} \
+             UNION ALL SELECT 1 FROM branding_asset WHERE storage_key = {1} LIMIT 1",
             self.is_pg_store(),
         );
         let hit: Option<i32> = on_pool!(self, q, q, |q, p| sqlx::query_scalar(q)

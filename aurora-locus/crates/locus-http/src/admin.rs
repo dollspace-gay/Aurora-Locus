@@ -353,6 +353,8 @@ pub async fn update_subject_status(
                     input.subject["cid"].as_str().unwrap_or_default(),
                 );
                 s.store.set_blob_takedown(did, cid, r.as_deref()).await?;
+                // Into quarantine, or back out of it.
+                crate::repo::place_blob(&s, did, cid).await;
             }
             other => {
                 return Err(XrpcError::invalid_request(format!(

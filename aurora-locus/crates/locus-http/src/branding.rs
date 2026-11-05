@@ -228,11 +228,11 @@ pub async fn asset(State(s): St, Path(id): Path<String>) -> Response {
     let Ok(Some(row)) = s.store.branding_asset(&id).await else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
-    let file = match s.blobs.open(&row.storage_key).await {
-        Ok(Some(f)) => f,
+    let reader = match s.blobs.read(&row.storage_key, None).await {
+        Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
-    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    let body = axum::body::Body::from_stream(reader.body);
     let mut res = body.into_response();
     let h = res.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&row.mime) {

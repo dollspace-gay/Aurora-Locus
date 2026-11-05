@@ -69,7 +69,7 @@ pub async fn import_repo(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
 
     let key = format!("imports/{}.car", job.id);
     let written = s
-        .blobs
+        .scratch
         .write_stream(&key, body.into_data_stream(), limit)
         .await;
     if let Err(e) = written {
@@ -88,7 +88,7 @@ pub async fn import_repo(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         return Err(err);
     }
     let result = run(&s, &job, &key, account.status == Status::Active).await;
-    if let Err(e) = s.blobs.delete(&key).await {
+    if let Err(e) = s.scratch.delete(&key).await {
         tracing::warn!(job = job.id, "could not remove the import upload: {e}");
     }
     result?;
@@ -98,7 +98,7 @@ pub async fn import_repo(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
 
 async fn run(s: &AppState, job: &BulkJob, key: &str, active: bool) -> XrpcResult<()> {
     let path = s
-        .blobs
+        .scratch
         .local_path(key)
         .map_err(|e| XrpcError::internal(e.to_string()))?;
     // The account's current key, for the signature check (a mismatch is

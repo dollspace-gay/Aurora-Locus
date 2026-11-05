@@ -264,8 +264,11 @@ pub struct AppState {
     pub secrets: ServerSecrets,
     pub sessions: LegacySessions,
     pub mailer: locus_mail::Mailer,
-    /// Blob bytes.
-    pub blobs: locus_blob::DiskStore,
+    /// Blob bytes: the install's active backend.
+    pub blobs: locus_blob::BlobStore,
+    /// This node's local files that aren't blobs (repository imports in
+    /// progress), under the data directory.
+    pub scratch: locus_blob::DiskStore,
     /// This node's view of the event log.
     pub firehose: Arc<locus_sync::Firehose>,
     pub repo: RepoEngine,

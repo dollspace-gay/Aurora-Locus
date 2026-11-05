@@ -255,10 +255,13 @@ impl Node {
             } else {
                 "SQLite".into()
             },
-            blob_store: format!(
-                "On disk, in the data directory ({})",
-                self.bootstrap.data_dir.display()
-            ),
+            blob_store: match self.settings.current().text("blobs.s3_bucket").trim() {
+                "" => format!(
+                    "On disk, in the data directory ({})",
+                    self.bootstrap.data_dir.display()
+                ),
+                bucket => format!("In the S3 bucket {bucket}"),
+            },
             data_dir: self.bootstrap.data_dir.clone(),
             token_path: token_path(&self.bootstrap)
                 .map(|p| p.display().to_string())
@@ -307,15 +310,29 @@ impl Node {
                 audit_rx,
                 self.cancel.clone(),
             )));
+        let blobs = locus_blob::open_blob_store(
+            &self.store,
+            &self.master_key,
+            &self.settings.current(),
+            &env,
+            &self.bootstrap.data_dir,
+        )
+        .await?;
+        tracing::info!(backend = blobs.name(), "blob store opened");
+        let gate_settings = self.settings.clone();
         let state = Arc::new(AppState {
-            repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id))),
+            repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id)))
+                .with_media_gate(move || {
+                    locus_http::media_gate::gate_on_in(&gate_settings.current())
+                }),
             store: self.store.clone(),
             settings: self.settings.clone(),
             master_key: self.master_key.clone(),
             secrets,
             sessions,
             mailer,
-            blobs: locus_blob::DiskStore::new(self.bootstrap.data_dir.clone()),
+            blobs,
+            scratch: locus_blob::DiskStore::new(self.bootstrap.data_dir.clone()),
             firehose,
             hostname,
             public_url,
@@ -640,11 +657,19 @@ impl Node {
     }
 
     /// Blob upkeep, each on one node at a time: finishing moves a crash or
-    /// failure left, deleting queued keys after their grace period, and GC
-    /// of never-referenced temp blobs and long-unreferenced ones.
+    /// failure left, moving blobs into or out of the gated store and
+    /// quarantine (the gate switched, or a move that never started),
+    /// deleting queued keys after their grace period, and GC of
+    /// never-referenced temp blobs and long-unreferenced ones.
     fn spawn_blob_jobs(&mut self, state: Arc<AppState>) {
         const EVERY: Duration = Duration::from_secs(60);
-        for name in ["blob-moves", "blob-deletes", "blob-gc", "blob-rescan"] {
+        for name in [
+            "blob-moves",
+            "blob-placement",
+            "blob-deletes",
+            "blob-gc",
+            "blob-rescan",
+        ] {
             let state = Arc::clone(&state);
             self.tasks
                 .push(tokio::spawn(locus_store::runtime::run_leased(
@@ -662,6 +687,14 @@ impl Node {
                                     "blob-moves" => locus_blob::run_pending_moves(
                                         &state.store,
                                         &state.blobs,
+                                        500,
+                                    )
+                                    .await
+                                    .map(|n| n as u64),
+                                    "blob-placement" => locus_blob::run_placement(
+                                        &state.store,
+                                        &state.blobs,
+                                        locus_http::media_gate::gate_on_in(&snap),
                                         500,
                                     )
                                     .await

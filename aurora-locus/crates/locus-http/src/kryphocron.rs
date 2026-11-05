@@ -358,6 +358,7 @@ async fn scan_private_media(
                 s.store.quarantine_match(did, &cid).await?;
                 crate::scanner::record_match(s, did, &cid, "commit", &result, reason.as_deref())
                     .await?;
+                crate::repo::place_blob(s, did, &cid).await;
                 return Err(XrpcError::named(
                     "BlobNotFound",
                     format!("Could not find blob: {cid}"),

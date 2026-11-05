@@ -120,6 +120,32 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
+/// The blob store tests use: disk under the test's directory, or, with
+/// `LOCUS_TEST_S3_ENDPOINT` set, the S3-compatible service there
+/// (`LOCUS_TEST_S3_BUCKET`, default `locus-test`, and
+/// `LOCUS_TEST_S3_GATED_BUCKET` if gated blobs get a bucket of their own;
+/// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` sign in). Every key is
+/// unique, so tests can share a bucket.
+fn test_blob_store(dir: &std::path::Path) -> locus_blob::BlobStore {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let Some(endpoint) = var("LOCUS_TEST_S3_ENDPOINT") else {
+        return locus_blob::BlobStore::Disk(locus_blob::DiskStore::new(dir.join("blobs")));
+    };
+    let config = locus_blob::S3Config {
+        bucket: var("LOCUS_TEST_S3_BUCKET").unwrap_or_else(|| "locus-test".into()),
+        gated_bucket: var("LOCUS_TEST_S3_GATED_BUCKET"),
+        region: None,
+        endpoint: Some(endpoint),
+        force_path_style: true,
+        access_key_id: var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
+        secret_access_key: var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+        session_token: None,
+        upload_timeout: std::time::Duration::from_secs(30),
+        request_timeout: None,
+    };
+    locus_blob::BlobStore::S3(locus_blob::S3Store::new(&config).unwrap())
+}
+
 async fn harness(invite_required: bool) -> Harness {
     harness_with(invite_required, true).await
 }
@@ -182,15 +208,18 @@ async fn harness_build(
         audit_rx,
         tokio_util::sync::CancellationToken::new(),
     ));
+    let gate_settings = Arc::clone(&settings);
     let state = Arc::new(AppState {
-        repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0))),
+        repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0)))
+            .with_media_gate(move || crate::media_gate::gate_on_in(&gate_settings.current())),
         store,
         settings,
         master_key,
         secrets,
         sessions,
         mailer,
-        blobs: locus_blob::DiskStore::new(dir.path().join("blobs")),
+        blobs: test_blob_store(dir.path()),
+        scratch: locus_blob::DiskStore::new(dir.path()),
         firehose,
         public_url: format!("https://{hostname}"),
         hostname,
@@ -1805,6 +1834,8 @@ async fn accounts_earn_invite_codes_on_an_interval() {
         .await;
     assert_eq!(st, StatusCode::OK, "{acct}");
     let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    // One code a millisecond: let more than five intervals pass.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let list = |used: bool| {
         let access = access.clone();
         let h = &h;
@@ -2367,7 +2398,7 @@ async fn blobs_upload_get_referenced_promoted_served_and_collected() {
     assert!(
         h.state
             .blobs
-            .open(&row.storage_key)
+            .read(&row.storage_key, None)
             .await
             .unwrap()
             .is_none()
@@ -7621,6 +7652,19 @@ async fn uploads_are_scanned_and_matches_quarantined_for_review() {
     );
     let row = h.state.store.blob(&did, &bad_cid).await.unwrap().unwrap();
     assert_eq!((row.state.as_str(), row.review_hold), ("quarantined", true));
+    assert!(
+        row.storage_key
+            .starts_with(&format!("quarantine/{did}/{bad_cid}.")),
+        "preserved in quarantine: {row:?}"
+    );
+    assert!(
+        h.state
+            .blobs
+            .size(&row.storage_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let reviews = h.state.store.reviews("open", 10).await.unwrap();
     assert_eq!(
         (
@@ -7707,6 +7751,18 @@ async fn uploads_are_scanned_and_matches_quarantined_for_review() {
         "quarantined"
     );
     assert_eq!(h.state.store.reviews("open", 10).await.unwrap().len(), 2);
+    let row = h.state.store.blob(&did, &bad2_cid).await.unwrap().unwrap();
+    assert!(row.storage_key.starts_with("quarantine/"), "{row:?}");
+    // Cleared as a false positive: out of quarantine (back to temp, as
+    // nothing references it).
+    h.state
+        .store
+        .release_quarantined_blob(&did, &bad2_cid)
+        .await
+        .unwrap();
+    crate::repo::place_blob(&h.state, &did, &bad2_cid).await;
+    let row = h.state.store.blob(&did, &bad2_cid).await.unwrap().unwrap();
+    assert!(row.storage_key.starts_with("tmp/"), "{row:?}");
 
     // An operator resolves a review once.
     let id = h.state.store.reviews("open", 10).await.unwrap()[0].id;
@@ -7782,11 +7838,54 @@ async fn gated_private_media_is_served_only_to_the_audience() {
     // Gate off (the default): served by CID like any blob.
     assert_eq!(get(None, path.clone()).await.0, StatusCode::OK);
 
+    let key_of = |cid: String| {
+        let h = &h;
+        let owner = owner.clone();
+        async move {
+            let r = h.state.store.blob(&owner, &cid).await.unwrap().unwrap();
+            assert!(r.pending_move.is_none(), "{r:?}");
+            r.storage_key
+        }
+    };
+    assert!(
+        key_of(cid.clone()).await.starts_with("blobs/"),
+        "gate off: the normal store"
+    );
+
     h.state
         .settings
         .set("kryphocron.private_media_gated", json!(true), "test")
         .await
         .unwrap();
+    // Switching the gate on moves private-only bytes to the gated store.
+    assert_eq!(
+        locus_blob::run_placement(&h.state.store, &h.state.blobs, true, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        key_of(cid.clone())
+            .await
+            .starts_with(&format!("gated/{owner}/{cid}."))
+    );
+    assert_eq!(
+        locus_blob::run_placement(&h.state.store, &h.state.blobs, true, 100)
+            .await
+            .unwrap(),
+        0,
+        "nothing left to move"
+    );
+    // With the gate on, new private media goes straight there.
+    let img2 = h
+        .upload(&owner_access, b"\x89PNG another private one", "image/png")
+        .await;
+    let cid2 = img2["ref"]["$link"].as_str().unwrap().to_owned();
+    let mut rec = private_post("another", &audience);
+    rec["embed"] = json!({"$type": "tools.kryphocron.feed.postPublic#embedImage", "images": [{"image": img2, "alt": ""}]});
+    let (st, v) = h.private_post_as(&owner, &owner_access, rec).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(key_of(cid2.clone()).await.starts_with("gated/"));
     let (st, headers, body) = get(None, path.clone()).await;
     let (mst, mheaders, mbody) = get(None, missing.clone()).await;
     assert_eq!((st, &body), (mst, &mbody), "identical to a missing blob");
@@ -7882,12 +7981,40 @@ async fn gated_private_media_is_served_only_to_the_audience() {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(!h.state.store.blob_private_only(&owner, &cid).await.unwrap());
+    assert!(
+        key_of(cid.clone()).await.starts_with("blobs/"),
+        "public: out of the gated store"
+    );
     let (st, headers, _) = get(None, path.clone()).await;
     assert_eq!(st, StatusCode::OK);
     assert!(
         headers
             .get("cache-control")
             .is_none_or(|v| v != "private, no-store")
+    );
+
+    // Switching the gate off moves gated bytes back to the normal store.
+    h.state
+        .settings
+        .set("kryphocron.private_media_gated", json!(false), "test")
+        .await
+        .unwrap();
+    assert!(key_of(cid2.clone()).await.starts_with("gated/"));
+    assert_eq!(
+        locus_blob::run_placement(&h.state.store, &h.state.blobs, false, 100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(key_of(cid2.clone()).await.starts_with("blobs/"));
+    let (st, _, body) = get(
+        None,
+        format!("/xrpc/com.atproto.sync.getBlob?did={owner}&cid={cid2}"),
+    )
+    .await;
+    assert_eq!(
+        (st, body.as_slice()),
+        (StatusCode::OK, &b"\x89PNG another private one"[..])
     );
 }
 
@@ -8098,6 +8225,34 @@ async fn the_admin_api_checks_roles_and_takes_subjects_down() {
         ))
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "taken down");
+    // Its bytes moved to quarantine, and the old copy is queued.
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    assert!(
+        row.storage_key
+            .starts_with(&format!("quarantine/{did}/{cid}."))
+            && row.pending_move.is_none(),
+        "{row:?}"
+    );
+    assert_eq!(
+        h.state.blobs.size(&row.storage_key).await.unwrap(),
+        Some(10)
+    );
+    // Reversed: back out of quarantine, served again.
+    let subject = json!({"subject": {"$type": "com.atproto.admin.defs#repoBlobRef", "did": did, "cid": cid}, "takedown": {"applied": false}});
+    assert_eq!(
+        h.admin_call("POST", update, &moderator, Some(subject))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    assert!(row.storage_key.starts_with("tmp/"), "{row:?}");
+    let (st, _, body) = h
+        .raw_get(format!(
+            "/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"
+        ))
+        .await;
+    assert_eq!((st, body.as_slice()), (StatusCode::OK, &b"some bytes"[..]));
 
     // Credentials need admin.
     let pw = json!({"did": did, "password": "new-password"});

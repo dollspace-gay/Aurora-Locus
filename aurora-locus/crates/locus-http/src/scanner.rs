@@ -42,15 +42,15 @@ pub async fn scan_key(s: &AppState, did: &str, cid: &str, mime: &str, storage_ke
     if url.is_empty() {
         return Scan::Unavailable("no scanner URL".into());
     }
-    let file = match s.blobs.open(storage_key).await {
-        Ok(Some(f)) => f,
+    let file = match s.blobs.read(storage_key, None).await {
+        Ok(Some(r)) => r.body,
         Ok(None) => return Scan::Unavailable("the bytes are missing".into()),
         Err(e) => return Scan::Unavailable(e.to_string()),
     };
     let Ok(client) = crate::pipethrough::client(s, false) else {
         return Scan::Unavailable("no client".into());
     };
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let body = reqwest::Body::wrap_stream(file);
     let res = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, mime)
@@ -113,6 +113,7 @@ pub async fn rescan_pass(s: &AppState) -> locus_core::CoreResult<u64> {
             Scan::Matched { result, reason } => {
                 s.store.quarantine_match(&b.did, &b.cid).await?;
                 record_match(s, &b.did, &b.cid, "rescan", &result, reason.as_deref()).await?;
+                crate::repo::place_blob(s, &b.did, &b.cid).await;
             }
             Scan::NotConfigured | Scan::Unavailable(_) => break,
         }

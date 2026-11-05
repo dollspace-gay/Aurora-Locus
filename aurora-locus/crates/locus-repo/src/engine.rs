@@ -172,6 +172,9 @@ pub struct RepoEngine {
     store: Store,
     tids: Arc<TidClock>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Whether the private media gate is in effect, so private-only blobs
+    /// go to the gated store.
+    media_gate: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 fn cid_str(c: &Cid) -> String {
@@ -211,7 +214,21 @@ impl RepoEngine {
             store,
             tids,
             locks: Mutex::new(HashMap::new()),
+            media_gate: Arc::new(|| false),
         }
+    }
+
+    /// Reads whether the private media gate is in effect from `gate`.
+    #[must_use]
+    pub fn with_media_gate(mut self, gate: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.media_gate = Arc::new(gate);
+        self
+    }
+
+    /// Whether the private media gate is in effect.
+    #[must_use]
+    pub fn media_gate_on(&self) -> bool {
+        (self.media_gate)()
     }
 
     pub fn tids(&self) -> &TidClock {
@@ -707,7 +724,8 @@ impl RepoEngine {
             .await?;
         tx.apply_record_changes(did, &rev, &record_changes).await?;
         index_private(&mut tx, did, &writes).await?;
-        let moves = apply_references(&mut tx, did, &writes, &paths).await?;
+        let gate_on = self.media_gate_on();
+        let moves = apply_references(&mut tx, did, &writes, &paths, gate_on).await?;
         tx.set_repo_root(
             did,
             &RepoRoot {
@@ -747,6 +765,7 @@ async fn apply_references(
     did: &str,
     writes: &[PreparedWrite],
     paths: &[(String, String)],
+    gate_on: bool,
 ) -> Result<Vec<PendingMove>, CommitError> {
     // Each path's final write (None: deleted).
     let mut last: BTreeMap<(String, String), Option<&PreparedWrite>> = BTreeMap::new();
@@ -848,8 +867,14 @@ async fn apply_references(
         // Whether each touched blob is private-only (the media gate reads
         // the row, so it applies from this commit).
         let touched: BTreeSet<&String> = named.keys().chain(old.values().flatten()).collect();
+        // Then each goes to the store that calls for (gated, or back out),
+        // superseding a promotion's move.
         for cid in touched {
             tx.recompute_private_only(did, cid).await?;
+            if let Some(m) = tx.place_blob(did, cid, gate_on, backend.epoch).await? {
+                moves.retain(|p| p.cid != m.cid);
+                moves.push(m);
+            }
         }
     }
     for (path, w) in &last {

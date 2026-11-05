@@ -18,7 +18,12 @@ use crate::state::AppState;
 /// without one.
 #[must_use]
 pub fn gate_on(s: &AppState) -> bool {
-    let snap = s.snapshot();
+    gate_on_in(&s.snapshot())
+}
+
+/// `gate_on` for a settings snapshot.
+#[must_use]
+pub fn gate_on_in(snap: &locus_core::settings::Snapshot) -> bool {
     snap.bool("kryphocron.private_media_gated") && snap.text("blobs.scanner") != "none"
 }
 

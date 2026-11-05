@@ -186,23 +186,31 @@ impl Store {
         Ok(())
     }
 
+    /// Records an upload whose bytes are at `a.storage_key`, drawing its
+    /// key sequence value after the backend read, as blob rows do.
     pub async fn put_branding_asset(&self, a: &AssetRow) -> CoreResult<()> {
+        let mut tx = self.begin().await?;
+        tx.blob_backend().await?;
+        let seq = tx.next_key_seq().await?;
         let q = sql(
             &format!(
-                "INSERT INTO branding_asset ({ASSET_COLS}) VALUES ({{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {{6}}, {{now}}, {{now}})"
+                "INSERT INTO branding_asset ({ASSET_COLS}, key_seq) \
+                 VALUES ({{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {{6}}, {{now}}, {{now}}, {{7}})"
             ),
             self.is_postgres(),
         );
-        exec!(
-            self,
+        tx_exec!(
+            &mut tx,
             q,
             &a.id,
             &a.kind,
             &a.name,
             &a.mime,
             a.size,
-            &a.storage_key
+            &a.storage_key,
+            seq
         )?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -224,12 +232,14 @@ impl Store {
     pub async fn collect_branding_assets(&self, grace_ms: i64) -> CoreResult<u64> {
         let mut tx = self.begin().await?;
         let pg = matches!(tx, Tx::Postgres(_));
+        // The backend first, before any row is read, as every transaction
+        // that names a storage key.
+        let epoch = tx.blob_backend().await?.epoch;
         let q = sql(
             "SELECT id, storage_key FROM branding_asset WHERE unused_since IS NOT NULL AND unused_since < {now} - {1}",
             pg,
         );
         let gone: Vec<(String, String)> = tx_run!(&mut tx, q, fetch_all, grace_ms)?;
-        let epoch = tx.blob_backend().await?.epoch;
         for (id, key) in &gone {
             let q = sql("DELETE FROM branding_asset WHERE id = {1}", pg);
             tx_exec!(&mut tx, q, id)?;

@@ -460,11 +460,24 @@ kryphocron built in.
   own network and locus published on localhost only, a Caddy image with
   DNS provider modules, an installer for a fresh server, a hardened
   systemd unit, and notes for Caddy, nginx, Traefik and HAProxy.
+- S3-compatible blob storage (AWS, R2, B2 and similar, with a custom
+  endpoint and path-style addressing) from the reference's
+  `PDS_BLOBSTORE_S3_*` variables, with an optional separate bucket for
+  gated media. A new install with a bucket configured stores its blobs
+  there; large uploads go up in parts and appear only once complete.
+- Blob bytes follow their state: private-only media moves to the gated
+  store while the media gate is on (and back when it's switched off or a
+  public record uses it), and taken-down or scanner-matched blobs move to
+  quarantine (and back when the takedown is reversed or the match cleared).
+  A background job catches any move a crash or a gate switch left.
 
 ### Changed
 
 - A leased job stops when a renewal hasn't answered before its lease could
   run out, so a slow database can't leave two nodes running it at once.
+- Blobs uploaded after an import whose records already use them, and blobs
+  an import brings in, are now checked for being private-only.
+- The blob delete job skips keys a branding upload still uses.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.

@@ -319,6 +319,7 @@ pub async fn resolve_review(
         s.store
             .release_quarantined_blob(&review.did, &review.cid)
             .await?;
+        crate::repo::place_blob(&s, &review.did, &review.cid).await;
     }
     admin_auth::audit(
         &s,

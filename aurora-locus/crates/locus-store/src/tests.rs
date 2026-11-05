@@ -1572,6 +1572,131 @@ async fn private_only_blobs_on_both_backends() {
 }
 
 #[tokio::test]
+async fn blob_placement_on_both_backends() {
+    use crate::blob::Place;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        // An install that has stored nothing can adopt another backend.
+        assert!(s.adopt_blob_backend_if_empty("s3").await.unwrap(), "{n}");
+        assert_eq!(s.blob_backend().await.unwrap().active, "s3", "{n}");
+        assert!(s.adopt_blob_backend_if_empty("disk").await.unwrap(), "{n}");
+
+        let (did, cid) = ("did:plc:a", "bafyimg");
+        let finish = |to: String| async move {
+            let mut tx = s.begin().await.unwrap();
+            assert!(tx.finish_blob_move(did, cid, &to, 1).await.unwrap());
+            tx.commit().await.unwrap();
+        };
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob(did, cid, "image/png", 10, "tmp/x")
+            .await
+            .unwrap();
+        let promoted = crate::blob::permanent_key(did, cid);
+        tx.reference_blob(did, cid, &promoted, 1).await.unwrap();
+        tx.replace_record_blobs(
+            did,
+            "tools.kryphocron.feed.postPrivate",
+            "3m6p",
+            &[cid.into()],
+        )
+        .await
+        .unwrap();
+        tx.recompute_private_only(did, cid).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !s.adopt_blob_backend_if_empty("s3").await.unwrap(),
+            "{n}: not empty"
+        );
+        // The promotion is in flight: not picked up by the pass.
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        finish(promoted).await;
+
+        // Private-only and in the normal store: misplaced only with the gate on.
+        assert!(
+            s.misplaced_blobs(false, 10).await.unwrap().is_empty(),
+            "{n}"
+        );
+        assert_eq!(
+            s.misplaced_blobs(true, 10).await.unwrap(),
+            [(did.to_owned(), cid.to_owned())],
+            "{n}"
+        );
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.place_blob(did, cid, false, 1).await.unwrap().is_none(),
+            "{n}"
+        );
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(
+            m.from.starts_with("blobs/") && m.to.starts_with("gated/did:plc:a/bafyimg."),
+            "{n}"
+        );
+        assert!(
+            tx.place_blob(did, cid, true, 1).await.unwrap().is_none(),
+            "{n}: already heading there"
+        );
+        tx.commit().await.unwrap();
+        let old = m.from.clone();
+        finish(m.to).await;
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        assert!(!s.blob_key_in_use(&old).await.unwrap(), "{n}");
+        // The gate off: out of the gated store again.
+        assert_eq!(s.misplaced_blobs(false, 10).await.unwrap().len(), 1, "{n}");
+
+        // A takedown wins over the gate: quarantine, and back on reversal.
+        assert!(s.set_blob_takedown(did, cid, Some("t1")).await.unwrap());
+        assert_eq!(s.misplaced_blobs(true, 10).await.unwrap().len(), 1, "{n}");
+        let mut tx = s.begin().await.unwrap();
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(m.to.starts_with("quarantine/did:plc:a/bafyimg."), "{n}");
+        tx.commit().await.unwrap();
+        finish(m.to).await;
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        assert!(s.set_blob_takedown(did, cid, None).await.unwrap());
+        let mut tx = s.begin().await.unwrap();
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(
+            m.from.starts_with("quarantine/") && m.to.starts_with("gated/"),
+            "{n}"
+        );
+        tx.commit().await.unwrap();
+
+        // Branding uploads draw a key sequence value, and their keys count
+        // as in use.
+        s.put_branding_asset(&crate::branding::AssetRow {
+            id: "a1".into(),
+            kind: "logo".into(),
+            name: "logo.png".into(),
+            mime: "image/png".into(),
+            size: 3,
+            storage_key: "branding/a1.0".into(),
+            created_at: 0,
+            unused_since: None,
+        })
+        .await
+        .unwrap();
+        assert!(s.blob_key_in_use("branding/a1.0").await.unwrap(), "{n}");
+        assert!(!s.blob_key_in_use("branding/a2.0").await.unwrap(), "{n}");
+    }
+    // The rules themselves.
+    assert_eq!(Place::of("permanent", true, true, true), Place::Quarantine);
+    assert_eq!(
+        Place::of("quarantined", false, false, false),
+        Place::Quarantine
+    );
+    assert_eq!(Place::of("temp", false, true, true), Place::Temp);
+    assert_eq!(Place::of("permanent", false, true, true), Place::Gated);
+    assert_eq!(Place::of("permanent", false, true, false), Place::Normal);
+    assert!(
+        Place::Normal.holds("blocks/did:plc:a/bafy"),
+        "imported in place"
+    );
+    assert!(!Place::Normal.holds("tmp/x") && Place::Temp.holds("tmp/x"));
+    assert!(!Place::Temp.holds("quarantine/x") && !Place::Gated.holds("blobs/x"));
+}
+
+#[tokio::test]
 async fn operators_and_admin_queries_on_both_backends() {
     for b in backends().await {
         let s = &b.store;
