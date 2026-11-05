@@ -10,6 +10,7 @@
 pub mod assets;
 pub mod console;
 pub mod console_pages;
+pub mod portal;
 pub mod setup;
 pub mod theme;
 pub mod view;

@@ -18,6 +18,7 @@ pub mod kryphocron;
 pub mod lease;
 pub mod oauth;
 pub mod operators;
+pub mod portal;
 pub mod prefs;
 pub mod repo;
 pub mod runtime;

@@ -23,6 +23,7 @@ pub mod membership;
 pub mod oauth;
 pub mod oauth_ui;
 pub mod pipethrough;
+pub mod portal;
 pub mod ratelimit;
 pub mod raw;
 pub mod repo;
@@ -341,6 +342,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/oauth/authorize/select", post(oauth_ui::select))
         .route("/oauth/authorize/accept", post(oauth_ui::accept))
         .route("/oauth/authorize/reject", post(oauth_ui::reject))
+        .route("/oauth/authorize/sign-up", post(oauth_ui::sign_up))
+        .route(
+            "/oauth/authorize/show-sign-up",
+            post(oauth_ui::show_sign_up),
+        )
+        .route(
+            "/oauth/authorize/show-sign-in",
+            post(oauth_ui::show_sign_in),
+        )
         .route("/oauth/assets/style.css", get(oauth_ui::style))
         .route("/oauth/assets/form-post.js", get(oauth_ui::form_post_js))
         .route("/static/{*path}", get(web::asset))
@@ -388,6 +398,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(console::routes())
         .merge(console_people::routes())
         .merge(console_sections::routes())
+        .merge(portal::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(

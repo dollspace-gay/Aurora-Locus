@@ -172,6 +172,13 @@ impl LegacySessions {
         )
     }
 
+    /// A fresh access token for an existing session (the account portal
+    /// signs its own calls with one; it holds no refresh token).
+    #[must_use]
+    pub fn mint_access(&self, did: &str, scope: &str, session_id: &str) -> String {
+        self.access_jwt(did, scope, session_id, now_s())
+    }
+
     /// Opens a session. `store_refresh` is false for a taken-down account's
     /// login (it gets an access token only, as the reference).
     pub async fn create(

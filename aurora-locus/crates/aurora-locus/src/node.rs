@@ -462,9 +462,13 @@ impl Node {
                                 },
                                 e => e,
                             };
-                            // Console sign-ins past their end.
+                            // Console and portal sign-ins past their end.
                             let result = match result {
                                 Ok(t) => state.store.prune_operator_sessions().await.map(|n| t + n),
+                                e => e,
+                            };
+                            let result = match result {
+                                Ok(t) => state.store.prune_portal_sessions().await.map(|n| t + n),
                                 e => e,
                             };
                             if let Err(e) = &result {

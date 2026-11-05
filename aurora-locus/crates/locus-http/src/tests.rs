@@ -10094,3 +10094,520 @@ async fn every_console_page_renders_for_each_role_under_the_csp() {
         "signed out, no export"
     );
 }
+
+/// The last emailed code (`XXXXX-XXXXX`).
+fn last_code(h: &Harness) -> String {
+    let sent = h
+        .mail
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("an email was sent");
+    sent.email
+        .text
+        .split_whitespace()
+        .find(|w| w.len() == 11 && w.as_bytes()[5] == b'-')
+        .expect("a code in the email")
+        .to_owned()
+}
+
+async fn portal_sign_in(
+    h: &Harness,
+    b: &Browser,
+    id: &str,
+    pw: &str,
+    code: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let (_, _, page) = b.get(h, "/account/sign-in").await;
+    let csrf = hidden(&page, "csrf");
+    let mut form = vec![
+        ("csrf", csrf.as_str()),
+        ("identifier", id),
+        ("password", pw),
+    ];
+    if let Some(c) = code {
+        form.push(("code", c));
+    }
+    b.post(h, "/account/sign-in", &form).await
+}
+
+#[tokio::test]
+async fn the_account_portal_runs_on_the_account_api() {
+    let h = harness(false).await;
+    let b = Browser::default();
+    let (st, headers, _) = b.get(&h, "/account").await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/account/sign-in?next=%2Faccount")
+    );
+
+    // Sign up (the handle gets this server's domain), and land signed in.
+    let (_, _, page) = b.get(&h, "/account/sign-up").await;
+    assert!(
+        page.contains(".pds.example.com") && !page.contains("Invite code"),
+        "{page}"
+    );
+    let csrf = hidden(&page, "csrf");
+    let (st, headers, body) = b
+        .post(
+            &h,
+            "/account/sign-up",
+            &[
+                ("csrf", &csrf),
+                ("handle", "erin"),
+                ("email", "erin@example.com"),
+                ("password", "erins password"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+    assert_eq!(headers["location"], "/account");
+    let erin = h
+        .state
+        .store
+        .account_by_handle("erin.pds.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    let (st, _, page) = b.get(&h, "/account").await;
+    assert!(
+        st == StatusCode::OK
+            && page.contains("@erin.pds.example.com")
+            && page.contains("Your account"),
+        "{page}"
+    );
+    assert!(
+        page.contains("isn&#x27;t confirmed yet") || page.contains("confirmed yet"),
+        "the unconfirmed-email banner"
+    );
+    let csrf = hidden(&page, "csrf");
+
+    // Confirm the email with the code sent.
+    let (st, _, _) = b
+        .post(&h, "/account/email/send-confirm", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let code = last_code(&h);
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/account/email/confirm",
+            &[("csrf", &csrf), ("code", &code)],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/account/email?done=confirmed")
+    );
+    assert!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_confirmed_at
+            .is_some()
+    );
+
+    // Sign-in codes: on at once (it only adds protection, as the
+    // reference); off needs a code from the inbox.
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/account/email/factor",
+            &[("csrf", &csrf), ("factor", "on")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_auth_factor_at
+            .is_some()
+    );
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/account/email/factor",
+            &[("csrf", &csrf), ("factor", "off")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a code is needed: {page}");
+    let code = last_code(&h);
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/account/email/factor",
+            &[("csrf", &csrf), ("factor", "off"), ("code", &code)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_auth_factor_at
+            .is_none()
+    );
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/account/email/factor",
+            &[("csrf", &csrf), ("factor", "on")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+
+    // An app password works for apps, not for the portal.
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/account/app-passwords/create",
+            &[("csrf", &csrf), ("name", "phone"), ("privileged", "no")],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("New app password: phone"),
+        "{page}"
+    );
+    let app_pw = page
+        .split("Copy it now")
+        .nth(1)
+        .unwrap()
+        .split("<span class=\"v\">")
+        .nth(1)
+        .unwrap()
+        .split('<')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(app_pw.len(), 19, "{app_pw}");
+
+    // Sign out; signing back in needs the emailed code too.
+    let (st, _, _) = b.post(&h, "/account/sign-out", &[("csrf", &csrf)]).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(b.get(&h, "/account").await.0, StatusCode::SEE_OTHER);
+    let (st, _, page) =
+        portal_sign_in(&h, &b, "erin.pds.example.com", "erins password", None).await;
+    assert!(
+        st == StatusCode::OK && page.contains("emailed you a sign-in code"),
+        "{page}"
+    );
+    let code = last_code(&h);
+    // App passwords skip the code (as the reference), and are refused here.
+    let (st, _, page) = portal_sign_in(&h, &b, "erin.pds.example.com", &app_pw, None).await;
+    assert!(
+        st == StatusCode::UNAUTHORIZED && page.contains("not an app password"),
+        "{page}"
+    );
+    let (st, headers, body) = portal_sign_in(
+        &h,
+        &b,
+        "erin.pds.example.com",
+        "erins password",
+        Some(&code),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::SEE_OTHER,
+        "{}",
+        body.split("role=\"alert\">").nth(1).unwrap_or(&body)
+    );
+    assert_eq!(headers["location"], "/account");
+    let csrf = hidden(&b.get(&h, "/account").await.2, "csrf");
+
+    // Handle, export, deactivation.
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/account/handle",
+            &[("csrf", &csrf), ("handle", "erin2")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "erin2.pds.example.com"
+    );
+    let cookie = b.cookie_header();
+    let (st, headers, car) = h
+        .raw(
+            "GET",
+            "/account/export/repo.car",
+            None,
+            vec![],
+            &[("cookie", &cookie)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/vnd.ipld.car");
+    assert!(
+        headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("erin2.pds.example.com.car")
+    );
+    assert!(!car.is_empty());
+    let (st, _, page) = b.get(&h, "/account/apps").await;
+    assert!(
+        st == StatusCode::OK && page.contains("No app is signed in"),
+        "{page}"
+    );
+    b.post(&h, "/account/deactivate", &[("csrf", &csrf), ("to", "off")])
+        .await;
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        locus_store::accounts::Status::Deactivated
+    );
+    b.post(&h, "/account/deactivate", &[("csrf", &csrf), ("to", "on")])
+        .await;
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&erin.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        locus_store::accounts::Status::Active
+    );
+
+    // A password reset ends this sign-in (its session is revoked).
+    b.post(&h, "/account/password/send", &[("csrf", &csrf)])
+        .await;
+    let code = last_code(&h);
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/account/password/reset",
+            &[
+                ("csrf", &csrf),
+                ("code", &code),
+                ("password", "a new password"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/account/sign-in?done=password")
+    );
+    assert_eq!(b.get(&h, "/account").await.0, StatusCode::SEE_OTHER);
+    // A stolen portal cookie dies with its session too.
+    let other = Browser::default();
+    let (_, _, _) =
+        portal_sign_in(&h, &other, "erin2.pds.example.com", "a new password", None).await;
+    let code = last_code(&h);
+    let (st, _, _) = portal_sign_in(
+        &h,
+        &other,
+        "erin2.pds.example.com",
+        "a new password",
+        Some(&code),
+    )
+    .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(other.get(&h, "/account").await.0, StatusCode::OK);
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.revoke_sessions(&erin.did, locus_store::accounts::SessionFilter::All)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(other.get(&h, "/account").await.0, StatusCode::SEE_OTHER);
+
+    // The switch: off, the portal isn't there.
+    h.state
+        .store
+        .set_setting("portal.enabled", json!(false), "test")
+        .await
+        .unwrap();
+    h.state.settings.refresh().await.unwrap();
+    for path in [
+        "/account",
+        "/account/sign-in",
+        "/account/sign-up",
+        "/account/email",
+    ] {
+        assert_eq!(b.get(&h, path).await.0, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_portal_deletes_an_account_with_its_code() {
+    let h = harness(false).await;
+    h.create_account("finn.pds.example.com", "finn@example.com", "finns password")
+        .await;
+    let b = Browser::default();
+    let (st, _, _) = portal_sign_in(&h, &b, "finn@example.com", "finns password", None).await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "sign-in by email works too");
+    let csrf = hidden(&b.get(&h, "/account/delete").await.2, "csrf");
+    b.post(&h, "/account/delete/send", &[("csrf", &csrf)]).await;
+    let code = last_code(&h);
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/account/delete/confirm",
+            &[("csrf", &csrf), ("code", &code), ("password", "wrong")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{page}");
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/account/delete/confirm",
+            &[
+                ("csrf", &csrf),
+                ("code", &code),
+                ("password", "finns password"),
+            ],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("being deleted"),
+        "{page}"
+    );
+    assert_eq!(b.get(&h, "/account").await.0, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn oauth_prompt_create_signs_a_new_account_up_and_on_to_consent() {
+    const LB: &str = "http://localhost?scope=atproto+transition%3Ageneric";
+    let h = harness(true).await;
+    let client = DpopClient::new();
+    let par = |prompt: Option<&'static str>| {
+        let client = &client;
+        let h = &h;
+        async move {
+            let (_, challenge) = pkce();
+            let mut form = vec![
+                ("client_id", LB.to_owned()),
+                ("response_type", "code".to_owned()),
+                ("scope", "atproto transition:generic".to_owned()),
+                ("redirect_uri", "http://127.0.0.1/".to_owned()),
+                ("code_challenge", challenge),
+                ("code_challenge_method", "S256".to_owned()),
+            ];
+            if let Some(p) = prompt {
+                form.push(("prompt", p.to_owned()));
+            }
+            let f: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (_, _, v) = client.post(h, "/oauth/par", &f).await;
+            format!(
+                "/oauth/authorize?client_id={}&request_uri={}",
+                url::form_urlencoded::byte_serialize(LB.as_bytes()).collect::<String>(),
+                url::form_urlencoded::byte_serialize(v["request_uri"].as_str().unwrap().as_bytes())
+                    .collect::<String>()
+            )
+        }
+    };
+    let b = Browser::default();
+    let (st, _, html) = b.get(&h, &par(Some("create")).await).await;
+    assert!(
+        st == StatusCode::OK
+            && html.contains("Create an account for")
+            && html.contains("Invite code"),
+        "{html}"
+    );
+    let (csrf, rid) = (hidden(&html, "csrf"), hidden(&html, "request_id"));
+
+    // Sign-ups need an invite here.
+    let (st, _, html) = b
+        .post(
+            &h,
+            "/oauth/authorize/sign-up",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &rid),
+                ("handle", "gale"),
+                ("email", "gale@example.com"),
+                ("password", "gales password"),
+            ],
+        )
+        .await;
+    assert!(
+        st.is_client_error() && html.contains("Create an account for"),
+        "{st} {html}"
+    );
+    let invite = {
+        let code = "pds-example-com-abcde-fghij";
+        let mut tx = h.state.store.begin().await.unwrap();
+        tx.insert_invite_code(code, 1, "admin", "admin")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        code
+    };
+    let (st, _, html) = b
+        .post(
+            &h,
+            "/oauth/authorize/sign-up",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &rid),
+                ("handle", "gale"),
+                ("email", "gale@example.com"),
+                ("password", "gales password"),
+                ("invite", invite),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{html}");
+    assert!(
+        html.contains("@gale.pds.example.com") || html.contains("gale.pds.example.com"),
+        "on to consent as the new account: {html}"
+    );
+    assert!(
+        h.state
+            .store
+            .account_by_handle("gale.pds.example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The sign-in page links to sign-up and back.
+    let b2 = Browser::default();
+    let (_, _, html) = b2.get(&h, &par(None).await).await;
+    assert!(
+        html.contains("Sign in to") && html.contains("/oauth/authorize/show-sign-up"),
+        "{html}"
+    );
+    let (csrf, rid) = (hidden(&html, "csrf"), hidden(&html, "request_id"));
+    let (_, _, html) = b2
+        .post(
+            &h,
+            "/oauth/authorize/show-sign-up",
+            &[("csrf", &csrf), ("request_id", &rid)],
+        )
+        .await;
+    assert!(html.contains("Create an account for"), "{html}");
+    let (_, _, html) = b2
+        .post(
+            &h,
+            "/oauth/authorize/show-sign-in",
+            &[("csrf", &csrf), ("request_id", &rid)],
+        )
+        .await;
+    assert!(html.contains("Sign in to"), "{html}");
+}

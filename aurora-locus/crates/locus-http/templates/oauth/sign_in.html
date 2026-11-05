@@ -43,6 +43,12 @@
 <button type="submit" class="primary">Sign in</button>
 </form>
 
+<form method="post" action="/oauth/authorize/show-sign-up">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<button type="submit" class="link">Create an account</button>
+</form>
+
 <form method="post" action="/oauth/authorize/reject">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="request_id" value="{{ request_id }}">

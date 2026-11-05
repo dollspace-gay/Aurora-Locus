@@ -58,6 +58,21 @@ struct SignInPage {
     remember: bool,
 }
 
+#[derive(Template)]
+#[template(path = "oauth/sign_up.html")]
+struct SignUpPage {
+    service_name: String,
+    client_name: String,
+    client_host: String,
+    error: String,
+    csrf: String,
+    request_id: String,
+    domains: String,
+    invite_required: bool,
+    handle: String,
+    email: String,
+}
+
 struct ScopeLine {
     value: String,
     label: String,
@@ -564,6 +579,111 @@ fn sign_in_page(
     with_cookies(page(html, StatusCode::OK, None), &c.set)
 }
 
+fn sign_up_page(
+    s: &AppState,
+    c: &Ctx,
+    error: &str,
+    handle: &str,
+    email: &str,
+    status: StatusCode,
+) -> Response {
+    let html = SignUpPage {
+        service_name: service_name(s),
+        client_name: client_name(&c.client),
+        client_host: client_host(&c.client),
+        error: error.to_owned(),
+        csrf: c.csrf.clone(),
+        request_id: c.request_id.clone(),
+        domains: s.handle_domains().join(" or "),
+        invite_required: s.snapshot().bool("accounts.invite_required"),
+        handle: handle.to_owned(),
+        email: email.to_owned(),
+    }
+    .render()
+    .unwrap_or_default();
+    with_cookies(page(html, status, None), &c.set)
+}
+
+/// `POST /oauth/authorize/show-sign-up` and `show-sign-in`: switch between
+/// the two forms of the same request.
+pub async fn show_sign_up(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let form = parse_form(&body);
+    match post_ctx(&s, &headers, &form).await {
+        Ok(c) => sign_up_page(&s, &c, "", "", "", StatusCode::OK),
+        Err(r) => r,
+    }
+}
+
+pub async fn show_sign_in(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let form = parse_form(&body);
+    match post_ctx(&s, &headers, &form).await {
+        Ok(c) => {
+            let accounts = device_accounts(&s, &c.device).await.unwrap_or_default();
+            sign_in_page(&s, &c, &accounts, "", "", "", false, true)
+        }
+        Err(r) => r,
+    }
+}
+
+/// `POST /oauth/authorize/sign-up` (`prompt=create`, or "Create an
+/// account"): `createAccount`, then on as a sign-in on this device.
+pub async fn sign_up(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let form = parse_form(&body);
+    let c = match post_ctx(&s, &headers, &form).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let handle = crate::portal::full_handle(&s, form_value(&form, "handle").unwrap_or(""));
+    let email = form_value(&form, "email").unwrap_or("").trim().to_owned();
+    let mut input = serde_json::json!({
+        "handle": handle,
+        "email": email,
+        "password": form_value(&form, "password").unwrap_or(""),
+    });
+    if let Some(code) = form_value(&form, "invite").filter(|v| !v.trim().is_empty()) {
+        input["inviteCode"] = serde_json::json!(code.trim());
+    }
+    let input = match serde_json::from_value(input) {
+        Ok(i) => i,
+        Err(e) => {
+            return sign_up_page(
+                &s,
+                &c,
+                &e.to_string(),
+                &handle,
+                &email,
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let created =
+        crate::server::create_account(State(Arc::clone(&s)), HeaderMap::new(), axum::Json(input))
+            .await;
+    let did = match created {
+        Ok(axum::Json(v)) => v["did"].as_str().unwrap_or_default().to_owned(),
+        Err(e) => return sign_up_page(&s, &c, &e.message, &handle, &email, e.status),
+    };
+    let Ok(Some(account)) = s.store.account_by_did(&did).await else {
+        return error_page(
+            &s,
+            "Internal Server Error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    };
+    if s.store
+        .oauth_touch_account_device(&account.did, &c.device)
+        .await
+        .is_err()
+    {
+        return error_page(
+            &s,
+            "Internal Server Error",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+    after_sign_in(&s, &c, &account, true).await
+}
+
 async fn consent_page(s: &AppState, c: &Ctx, account: &Account, remember: bool) -> Response {
     let sets = crate::lexicon::permission_sets(s, c.params.scope.as_deref())
         .await
@@ -749,6 +869,9 @@ pub async fn authorize_page(State(s): St, headers: HeaderMap, RawQuery(q): RawQu
             }
             _ => {}
         }
+    }
+    if prompt == Some("create") {
+        return sign_up_page(&s, &c, "", "", "", StatusCode::OK);
     }
     let identifier = hint.unwrap_or("").to_owned();
     sign_in_page(&s, &c, &accounts, "", "", &identifier, false, true)
