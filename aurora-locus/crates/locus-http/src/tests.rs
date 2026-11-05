@@ -7693,3 +7693,168 @@ async fn uploads_are_scanned_and_matches_quarantined_for_review() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn gated_private_media_is_served_only_to_the_audience() {
+    let h = harness(false).await;
+    let (owner, owner_access) = h.user("vic.pds.example.com").await;
+    let (member, member_access) = h.user("wes.pds.example.com").await;
+    let (stranger, stranger_access) = h.user("xan.pds.example.com").await;
+    h.with_prism().await;
+    let (url, _) = mock_scanner().await;
+    h.state
+        .settings
+        .set("blobs.scanner", json!("webhook"), "test")
+        .await
+        .unwrap();
+    h.state
+        .settings
+        .set("blobs.scanner_url", json!(url), "test")
+        .await
+        .unwrap();
+    let audience = h
+        .add_audience_with(&owner, "3m6aaaaaaaaaa", "list", &[&member])
+        .await;
+    for (did, access, rkey) in [
+        (&member, &member_access, "3m6mmmmmmmmmm"),
+        (&stranger, &stranger_access, "3m6ssssssssss"),
+    ] {
+        let own = h.add_audience(did, rkey).await;
+        assert_eq!(
+            h.private_post_as(did, access, private_post("x", &own))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    let img = h
+        .upload(&owner_access, b"\x89PNG a private picture", "image/png")
+        .await;
+    let cid = img["ref"]["$link"].as_str().unwrap().to_owned();
+    let mut rec = private_post("a picture", &audience);
+    rec["embed"] = json!({"$type": "tools.kryphocron.feed.postPublic#embedImage", "images": [{"image": img, "alt": ""}]});
+    let (st, v) = h.private_post_as(&owner, &owner_access, rec).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(h.state.store.blob_private_only(&owner, &cid).await.unwrap());
+
+    let path = format!("/xrpc/com.atproto.sync.getBlob?did={owner}&cid={cid}");
+    let missing = format!(
+        "/xrpc/com.atproto.sync.getBlob?did={owner}&cid={}",
+        proto_blue_lex_data::Cid::for_raw(b"never uploaded").to_string_base32()
+    );
+    let get = |auth: Option<String>, p: String| {
+        let h = &h;
+        async move { h.raw("GET", &p, auth.as_deref(), vec![], &[]).await }
+    };
+    // Gate off (the default): served by CID like any blob.
+    assert_eq!(get(None, path.clone()).await.0, StatusCode::OK);
+
+    h.state
+        .settings
+        .set("kryphocron.private_media_gated", json!(true), "test")
+        .await
+        .unwrap();
+    let (st, headers, body) = get(None, path.clone()).await;
+    let (mst, mheaders, mbody) = get(None, missing.clone()).await;
+    assert_eq!((st, &body), (mst, &mbody), "identical to a missing blob");
+    for h in [&headers, &mheaders] {
+        assert_eq!(h["cache-control"], "private, no-store");
+        assert_eq!(h["vary"], "Authorization");
+    }
+    assert_eq!(
+        get(Some(stranger_access.clone()), path.clone()).await.0,
+        StatusCode::BAD_REQUEST,
+        "not in the audience"
+    );
+    let (st, headers, body) = get(Some(member_access.clone()), path.clone()).await;
+    assert_eq!(
+        (st, body.as_slice()),
+        (StatusCode::OK, &b"\x89PNG a private picture"[..])
+    );
+    assert_eq!(headers["cache-control"], "private, no-store");
+    assert_eq!(
+        get(Some(owner_access.clone()), path.clone()).await.0,
+        StatusCode::OK
+    );
+
+    // A trusted service, with service auth; every fetch is audited.
+    h.state
+        .settings
+        .set(
+            "kryphocron.media_trusted_services",
+            json!([stranger]),
+            "test",
+        )
+        .await
+        .unwrap();
+    let (_, t) = h
+        .service_token(
+            &stranger_access,
+            &h.state.service_did,
+            "com.atproto.sync.getBlob",
+        )
+        .await;
+    assert_eq!(
+        get(Some(t["token"].as_str().unwrap().to_owned()), path.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        h.state
+            .store
+            .kr_audit(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.event == "media.trusted_fetch")
+    );
+    h.state
+        .settings
+        .set("kryphocron.media_trusted_services", json!([]), "test")
+        .await
+        .unwrap();
+
+    // listBlobs leaves it out, except for the owner.
+    let list = format!("/xrpc/com.atproto.sync.listBlobs?did={owner}");
+    let (_, anyone) = h.call("GET", &list, None, None).await;
+    assert!(
+        !anyone["cids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == &json!(cid)),
+        "{anyone}"
+    );
+    let (_, mine) = h.call("GET", &list, Some(&owner_access), None).await;
+    assert!(
+        mine["cids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == &json!(cid))
+    );
+
+    // A public record referencing it makes it public at once.
+    let mut public = post_record("now public");
+    public["embed"] =
+        json!({"$type": "app.bsky.embed.images", "images": [{"image": img, "alt": ""}]});
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&owner_access),
+            json!({"repo": owner, "collection": "app.bsky.feed.post", "record": public}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!h.state.store.blob_private_only(&owner, &cid).await.unwrap());
+    let (st, headers, _) = get(None, path.clone()).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        headers
+            .get("cache-control")
+            .is_none_or(|v| v != "private, no-store")
+    );
+}

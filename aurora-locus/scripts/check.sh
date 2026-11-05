@@ -7,6 +7,15 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
 export LOCUS_TEST_POSTGRES_URL="${LOCUS_TEST_POSTGRES_URL:-postgres://locus:locus@127.0.0.1:55491/locus}"
 
+# Each store test makes its own database; drop the ones earlier runs left.
+if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx locus-test-pg; then
+  docker exec locus-test-pg psql -U locus -d locus -tAc \
+    "SELECT datname FROM pg_database WHERE datname LIKE 'locus_test_%'" |
+    while read -r db; do
+      [ -n "$db" ] && docker exec locus-test-pg dropdb -U locus --if-exists "$db"
+    done
+fi
+
 cargo fmt --all
 cargo clippy --workspace --all-targets --quiet --message-format short -- -D warnings
 set +o pipefail

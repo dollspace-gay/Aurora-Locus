@@ -845,6 +845,12 @@ async fn apply_references(
         for cid in dropped {
             tx.orphan_blob_if_unreferenced(did, cid).await?;
         }
+        // Whether each touched blob is private-only (the media gate reads
+        // the row, so it applies from this commit).
+        let touched: BTreeSet<&String> = named.keys().chain(old.values().flatten()).collect();
+        for cid in touched {
+            tx.recompute_private_only(did, cid).await?;
+        }
     }
     for (path, w) in &last {
         let links = w.map(|w| w.backlinks.as_slice()).unwrap_or_default();

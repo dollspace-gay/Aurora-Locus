@@ -775,6 +775,20 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "When the scanner can't be reached: refuse uploads (retryable), or store them unscanned and scan them when it's back.",
     },
+    Def {
+        key: "kryphocron.private_media_gated",
+        kind: Kind::Bool,
+        default: "false",
+        env: None,
+        description: "Serve media only private posts use to their audience members and trusted services. Needs a scanner, and clients that fetch blobs with an Authorization header.",
+    },
+    Def {
+        key: "kryphocron.media_trusted_services",
+        kind: Kind::TextList { max_len: 2048 },
+        default: "[]",
+        env: None,
+        description: "Service DIDs (moderation, scanning, labeling) that may fetch gated media with service auth; every fetch is audited.",
+    },
 ];
 
 /// Looks up a setting definition.

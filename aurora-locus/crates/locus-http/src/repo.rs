@@ -972,8 +972,8 @@ pub async fn get_blob(
     State(s): St,
     headers: HeaderMap,
     Query(p): Query<GetBlobParams>,
-) -> XrpcResult<Response> {
-    serve_blob(&s, &headers, &p.did, &p.cid).await
+) -> Response {
+    gated_blob(&s, &headers, &p.did, &p.cid).await
 }
 
 /// The `/blob/<did>/<cid>` alias.
@@ -981,15 +981,35 @@ pub async fn get_blob_path(
     State(s): St,
     headers: HeaderMap,
     Path((did, cid)): Path<(String, String)>,
-) -> XrpcResult<Response> {
-    serve_blob(&s, &headers, &did, &cid).await
+) -> Response {
+    gated_blob(&s, &headers, &did, &cid).await
 }
 
+/// A blob response, through the media gate: while it's on, a private-only
+/// blob goes only to those who may read it, and its responses and every
+/// refusal (missing blobs included) are private and never cached.
+async fn gated_blob(s: &Arc<AppState>, headers: &HeaderMap, did: &str, cid: &str) -> Response {
+    let gate = crate::media_gate::gate_on(s);
+    let mut res = match serve_blob(s, headers, did, cid, gate).await {
+        Ok(r) => r,
+        Err(e) => e.into_response(),
+    };
+    if gate && (res.extensions().get::<GatedBlob>().is_some() || !res.status().is_success()) {
+        crate::media_gate::no_store(&mut res);
+    }
+    res
+}
+
+/// Marks a response as a gated blob's.
+#[derive(Debug, Clone, Copy)]
+struct GatedBlob;
+
 async fn serve_blob(
-    s: &AppState,
+    s: &Arc<AppState>,
     headers: &HeaderMap,
     did: &str,
     cid: &str,
+    gate: bool,
 ) -> XrpcResult<Response> {
     let account = s
         .store
@@ -1013,6 +1033,14 @@ async fn serve_blob(
     let row = s.store.blob(did, cid).await?.ok_or_else(not_found)?;
     if row.takedown_ref.is_some() || row.state == "quarantined" {
         return Err(not_found());
+    }
+    let gated = gate && s.store.blob_private_only(did, cid).await?;
+    if gated && !owner {
+        let reader = crate::media_gate::reader(s, headers, "com.atproto.sync.getBlob").await;
+        if !crate::media_gate::may_read(s, &reader, did, cid).await? {
+            // The same answer as for a missing blob.
+            return Err(not_found());
+        }
     }
     let mut file = s
         .blobs
@@ -1063,6 +1091,9 @@ async fn serve_blob(
             header::CONTENT_RANGE,
             hv(&format!("bytes {start}-{end}/{size}")),
         );
+    }
+    if gated {
+        res.extensions_mut().insert(GatedBlob);
     }
     Ok(res.into_response())
 }

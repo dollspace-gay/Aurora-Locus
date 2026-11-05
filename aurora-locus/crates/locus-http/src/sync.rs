@@ -481,12 +481,30 @@ pub async fn list_blobs(
             "limit must be between 1 and 1000",
         ));
     }
-    let cids = s
+    let mut cids = s
         .store
         .list_blob_cids(&p.did, p.since.as_deref(), p.cursor.as_deref(), limit)
         .await?;
+    let cursor = cids.last().cloned();
+    // While the media gate is on, private-only blobs are listed only to the
+    // owner and trusted services.
+    if crate::media_gate::gate_on(&s) {
+        use crate::media_gate::Reader;
+        let reader = crate::media_gate::reader(&s, &headers, "com.atproto.sync.listBlobs").await;
+        let sees_all = matches!(&reader, Reader::Trusted(_))
+            || matches!(&reader, Reader::Account(d) if *d == p.did);
+        if !sees_all {
+            let mut visible = Vec::with_capacity(cids.len());
+            for c in cids {
+                if !s.store.blob_private_only(&p.did, &c).await? {
+                    visible.push(c);
+                }
+            }
+            cids = visible;
+        }
+    }
     let mut out = json!({ "cids": cids });
-    if let Some(last) = cids.last() {
+    if let Some(last) = cursor {
         out["cursor"] = json!(last);
     }
     Ok(Json(out))

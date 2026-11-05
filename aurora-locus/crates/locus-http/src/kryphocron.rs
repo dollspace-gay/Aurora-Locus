@@ -324,7 +324,51 @@ pub(crate) async fn prepare_write(
             .prepare_post(&s.kr.audit, did, rkey, map, &validate)
             .await
             .map_err(pipeline_error)?;
+    scan_private_media(s, did, &out).await?;
     Ok(Some(LexValue::Map(out)))
+}
+
+/// With the media gate on, a private post can't take a blob that hasn't
+/// passed a scan: it's scanned now, before the commit (no private media
+/// without a scanner; a scanner that can't answer is a retryable error).
+async fn scan_private_media(
+    s: &Arc<AppState>,
+    did: &str,
+    record: &BTreeMap<String, LexValue>,
+) -> XrpcResult<()> {
+    use crate::scanner::Scan;
+    if !crate::media_gate::gate_on(s) {
+        return Ok(());
+    }
+    let blobs = records::blob_uses(&LexValue::Map(record.clone()))
+        .map_err(|e| XrpcError::invalid_request(e.0))?;
+    for b in blobs {
+        let cid = b.cid.to_string_base32();
+        let status = s.store.scan_status(did, &cid).await?;
+        if status.as_deref() == Some("allowed") {
+            continue;
+        }
+        let Some(row) = s.store.blob(did, &cid).await? else {
+            // Missing blobs are the commit's to refuse.
+            continue;
+        };
+        match crate::scanner::scan_key(s, did, &cid, &row.mime_type, &row.storage_key).await {
+            Scan::Allowed => s.store.set_scan_status(did, &cid, "allowed").await?,
+            Scan::Matched { result, reason } => {
+                s.store.quarantine_match(did, &cid).await?;
+                crate::scanner::record_match(s, did, &cid, "commit", &result, reason.as_deref())
+                    .await?;
+                return Err(XrpcError::named(
+                    "BlobNotFound",
+                    format!("Could not find blob: {cid}"),
+                ));
+            }
+            Scan::NotConfigured | Scan::Unavailable(_) => {
+                return Err(retry("The media couldn't be checked; try again shortly"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- procedures

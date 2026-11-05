@@ -1494,3 +1494,79 @@ async fn the_review_queue_on_both_backends() {
         assert!(s.scan_status("did:plc:a", "bafy").await.unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn private_only_blobs_on_both_backends() {
+    use crate::kryphocron::PrivateRecord;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob("did:plc:a", "bafyimg", "image/png", 10, "tmp/x")
+            .await
+            .unwrap();
+        tx.replace_record_blobs(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa2",
+            &["bafyimg".into()],
+        )
+        .await
+        .unwrap();
+        let e = PrivateRecord {
+            did: "did:plc:a".into(),
+            collection: "tools.kryphocron.feed.postPrivate".into(),
+            rkey: "3m6aaaaaaaaa2".into(),
+            generation: None,
+            legacy_text: false,
+            flagged: None,
+            audience_did: Some("did:plc:a".into()),
+            audience_rkey: Some("3m6aud".into()),
+        };
+        tx.replace_private_record("did:plc:a", &e.collection, &e.rkey, Some(&e))
+            .await
+            .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            s.blob_private_only("did:plc:a", "bafyimg").await.unwrap(),
+            "{n}"
+        );
+        let refs = s.blob_private_posts("did:plc:a", "bafyimg").await.unwrap();
+        assert_eq!(
+            (refs.len(), refs[0].audience_rkey.as_deref()),
+            (1, Some("3m6aud")),
+            "{n}"
+        );
+        // A public reference makes it public.
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_record_blobs(
+            "did:plc:a",
+            "app.bsky.feed.post",
+            "3m6aaaaaaaaa3",
+            &["bafyimg".into()],
+        )
+        .await
+        .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !s.blob_private_only("did:plc:a", "bafyimg").await.unwrap(),
+            "{n}"
+        );
+        // Never-scanned private-only blobs are picked up by the rescan.
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_record_blobs("did:plc:a", "app.bsky.feed.post", "3m6aaaaaaaaa3", &[])
+            .await
+            .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(s.unscanned_blobs(10).await.unwrap().len(), 1, "{n}");
+    }
+}

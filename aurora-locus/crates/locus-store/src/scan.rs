@@ -103,11 +103,13 @@ impl Store {
         tx.commit().await
     }
 
-    /// Blobs stored without a scan (the scanner was down), oldest first.
+    /// Blobs stored without a scan (the scanner was down), and private-only
+    /// ones never scanned (uploaded before a scanner was set up), oldest
+    /// first.
     pub async fn unscanned_blobs(&self, limit: i64) -> CoreResult<Vec<Unscanned>> {
         let q = sql(
-            "SELECT did, cid, mime_type, storage_key FROM blob WHERE scan_status = 'unscanned' \
-             AND state IN ('temp', 'permanent') ORDER BY created_at LIMIT {1}",
+            "SELECT did, cid, mime_type, storage_key FROM blob WHERE (scan_status = 'unscanned' \
+             OR (gated AND scan_status = 'none')) AND state IN ('temp', 'permanent') ORDER BY created_at LIMIT {1}",
             self.is_postgres(),
         );
         match self {
@@ -241,6 +243,92 @@ impl Store {
                     .fetch_optional(p)
                     .await
             }
+        }
+        .map_err(db_err)
+    }
+}
+
+/// The private-tier collections: a blob only they reference is private-only.
+const PRIVATE_COLLECTIONS: &str = "'tools.kryphocron.feed.postPrivate', 'tools.kryphocron.graph.block', \
+     'tools.kryphocron.graph.mute'";
+
+impl Tx {
+    /// Sets a blob's `gated` flag to whether it's private-only: referenced,
+    /// and only by private-tier records of its account. (The media gate
+    /// applies it only while the gate is on.)
+    pub async fn recompute_private_only(&mut self, did: &str, cid: &str) -> CoreResult<()> {
+        let q = sql(
+            &format!(
+                "UPDATE blob SET gated = (EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} AND r.blob_cid = {{2}}) \
+                 AND NOT EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} AND r.blob_cid = {{2}} \
+                 AND r.collection NOT IN ({PRIVATE_COLLECTIONS}))) WHERE did = {{1}} AND cid = {{2}}"
+            ),
+            matches!(self, Tx::Postgres(_)),
+        );
+        match self {
+            Tx::Sqlite(t) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .execute(&mut **t)
+                .await
+                .map(|_| ()),
+            Tx::Postgres(t) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .execute(&mut **t)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(db_err)
+    }
+}
+
+/// A private post referencing a blob, with its audience.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Referencing {
+    pub rkey: String,
+    pub audience_did: Option<String>,
+    pub audience_rkey: Option<String>,
+}
+
+impl Store {
+    /// Whether a blob is private-only (its `gated` flag).
+    pub async fn blob_private_only(&self, did: &str, cid: &str) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT gated FROM blob WHERE did = {1} AND cid = {2}",
+            self.is_postgres(),
+        );
+        let v: Option<bool> = match self {
+            Store::Sqlite(p) => {
+                sqlx::query_scalar(&q)
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+            Store::Postgres(p) => {
+                sqlx::query_scalar(&q)
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+        }
+        .map_err(db_err)?;
+        Ok(v.unwrap_or(false))
+    }
+
+    /// The private posts referencing a blob, with their audiences.
+    pub async fn blob_private_posts(&self, did: &str, cid: &str) -> CoreResult<Vec<Referencing>> {
+        let q = sql(
+            "SELECT r.rkey, p.audience_did, p.audience_rkey FROM record_blob r JOIN kr_private_record p \
+             ON p.did = r.did AND p.collection = r.collection AND p.rkey = r.rkey \
+             WHERE r.did = {1} AND r.blob_cid = {2} ORDER BY r.rkey LIMIT 100",
+            self.is_postgres(),
+        );
+        match self {
+            Store::Sqlite(p) => sqlx::query_as(&q).bind(did).bind(cid).fetch_all(p).await,
+            Store::Postgres(p) => sqlx::query_as(&q).bind(did).bind(cid).fetch_all(p).await,
         }
         .map_err(db_err)
     }

@@ -12,6 +12,7 @@ pub mod identity;
 pub mod import;
 pub mod kryphocron;
 pub mod lexicon;
+pub mod media_gate;
 pub mod membership;
 pub mod oauth;
 pub mod oauth_ui;
