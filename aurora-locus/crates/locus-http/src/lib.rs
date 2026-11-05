@@ -20,6 +20,7 @@ pub mod ratelimit;
 pub mod raw;
 pub mod repo;
 pub mod routing;
+pub mod scanner;
 pub mod server;
 pub mod state;
 pub mod sync;

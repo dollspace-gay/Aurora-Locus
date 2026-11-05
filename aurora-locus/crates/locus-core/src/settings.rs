@@ -754,6 +754,27 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Most kryphocron block records read from another PDS to check a reply; past it the reply is refused.",
     },
+    Def {
+        key: "blobs.scanner",
+        kind: Kind::Choice(&["none", "webhook"]),
+        default: r#""none""#,
+        env: None,
+        description: "The scanner every upload goes through before it can be used: none, or an HTTP webhook (blobs.scanner_url).",
+    },
+    Def {
+        key: "blobs.scanner_url",
+        kind: Kind::Url,
+        default: r#""""#,
+        env: None,
+        description: "The scanner webhook: POSTed each upload's bytes, it answers {\"result\": \"allow\" | \"reject\" | \"quarantine\"}.",
+    },
+    Def {
+        key: "blobs.scan_unavailable",
+        kind: Kind::Choice(&["refuse", "accept_unscanned"]),
+        default: r#""refuse""#,
+        env: None,
+        description: "When the scanner can't be reached: refuse uploads (retryable), or store them unscanned and scan them when it's back.",
+    },
 ];
 
 /// Looks up a setting definition.

@@ -18,6 +18,7 @@ pub mod oauth;
 pub mod prefs;
 pub mod repo;
 pub mod runtime;
+pub mod scan;
 pub mod secrets;
 pub mod seq;
 pub mod settings;

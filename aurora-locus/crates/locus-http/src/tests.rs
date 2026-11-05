@@ -7513,3 +7513,183 @@ async fn membership_assertions_are_issued_to_members_and_verified() {
         Err(locus_auth::service_jwt::ServiceJwtError::BadJwtType)
     ));
 }
+
+/// A scanner webhook: matches bytes containing `BAD`; answers 500 while
+/// `down` is set.
+async fn mock_scanner() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = Router::new()
+        .route(
+            "/scan",
+            axum::routing::post(
+                |State(down): State<Arc<std::sync::atomic::AtomicBool>>,
+                 body: axum::body::Bytes| async move {
+                    if down.load(std::sync::atomic::Ordering::SeqCst) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({})))
+                            .into_response();
+                    }
+                    let bad = body.windows(3).any(|w| w == b"BAD");
+                    let result = if bad { "quarantine" } else { "allow" };
+                    axum::Json(json!({"result": result, "reason": "test hash"})).into_response()
+                },
+            ),
+        )
+        .with_state(down.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/scan"), down)
+}
+
+#[tokio::test]
+async fn uploads_are_scanned_and_matches_quarantined_for_review() {
+    let h = harness(false).await;
+    let (did, access) = h.user("una.pds.example.com").await;
+    let (url, down) = mock_scanner().await;
+    h.state
+        .settings
+        .set("blobs.scanner", json!("webhook"), "test")
+        .await
+        .unwrap();
+    h.state
+        .settings
+        .set("blobs.scanner_url", json!(url), "test")
+        .await
+        .unwrap();
+
+    let good = h.upload(&access, b"a good picture", "image/png").await;
+    let good_cid = good["ref"]["$link"].as_str().unwrap().to_owned();
+    assert_eq!(
+        h.state
+            .store
+            .scan_status(&did, &good_cid)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("allowed")
+    );
+
+    // A match is refused, kept (held, quarantined) and queued for review.
+    let bad_bytes = b"a BAD picture";
+    let bad_cid = proto_blue_lex_data::Cid::for_raw(bad_bytes).to_string_base32();
+    let (st, _, body) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            bad_bytes.to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let row = h.state.store.blob(&did, &bad_cid).await.unwrap().unwrap();
+    assert_eq!((row.state.as_str(), row.review_hold), ("quarantined", true));
+    let reviews = h.state.store.reviews("open", 10).await.unwrap();
+    assert_eq!(
+        (
+            reviews.len(),
+            reviews[0].cid.as_str(),
+            reviews[0].source.as_str()
+        ),
+        (1, bad_cid.as_str(), "upload")
+    );
+    let (st, _, _) = h
+        .raw_get(format!(
+            "/xrpc/com.atproto.sync.getBlob?did={did}&cid={bad_cid}"
+        ))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "not served");
+    let (st, _, _) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            bad_bytes.to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "can't be uploaded again");
+
+    // The scanner is down: refused (retryable) by default...
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (st, _, _) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            b"while down".to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    // ...or stored unscanned and scanned when it's back.
+    h.state
+        .settings
+        .set("blobs.scan_unavailable", json!("accept_unscanned"), "test")
+        .await
+        .unwrap();
+    let later_ok = h.upload(&access, b"fine, checked later", "image/png").await;
+    let later_bad = h.upload(&access, b"BAD, checked later", "image/png").await;
+    let (ok_cid, bad2_cid) = (
+        later_ok["ref"]["$link"].as_str().unwrap().to_owned(),
+        later_bad["ref"]["$link"].as_str().unwrap().to_owned(),
+    );
+    assert_eq!(
+        h.state
+            .store
+            .scan_status(&did, &ok_cid)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("unscanned")
+    );
+    assert_eq!(
+        crate::scanner::rescan_pass(&h.state).await.unwrap(),
+        0,
+        "still down"
+    );
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(crate::scanner::rescan_pass(&h.state).await.unwrap(), 2);
+    assert_eq!(
+        h.state
+            .store
+            .scan_status(&did, &ok_cid)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("allowed")
+    );
+    assert_eq!(
+        h.state
+            .store
+            .blob(&did, &bad2_cid)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "quarantined"
+    );
+    assert_eq!(h.state.store.reviews("open", 10).await.unwrap().len(), 2);
+
+    // An operator resolves a review once.
+    let id = h.state.store.reviews("open", 10).await.unwrap()[0].id;
+    assert!(
+        h.state
+            .store
+            .resolve_review(id, "cleared", "admin", Some("false positive"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.state
+            .store
+            .resolve_review(id, "reported", "admin", None)
+            .await
+            .unwrap()
+    );
+}

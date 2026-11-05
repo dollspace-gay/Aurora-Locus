@@ -1458,3 +1458,39 @@ async fn the_mapping_transaction_on_both_backends() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_review_queue_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let id = s
+            .add_review("did:plc:a", "bafy", "upload", "quarantine", Some("hash"))
+            .await
+            .unwrap();
+        s.add_review("did:plc:a", "bafz", "rescan", "reject", None)
+            .await
+            .unwrap();
+        let open = s.reviews("open", 10).await.unwrap();
+        assert_eq!(open.len(), 2, "{n}");
+        assert_eq!(open[0].reason.as_deref(), Some("hash"));
+        assert!(
+            s.resolve_review(id, "reported", "admin", Some("sent"))
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.resolve_review(id, "cleared", "admin", None)
+                .await
+                .unwrap(),
+            "{n}: once"
+        );
+        assert_eq!(
+            s.reviews("reported", 10).await.unwrap()[0].note.as_deref(),
+            Some("sent")
+        );
+        assert!(s.unscanned_blobs(10).await.unwrap().is_empty(), "{n}");
+        assert!(s.scan_status("did:plc:a", "bafy").await.unwrap().is_none());
+    }
+}

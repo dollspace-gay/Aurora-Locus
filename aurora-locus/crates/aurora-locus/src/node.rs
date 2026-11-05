@@ -387,7 +387,7 @@ impl Node {
     /// of never-referenced temp blobs and long-unreferenced ones.
     fn spawn_blob_jobs(&mut self, state: Arc<AppState>) {
         const EVERY: Duration = Duration::from_secs(60);
-        for name in ["blob-moves", "blob-deletes", "blob-gc"] {
+        for name in ["blob-moves", "blob-deletes", "blob-gc", "blob-rescan"] {
             let state = Arc::clone(&state);
             self.tasks
                 .push(tokio::spawn(locus_store::runtime::run_leased(
@@ -417,6 +417,9 @@ impl Node {
                                     )
                                     .await
                                     .map(|n| n as u64),
+                                    // Uploads stored unscanned while the
+                                    // scanner was down.
+                                    "blob-rescan" => locus_http::scanner::rescan_pass(&state).await,
                                     _ => {
                                         locus_blob::run_gc(
                                             &state.store,

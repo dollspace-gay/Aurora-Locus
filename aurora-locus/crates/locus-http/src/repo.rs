@@ -842,7 +842,32 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     let mime = locus_blob::mime_type(&written.head, content_type.as_deref());
     let size = i64::try_from(written.size).unwrap_or(i64::MAX);
 
+    // Scanned in temp storage, before it can be used.
+    use crate::scanner::Scan;
+    let scan = crate::scanner::scan_key(&s, &account.did, &cid, &mime, &temp).await;
+    let scan_status = match &scan {
+        Scan::NotConfigured => "none",
+        Scan::Allowed => "allowed",
+        Scan::Matched { .. } => "matched",
+        Scan::Unavailable(why) => {
+            tracing::warn!("the blob scanner is unavailable: {why}");
+            if s.snapshot().text("blobs.scan_unavailable") == "refuse" {
+                let mut tx = s.store.begin().await?;
+                let backend = tx.blob_backend().await?;
+                tx.queue_blob_delete(&temp, backend.epoch).await?;
+                tx.commit().await?;
+                return Err(XrpcError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TemporarilyUnavailable",
+                    "The file couldn't be checked; try again shortly",
+                ));
+            }
+            "unscanned"
+        }
+    };
+
     // Metadata under the repo lock (serialized with commits for this account).
+    let mut newly_matched = false;
     let result: XrpcResult<Vec<locus_store::blob::PendingMove>> = async {
         let (_lock, mut tx) = s.repo.locked_tx(&account.did).await.map_err(commit_error)?;
         let backend = tx.blob_backend().await?;
@@ -881,6 +906,16 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
                 false
             }
         };
+        if let Scan::Matched { .. } = &scan {
+            // Kept (never collected) for review; the upload is refused.
+            tx.quarantine_match(&account.did, &cid).await?;
+            tx.commit().await?;
+            newly_matched = true;
+            return Err(XrpcError::invalid_request("This file can't be uploaded"));
+        }
+        if fresh && scan_status != "none" {
+            tx.set_scan_status(&account.did, &cid, scan_status).await?;
+        }
         // Already referenced (records imported before their blobs, or an
         // active import's new tree): permanent at once.
         let mut moves = Vec::new();
@@ -911,6 +946,10 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     .await;
     if let Err(e) = &result {
         tracing::debug!("upload metadata refused: {}", e.message);
+    }
+    if let (true, Scan::Matched { result: r, reason }) = (newly_matched, &scan) {
+        crate::scanner::record_match(&s, &account.did, &cid, "upload", r, reason.as_deref())
+            .await?;
     }
     finish_moves(&s, &result?).await;
     Ok(Json(json!({
