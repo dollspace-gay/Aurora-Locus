@@ -214,6 +214,21 @@ kryphocron built in.
   `getRepoStatus` always answers.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
+- `importRepo`: the uploaded CAR (up to `limits.import_size`, 1 GB) is
+  applied as a diff onto the account's repository by a resumable job. The
+  upload is streamed and checked (CIDs against bytes, one root, the
+  account's DID, a bounded tree walk that refuses a node referenced twice,
+  keys out of order or on the wrong layer, and missing blocks); blocks the
+  CAR leaves out are taken from the current repository. The import is
+  re-signed with a fresh rev and emits `#sync` for an active account; a
+  commit not signed by the account's current key is accepted and noted. Any
+  failure before the new root is in place rolls back completely; after it,
+  the job only finishes. Writes are blocked until the job ends.
+  `accounts.accept_imports` (`PDS_ACCEPTING_REPO_IMPORTS`) turns imports off.
+- `listMissingBlobs`, and uploads of a blob records already reference are
+  made permanent at once.
+- `app.nearhorizon.locus.account.getImportStatus`: the account's latest
+  import, its phase and progress, and why it failed.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.

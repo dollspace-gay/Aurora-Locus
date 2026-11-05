@@ -4,6 +4,7 @@
 pub mod car;
 pub mod engine;
 pub mod event;
+pub mod import;
 mod known_lexicons;
 pub mod records;
 pub mod tid;

@@ -342,6 +342,23 @@ pub static REGISTRY: &[Def] = &[
         description: "Largest single record (DAG-CBOR), in bytes.",
     },
     Def {
+        key: "limits.import_size",
+        kind: Kind::Int {
+            min: 1024,
+            max: 1 << 40,
+        },
+        default: "1073741824",
+        env: None,
+        description: "Largest repository import (CAR upload), in bytes.",
+    },
+    Def {
+        key: "accounts.accept_imports",
+        kind: Kind::Bool,
+        default: "true",
+        env: Some("PDS_ACCEPTING_REPO_IMPORTS"),
+        description: "Accept repository imports (com.atproto.repo.importRepo).",
+    },
+    Def {
         key: "blobs.upload_limit",
         kind: Kind::Int {
             min: 1,

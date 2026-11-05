@@ -2717,3 +2717,238 @@ impl Harness {
         self.raw("GET", &path, None, Vec::new(), &[]).await
     }
 }
+
+impl Harness {
+    async fn import(&self, access: &str, car: Vec<u8>) -> (StatusCode, Value) {
+        let (st, _, body) = self
+            .raw(
+                "POST",
+                "/xrpc/com.atproto.repo.importRepo",
+                Some(access),
+                car,
+                &[("content-type", "application/vnd.ipld.car")],
+            )
+            .await;
+        (st, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// Polls getImportStatus until the latest import ends.
+    async fn import_finished(&self, access: &str) -> Value {
+        for _ in 0..200 {
+            let (_, v) = self
+                .call(
+                    "GET",
+                    "/xrpc/app.nearhorizon.locus.account.getImportStatus",
+                    Some(access),
+                    None,
+                )
+                .await;
+            if v["import"]["done"] == true {
+                return v["import"].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the import didn't finish");
+    }
+
+    async fn post_rkeys(&self, did: &str) -> Vec<(String, String)> {
+        let (_, v) = self
+            .get(format!(
+                "/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post&reverse=true"
+            ))
+            .await;
+        v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned(),
+                    r["value"]["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn an_exported_repo_imports_back_as_a_diff() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("ida.pds.example.com", "ida@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend(std::iter::repeat_n(3u8, 500));
+    let blob = h.upload(&access, &png, "image/png").await;
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    let mut with_image = post_record("one");
+    with_image["embed"] =
+        json!({"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": ""}]});
+    let put = |rkey: &'static str, record: Value| {
+        h.post(
+            "com.atproto.repo.putRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey, "record": record}),
+        )
+    };
+    put("3m5aaaaaaaaaa", with_image).await;
+    put("3m5aaaaaaaaab", post_record("two")).await;
+    put("3m5aaaaaaaaac", post_record("three")).await;
+    let (_, _, car) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}")).await;
+    let (_, before) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+
+    // Change things, then import the export: back to how it was.
+    h.post(
+        "com.atproto.repo.deleteRecord",
+        Some(&access),
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "3m5aaaaaaaaaa"}),
+    )
+    .await;
+    put("3m5aaaaaaaaac", post_record("THREE")).await;
+    put("3m5aaaaaaaaad", post_record("four")).await;
+    assert!(
+        h.state.store.blob(&did, &cid).await.unwrap().unwrap().unreferenced_since.is_some(),
+        "the image's record went"
+    );
+    let (st, v) = h.import(&access, car.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let status = h.import_finished(&access).await;
+    assert_eq!(status["phase"], "done", "{status}");
+    assert!(status.get("notes").is_none(), "signed by the account's key");
+    assert_eq!(
+        h.post_rkeys(&did).await,
+        vec![
+            ("3m5aaaaaaaaaa".to_owned(), "one".to_owned()),
+            ("3m5aaaaaaaaab".to_owned(), "two".to_owned()),
+            ("3m5aaaaaaaaac".to_owned(), "three".to_owned()),
+        ]
+    );
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    assert_eq!((row.state.as_str(), row.unreferenced_since), ("permanent", None));
+
+    // Re-signed with a newer rev over the same data, and verifiable.
+    let signing = h.state.signing_key(&did).await.unwrap().did();
+    let (_, _, now) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={did}")).await;
+    let old = proto_blue_repo::sync::verify_repo_car(&car, Some(&did), Some(&signing)).unwrap();
+    let new = proto_blue_repo::sync::verify_repo_car(&now, Some(&did), Some(&signing)).unwrap();
+    assert_eq!(old.commit.data, new.commit.data);
+    assert!(new.commit.rev.as_str() > before["rev"].as_str().unwrap());
+    let kinds: Vec<String> = h
+        .state
+        .store
+        .outbox_for(&did)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(kinds.last().map(String::as_str), Some("sync"));
+    let (_, missing) = h
+        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&access), None)
+        .await;
+    assert_eq!(missing["blobs"], json!([]));
+
+    // Writes work again; imports can be turned off.
+    let (st, _) = put("3m5aaaaaaaaae", post_record("five")).await;
+    assert_eq!(st, StatusCode::OK);
+    h.state
+        .settings
+        .set("accounts.accept_imports", json!(false), "test")
+        .await
+        .unwrap();
+    let (st, v) = h.import(&access, car).await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("Service is not accepting repo imports"))
+    );
+}
+
+#[tokio::test]
+async fn a_repo_from_elsewhere_lists_its_missing_blobs_until_uploaded() {
+    use proto_blue_repo::commit::{SignedCommit, UnsignedCommit, sign_commit};
+    let h = harness(false).await;
+    let hr = &h;
+    let make = |handle: &'static str| async move {
+        let a = hr
+            .create_account(&format!("{handle}.pds.example.com"), &format!("{handle}@example.com"), "pw")
+            .await;
+        (
+            a["did"].as_str().unwrap().to_owned(),
+            a["accessJwt"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (src, src_access) = make("sora").await;
+    let (dst, dst_access) = make("dana").await;
+    let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+    let blob = h.upload(&src_access, &png, "image/png").await;
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    let mut record = post_record("moved");
+    record["embed"] =
+        json!({"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": ""}]});
+    h.post(
+        "com.atproto.repo.putRecord",
+        Some(&src_access),
+        json!({"repo": src, "collection": "app.bsky.feed.post", "rkey": "3m6aaaaaaaaaa", "record": record}),
+    )
+    .await;
+
+    // The source's repo, re-signed for the destination by some other key.
+    let (_, _, car) = h.raw_get(format!("/xrpc/com.atproto.sync.getRepo?did={src}")).await;
+    let (root, mut blocks) = proto_blue_repo::car::read_car_with_root(&car).unwrap();
+    let commit =
+        SignedCommit::from_lex_value(&proto_blue_lex_cbor::decode(blocks.get(&root).unwrap()).unwrap())
+            .unwrap();
+    let resigned = sign_commit(
+        &UnsignedCommit::new(dst.clone(), commit.data.clone(), commit.rev.clone(), None),
+        &proto_blue_crypto::K256Keypair::generate(),
+    )
+    .unwrap();
+    let new_root = resigned.cid().unwrap();
+    blocks.set(new_root.clone(), resigned.to_cbor().unwrap());
+    let foreign = proto_blue_repo::car::blocks_to_car(Some(&new_root), &blocks).unwrap();
+
+    // Refused as it is (another account's commit).
+    let (st, v) = h.import(&dst_access, car).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(h.import_finished(&dst_access).await["phase"], "failed");
+
+    let (st, v) = h.import(&dst_access, foreign).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let status = h.import_finished(&dst_access).await;
+    assert_eq!(status["phase"], "done");
+    assert!(status["notes"].as_str().unwrap().contains("re-signed"), "{status}");
+    assert_eq!(
+        h.post_rkeys(&dst).await,
+        vec![("3m6aaaaaaaaaa".to_owned(), "moved".to_owned())]
+    );
+    let (_, missing) = h
+        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&dst_access), None)
+        .await;
+    assert_eq!(
+        missing,
+        json!({
+            "blobs": [{"cid": cid, "recordUri": format!("at://{dst}/app.bsky.feed.post/3m6aaaaaaaaaa")}],
+            "cursor": cid,
+        })
+    );
+
+    // Uploading it makes it permanent at once (a record already uses it).
+    h.upload(&dst_access, &png, "image/png").await;
+    let row = h.state.store.blob(&dst, &cid).await.unwrap().unwrap();
+    assert_eq!(row.state, "permanent");
+    assert!(row.storage_key.starts_with(&format!("blobs/{dst}/")), "{}", row.storage_key);
+    let (_, missing) = h
+        .call("GET", "/xrpc/com.atproto.repo.listMissingBlobs", Some(&dst_access), None)
+        .await;
+    assert_eq!(missing["blobs"], json!([]));
+    let (st, _, body) = h
+        .raw_get(format!("/xrpc/com.atproto.sync.getBlob?did={dst}&cid={cid}"))
+        .await;
+    assert_eq!((st, body), (StatusCode::OK, png.to_vec()));
+}

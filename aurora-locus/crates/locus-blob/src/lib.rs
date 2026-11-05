@@ -71,6 +71,11 @@ impl DiskStore {
         Ok(self.root.join(rel))
     }
 
+    /// Where `key` lives on disk.
+    pub fn local_path(&self, key: &str) -> Result<PathBuf, BlobError> {
+        self.path(key)
+    }
+
     /// Streams `body` to `key`, refusing more than `limit` bytes, and
     /// returns its size, raw CID and first bytes.
     pub async fn write_stream<S, B, E>(

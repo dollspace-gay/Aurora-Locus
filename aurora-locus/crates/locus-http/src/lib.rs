@@ -6,6 +6,7 @@ pub mod auth;
 pub mod email;
 pub mod error;
 pub mod identity;
+pub mod import;
 pub mod repo;
 pub mod routing;
 pub mod server;
@@ -142,6 +143,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(repo::describe_repo),
         )
         .route("/xrpc/com.atproto.repo.uploadBlob", post(repo::upload_blob))
+        .route("/xrpc/com.atproto.repo.importRepo", post(import::import_repo))
+        .route(
+            "/xrpc/com.atproto.repo.listMissingBlobs",
+            get(import::list_missing_blobs),
+        )
+        .route(
+            "/xrpc/app.nearhorizon.locus.account.getImportStatus",
+            get(import::get_import_status),
+        )
         .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
         .route(
             "/xrpc/com.atproto.sync.subscribeRepos",

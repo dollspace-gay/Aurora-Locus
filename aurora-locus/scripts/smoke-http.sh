@@ -98,6 +98,19 @@ x POST createRecord-image -H "authorization: Bearer $access" -H 'content-type: a
 echo "> GET getBlob (bytes match: $(curl -s "$base/com.atproto.sync.getBlob?did=$did&cid=$cid" | cmp -s - "$data/img.png" && echo yes || echo no))"
 echo "> stored under: $(find "$data/blobs" -type f | sed "s|$data/||")"
 
+# Export, change, import the export back.
+curl -s "$base/com.atproto.sync.getRepo?did=$did" -o "$data/repo.car"
+echo "> getRepo: $(wc -c <"$data/repo.car") bytes"
+x POST deleteRecord -H "authorization: Bearer $access" -H 'content-type: application/json' \
+  -d "{\"repo\":\"$did\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"3m3smokeaaaaa\"}" \
+  "$base/com.atproto.repo.deleteRecord"
+x POST importRepo -H "authorization: Bearer $access" -H 'content-type: application/vnd.ipld.car' \
+  --data-binary "@$data/repo.car" "$base/com.atproto.repo.importRepo"
+sleep 0.5
+x GET getImportStatus -H "authorization: Bearer $access" "$base/app.nearhorizon.locus.account.getImportStatus"
+x GET getRecord-restored "$base/com.atproto.repo.getRecord?repo=$did&collection=app.bsky.feed.post&rkey=3m3smokeaaaaa"
+x GET listMissingBlobs -H "authorization: Bearer $access" "$base/com.atproto.repo.listMissingBlobs"
+
 # The firehose from the start: a minimal WebSocket client (stdlib only)
 # that reads frames for two seconds and lists their event types.
 sleep 1

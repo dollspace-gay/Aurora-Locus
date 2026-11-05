@@ -108,7 +108,7 @@ pub async fn limit_body(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if path == "/xrpc/com.atproto.repo.uploadBlob" {
+    if path == "/xrpc/com.atproto.repo.uploadBlob" || path == "/xrpc/com.atproto.repo.importRepo" {
         return next.run(req).await;
     }
     let snap = s.snapshot();

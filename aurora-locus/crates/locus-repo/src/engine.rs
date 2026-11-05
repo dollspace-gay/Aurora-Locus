@@ -189,6 +189,10 @@ impl RepoEngine {
         &self.tids
     }
 
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
     fn repo_lock(&self, did: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self
             .locks

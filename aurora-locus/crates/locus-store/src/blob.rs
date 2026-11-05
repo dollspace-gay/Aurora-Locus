@@ -128,7 +128,7 @@ macro_rules! on_pool {
 
 /// SQL placeholders `?1..` (SQLite) or `$1..` (Postgres) in a template
 /// written with `{1}`, `{2}`, … and `{now}`.
-fn sql(template: &str, pg: bool) -> String {
+pub(crate) fn sql(template: &str, pg: bool) -> String {
     let mut out = template.replace("{now}", if pg { PG_NOW_MS } else { SQLITE_NOW_MS });
     for i in (1..=9).rev() {
         out = out.replace(
@@ -512,7 +512,14 @@ impl Tx {
         limit: i64,
         epoch: i64,
     ) -> CoreResult<u64> {
-        let not_referenced = "NOT EXISTS (SELECT 1 FROM record_blob r WHERE r.did = blob.did AND r.blob_cid = blob.cid)";
+        // A CID an active import's new tree references counts as referenced.
+        let not_referenced = format!(
+            "NOT EXISTS (SELECT 1 FROM record_blob r WHERE r.did = blob.did AND r.blob_cid = blob.cid) \
+             AND NOT EXISTS (SELECT 1 FROM import_blob ib JOIN bulk_job j ON j.id = ib.job_id \
+             WHERE j.did = blob.did AND ib.cid = blob.cid AND ib.in_new_tree AND j.kind = 'import' \
+             AND j.phase IN {})",
+            crate::import::ACTIVE_IMPORT_PHASES
+        );
         let collectable = format!(
             "pending_move IS NULL AND takedown_ref IS NULL AND NOT review_hold AND {not_referenced} AND \
              ((state = 'temp' AND created_at < {{now}} - {{1}}) OR \

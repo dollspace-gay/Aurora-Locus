@@ -136,7 +136,7 @@ async fn commit(
 
 /// Copies promoted blobs to their permanent keys now; a failure is left to
 /// the mover job.
-async fn finish_moves(s: &AppState, moves: &[locus_store::blob::PendingMove]) {
+pub(crate) async fn finish_moves(s: &AppState, moves: &[locus_store::blob::PendingMove]) {
     for m in moves {
         if let Err(e) = locus_blob::finish_move(&s.store, &s.blobs, m).await {
             tracing::warn!(
@@ -597,7 +597,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     let size = i64::try_from(written.size).unwrap_or(i64::MAX);
 
     // Metadata under the repo lock (serialized with commits for this account).
-    let result: XrpcResult<()> = async {
+    let result: XrpcResult<Vec<locus_store::blob::PendingMove>> = async {
         let (_lock, mut tx) = s.repo.locked_tx(&account.did).await.map_err(commit_error)?;
         let backend = tx.blob_backend().await?;
         if backend.paused {
@@ -609,10 +609,11 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
                 "Blob storage is being moved; try again shortly",
             ));
         }
-        match tx.blob_for_update(&account.did, &cid).await? {
+        let fresh = match tx.blob_for_update(&account.did, &cid).await? {
             None => {
                 tx.insert_temp_blob(&account.did, &cid, &mime, size, &temp)
                     .await?;
+                true
             }
             Some(row) if row.takedown_ref.is_some() || row.state == "quarantined" => {
                 tx.queue_blob_delete(&temp, backend.epoch).await?;
@@ -625,21 +626,47 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
                 if let Some(old) = tx.repoint_temp_blob(&account.did, &cid, &temp).await? {
                     tx.queue_blob_delete(&old, backend.epoch).await?;
                 }
+                true
             }
             Some(_) => {
                 // Already permanent: keep its copy, drop this one.
                 tx.queue_blob_delete(&temp, backend.epoch).await?;
                 tx.restart_unreferenced(&account.did, &cid).await?;
+                false
+            }
+        };
+        // Already referenced (records imported before their blobs, or an
+        // active import's new tree): permanent at once.
+        let mut moves = Vec::new();
+        if fresh {
+            let import = tx.active_import_for_blob(&account.did, &cid).await?;
+            if import.is_some() || tx.blob_has_records(&account.did, &cid).await? {
+                let key = locus_store::blob::permanent_key(&account.did, &cid);
+                if let Some(r) = tx
+                    .reference_blob(&account.did, &cid, &key, backend.epoch)
+                    .await?
+                    && r.pending_move.as_deref() == Some(key.as_str())
+                {
+                    moves.push(locus_store::blob::PendingMove {
+                        did: account.did.clone(),
+                        cid: cid.clone(),
+                        from: r.storage_key,
+                        to: key,
+                    });
+                }
+                if let Some(job) = import {
+                    tx.mark_import_blob(&job, &cid, true).await?;
+                }
             }
         }
         tx.commit().await?;
-        Ok(())
+        Ok(moves)
     }
     .await;
     if let Err(e) = &result {
         tracing::debug!("upload metadata refused: {}", e.message);
     }
-    result?;
+    finish_moves(&s, &result?).await;
     Ok(Json(json!({
         "blob": {
             "$type": "blob",
