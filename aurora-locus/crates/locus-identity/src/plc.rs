@@ -165,6 +165,92 @@ impl Operation {
     }
 }
 
+impl Operation {
+    /// This document with `handle` as its handle: the first `at://` entry of
+    /// `alsoKnownAs` is replaced in place (or the handle goes first), as the
+    /// reference's `updateHandleOp`.
+    #[must_use]
+    pub fn with_handle(&self, handle: &str) -> Self {
+        let uri = format!("at://{handle}");
+        let mut next = self.clone();
+        match next
+            .also_known_as
+            .iter()
+            .position(|a| a.starts_with("at://"))
+        {
+            Some(i) => next.also_known_as[i] = uri,
+            None => next.also_known_as.insert(0, uri),
+        }
+        next
+    }
+
+    /// The handle the document names (its first `at://` entry).
+    #[must_use]
+    pub fn handle(&self) -> Option<&str> {
+        self.also_known_as
+            .iter()
+            .find_map(|a| a.strip_prefix("at://"))
+    }
+}
+
+/// What a DID's latest operation leaves: the document (None for a
+/// tombstone) and the operation's CID, which the next operation names as
+/// `prev`. Legacy `create` operations are read as the directory reads them.
+pub fn last_op_state(v: &Value) -> Result<(Option<Operation>, String), PlcError> {
+    let cid = Cid::for_cbor(&cbor(&json_to_lex(v)?)?).to_string_base32();
+    let state = match v.get("type").and_then(Value::as_str) {
+        Some("create") => {
+            let field = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| PlcError::Invalid(format!("legacy create op without {k}")))
+            };
+            let signing = field("signingKey")?;
+            let recovery = field("recoveryKey")?;
+            let handle = field("handle")?;
+            let service = field("service")?;
+            Some(Operation {
+                rotation_keys: vec![recovery, signing.clone()],
+                verification_methods: BTreeMap::from([("atproto".to_owned(), signing)]),
+                also_known_as: vec![format!("at://{handle}")],
+                services: BTreeMap::from([(
+                    "atproto_pds".to_owned(),
+                    Service {
+                        kind: "AtprotoPersonalDataServer".into(),
+                        endpoint: service,
+                    },
+                )]),
+                prev: None,
+            })
+        }
+        _ => match SignedOp::from_json(v)? {
+            SignedOp::Operation { op, .. } => Some(op),
+            SignedOp::Tombstone { .. } => None,
+        },
+    };
+    Ok((state, cid))
+}
+
+/// JSON (as the directory serves operations) to the data model.
+fn json_to_lex(v: &Value) -> Result<LexValue, PlcError> {
+    Ok(match v {
+        Value::Null => LexValue::Null,
+        Value::Bool(b) => LexValue::Bool(*b),
+        Value::Number(n) => LexValue::Integer(
+            n.as_i64()
+                .ok_or_else(|| PlcError::Invalid("non-integer number in an operation".into()))?,
+        ),
+        Value::String(s) => LexValue::String(s.clone()),
+        Value::Array(a) => LexValue::Array(a.iter().map(json_to_lex).collect::<Result<_, _>>()?),
+        Value::Object(m) => LexValue::Map(
+            m.iter()
+                .map(|(k, v)| Ok((k.clone(), json_to_lex(v)?)))
+                .collect::<Result<_, PlcError>>()?,
+        ),
+    })
+}
+
 /// Signs a tombstone of the DID whose latest operation is `prev`.
 pub fn sign_tombstone(prev: &str, signer: &dyn Signer) -> Result<SignedOp, PlcError> {
     let unsigned = tombstone_lex(prev, None);
@@ -480,6 +566,39 @@ mod tests {
         let mut bad = base;
         bad.rotation_keys = vec![k.clone(), k];
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn the_last_op_gives_the_document_and_the_next_prev() {
+        let (state, cid) = last_op_state(&serde_json::from_str(SECOND).unwrap()).unwrap();
+        assert_eq!(cid, SECOND_CID, "CID computed from the directory's JSON");
+        let op = state.unwrap();
+        assert_eq!(op.handle(), Some("atproto.com"));
+        let next = op.with_handle("new.example.net");
+        assert_eq!(next.also_known_as, vec!["at://new.example.net"]);
+
+        // Other alsoKnownAs entries keep their place; a missing handle goes first.
+        let mut multi = op.clone();
+        multi.also_known_as = vec!["https://elsewhere".into(), "at://old.test".into()];
+        assert_eq!(
+            multi.with_handle("h.test").also_known_as,
+            vec!["https://elsewhere", "at://h.test"]
+        );
+        multi.also_known_as = vec!["https://elsewhere".into()];
+        assert_eq!(
+            multi.with_handle("h.test").also_known_as,
+            vec!["at://h.test", "https://elsewhere"]
+        );
+
+        let tomb = json!({"type": "plc_tombstone", "prev": SECOND_CID, "sig": "x"});
+        assert!(last_op_state(&tomb).unwrap().0.is_none());
+
+        let legacy = json!({"type": "create", "signingKey": "did:key:zS", "recoveryKey": "did:key:zR",
+            "handle": "old.bsky.social", "service": "https://bsky.social", "prev": null, "sig": "x"});
+        let op = last_op_state(&legacy).unwrap().0.unwrap();
+        assert_eq!(op.rotation_keys, vec!["did:key:zR", "did:key:zS"]);
+        assert_eq!(op.handle(), Some("old.bsky.social"));
+        assert_eq!(op.services["atproto_pds"].endpoint, "https://bsky.social");
     }
 
     #[test]

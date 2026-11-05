@@ -82,6 +82,30 @@ kryphocron built in.
   signing key) are generated on first boot and kept in the key store;
   `PDS_JWT_SECRET` and `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` are
   imported when set.
+- PLC rotation keys are held by role (current, pending, secondary). Every
+  op locus signs uses the held key the account's PLC document lists first,
+  and locus records which held keys each account's document lists.
+- `com.atproto.identity.updateHandle`, for did:plc and did:web accounts and
+  for handles on other domains (verified by DNS or HTTPS). On did:plc the
+  PLC op goes first; if anything after it fails, or the directory's answer
+  is unclear, a repair job finishes the change. The same job tombstones the
+  DID of a sign-up that failed after its DID was registered.
+- did:web accounts: `createAccount` with `locusDidMethod: "web"` (or the
+  `accounts.default_did_method` setting) creates `did:web:<handle>`, whose
+  document locus serves on that host and updates on handle changes. A
+  did:web host stays tied to its DID: no other account can take it as a
+  handle, nor the PDS hostname.
+- `resolveHandle` resolves handles elsewhere on the network: DNS
+  (`_atproto` TXT, with the reference's backup nameservers setting) raced
+  against HTTPS, with a shared cache (10 minutes for a hit, 1 minute for a
+  miss). DID documents are resolved through a cache shared by every node
+  (`PDS_DID_CACHE_STALE_TTL`, `PDS_DID_CACHE_MAX_TTL`).
+- Outbound requests to user-influenced URLs go through an SSRF-safe client,
+  as the reference's: HTTPS and public unicast addresses only (checked when
+  connecting), no redirects, 512 KB responses, and no IP-literal hosts or
+  forbidden domains for documents and handle lookups.
+  `PDS_DISABLE_SSRF_PROTECTION` and local dev mode relax it as the
+  reference does.
 
 ### Changed
 

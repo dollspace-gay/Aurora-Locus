@@ -56,5 +56,19 @@ x GET resolveHandle "$base/com.atproto.identity.resolveHandle?handle=alice.test"
 x GET atproto-did -H 'host: alice.test' "http://localhost:$port/.well-known/atproto-did"
 x GET did.json "http://localhost:$port/.well-known/did.json"
 
+x POST updateHandle -H "authorization: Bearer $access" -H 'content-type: application/json' \
+  -d '{"handle":"alice2.test"}' "$base/com.atproto.identity.updateHandle"
+x GET resolveHandle-old "$base/com.atproto.identity.resolveHandle?handle=alice.test"
+x GET resolveHandle-new "$base/com.atproto.identity.resolveHandle?handle=alice2.test"
+x GET getSession-after -H "authorization: Bearer $access" "$base/com.atproto.server.getSession"
+
+x POST createAccount-web -H 'content-type: application/json' \
+  -d '{"handle":"wendy.test","email":"wendy@example.com","password":"smoke-pw-2","locusDidMethod":"web"}' \
+  "$base/com.atproto.server.createAccount"
+x GET did.json-web -H 'host: wendy.test' "http://localhost:$port/.well-known/did.json"
+
+# A handle elsewhere on the network, through DNS or HTTPS.
+x GET resolveHandle-network "$base/com.atproto.identity.resolveHandle?handle=atproto.com"
+
 kill -TERM "$pid"; wait "$pid" && echo "exit code: 0"
 echo "--- log ---"; cat "$data/log"

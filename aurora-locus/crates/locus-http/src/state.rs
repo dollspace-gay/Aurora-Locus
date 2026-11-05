@@ -8,8 +8,10 @@ use locus_core::keys::MasterKey;
 use locus_core::settings::Snapshot;
 use locus_core::{CoreError, CoreResult};
 use locus_identity::plc_client::PlcClient;
+use locus_identity::resolve::{ResolverConfig, Resolvers};
 use locus_repo::RepoEngine;
 use locus_store::Store;
+use locus_store::identity::{PlcKeyRole, plc_key_secret_name};
 use locus_store::runtime::Settings;
 use proto_blue_crypto::{ExportableKeypair, K256Keypair, Keypair};
 use zeroize::Zeroizing;
@@ -18,7 +20,6 @@ use zeroize::Zeroizing;
 pub mod secret_names {
     pub const JWT: &str = "jwt_secret";
     pub const APP_PASSWORD_PEPPER: &str = "app_password_pepper";
-    pub const PLC_ROTATION_KEY: &str = "plc_rotation_key";
     pub const SERVICE_KEY: &str = "service_signing_key";
 }
 
@@ -26,8 +27,106 @@ pub mod secret_names {
 pub struct ServerSecrets {
     pub jwt: Zeroizing<Vec<u8>>,
     pub app_password_pepper: Zeroizing<Vec<u8>>,
-    pub plc_rotation_key: K256Keypair,
+    pub plc_keys: PlcKeys,
     pub service_key: K256Keypair,
+}
+
+/// The PDS's held PLC rotation keys: the current one, plus any pending or
+/// secondary ones it can still sign with.
+pub struct PlcKeys {
+    /// Index of the current key in `held`.
+    current: usize,
+    held: Vec<(String, PlcKeyRole, K256Keypair)>,
+}
+
+impl PlcKeys {
+    /// Loads the held keys. On first boot the current key is created:
+    /// imported from `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` if set,
+    /// otherwise generated.
+    pub async fn load_or_create(store: &Store, key: &MasterKey) -> CoreResult<Self> {
+        if store.plc_rotation_keys().await?.is_empty() {
+            let candidate = match std::env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX") {
+                Ok(h) if !h.trim().is_empty() => {
+                    let bytes = Zeroizing::new(hex::decode(h.trim()).map_err(|e| {
+                        CoreError::Config(format!("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: {e}"))
+                    })?);
+                    K256Keypair::from_private_key(&bytes).map_err(|e| {
+                        CoreError::Config(format!("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: {e}"))
+                    })?
+                }
+                _ => K256Keypair::generate(),
+            };
+            let did_key = candidate.did();
+            let private = Zeroizing::new(candidate.export_private_key());
+            let mut tx = store.begin().await?;
+            tx.put_secret_if_absent(&plc_key_secret_name(&did_key), &private, key)
+                .await?;
+            match tx
+                .insert_plc_rotation_key(&did_key, PlcKeyRole::Current)
+                .await
+            {
+                Ok(()) => tx.commit().await?,
+                // Another node created the current key first; use theirs.
+                Err(CoreError::Conflict(_)) => tx.rollback().await?,
+                Err(e) => return Err(e),
+            }
+        }
+        let mut held = Vec::new();
+        for row in store.plc_rotation_keys().await? {
+            let bytes = store
+                .get_secret(&plc_key_secret_name(&row.did_key), key)
+                .await?
+                .ok_or_else(|| {
+                    CoreError::Config(format!(
+                        "PLC rotation key {} is missing from the key store",
+                        row.did_key
+                    ))
+                })?;
+            let pair = K256Keypair::from_private_key(&bytes).map_err(|e| {
+                CoreError::Config(format!(
+                    "stored PLC rotation key {} is invalid: {e}",
+                    row.did_key
+                ))
+            })?;
+            if pair.did() != row.did_key {
+                return Err(CoreError::Config(format!(
+                    "stored PLC rotation key doesn't match its id {}",
+                    row.did_key
+                )));
+            }
+            held.push((row.did_key, row.role, pair));
+        }
+        let current = held
+            .iter()
+            .position(|(_, role, _)| *role == PlcKeyRole::Current)
+            .ok_or_else(|| CoreError::Config("no current PLC rotation key".into()))?;
+        Ok(Self { current, held })
+    }
+
+    /// The key new genesis operations and recommendations name.
+    pub fn current(&self) -> &K256Keypair {
+        &self.held[self.current].2
+    }
+
+    /// The held key to sign an account's next op with: the first one its
+    /// latest document lists, in document order.
+    pub fn signer_for<'a>(&'a self, rotation_keys: &[String]) -> Option<&'a K256Keypair> {
+        rotation_keys.iter().find_map(|k| {
+            self.held
+                .iter()
+                .find(|(id, _, _)| id == k)
+                .map(|(_, _, p)| p)
+        })
+    }
+
+    /// The held keys a document lists, in document order.
+    pub fn listed(&self, rotation_keys: &[String]) -> Vec<String> {
+        rotation_keys
+            .iter()
+            .filter(|k| self.held.iter().any(|(id, _, _)| id == *k))
+            .cloned()
+            .collect()
+    }
 }
 
 impl ServerSecrets {
@@ -47,13 +146,7 @@ impl ServerSecrets {
             rand::random::<[u8; 32]>().to_vec()
         })
         .await?;
-        let rotation = load_or(store, key, secret_names::PLC_ROTATION_KEY, || {
-            std::env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX")
-                .ok()
-                .and_then(|h| hex::decode(h.trim()).ok())
-                .unwrap_or_else(|| K256Keypair::generate().export_private_key())
-        })
-        .await?;
+        let plc_keys = PlcKeys::load_or_create(store, key).await?;
         let service = load_or(store, key, secret_names::SERVICE_KEY, || {
             K256Keypair::generate().export_private_key()
         })
@@ -64,7 +157,7 @@ impl ServerSecrets {
             })
         };
         Ok(Self {
-            plc_rotation_key: keypair(&rotation, "PLC rotation key")?,
+            plc_keys,
             service_key: keypair(&service, "service key")?,
             jwt,
             app_password_pepper,
@@ -106,9 +199,53 @@ pub struct AppState {
     pub public_url: String,
     /// `did:web:<hostname>`.
     pub service_did: String,
+    /// The reference's `ssrfProtection`, fixed at boot.
+    pub ssrf_protection: bool,
+    pub resolvers: ResolverCache,
 }
 
+/// The network resolvers, rebuilt when the settings they're made from change.
+#[derive(Default)]
+pub struct ResolverCache(std::sync::Mutex<Option<Arc<Resolvers>>>);
+
 impl AppState {
+    /// DID and handle resolution over the network.
+    pub fn resolvers(&self) -> Result<Arc<Resolvers>, crate::error::XrpcError> {
+        let snap = self.snapshot();
+        let backup_nameservers = snap
+            .list("identity.handle_backup_nameservers")
+            .into_iter()
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let config = ResolverConfig {
+            plc_url: snap
+                .text("identity.plc_url")
+                .trim_end_matches('/')
+                .to_owned(),
+            timeout_ms: u64::try_from(snap.int("identity.resolver_timeout_ms")).unwrap_or(3000),
+            did_stale_ms: snap.int("identity.did_cache_stale_ms"),
+            did_max_ms: snap.int("identity.did_cache_max_ms"),
+            backup_nameservers,
+            ssrf_protection: self.ssrf_protection,
+        };
+        let mut slot = self
+            .resolvers
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = slot.as_ref()
+            && *r.config() == config
+        {
+            return Ok(Arc::clone(r));
+        }
+        let r = Arc::new(
+            Resolvers::new(self.store.clone(), config)
+                .map_err(|e| crate::error::XrpcError::internal(e.to_string()))?,
+        );
+        *slot = Some(Arc::clone(&r));
+        Ok(r)
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.settings.current()
     }

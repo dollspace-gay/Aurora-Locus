@@ -155,6 +155,10 @@ fn unique_violation(e: &sqlx::Error) -> Option<String> {
     is_unique.then(|| db.message().to_owned())
 }
 
+pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
+    unique_violation(e).is_some()
+}
+
 fn account_conflict(e: sqlx::Error) -> CoreError {
     match unique_violation(&e) {
         Some(m) if m.contains("handle") => CoreError::Conflict("Handle already taken".into()),
@@ -226,6 +230,25 @@ impl Tx {
             .await
             .map(|r| r.rows_affected()))
         .map_err(db_err)?;
+        if rows == 1 {
+            Ok(())
+        } else {
+            Err(CoreError::NotFound(format!("account {did}")))
+        }
+    }
+
+    /// Changes an account's handle; a handle another account holds is a
+    /// [`CoreError::Conflict`] ("Handle already taken").
+    pub async fn set_account_handle(&mut self, did: &str, handle: &str) -> CoreResult<()> {
+        let sqlite = "UPDATE account SET handle = ?2 WHERE did = ?1";
+        let pg = "UPDATE account SET handle = $2 WHERE did = $1";
+        let rows = by_backend!(self, sqlite, pg, |q, ex| sqlx::query(q)
+            .bind(did)
+            .bind(handle)
+            .execute(ex)
+            .await
+            .map(|r| r.rows_affected()))
+        .map_err(account_conflict)?;
         if rows == 1 {
             Ok(())
         } else {

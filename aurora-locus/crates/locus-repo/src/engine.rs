@@ -171,6 +171,20 @@ impl RepoEngine {
         Arc::clone(locks.entry(did.to_owned()).or_default())
     }
 
+    /// A transaction holding `did`'s repo lock (in this process and in the
+    /// database), for writing events that don't touch the repo, such as
+    /// `#identity` and `#account`, in order with the DID's commits. The lock
+    /// is released when the guard drops; commit the transaction first.
+    pub async fn locked_tx(
+        &self,
+        did: &str,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Tx), CommitError> {
+        let guard = self.repo_lock(did).lock_owned().await;
+        let mut tx = self.store.begin().await?;
+        tx.lock_repo(did).await?;
+        Ok((guard, tx))
+    }
+
     /// Creates an account's empty repository in its own transaction, with
     /// its `#commit` event.
     pub async fn create_repo(

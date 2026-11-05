@@ -16,7 +16,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use tokio_util::sync::CancellationToken;
 
-pub use state::{AppState, ServerSecrets};
+pub use state::{AppState, ResolverCache, ServerSecrets};
 
 /// Every route.
 pub fn router(state: Arc<AppState>) -> Router {
@@ -61,6 +61,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",
             get(identity::resolve_handle),
+        )
+        .route(
+            "/xrpc/com.atproto.identity.updateHandle",
+            post(identity::update_handle),
         )
         .route(
             "/.well-known/atproto-did",

@@ -206,6 +206,50 @@ pub static REGISTRY: &[Def] = &[
         description: "Operator recovery key (a did:key) added to new did:plc accounts' rotation keys.",
     },
     Def {
+        key: "identity.resolver_timeout_ms",
+        kind: Kind::Int {
+            min: 100,
+            max: 60_000,
+        },
+        default: "3000",
+        env: Some("PDS_ID_RESOLVER_TIMEOUT"),
+        description: "Timeout for each DID document or handle lookup, in milliseconds.",
+    },
+    Def {
+        key: "identity.did_cache_stale_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: 7 * 24 * 3_600_000,
+        },
+        default: "3600000",
+        env: Some("PDS_DID_CACHE_STALE_TTL"),
+        description: "Age after which a cached DID document is refreshed in the background, in milliseconds.",
+    },
+    Def {
+        key: "identity.did_cache_max_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: 30 * 24 * 3_600_000,
+        },
+        default: "86400000",
+        env: Some("PDS_DID_CACHE_MAX_TTL"),
+        description: "Age after which a cached DID document is no longer used, in milliseconds.",
+    },
+    Def {
+        key: "identity.handle_backup_nameservers",
+        kind: Kind::TextList { max_len: 64 },
+        default: "[]",
+        env: Some("PDS_HANDLE_BACKUP_NAMESERVERS"),
+        description: "DNS servers (IP addresses) tried for _atproto lookups when the system resolver finds nothing.",
+    },
+    Def {
+        key: "accounts.default_did_method",
+        kind: Kind::Choice(&["plc", "web"]),
+        default: r#""plc""#,
+        env: None,
+        description: "DID method for new accounts that don't ask for one.",
+    },
+    Def {
         key: "accounts.invite_required",
         kind: Kind::Bool,
         default: "true",

@@ -7,7 +7,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
-use axum::routing::post;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use http_body_util::BodyExt;
 use locus_auth::session::LegacySessions;
 use locus_core::bootstrap::DatabaseUrl;
@@ -22,45 +23,67 @@ use tower::ServiceExt;
 
 use crate::state::{AppState, ServerSecrets};
 
-type Plc = Arc<Mutex<HashMap<String, Value>>>;
+/// A PLC directory: each DID's log of ops. With `fail_after_apply` set, it
+/// applies an op and then answers 500, like a timeout after the write.
+#[derive(Default)]
+struct PlcMock {
+    log: HashMap<String, Vec<Value>>,
+    fail_after_apply: bool,
+}
+
+impl PlcMock {
+    fn last(&self, did: &str) -> Option<Value> {
+        self.log.get(did).and_then(|l| l.last()).cloned()
+    }
+}
+
+type Plc = Arc<Mutex<PlcMock>>;
 
 async fn mock_plc() -> (String, Plc) {
-    let ops: Plc = Arc::default();
+    let plc: Plc = Arc::default();
     let app = Router::new()
         .route(
             "/{did}",
             post(
-                |State(ops): State<Plc>,
+                |State(plc): State<Plc>,
                  Path(did): Path<String>,
                  axum::Json(op): axum::Json<Value>| async move {
-                    ops.lock().unwrap().insert(did, op);
-                    StatusCode::OK
+                    let mut p = plc.lock().unwrap();
+                    p.log.entry(did).or_default().push(op);
+                    if p.fail_after_apply {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    }
                 },
             )
             .get(
-                |State(ops): State<Plc>, Path(did): Path<String>| async move {
-                    if ops.lock().unwrap().contains_key(&did) {
-                        (StatusCode::OK, axum::Json(json!({"id": did}))).into_response_parts()
-                    } else {
-                        (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response_parts()
+                |State(plc): State<Plc>, Path(did): Path<String>| async move {
+                    match plc.lock().unwrap().last(&did) {
+                        Some(op) if op["type"] != "plc_tombstone" => {
+                            (StatusCode::OK, axum::Json(json!({"id": did}))).into_response()
+                        }
+                        _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response(),
                     }
                 },
             ),
         )
-        .with_state(ops.clone());
+        .route(
+            "/{did}/log/last",
+            get(
+                |State(plc): State<Plc>, Path(did): Path<String>| async move {
+                    match plc.lock().unwrap().last(&did) {
+                        Some(op) => (StatusCode::OK, axum::Json(op)).into_response(),
+                        None => (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(plc.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), ops)
-}
-
-trait IntoParts {
-    fn into_response_parts(self) -> axum::response::Response;
-}
-impl<T: axum::response::IntoResponse> IntoParts for T {
-    fn into_response_parts(self) -> axum::response::Response {
-        self.into_response()
-    }
+    (format!("http://{addr}"), plc)
 }
 
 struct Harness {
@@ -102,6 +125,8 @@ async fn harness(invite_required: bool) -> Harness {
         public_url: format!("https://{hostname}"),
         hostname,
         service_did,
+        ssrf_protection: true,
+        resolvers: crate::state::ResolverCache::default(),
     });
     Harness {
         app: crate::router(state.clone()),
@@ -186,16 +211,15 @@ async fn account_creation_registers_a_verifiable_did_and_writes_everything() {
     assert_eq!(acct["handle"], "alice.pds.example.com");
 
     // The directory got the genesis op that derives this DID, signed by our rotation key.
-    let op = h
-        .plc
-        .lock()
-        .unwrap()
-        .get(&did)
-        .cloned()
-        .expect("op submitted");
+    let op = h.plc.lock().unwrap().last(&did).expect("op submitted");
     let signed = SignedOp::from_json(&op).unwrap();
     assert_eq!(signed.genesis_did().unwrap(), did);
-    assert!(signed.verify(&h.state.secrets.plc_rotation_key.did()));
+    let rotation = h.state.secrets.plc_keys.current().did();
+    assert!(signed.verify(&rotation));
+    assert_eq!(
+        h.state.store.plc_key_listing(&did).await.unwrap(),
+        Some(vec![rotation])
+    );
     assert_eq!(op["alsoKnownAs"], json!(["at://alice.pds.example.com"]));
     assert_eq!(
         op["services"]["atproto_pds"]["endpoint"],
@@ -515,4 +539,281 @@ async fn handles_resolve_and_documents_are_served_by_host() {
         )
         .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "not on a handle host");
+}
+
+impl Harness {
+    async fn outbox_kinds(&self, did: &str) -> Vec<String> {
+        self.state
+            .store
+            .outbox_for(did)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    async fn update_handle(&self, access: &str, handle: &str) -> (StatusCode, Value) {
+        self.call(
+            "POST",
+            "/xrpc/com.atproto.identity.updateHandle",
+            Some(access),
+            Some(json!({ "handle": handle })),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn plc_handle_changes_submit_an_op_then_update_the_account() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("hana.pds.example.com", "hana@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let genesis = h.plc.lock().unwrap().last(&did).unwrap();
+
+    let (st, v) = h.update_handle(&access, "Hana2.pds.example.com").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // The op chains to the genesis, names the new handle and verifies.
+    let op = h.plc.lock().unwrap().last(&did).unwrap();
+    let genesis_cid = SignedOp::from_json(&genesis).unwrap().cid().unwrap();
+    assert_eq!(op["prev"], genesis_cid.to_string_base32());
+    assert_eq!(op["alsoKnownAs"], json!(["at://hana2.pds.example.com"]));
+    let signed = SignedOp::from_json(&op).unwrap();
+    assert!(signed.verify(&h.state.secrets.plc_keys.current().did()));
+
+    // The account, events and lookups follow; nothing is left to repair.
+    let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!(a.handle, "hana2.pds.example.com");
+    assert_eq!(h.outbox_kinds(&did).await.last().unwrap(), "identity");
+    assert!(
+        h.state
+            .store
+            .due_identity_repairs(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (st, _) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.identity.resolveHandle?handle=hana.pds.example.com",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "the old handle is free");
+
+    // Another account can't take it; nobody can take a non-service handle
+    // that doesn't resolve to them.
+    let other = h
+        .create_account("ivan.pds.example.com", "ivan@example.com", "pw")
+        .await;
+    let (st, v) = h
+        .update_handle(
+            other["accessJwt"].as_str().unwrap(),
+            "hana2.pds.example.com",
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("HandleNotAvailable"))
+    );
+    let (st, v) = h.update_handle(&access, "pds.example.com").await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("HandleNotAvailable")),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn an_unclear_plc_answer_is_repaired_later() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("jun.pds.example.com", "jun@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    h.plc.lock().unwrap().fail_after_apply = true;
+    let (st, v) = h
+        .update_handle(acct["accessJwt"].as_str().unwrap(), "jun2.pds.example.com")
+        .await;
+    // The op applied but the answer was a 500: the follow-up read shows the
+    // handle, so the change goes through.
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!(a.handle, "jun2.pds.example.com");
+
+    // A change PLC really didn't take stays queued, then converges once
+    // the directory answers.
+    h.plc.lock().unwrap().fail_after_apply = false;
+    h.state
+        .store
+        .queue_identity_repair(
+            &did,
+            locus_store::identity::RepairKind::Handle,
+            "jun3.pds.example.com",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::identity::run_identity_repairs(&h.state)
+            .await
+            .unwrap(),
+        1
+    );
+    let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!(a.handle, "jun3.pds.example.com");
+    let op = h.plc.lock().unwrap().last(&did).unwrap();
+    assert_eq!(op["alsoKnownAs"], json!(["at://jun3.pds.example.com"]));
+    assert!(
+        h.state
+            .store
+            .due_identity_repairs(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
+    use locus_identity::plc::{Operation, Service};
+    use std::collections::BTreeMap;
+    let h = harness(false).await;
+    // A DID registered for a sign-up that never finished.
+    let op = Operation {
+        rotation_keys: vec![h.state.secrets.plc_keys.current().did()],
+        verification_methods: BTreeMap::from([(
+            "atproto".to_owned(),
+            proto_blue_crypto::K256Keypair::generate().did(),
+        )]),
+        also_known_as: vec!["at://orphan.pds.example.com".into()],
+        services: BTreeMap::from([(
+            "atproto_pds".to_owned(),
+            Service {
+                kind: "AtprotoPersonalDataServer".into(),
+                endpoint: "https://pds.example.com".into(),
+            },
+        )]),
+        prev: None,
+    };
+    let genesis = op.sign(h.state.secrets.plc_keys.current()).unwrap();
+    let orphan = genesis.genesis_did().unwrap();
+    h.plc
+        .lock()
+        .unwrap()
+        .log
+        .insert(orphan.clone(), vec![genesis.to_json()]);
+    let live = h
+        .create_account("kim.pds.example.com", "kim@example.com", "pw")
+        .await["did"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for did in [&orphan, &live] {
+        h.state
+            .store
+            .queue_identity_repair(did, locus_store::identity::RepairKind::Tombstone, did)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        crate::identity::run_identity_repairs(&h.state)
+            .await
+            .unwrap(),
+        2
+    );
+    let tomb = h.plc.lock().unwrap().last(&orphan).unwrap();
+    assert_eq!(tomb["type"], "plc_tombstone");
+    assert_eq!(tomb["prev"], genesis.cid().unwrap().to_string_base32());
+    assert!(
+        SignedOp::from_json(&tomb)
+            .unwrap()
+            .verify(&h.state.secrets.plc_keys.current().did())
+    );
+    let live_last = h.plc.lock().unwrap().last(&live).unwrap();
+    assert_eq!(
+        live_last["type"], "plc_operation",
+        "the live account is untouched"
+    );
+}
+
+#[tokio::test]
+async fn did_web_accounts_are_served_here_and_their_hosts_stay_reserved() {
+    let h = harness(false).await;
+    let (st, acct) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(
+                json!({"handle": "wendy.pds.example.com", "email": "wendy@example.com",
+                "password": "pw", "locusDidMethod": "web"}),
+            ),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{acct}");
+    assert_eq!(acct["did"], "did:web:wendy.pds.example.com");
+    assert!(h.plc.lock().unwrap().log.is_empty(), "no PLC involved");
+    assert_eq!(
+        h.outbox_kinds("did:web:wendy.pds.example.com").await,
+        vec!["identity", "account", "commit", "sync"]
+    );
+
+    // The document is served on the account's host.
+    let (st, doc) = h
+        .call_host(
+            "GET",
+            "/.well-known/did.json",
+            None,
+            None,
+            "wendy.pds.example.com",
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{doc}");
+    assert_eq!(doc["id"], "did:web:wendy.pds.example.com");
+    assert_eq!(doc["alsoKnownAs"], json!(["at://wendy.pds.example.com"]));
+    assert_eq!(
+        doc["service"][0]["serviceEndpoint"],
+        "https://pds.example.com"
+    );
+
+    // A handle change edits the served document at once.
+    let access = acct["accessJwt"].as_str().unwrap();
+    let (st, v) = h.update_handle(access, "wendy2.pds.example.com").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, doc) = h
+        .call_host(
+            "GET",
+            "/.well-known/did.json",
+            None,
+            None,
+            "wendy.pds.example.com",
+        )
+        .await;
+    assert_eq!(doc["alsoKnownAs"], json!(["at://wendy2.pds.example.com"]));
+
+    // The old host stays tied to the DID: nobody else can take it as a
+    // handle, though the account itself can take it back.
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "wendy.pds.example.com", "email": "other@example.com", "password": "pw"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("HandleNotAvailable")),
+        "{v}"
+    );
+    let (st, v) = h.update_handle(access, "wendy.pds.example.com").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
 }

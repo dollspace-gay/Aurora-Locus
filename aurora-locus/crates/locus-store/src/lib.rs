@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod env;
+pub mod identity;
 pub mod jobs;
 pub mod lease;
 pub mod repo;

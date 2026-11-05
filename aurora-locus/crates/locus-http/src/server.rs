@@ -14,7 +14,6 @@ use locus_auth::session::{
 };
 use locus_core::CoreError;
 use locus_identity::did_doc::DidDocument;
-use locus_identity::handle::{self, HandleError, LabelLimits};
 use locus_identity::plc::{Operation, Service};
 use locus_identity::plc_client::PlcClientError;
 use locus_repo::event::{account_body, identity_body, sync_body};
@@ -66,40 +65,8 @@ pub struct CreateAccountInput {
     invite_code: Option<String>,
     password: Option<String>,
     recovery_key: Option<String>,
-}
-
-fn handle_error(e: HandleError) -> XrpcError {
-    match e {
-        HandleError::Invalid(m) => XrpcError::named("InvalidHandle", m),
-        HandleError::NotAvailable(m) => XrpcError::named("HandleNotAvailable", m),
-    }
-}
-
-/// Validates a new handle on one of this PDS's handle domains.
-pub fn check_new_handle(s: &AppState, raw: &str) -> XrpcResult<String> {
-    let h = handle::normalize_and_validate(raw).map_err(handle_error)?;
-    let domains = s.handle_domains();
-    if handle::service_domain(&h, &domains).is_none() {
-        return Err(XrpcError::named(
-            "UnsupportedDomain",
-            "Not a supported handle domain",
-        ));
-    }
-    handle::ensure_service_constraints(&h, &domains, LabelLimits::default(), &[], false)
-        .map_err(handle_error)?;
-    if handle::has_explicit_slur(&h) {
-        return Err(XrpcError::named(
-            "InvalidHandle",
-            "Inappropriate language in handle",
-        ));
-    }
-    if h == s.hostname {
-        return Err(XrpcError::named(
-            "HandleNotAvailable",
-            "Handle already taken",
-        ));
-    }
-    Ok(h)
+    /// Locus extension, ignored by stock clients: `plc` or `web`.
+    locus_did_method: Option<String>,
 }
 
 fn check_email(raw: &str) -> XrpcResult<String> {
@@ -177,7 +144,7 @@ pub async fn create_account(
             .as_deref()
             .ok_or_else(|| XrpcError::invalid_request("Email is required"))?,
     )?;
-    let handle = check_new_handle(&s, &input.handle)?;
+    let handle = crate::identity::validate_handle(&s, &input.handle, None).await?;
     let password_hash = match &input.password {
         Some(p) if p.len() > password::MAX_NEW_PASSWORD => {
             return Err(XrpcError::invalid_request("Password too long"));
@@ -204,62 +171,36 @@ pub async fn create_account(
         return Err(XrpcError::invalid_request("Email already taken"));
     }
 
-    // Keys and the genesis operation.
+    let method = input
+        .locus_did_method
+        .as_deref()
+        .unwrap_or_else(|| snap.text("accounts.default_did_method"))
+        .to_owned();
     let signing = K256Keypair::generate();
-    let mut rotation_keys = Vec::new();
-    if let Some(k) = input.recovery_key.as_deref().filter(|k| !k.is_empty()) {
-        rotation_keys.push(k.to_owned());
-    }
-    let operator_recovery = snap.text("identity.recovery_did_key");
-    if !operator_recovery.is_empty() {
-        rotation_keys.push(operator_recovery.to_owned());
-    }
-    rotation_keys.push(s.secrets.plc_rotation_key.did());
-    let op = Operation {
-        rotation_keys,
-        verification_methods: BTreeMap::from([("atproto".to_owned(), signing.did())]),
-        also_known_as: vec![format!("at://{handle}")],
-        services: BTreeMap::from([(
-            "atproto_pds".to_owned(),
-            Service {
-                kind: "AtprotoPersonalDataServer".into(),
-                endpoint: s.public_url.clone(),
-            },
-        )]),
-        prev: None,
-    };
-    op.validate()
-        .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
-    let genesis = op
-        .sign(&s.secrets.plc_rotation_key)
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
-    let did = genesis
-        .genesis_did()
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
-
-    // Register the DID. No transaction is open during the network call.
-    let plc = s.plc()?;
-    match plc.submit(&did, &genesis).await {
-        Ok(()) => {}
-        Err(PlcClientError::Refused(m)) => {
-            return Err(XrpcError::invalid_request(format!(
-                "The PLC directory refused the DID: {m}"
-            )));
+    let (did, web_doc, rotation_keys) = match method.as_str() {
+        "plc" => {
+            let (did, keys) =
+                register_plc_did(&s, &handle, &signing, input.recovery_key.as_deref()).await?;
+            (did, None, keys)
         }
-        Err(e) => {
-            // Ambiguous: it may have been applied. Check before giving up.
-            match plc.document(&did).await {
-                Ok(Some(_)) => {}
-                _ => {
-                    return Err(XrpcError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "UpstreamFailure",
-                        e.to_string(),
-                    ));
-                }
+        "web" => {
+            // did:web:<handle host>, served by locus at that host.
+            let did = format!("did:web:{handle}");
+            if s.store.account_by_did(&did).await?.is_some() {
+                return Err(XrpcError::named(
+                    "HandleNotAvailable",
+                    "Handle already taken",
+                ));
             }
+            let doc = DidDocument::account(&did, &handle, &signing.did(), &s.public_url).to_json();
+            (did, Some(doc.to_string()), Vec::new())
         }
-    }
+        _ => {
+            return Err(XrpcError::invalid_request(
+                "locusDidMethod must be plc or web",
+            ));
+        }
+    };
 
     // One transaction writes the account and everything that goes with it.
     let result: XrpcResult<(Account, Tokens)> = async {
@@ -270,7 +211,7 @@ pub async fn create_account(
             email: Some(&email),
             password_hash: password_hash.as_deref(),
             status: Status::Active,
-            did_method: "plc",
+            did_method: &method,
         })
         .await
         .map_err(|e| match e {
@@ -279,6 +220,14 @@ pub async fn create_account(
             }
             other => other.into(),
         })?;
+        if let Some(doc) = &web_doc {
+            tx.insert_hosted_did_web(&did, &handle, doc)
+                .await
+                .map_err(|e| match e {
+                    CoreError::Conflict(m) => XrpcError::named("HandleNotAvailable", m),
+                    other => other.into(),
+                })?;
+        }
         tx.put_signing_key(&did, "k256", &signing.export_private_key(), &s.master_key)
             .await?;
         if let Some(code) = &invite {
@@ -329,11 +278,19 @@ pub async fn create_account(
     let (account, tokens) = match result {
         Ok(v) => v,
         Err(e) => {
-            // Locus created this DID; tombstone it so it doesn't dangle.
-            tombstone_quietly(&s, &did, &genesis).await;
+            if method == "plc" {
+                // Locus created this DID; tombstone it so it doesn't dangle.
+                tombstone_or_queue(&s, &did).await;
+            }
             return Err(e);
         }
     };
+    if !rotation_keys.is_empty() {
+        let _ = s
+            .store
+            .set_plc_key_listing(&did, &s.secrets.plc_keys.listed(&rotation_keys))
+            .await;
+    }
     let did_doc = did_doc_for(&s, &account).await?;
     let mut out = json!({
         "handle": account.handle,
@@ -347,20 +304,94 @@ pub async fn create_account(
     Ok(Json(out))
 }
 
-async fn tombstone_quietly(s: &AppState, did: &str, genesis: &locus_identity::plc::SignedOp) {
-    let Ok(prev) = genesis.cid() else { return };
-    let Ok(t) =
-        locus_identity::plc::sign_tombstone(&prev.to_string_base32(), &s.secrets.plc_rotation_key)
-    else {
-        return;
+/// Builds, signs and registers a new account's genesis operation. Returns
+/// the DID and its rotation keys. No transaction is open meanwhile.
+async fn register_plc_did(
+    s: &AppState,
+    handle: &str,
+    signing: &K256Keypair,
+    recovery_key: Option<&str>,
+) -> XrpcResult<(String, Vec<String>)> {
+    let snap = s.snapshot();
+    let mut rotation_keys = Vec::new();
+    if let Some(k) = recovery_key.filter(|k| !k.is_empty()) {
+        rotation_keys.push(k.to_owned());
+    }
+    let operator_recovery = snap.text("identity.recovery_did_key");
+    if !operator_recovery.is_empty() {
+        rotation_keys.push(operator_recovery.to_owned());
+    }
+    rotation_keys.push(s.secrets.plc_keys.current().did());
+    let op = Operation {
+        rotation_keys: rotation_keys.clone(),
+        verification_methods: BTreeMap::from([("atproto".to_owned(), signing.did())]),
+        also_known_as: vec![format!("at://{handle}")],
+        services: BTreeMap::from([(
+            "atproto_pds".to_owned(),
+            Service {
+                kind: "AtprotoPersonalDataServer".into(),
+                endpoint: s.public_url.clone(),
+            },
+        )]),
+        prev: None,
     };
-    if let Ok(plc) = s.plc()
-        && let Err(e) = plc.submit(did, &t).await
-    {
-        tracing::warn!(
-            did,
-            "couldn't tombstone the DID of a failed account creation: {e}"
-        );
+    op.validate()
+        .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
+    let genesis = op
+        .sign(s.secrets.plc_keys.current())
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let did = genesis
+        .genesis_did()
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let plc = s.plc()?;
+    match plc.submit(&did, &genesis).await {
+        Ok(()) => {}
+        Err(PlcClientError::Refused(m)) => {
+            return Err(XrpcError::invalid_request(format!(
+                "The PLC directory refused the DID: {m}"
+            )));
+        }
+        Err(e) => {
+            // Ambiguous: it may have been applied. Check before giving up.
+            match plc.document(&did).await {
+                Ok(Some(_)) => {}
+                _ => {
+                    return Err(XrpcError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "UpstreamFailure",
+                        e.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok((did, rotation_keys))
+}
+
+/// Tombstones a DID locus created for a failed account creation, or leaves
+/// it to the identity repair job when PLC can't be reached.
+async fn tombstone_or_queue(s: &AppState, did: &str) {
+    match crate::identity::plc_tombstone(s, did).await {
+        Ok(()) => {}
+        Err(crate::identity::PlcStep::Refused(e)) => {
+            tracing::warn!(
+                did,
+                "PLC refused the tombstone of a failed account creation: {}",
+                e.message
+            );
+        }
+        Err(crate::identity::PlcStep::Ambiguous(_)) => {
+            if let Err(e) = s
+                .store
+                .queue_identity_repair(did, locus_store::identity::RepairKind::Tombstone, did)
+                .await
+            {
+                tracing::error!(
+                    did,
+                    "couldn't queue the tombstone of a failed account creation: {e}"
+                );
+            }
+        }
     }
 }
 

@@ -1,5 +1,6 @@
-//! `com.atproto.identity.resolveHandle` and the documents locus serves:
-//! `/.well-known/atproto-did` and `/.well-known/did.json`.
+//! `com.atproto.identity.*` (handle resolution and changes) and the
+//! documents locus serves: `/.well-known/atproto-did` and
+//! `/.well-known/did.json`, plus the identity repair job.
 
 use std::sync::Arc;
 
@@ -8,11 +9,16 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use locus_identity::did_doc::{DidDocument, ServiceEntry, VerificationMethod};
-use locus_identity::handle;
+use locus_identity::handle::{self, HandleError, LabelLimits};
+use locus_identity::plc::{self, Operation};
+use locus_identity::plc_client::PlcClientError;
+use locus_repo::event::identity_body;
 use locus_store::accounts::Status;
+use locus_store::identity::RepairKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::auth;
 use crate::error::{XrpcError, XrpcResult};
 use crate::state::AppState;
 
@@ -31,6 +37,60 @@ pub fn request_host(headers: &HeaderMap) -> Option<String> {
     Some(host.trim_end_matches('.').to_ascii_lowercase())
 }
 
+fn handle_error(e: HandleError) -> XrpcError {
+    match e {
+        HandleError::Invalid(m) => XrpcError::named("InvalidHandle", m),
+        HandleError::NotAvailable(m) => XrpcError::named("HandleNotAvailable", m),
+    }
+}
+
+fn taken() -> XrpcError {
+    XrpcError::named("HandleNotAvailable", "Handle already taken")
+}
+
+/// Validates a handle for an account, as the reference's
+/// `normalizeAndValidateHandle`: `did` is None for a new account, which must
+/// use one of this PDS's handle domains; an existing account may also take
+/// an external handle that resolves to its DID. On top of the reference,
+/// PDS hostnames and hosted did:web hosts of other DIDs are reserved forever.
+pub async fn validate_handle(s: &AppState, raw: &str, did: Option<&str>) -> XrpcResult<String> {
+    let h = handle::normalize_and_validate(raw).map_err(handle_error)?;
+    if handle::has_explicit_slur(&h) {
+        return Err(XrpcError::named(
+            "InvalidHandle",
+            "Inappropriate language in handle",
+        ));
+    }
+    if h == s.hostname {
+        return Err(taken());
+    }
+    if let Some(web) = s.store.hosted_did_web_by_host(&h).await?
+        && Some(web.did.as_str()) != did
+    {
+        return Err(taken());
+    }
+    let domains = s.handle_domains();
+    if handle::service_domain(&h, &domains).is_some() {
+        handle::ensure_service_constraints(&h, &domains, LabelLimits::default(), &[], false)
+            .map_err(handle_error)?;
+        return Ok(h);
+    }
+    let Some(did) = did else {
+        return Err(XrpcError::named(
+            "UnsupportedDomain",
+            "Not a supported handle domain",
+        ));
+    };
+    // An external handle: it must resolve to this DID now, not from a cache.
+    let resolved = s.resolvers()?.resolve_handle_uncached(&h).await;
+    if resolved.as_deref() != Some(did) {
+        return Err(XrpcError::invalid_request(
+            "External handle did not resolve to DID",
+        ));
+    }
+    Ok(h)
+}
+
 #[derive(Deserialize)]
 pub struct ResolveHandleParams {
     handle: String,
@@ -47,12 +107,300 @@ pub async fn resolve_handle(
     {
         return Ok(Json(json!({ "did": account.did })));
     }
-    // A name on our own handle domains with no local account doesn't exist.
-    // External resolution (DNS and HTTPS) arrives with the resolver work.
+    // A name on our own handle domains with no local account doesn't exist;
+    // anything else is looked up on the network (cache, then DNS and HTTPS).
+    if handle::service_domain(&h, &s.handle_domains()).is_none()
+        && let Some(did) = s.resolvers()?.resolve_handle(&h).await
+    {
+        return Ok(Json(json!({ "did": did })));
+    }
     Err(XrpcError::named(
         "HandleNotFound",
         "Unable to resolve handle",
     ))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateHandleInput {
+    handle: String,
+}
+
+pub async fn update_handle(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<UpdateHandleInput>,
+) -> XrpcResult<()> {
+    let authed = auth::access(&s, &headers).await?;
+    let account = auth::account_checked(&s, &authed.did, false).await?;
+    let did = account.did.as_str();
+    let handle = validate_handle(&s, &input.handle, Some(did)).await?;
+    if let Some(other) = s.store.account_by_handle(&handle).await?
+        && other.did != did
+    {
+        return Err(XrpcError::named(
+            "HandleNotAvailable",
+            format!("Handle already taken: {handle}"),
+        ));
+    }
+    if did.starts_with("did:plc:") {
+        // PLC first, then the database. The repair entry makes the change
+        // converge if anything after the PLC step fails.
+        s.store
+            .queue_identity_repair(did, RepairKind::Handle, &handle)
+            .await?;
+        match plc_set_handle(&s, did, &handle).await {
+            Ok(()) => {}
+            Err(PlcStep::Refused(e)) => {
+                s.store
+                    .finish_identity_repair(did, RepairKind::Handle, &handle)
+                    .await?;
+                return Err(e);
+            }
+            Err(PlcStep::Ambiguous(e)) => return Err(e),
+        }
+        apply_handle(&s, did, &handle, None).await?;
+        s.store
+            .finish_identity_repair(did, RepairKind::Handle, &handle)
+            .await?;
+    } else if let Some(hosted) = s.store.hosted_did_web(did).await?
+        && let Some(doc) = hosted.doc
+    {
+        // A document locus serves: edit it in the same transaction.
+        let mut doc: Value =
+            serde_json::from_str(&doc).map_err(|e| XrpcError::internal(e.to_string()))?;
+        set_doc_handle(&mut doc, &handle);
+        apply_handle(&s, did, &handle, Some(&doc.to_string())).await?;
+    } else {
+        // Someone else serves the document: it must already name the handle.
+        let doc = s
+            .resolvers()?
+            .resolve_did(did, true)
+            .await
+            .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
+        let named = doc.as_ref().and_then(|d| proto_blue_common::get_handle(d));
+        if named != Some(handle.as_str()) {
+            return Err(XrpcError::invalid_request(
+                "DID is not properly configured for handle",
+            ));
+        }
+        apply_handle(&s, did, &handle, None).await?;
+    }
+    for h in [&account.handle, &handle] {
+        let _ = s.store.clear_handle_cache(h).await;
+    }
+    let _ = s.store.clear_did_doc(did).await;
+    Ok(())
+}
+
+/// Puts `handle` first among a document's `at://` names.
+fn set_doc_handle(doc: &mut Value, handle: &str) {
+    let uri = Value::String(format!("at://{handle}"));
+    let aka = doc
+        .as_object_mut()
+        .map(|m| m.entry("alsoKnownAs").or_insert_with(|| json!([])));
+    if let Some(Value::Array(list)) = aka {
+        match list
+            .iter()
+            .position(|v| v.as_str().is_some_and(|a| a.starts_with("at://")))
+        {
+            Some(i) => list[i] = uri,
+            None => list.insert(0, uri),
+        }
+    }
+}
+
+/// The database half of a handle change: the account row, a hosted did:web
+/// document if any, and `#identity`, under the DID's repo lock.
+async fn apply_handle(
+    s: &AppState,
+    did: &str,
+    handle: &str,
+    web_doc: Option<&str>,
+) -> XrpcResult<()> {
+    let (_lock, mut tx) = s
+        .repo
+        .locked_tx(did)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    tx.set_account_handle(did, handle)
+        .await
+        .map_err(|e| match e {
+            locus_core::CoreError::Conflict(m) => XrpcError::named("HandleNotAvailable", m),
+            other => other.into(),
+        })?;
+    if let Some(doc) = web_doc {
+        tx.set_hosted_did_web_doc(did, Some(doc)).await?;
+    }
+    let body = identity_body(did, Some(handle)).map_err(|e| XrpcError::internal(e.to_string()))?;
+    tx.insert_outbox(did, "identity", &body).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A PLC step that failed: refused (nothing changed) or ambiguous (it may
+/// have applied; the repair job finds out).
+pub(crate) enum PlcStep {
+    Refused(XrpcError),
+    Ambiguous(XrpcError),
+}
+
+fn upstream(m: impl Into<String>) -> XrpcError {
+    XrpcError::new(StatusCode::BAD_GATEWAY, "UpstreamFailure", m)
+}
+
+/// The DID's current PLC document and the CID its next op must name.
+async fn plc_state(s: &AppState, did: &str) -> Result<(Option<Operation>, String), PlcStep> {
+    let plc = s.plc().map_err(PlcStep::Ambiguous)?;
+    let raw = match plc.last_op_json(did).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return Err(PlcStep::Refused(XrpcError::invalid_request(
+                "DID not found in the PLC directory",
+            )));
+        }
+        Err(e) => return Err(PlcStep::Ambiguous(upstream(e.to_string()))),
+    };
+    plc::last_op_state(&raw).map_err(|e| PlcStep::Ambiguous(upstream(e.to_string())))
+}
+
+fn no_held_key() -> PlcStep {
+    PlcStep::Refused(XrpcError::invalid_request(
+        "This PDS holds none of the rotation keys the DID document lists",
+    ))
+}
+
+/// Submits an op naming `handle`, signed with the held key the DID's
+/// document lists first. Already naming it counts as done.
+async fn plc_set_handle(s: &AppState, did: &str, handle: &str) -> Result<(), PlcStep> {
+    let (state, prev) = plc_state(s, did).await?;
+    let current =
+        state.ok_or_else(|| PlcStep::Refused(XrpcError::invalid_request("DID is tombstoned")))?;
+    if current.handle() == Some(handle) {
+        let _ = s
+            .store
+            .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&current.rotation_keys))
+            .await;
+        return Ok(());
+    }
+    let mut next = current.with_handle(handle);
+    next.prev = Some(prev);
+    next.validate()
+        .map_err(|e| PlcStep::Refused(XrpcError::invalid_request(e.to_string())))?;
+    let signer = s
+        .secrets
+        .plc_keys
+        .signer_for(&current.rotation_keys)
+        .ok_or_else(no_held_key)?;
+    let signed = next
+        .sign(signer)
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let plc = s.plc().map_err(PlcStep::Ambiguous)?;
+    match plc.submit(did, &signed).await {
+        Ok(()) => {}
+        Err(PlcClientError::Refused(m)) => {
+            return Err(PlcStep::Refused(XrpcError::invalid_request(format!(
+                "The PLC directory refused the update: {m}"
+            ))));
+        }
+        Err(e) => {
+            // Maybe it applied: look before reporting a failure.
+            match plc_state(s, did).await {
+                Ok((Some(op), _)) if op.handle() == Some(handle) => {}
+                _ => return Err(PlcStep::Ambiguous(upstream(e.to_string()))),
+            }
+        }
+    }
+    let _ = s
+        .store
+        .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&next.rotation_keys))
+        .await;
+    Ok(())
+}
+
+/// Tombstones a DID locus created for an account that was never created.
+pub(crate) async fn plc_tombstone(s: &AppState, did: &str) -> Result<(), PlcStep> {
+    let (state, prev) = plc_state(s, did).await?;
+    let Some(current) = state else {
+        return Ok(());
+    };
+    let signer = s
+        .secrets
+        .plc_keys
+        .signer_for(&current.rotation_keys)
+        .ok_or_else(no_held_key)?;
+    let t = plc::sign_tombstone(&prev, signer)
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let plc = s.plc().map_err(PlcStep::Ambiguous)?;
+    match plc.submit(did, &t).await {
+        Ok(()) => Ok(()),
+        Err(PlcClientError::Refused(m)) => Err(PlcStep::Refused(XrpcError::invalid_request(m))),
+        Err(e) => Err(PlcStep::Ambiguous(upstream(e.to_string()))),
+    }
+}
+
+/// One pass of the identity repair job over every due entry. Returns how
+/// many entries finished.
+pub async fn run_identity_repairs(s: &AppState) -> locus_core::CoreResult<usize> {
+    let mut done = 0;
+    for r in s.store.due_identity_repairs(100).await? {
+        let outcome = match r.kind {
+            RepairKind::Handle => repair_handle(s, &r.did, &r.value).await,
+            RepairKind::Tombstone => {
+                // Never tombstone a DID that has an account after all.
+                if s.store.account_by_did(&r.did).await?.is_some() {
+                    Ok(())
+                } else {
+                    plc_tombstone(s, &r.did).await
+                }
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                s.store
+                    .finish_identity_repair(&r.did, r.kind, &r.value)
+                    .await?;
+                done += 1;
+            }
+            Err(PlcStep::Refused(e)) => {
+                tracing::warn!(
+                    did = r.did,
+                    kind = r.kind.as_str(),
+                    "identity repair dropped: {}",
+                    e.message
+                );
+                s.store
+                    .finish_identity_repair(&r.did, r.kind, &r.value)
+                    .await?;
+            }
+            Err(PlcStep::Ambiguous(e)) => {
+                let backoff = (30_000_i64 << r.attempts.clamp(0, 7)).min(3_600_000);
+                s.store
+                    .retry_identity_repair(&r.did, r.kind, &e.message, backoff)
+                    .await?;
+            }
+        }
+    }
+    Ok(done)
+}
+
+async fn repair_handle(s: &AppState, did: &str, handle: &str) -> Result<(), PlcStep> {
+    let account = match s.store.account_by_did(did).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(PlcStep::Ambiguous(e.into())),
+    };
+    // The PLC step again (a no-op if it applied), then the database.
+    plc_set_handle(s, did, handle).await?;
+    if account.handle != handle {
+        apply_handle(s, did, handle, None).await.map_err(|e| {
+            if e.error == "HandleNotAvailable" {
+                PlcStep::Refused(e)
+            } else {
+                PlcStep::Ambiguous(e)
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// `/.well-known/atproto-did`: the DID of the active account whose handle is
@@ -74,12 +422,28 @@ pub async fn well_known_atproto_did(State(s): St, headers: HeaderMap) -> Respons
     }
 }
 
-/// `/.well-known/did.json`: the service DID document on the PDS hostname.
+/// `/.well-known/did.json`: the service DID document on the PDS hostname,
+/// or a hosted did:web account's document on its host.
 pub async fn well_known_did_json(State(s): St, headers: HeaderMap) -> Response {
-    if request_host(&headers).as_deref() != Some(s.hostname.as_str()) {
-        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    let not_found = || (StatusCode::NOT_FOUND, "Not found").into_response();
+    let Some(host) = request_host(&headers) else {
+        return not_found();
+    };
+    if host == s.hostname {
+        return Json(service_document(&s).to_json()).into_response();
     }
-    let doc = DidDocument {
+    match s.store.hosted_did_web_by_host(&host).await {
+        Ok(Some(web)) => match web.doc.and_then(|d| serde_json::from_str::<Value>(&d).ok()) {
+            Some(doc) => Json(doc).into_response(),
+            None => not_found(),
+        },
+        Ok(None) => not_found(),
+        Err(e) => XrpcError::from(e).into_response(),
+    }
+}
+
+fn service_document(s: &AppState) -> DidDocument {
+    DidDocument {
         id: s.service_did.clone(),
         also_known_as: Vec::new(),
         verification_methods: vec![VerificationMethod {
@@ -91,10 +455,25 @@ pub async fn well_known_did_json(State(s): St, headers: HeaderMap) -> Response {
             kind: "AtprotoPersonalDataServer".into(),
             endpoint: s.public_url.clone(),
         }],
-    };
-    Json(doc.to_json()).into_response()
+    }
 }
 
 pub async fn health() -> Json<Value> {
     Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_doc_handle;
+    use serde_json::json;
+
+    #[test]
+    fn hosted_documents_get_the_new_handle_in_place() {
+        let mut doc = json!({"id": "did:web:a.test", "alsoKnownAs": ["https://x", "at://a.test"]});
+        set_doc_handle(&mut doc, "b.test");
+        assert_eq!(doc["alsoKnownAs"], json!(["https://x", "at://b.test"]));
+        let mut doc = json!({"id": "did:web:a.test"});
+        set_doc_handle(&mut doc, "b.test");
+        assert_eq!(doc["alsoKnownAs"], json!(["at://b.test"]));
+    }
 }

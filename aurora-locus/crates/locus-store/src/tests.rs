@@ -531,3 +531,135 @@ async fn job_runs_are_recorded() {
         assert!(gc.last_run_at >= gc.last_ok_at, "{}", b.name);
     }
 }
+
+#[tokio::test]
+async fn identity_tables_on_both_backends() {
+    use crate::identity::{PlcKeyRole, RepairKind};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+
+        // One current PLC key at most; a second is a conflict.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_plc_rotation_key("did:key:zA", PlcKeyRole::Current)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        match tx
+            .insert_plc_rotation_key("did:key:zB", PlcKeyRole::Current)
+            .await
+        {
+            Err(CoreError::Conflict(_)) => {}
+            other => panic!("{n}: second current key: {other:?}"),
+        }
+        // A failed statement ends a Postgres transaction; start another.
+        tx.rollback().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_plc_rotation_key("did:key:zB", PlcKeyRole::Secondary)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let keys = s.plc_rotation_keys().await.unwrap();
+        assert_eq!(keys.len(), 2, "{n}");
+        assert_eq!(keys[0].role, PlcKeyRole::Current, "{n}");
+
+        s.set_plc_key_listing("did:plc:x", &["did:key:zB".into()])
+            .await
+            .unwrap();
+        s.set_plc_key_listing("did:plc:x", &["did:key:zA".into(), "did:key:zB".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.plc_key_listing("did:plc:x").await.unwrap(),
+            Some(vec!["did:key:zA".to_owned(), "did:key:zB".to_owned()]),
+            "{n}"
+        );
+
+        // Caches report their age on the database clock.
+        s.cache_did_doc("did:plc:x", "{}").await.unwrap();
+        let c = s.cached_did_doc("did:plc:x").await.unwrap().unwrap();
+        assert!((0..5_000).contains(&c.age_ms), "{n}: age {}", c.age_ms);
+        s.clear_did_doc("did:plc:x").await.unwrap();
+        assert!(
+            s.cached_did_doc("did:plc:x").await.unwrap().is_none(),
+            "{n}"
+        );
+        s.cache_handle("a.test", None).await.unwrap();
+        assert_eq!(
+            s.cached_handle("a.test").await.unwrap().unwrap().value,
+            None,
+            "{n}"
+        );
+        s.cache_handle("a.test", Some("did:plc:x")).await.unwrap();
+        assert_eq!(
+            s.cached_handle("a.test")
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("did:plc:x"),
+            "{n}"
+        );
+
+        // A did:web host is tied to one DID; the row outlives the document.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_hosted_did_web("did:web:w.test", "w.test", "{}")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        match tx
+            .insert_hosted_did_web("did:web:other", "w.test", "{}")
+            .await
+        {
+            Err(CoreError::Conflict(_)) => {}
+            other => panic!("{n}: second DID on a host: {other:?}"),
+        }
+        tx.rollback().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.set_hosted_did_web_doc("did:web:w.test", None)
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let row = s.hosted_did_web_by_host("w.test").await.unwrap().unwrap();
+        assert_eq!((row.did.as_str(), row.doc), ("did:web:w.test", None), "{n}");
+
+        // Repairs: due at once, retried with a backoff, finished only for
+        // the value they hold.
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h1.test")
+            .await
+            .unwrap();
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        let due = s.due_identity_repairs(10).await.unwrap();
+        assert_eq!(due.len(), 1, "{n}: replaced, not added");
+        assert_eq!(due[0].value, "h2.test", "{n}");
+        s.retry_identity_repair("did:plc:x", RepairKind::Handle, "timeout", 60_000)
+            .await
+            .unwrap();
+        assert!(
+            s.due_identity_repairs(10).await.unwrap().is_empty(),
+            "{n}: backing off"
+        );
+        s.finish_identity_repair("did:plc:x", RepairKind::Handle, "h1.test")
+            .await
+            .unwrap();
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.due_identity_repairs(10).await.unwrap().len(),
+            1,
+            "{n}: stale finish kept it"
+        );
+        s.finish_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        assert!(s.due_identity_repairs(10).await.unwrap().is_empty(), "{n}");
+    }
+}

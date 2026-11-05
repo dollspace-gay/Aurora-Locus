@@ -8,7 +8,7 @@ use locus_auth::session::LegacySessions;
 use locus_core::bootstrap::{self, Bootstrap};
 use locus_core::lease::{DEFAULT_LEASE_TTL, LeaseToken};
 use locus_core::{CoreError, CoreResult};
-use locus_http::{AppState, ServerSecrets};
+use locus_http::{AppState, ResolverCache, ServerSecrets};
 use locus_repo::{RepoEngine, TidClock};
 use locus_store::Store;
 use locus_store::env::{CLOCK_SLOT_FAMILY, collect_env};
@@ -151,7 +151,10 @@ impl Node {
             hostname,
             public_url,
             service_did,
+            ssrf_protection: !self.bootstrap.ssrf_protection_disabled(),
+            resolvers: ResolverCache::default(),
         });
+        self.spawn_identity_repair(Arc::clone(&state));
         let addr = self.bootstrap.listen;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -165,6 +168,41 @@ impl Node {
             }
         }));
         Ok(())
+    }
+
+    /// Retries identity changes that didn't finish (handle changes after an
+    /// unclear PLC answer, tombstones of DIDs from failed sign-ups), on one
+    /// node at a time.
+    fn spawn_identity_repair(&mut self, state: Arc<AppState>) {
+        const NAME: &str = "identity-repair";
+        const EVERY: Duration = Duration::from_secs(30);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                NAME.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        loop {
+                            let result = locus_http::identity::run_identity_repairs(&state).await;
+                            match &result {
+                                Ok(n) if *n > 0 => tracing::info!(repaired = n, "identity repair"),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("identity repair failed: {e}"),
+                            }
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state.store.record_job_run(NAME, err.as_deref(), None).await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(EVERY) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// Deletes repo blocks whose reference count has been 0 for longer than

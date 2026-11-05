@@ -75,6 +75,13 @@ impl PlcClient {
         self.get_json(&format!("{}/{did}", self.base)).await
     }
 
+    /// The DID's latest operation as the directory serves it, or None if
+    /// unknown (read it with [`crate::plc::last_op_state`]).
+    pub async fn last_op_json(&self, did: &str) -> Result<Option<Value>, PlcClientError> {
+        self.get_json(&format!("{}/{did}/log/last", self.base))
+            .await
+    }
+
     /// The DID's latest operation, or None if unknown.
     pub async fn last_op(&self, did: &str) -> Result<Option<SignedOp>, PlcClientError> {
         match self

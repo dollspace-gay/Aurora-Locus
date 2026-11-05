@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Formats, lints and tests the workspace. Postgres tests run when
-# LOCUS_TEST_PG is set (defaults to the local test container).
+# Formats, lints and tests the workspace. Store tests also run on Postgres
+# through LOCUS_TEST_POSTGRES_URL (defaults to the local test container).
 set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
-export LOCUS_TEST_PG="${LOCUS_TEST_PG:-postgres://locus:locus@127.0.0.1:55491/locus}"
+export LOCUS_TEST_POSTGRES_URL="${LOCUS_TEST_POSTGRES_URL:-postgres://locus:locus@127.0.0.1:55491/locus}"
 
 cargo fmt --all
 cargo clippy --workspace --all-targets --quiet --message-format short -- -D warnings
