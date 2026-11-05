@@ -387,8 +387,65 @@ kryphocron built in.
   (viewer); the private-tier block and the scanner review queue
   (moderator); changing settings and starting a rotation generation
   (admin); operators and API tokens (owner); and `describeCapabilities`.
+- A server-rendered web UI with no scripts and a strict Content Security
+  Policy: one stylesheet of tokens, bundled fonts (Atkinson Hyperlegible,
+  IBM Plex, JetBrains Mono), light, dark or the device's choice, four
+  colour schemes, and a page shell with a sidebar. Its design comes from
+  Horizon-Prism's admin UI.
+- First-run setup: until it completes a node serves only the setup wizard,
+  health and `/tls-check` (for the bootstrap hostname), behind a one-time
+  token printed to the log and written to `<data>/setup-token`. The wizard
+  covers the hostname, storage, proxy and TLS, handle domains (suggesting
+  the parent's wildcard and reserving the domain's existing subdomains and
+  the PDS's own label), the first operator, email with a test message,
+  network services, private posts and keys, then runs checks (DNS,
+  reachability through the public URL, Cloudflare's SSL mode, upload caps)
+  whose warnings must be accepted. `aurora-locus setup` asks the same
+  questions at a terminal, `--config setup.toml` takes them from a file,
+  and `LOCUS_SETUP_AUTO=true` builds them from env. Completion is one
+  transaction, so two nodes can't both apply it; every node then restarts
+  into service on its own.
+- The operator console at `/admin`: sign-in with a password and a TOTP
+  code app (codes work once; idle and absolute session limits; a fresh
+  password and code before managing operators or deleting accounts), and
+  pages for Home, accounts, invites, operators, moderation, scanning,
+  private posts, identity, network services, email (SMTP and a delivery
+  test), proxy and TLS (with a DNS check), limits, storage, jobs, the audit
+  log (filters and a JSON-lines export), this node's recent log lines, and
+  every setting. Each operator chooses their own appearance. Console forms
+  call the admin API as the signed-in operator, so its roles, checks and
+  audit entries apply.
+- The account portal at `/account` (`portal.enabled`, on): sign-up and
+  sign-in (with email sign-in codes; app passwords are refused), handle,
+  email confirmation and change, sign-in codes, password reset, app
+  passwords, connected OAuth apps, a repo download, the DID document and a
+  PLC recovery key, guidance for moving an account here, deactivation and
+  deletion. A portal sign-in is an ordinary account session, so a password
+  change ends it.
+- OAuth sign-up: `prompt=create`, or "Create an account" on the sign-in
+  page, makes an account and continues to consent.
+- Branding (console): a draft theme with colours for light and dark
+  (each checked for contrast before publishing), a logo, favicon,
+  backgrounds, links, a bundled or uploaded font, corner and spacing
+  presets, page text and custom CSS (parsed and re-serialized, rules and
+  `@media` only, `url()` limited to uploads). Published versions are kept
+  and can be put back. The OAuth sign-in and consent pages take only the
+  checked variables, never custom CSS or uploaded fonts. Uploads are
+  type-checked by their bytes and collected a week after no version uses
+  them; emails carry the theme's footer.
+- `identity.reserved_handles`, `deploy.proxy_mode` and
+  `admin.session_idle_minutes` settings.
+- The admin socket (`<data>/admin.sock`, mode 0600; root or the service's
+  own user, checked by peer credentials, as the owner) and the CLI's online
+  commands over it, or over HTTP with `--url` and `--token`: `status`,
+  `account`, `invite`, `settings` (including export and import),
+  `operator`, `moderation`, `crawl request`, `jobs list`, `kryphocron`,
+  `call` for any XRPC method, and `healthcheck`.
 
 ### Changed
+
+- A leased job stops when a renewal hasn't answered before its lease could
+  run out, so a slow database can't leave two nodes running it at once.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.
