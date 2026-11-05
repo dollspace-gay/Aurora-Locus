@@ -47,6 +47,7 @@ pub async fn describe_server(State(s): St) -> Json<Value> {
         "did": s.service_did,
         "availableUserDomains": s.handle_domains(),
         "inviteCodeRequired": snap.bool("accounts.invite_required"),
+        "phoneVerificationRequired": false,
         "links": links,
     });
     let contact = snap.text("server.contact_email");
@@ -820,4 +821,159 @@ pub async fn get_service_auth(
         locus_auth::service_jwt::create(&key, &authed.did, &p.aud, p.exp, lxm, now_ms / 1000)
             .map_err(|e| XrpcError::internal(e.to_string()))?;
     Ok(Json(json!({ "token": token })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountInviteCodesParams {
+    #[serde(default = "yes")]
+    include_used: bool,
+    #[serde(default = "yes")]
+    create_available: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// How many routine codes an account may make now, as the reference's
+/// `calculateCodesToCreate`: one per interval of its lifetime (counted from
+/// the epoch), at most 5 unused at a time; admin-gifted codes don't count.
+fn codes_to_create(
+    codes: &[locus_store::invites::InviteCode],
+    created_at: i64,
+    now: i64,
+    epoch: i64,
+    interval: i64,
+) -> (i64, i64) {
+    let routine: Vec<_> = codes.iter().filter(|c| c.created_by != "admin").collect();
+    let unused = routine
+        .iter()
+        .filter(|c| !c.disabled && c.available > i64::try_from(c.uses.len()).unwrap_or(i64::MAX))
+        .count();
+    let lifespan = now - created_at;
+    let could_create = if created_at >= epoch {
+        lifespan / interval
+    } else {
+        lifespan / interval - (epoch - created_at) / interval
+    };
+    let epoch_codes = routine.iter().filter(|c| c.created_at > epoch).count();
+    let to_create = (5 - i64::try_from(unused).unwrap_or(5))
+        .min(could_create - i64::try_from(epoch_codes).unwrap_or(0));
+    (
+        to_create,
+        i64::try_from(routine.len()).unwrap_or(0) + to_create,
+    )
+}
+
+pub async fn get_account_invite_codes(
+    State(s): St,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<GetAccountInviteCodesParams>,
+) -> XrpcResult<Json<Value>> {
+    let authed = auth::full_access(&s, &headers).await?;
+    let account = auth::account_checked(&s, &authed.did, false).await?;
+    let did = account.did.as_str();
+    let snap = s.snapshot();
+    let interval = snap.int("accounts.invite_interval_ms");
+    if p.create_available && snap.bool("accounts.invite_required") && interval > 0 {
+        let codes = s.store.invite_codes_for(did).await?;
+        let now = s.store.now_ms().await?;
+        let (to_create, total) = codes_to_create(
+            &codes,
+            account.created_at,
+            now,
+            snap.int("accounts.invite_epoch_ms"),
+            interval,
+        );
+        if to_create > 0 {
+            let mut tx = s.store.begin().await?;
+            // Another request may have topped the account up meanwhile.
+            if tx.routine_invite_count(did).await? == total - to_create {
+                for _ in 0..to_create {
+                    let code = format!(
+                        "{}-{}",
+                        s.hostname.replace('.', "-"),
+                        crate::email::new_token().to_ascii_lowercase()
+                    );
+                    tx.insert_invite_code(&code, 1, did, did).await?;
+                    if account.invites_disabled {
+                        tx.set_invite_disabled(&code, true).await?;
+                    }
+                }
+            }
+            tx.commit().await?;
+        }
+    }
+    let codes: Vec<Value> = s
+        .store
+        .invite_codes_for(did)
+        .await?
+        .into_iter()
+        .filter(|c| !c.disabled && (p.include_used || c.available > i64::try_from(c.uses.len()).unwrap_or(0)))
+        .map(|c| {
+            json!({
+                "code": c.code,
+                "available": c.available,
+                "disabled": c.disabled,
+                "forAccount": c.for_account,
+                "createdBy": c.created_by,
+                "createdAt": iso8601(c.created_at),
+                "uses": c.uses.iter().map(|(by, at)| json!({"usedBy": by, "usedAt": iso8601(*at)})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "codes": codes })))
+}
+
+/// As the reference: no signup queue here, so everyone is activated.
+pub async fn check_signup_queue(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    auth::access_with(
+        &s,
+        &headers,
+        auth::STANDARD,
+        &[locus_auth::session::SCOPE_SIGNUP_QUEUED],
+    )
+    .await?;
+    Ok(Json(json!({ "activated": true })))
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::codes_to_create;
+    use locus_store::invites::InviteCode;
+
+    fn code(created_by: &str, created_at: i64, used: bool) -> InviteCode {
+        InviteCode {
+            code: "c".into(),
+            available: 1,
+            disabled: false,
+            for_account: "did:plc:a".into(),
+            created_by: created_by.into(),
+            created_at,
+            uses: if used {
+                vec![("did:plc:b".into(), created_at)]
+            } else {
+                vec![]
+            },
+        }
+    }
+
+    #[test]
+    fn invite_math_matches_the_reference() {
+        const DAY: i64 = 86_400_000;
+        // Ten days old, one code per day, none yet: capped at 5 unused.
+        assert_eq!(codes_to_create(&[], 0, 10 * DAY, 0, DAY), (5, 5));
+        // Three used and two unused routine codes: three more.
+        let mut codes: Vec<_> = (1..=3).map(|d| code("did:plc:a", d * DAY, true)).collect();
+        codes.extend((4..=5).map(|d| code("did:plc:a", d * DAY, false)));
+        assert_eq!(codes_to_create(&codes, 0, 10 * DAY, 0, DAY), (3, 8));
+        // Admin gifts don't count.
+        codes.push(code("admin", DAY, false));
+        assert_eq!(codes_to_create(&codes, 0, 10 * DAY, 0, DAY), (3, 8));
+        // An epoch after creation only counts intervals since then.
+        assert_eq!(codes_to_create(&[], 0, 10 * DAY, 8 * DAY, DAY), (2, 2));
+        // Two days old: two codes at most.
+        assert_eq!(codes_to_create(&[], 8 * DAY, 10 * DAY, 0, DAY), (2, 2));
+    }
 }

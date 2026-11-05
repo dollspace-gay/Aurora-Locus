@@ -149,6 +149,10 @@ kryphocron built in.
 - did:plc documents are fetched from the configured PLC directory through
   the operator client (so a local directory on plain HTTP works);
   did:web documents go through the SSRF-safe client.
+- `getAccountInviteCodes`, with accounts earning codes on an interval as
+  the reference (`PDS_INVITE_INTERVAL`, `PDS_INVITE_EPOCH`; at most 5 unused;
+  admin-gifted codes don't count). `checkSignupQueue` answers activated.
+  `describeServer` reports `phoneVerificationRequired: false`.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

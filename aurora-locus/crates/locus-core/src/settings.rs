@@ -257,6 +257,26 @@ pub static REGISTRY: &[Def] = &[
         description: "Require an invite code to create an account.",
     },
     Def {
+        key: "accounts.invite_interval_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: 365 * 24 * 3_600_000,
+        },
+        default: "0",
+        env: Some("PDS_INVITE_INTERVAL"),
+        description: "Accounts earn an invite code every this many milliseconds (at most 5 unused). 0 turns it off.",
+    },
+    Def {
+        key: "accounts.invite_epoch_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: i64::MAX,
+        },
+        default: "0",
+        env: Some("PDS_INVITE_EPOCH"),
+        description: "Earned invite codes count from this time (ms since the epoch).",
+    },
+    Def {
         key: "accounts.did_doc_with_session",
         kind: Kind::Bool,
         default: "false",

@@ -1734,3 +1734,72 @@ impl Harness {
         .await
     }
 }
+
+#[tokio::test]
+async fn accounts_earn_invite_codes_on_an_interval() {
+    let h = harness(true).await;
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.insert_invite_code("seed-code", 1, "admin", "admin")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    h.state
+        .settings
+        .set("accounts.invite_interval_ms", json!(1), "test")
+        .await
+        .unwrap();
+    let (st, acct) = h
+        .post(
+            "com.atproto.server.createAccount",
+            None,
+            json!({"handle": "wes.pds.example.com", "email": "wes@example.com", "password": "pw", "inviteCode": "seed-code"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{acct}");
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    let list = |used: bool| {
+        let access = access.clone();
+        let h = &h;
+        async move {
+            let (st, v) = h
+                .call(
+                    "GET",
+                    &format!("/xrpc/com.atproto.server.getAccountInviteCodes?includeUsed={used}"),
+                    Some(&access),
+                    None,
+                )
+                .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v["codes"].as_array().unwrap().clone()
+        }
+    };
+    let codes = list(true).await;
+    assert_eq!(codes.len(), 5, "capped at 5 unused");
+    assert!(
+        codes[0]["code"]
+            .as_str()
+            .unwrap()
+            .starts_with("pds-example-com-")
+    );
+    assert_eq!(list(true).await.len(), 5, "no more while 5 are unused");
+
+    // Using one makes room for another.
+    let code = codes[0]["code"].as_str().unwrap().to_owned();
+    let (st, v) = h
+        .post(
+            "com.atproto.server.createAccount",
+            None,
+            json!({"handle": "xan.pds.example.com", "email": "xan@example.com", "password": "pw", "inviteCode": code}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let all = list(true).await;
+    assert_eq!(all.len(), 6);
+    let used = all.iter().find(|c| c["code"] == code.as_str()).unwrap();
+    assert_eq!(used["uses"][0]["usedBy"], v["did"]);
+    assert_eq!(
+        list(false).await.len(),
+        5,
+        "used codes hidden without includeUsed"
+    );
+}

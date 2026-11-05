@@ -8,6 +8,7 @@ pub mod bulk;
 pub mod email;
 pub mod env;
 pub mod identity;
+pub mod invites;
 pub mod jobs;
 pub mod lease;
 pub mod repo;

@@ -85,6 +85,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(email::reset_password),
         )
         .route(
+            "/xrpc/com.atproto.server.getAccountInviteCodes",
+            get(server::get_account_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.temp.checkSignupQueue",
+            get(server::check_signup_queue),
+        )
+        .route(
             "/xrpc/com.atproto.server.getServiceAuth",
             get(server::get_service_auth),
         )
