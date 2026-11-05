@@ -80,6 +80,10 @@ impl Settings {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let mut listener = this.connect_listener().await;
+            // A change made before LISTEN started sent no notification we'd see.
+            if let Err(e) = this.refresh().await {
+                tracing::warn!("settings refresh failed: {e}");
+            }
             loop {
                 let notified = async {
                     match listener.as_mut() {
@@ -97,11 +101,13 @@ impl Settings {
                         }
                     }
                 }
-                if let Err(e) = this.refresh().await {
-                    tracing::warn!("settings refresh failed: {e}");
-                }
+                // Reconnect first, so a change made while the listener was
+                // down is picked up by the refresh that follows.
                 if listener.is_none() {
                     listener = this.connect_listener().await;
+                }
+                if let Err(e) = this.refresh().await {
+                    tracing::warn!("settings refresh failed: {e}");
                 }
             }
         })

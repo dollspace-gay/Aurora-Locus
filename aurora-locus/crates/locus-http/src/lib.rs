@@ -92,6 +92,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(identity::update_handle),
         )
         .route(
+            "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
+            get(identity::get_recommended_did_credentials),
+        )
+        .route(
+            "/xrpc/com.atproto.identity.requestPlcOperationSignature",
+            post(identity::request_plc_operation_signature),
+        )
+        .route(
+            "/xrpc/com.atproto.identity.signPlcOperation",
+            post(identity::sign_plc_operation),
+        )
+        .route(
+            "/xrpc/com.atproto.identity.submitPlcOperation",
+            post(identity::submit_plc_operation),
+        )
+        .route(
             "/.well-known/atproto-did",
             get(identity::well_known_atproto_did),
         )

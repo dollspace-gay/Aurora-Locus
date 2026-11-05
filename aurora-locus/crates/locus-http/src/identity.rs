@@ -15,6 +15,7 @@ use locus_identity::plc_client::PlcClientError;
 use locus_repo::event::identity_body;
 use locus_store::accounts::Status;
 use locus_store::identity::RepairKind;
+use proto_blue_crypto::Keypair;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -401,6 +402,239 @@ async fn repair_handle(s: &AppState, did: &str, handle: &str) -> Result<(), PlcS
         })?;
     }
     Ok(())
+}
+
+/// The document this PDS would have an account's PLC document say, as the
+/// reference: the operator recovery key (if set) and the current PDS
+/// rotation key, the account's signing key, handle and this PDS.
+pub async fn get_recommended_did_credentials(
+    State(s): St,
+    headers: HeaderMap,
+) -> XrpcResult<Json<Value>> {
+    let authed = auth::access(&s, &headers).await?;
+    let signing = s.signing_key(&authed.did).await?;
+    let mut rotation_keys = Vec::new();
+    let recovery = s.snapshot().text("identity.recovery_did_key").to_owned();
+    if !recovery.is_empty() {
+        rotation_keys.push(recovery);
+    }
+    rotation_keys.push(s.secrets.plc_keys.current().did());
+    let mut out = json!({
+        "rotationKeys": rotation_keys,
+        "verificationMethods": { "atproto": signing.did() },
+        "services": { "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": s.public_url } },
+    });
+    if let Some(a) = s.store.account_by_did(&authed.did).await? {
+        out["alsoKnownAs"] = json!([format!("at://{}", a.handle)]);
+    }
+    Ok(Json(out))
+}
+
+/// Emails a code that `signPlcOperation` needs.
+pub async fn request_plc_operation_signature(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+    let authed = auth::access_with(
+        &s,
+        &headers,
+        auth::FULL,
+        &[locus_auth::session::SCOPE_TAKENDOWN],
+    )
+    .await?;
+    let account = s
+        .store
+        .account_by_did(&authed.did)
+        .await?
+        .ok_or_else(|| XrpcError::invalid_request("account not found"))?;
+    let email = account
+        .email
+        .ok_or_else(|| XrpcError::invalid_request("account does not have an email address"))?;
+    crate::email::require_email(&s).await?;
+    let token = crate::email::issue(
+        &s,
+        &account.did,
+        locus_store::email::TokenPurpose::PlcOperation,
+    )
+    .await?;
+    crate::email::send(
+        &s,
+        locus_mail::Template::PlcOperation,
+        &email,
+        &token,
+        &account.handle,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignPlcOperationInput {
+    token: Option<String>,
+    rotation_keys: Option<Vec<String>>,
+    also_known_as: Option<Vec<String>>,
+    verification_methods: Option<serde_json::Map<String, Value>>,
+    services: Option<serde_json::Map<String, Value>>,
+}
+
+/// Signs (doesn't submit) an update of the account's PLC document with the
+/// fields given, for migrating away. **[deviation]** The fields are
+/// validated, which the reference doesn't do.
+pub async fn sign_plc_operation(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<SignPlcOperationInput>,
+) -> XrpcResult<Json<Value>> {
+    let authed = auth::access_with(
+        &s,
+        &headers,
+        auth::FULL,
+        &[locus_auth::session::SCOPE_TAKENDOWN],
+    )
+    .await?;
+    let did = authed.did.as_str();
+    let token = input
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            XrpcError::invalid_request("email confirmation token required to sign PLC operations")
+        })?;
+    let purpose = locus_store::email::TokenPurpose::PlcOperation;
+    crate::email::check(&s, did, purpose, token).await?;
+    let mut tx = s.store.begin().await?;
+    tx.delete_email_token(did, purpose).await?;
+    tx.commit().await?;
+
+    let (state, prev) = plc_state(&s, did).await.map_err(PlcStep::into_error)?;
+    let current = state.ok_or_else(|| XrpcError::invalid_request("Did is tombstoned"))?;
+    let strings = |m: serde_json::Map<String, Value>,
+                   what: &str|
+     -> XrpcResult<std::collections::BTreeMap<String, String>> {
+        m.into_iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => Ok((k, s)),
+                _ => Err(XrpcError::invalid_request(format!(
+                    "{what} {k:?} must be a did:key"
+                ))),
+            })
+            .collect()
+    };
+    let services = match input.services {
+        Some(m) => m
+            .into_iter()
+            .map(|(k, v)| {
+                let field = |f: &str| v.get(f).and_then(Value::as_str).map(str::to_owned);
+                match (field("type"), field("endpoint")) {
+                    (Some(kind), Some(endpoint)) => Ok((k, plc::Service { kind, endpoint })),
+                    _ => Err(XrpcError::invalid_request(format!(
+                        "service {k:?} needs a type and an endpoint"
+                    ))),
+                }
+            })
+            .collect::<XrpcResult<_>>()?,
+        None => current.services.clone(),
+    };
+    let next = Operation {
+        rotation_keys: input
+            .rotation_keys
+            .unwrap_or_else(|| current.rotation_keys.clone()),
+        verification_methods: match input.verification_methods {
+            Some(m) => strings(m, "verification method")?,
+            None => current.verification_methods.clone(),
+        },
+        also_known_as: input
+            .also_known_as
+            .unwrap_or_else(|| current.also_known_as.clone()),
+        services,
+        prev: Some(prev),
+    };
+    next.validate()
+        .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
+    let signer = s
+        .secrets
+        .plc_keys
+        .signer_for(&current.rotation_keys)
+        .ok_or_else(|| no_held_key().into_error())?;
+    let signed = next
+        .sign(signer)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(json!({ "operation": signed.to_json() })))
+}
+
+#[derive(Deserialize)]
+pub struct SubmitPlcOperationInput {
+    operation: Value,
+}
+
+/// Submits a signed op for the account's DID, after checking that it keeps
+/// the account here: it lists the current PDS rotation key, this PDS as
+/// `atproto_pds`, the account's signing key and handle.
+pub async fn submit_plc_operation(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<SubmitPlcOperationInput>,
+) -> XrpcResult<()> {
+    let authed = auth::access(&s, &headers).await?;
+    let did = authed.did.as_str();
+    let invalid = || XrpcError::invalid_request("Invalid operation");
+    let op = plc::SignedOp::from_json(&input.operation).map_err(|_| invalid())?;
+    let plc::SignedOp::Operation { op: fields, .. } = &op else {
+        return Err(invalid());
+    };
+    if !fields
+        .rotation_keys
+        .contains(&s.secrets.plc_keys.current().did())
+    {
+        return Err(XrpcError::invalid_request(
+            "Rotation keys do not include server's rotation key",
+        ));
+    }
+    let pds = fields.services.get("atproto_pds");
+    if pds.map(|p| p.kind.as_str()) != Some("AtprotoPersonalDataServer") {
+        return Err(XrpcError::invalid_request(
+            "Incorrect type on atproto_pds service",
+        ));
+    }
+    if pds.map(|p| p.endpoint.as_str()) != Some(s.public_url.as_str()) {
+        return Err(XrpcError::invalid_request(
+            "Incorrect endpoint on atproto_pds service",
+        ));
+    }
+    if fields.verification_methods.get("atproto") != Some(&s.signing_key(did).await?.did()) {
+        return Err(XrpcError::invalid_request("Incorrect signing key"));
+    }
+    if let Some(a) = s.store.account_by_did(did).await?
+        && fields.also_known_as.first() != Some(&format!("at://{}", a.handle))
+    {
+        return Err(XrpcError::invalid_request(
+            "Incorrect handle in alsoKnownAs",
+        ));
+    }
+    match s.plc()?.submit(did, &op).await {
+        Ok(()) => {}
+        Err(PlcClientError::Refused(m)) => return Err(XrpcError::invalid_request(m)),
+        Err(e) => return Err(upstream(e.to_string())),
+    }
+    let _ = s
+        .store
+        .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&fields.rotation_keys))
+        .await;
+    let (_lock, mut tx) = s
+        .repo
+        .locked_tx(did)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let body = identity_body(did, None).map_err(|e| XrpcError::internal(e.to_string()))?;
+    tx.insert_outbox(did, "identity", &body).await?;
+    tx.commit().await?;
+    let _ = s.store.clear_did_doc(did).await;
+    Ok(())
+}
+
+impl PlcStep {
+    fn into_error(self) -> XrpcError {
+        match self {
+            Self::Refused(e) | Self::Ambiguous(e) => e,
+        }
+    }
 }
 
 /// `/.well-known/atproto-did`: the DID of the active account whose handle is

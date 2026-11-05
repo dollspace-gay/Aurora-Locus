@@ -1194,3 +1194,150 @@ async fn without_email_the_features_say_so() {
         );
     }
 }
+
+#[tokio::test]
+async fn plc_operations_are_recommended_signed_with_a_code_and_submitted() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("quinn.pds.example.com", "quinn@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    let current = h.state.secrets.plc_keys.current().did();
+    let genesis = h.plc.lock().unwrap().last(&did).unwrap();
+
+    let (st, rec) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{rec}");
+    assert_eq!(rec["rotationKeys"], json!([current]));
+    assert_eq!(rec["verificationMethods"], genesis["verificationMethods"]);
+    assert_eq!(rec["alsoKnownAs"], json!(["at://quinn.pds.example.com"]));
+    assert_eq!(
+        rec["services"]["atproto_pds"]["endpoint"],
+        "https://pds.example.com"
+    );
+
+    // Signing needs the emailed code, which works once.
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            Some(&access),
+            json!({"rotationKeys": [current]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    h.post(
+        "com.atproto.identity.requestPlcOperationSignature",
+        Some(&access),
+        json!({}),
+    )
+    .await;
+    let (subject, code) = h.last_mail("quinn@example.com");
+    assert_eq!(subject, "PLC Update Operation Requested");
+    let extra = proto_blue_crypto::K256Keypair::generate().did();
+    let (st, signed) = h
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            Some(&access),
+            json!({"token": code, "rotationKeys": [extra, current]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{signed}");
+    let op = &signed["operation"];
+    assert_eq!(op["rotationKeys"], json!([extra, current]));
+    assert_eq!(
+        op["alsoKnownAs"], genesis["alsoKnownAs"],
+        "unnamed fields carry over"
+    );
+    let genesis_cid = SignedOp::from_json(&genesis)
+        .unwrap()
+        .cid()
+        .unwrap()
+        .to_string_base32();
+    assert_eq!(op["prev"], genesis_cid);
+    assert!(SignedOp::from_json(op).unwrap().verify(&current));
+    assert_eq!(
+        h.plc.lock().unwrap().log[&did].len(),
+        1,
+        "signed, not submitted"
+    );
+    let (st, _) = h
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            Some(&access),
+            json!({"token": code}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "the code is spent");
+
+    // Bad fields are refused before signing (locus validates them).
+    h.post(
+        "com.atproto.identity.requestPlcOperationSignature",
+        Some(&access),
+        json!({}),
+    )
+    .await;
+    let (_, code) = h.last_mail("quinn@example.com");
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            Some(&access),
+            json!({"token": code, "rotationKeys": ["not-a-key"]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    // Submitting checks the op keeps the account here.
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.submitPlcOperation",
+            Some(&access),
+            json!({"operation": op}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(h.plc.lock().unwrap().log[&did].len(), 2);
+    assert_eq!(h.outbox_kinds(&did).await.last().unwrap(), "identity");
+    assert_eq!(
+        h.state.store.plc_key_listing(&did).await.unwrap(),
+        Some(vec![current.clone()])
+    );
+    let mut moved = op.clone();
+    moved["services"]["atproto_pds"]["endpoint"] = json!("https://elsewhere.example.net");
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.submitPlcOperation",
+            Some(&access),
+            json!({"operation": moved}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("Incorrect endpoint on atproto_pds service")
+        )
+    );
+    let mut keyless = op.clone();
+    keyless["rotationKeys"] = json!([extra]);
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.submitPlcOperation",
+            Some(&access),
+            json!({"operation": keyless}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("Rotation keys do not include server's rotation key")
+        )
+    );
+}

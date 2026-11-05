@@ -286,6 +286,17 @@ impl AppState {
             .map_err(|e| crate::error::XrpcError::internal(e.to_string()))
     }
 
+    /// An account's repo signing key.
+    pub async fn signing_key(&self, did: &str) -> Result<K256Keypair, crate::error::XrpcError> {
+        let (_, sk) = self
+            .store
+            .get_signing_key(did, &self.master_key)
+            .await?
+            .ok_or_else(|| crate::error::XrpcError::internal("account has no signing key"))?;
+        K256Keypair::from_private_key(&sk)
+            .map_err(|e| crate::error::XrpcError::internal(e.to_string()))
+    }
+
     pub fn service_did_key(&self) -> String {
         self.secrets.service_key.did()
     }

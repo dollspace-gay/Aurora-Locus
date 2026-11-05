@@ -122,6 +122,12 @@ kryphocron built in.
 - Email sign-in codes: `createSession` asks for `authFactorToken`
   (`AuthFactorTokenRequired`) when the account has them on, except for app
   passwords, as the reference.
+- `getRecommendedDidCredentials`, `requestPlcOperationSignature`,
+  `signPlcOperation` and `submitPlcOperation`, as the reference (an emailed
+  code to sign; a submitted op must keep the current PDS rotation key, this
+  PDS, the account's signing key and handle). `signPlcOperation` also
+  checks the fields it signs: did:key rotation keys and verification
+  methods, typed http(s) services, `at://` names.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.
