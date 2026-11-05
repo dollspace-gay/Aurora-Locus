@@ -312,6 +312,36 @@ pub static REGISTRY: &[Def] = &[
         description: "From address of moderation emails. Empty uses the account email address.",
     },
     Def {
+        key: "limits.repo_write_body",
+        kind: Kind::Int {
+            min: 1024,
+            max: 64 * 1024 * 1024,
+        },
+        default: "2000000",
+        env: None,
+        description: "Largest request body for record writes, in bytes.",
+    },
+    Def {
+        key: "limits.json_body",
+        kind: Kind::Int {
+            min: 1024,
+            max: 64 * 1024 * 1024,
+        },
+        default: "153600",
+        env: None,
+        description: "Largest JSON request body for other endpoints, in bytes.",
+    },
+    Def {
+        key: "limits.record_size",
+        kind: Kind::Int {
+            min: 1024,
+            max: 2_000_000,
+        },
+        default: "1100000",
+        env: None,
+        description: "Largest single record (DAG-CBOR), in bytes.",
+    },
+    Def {
         key: "blobs.upload_limit",
         kind: Kind::Int {
             min: 1,

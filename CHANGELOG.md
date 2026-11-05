@@ -188,6 +188,9 @@ kryphocron built in.
   dropped blobs after an hour), and their bytes are deleted after a further
   grace so reads in flight finish. Account deletion removes the account's
   blobs too.
+- Live request and record limits: 2,000,000-byte bodies for record writes
+  (the reference allows 1,000,000), 150 KB for other JSON bodies, and
+  1.1 MB per record (`limits.*` settings).
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

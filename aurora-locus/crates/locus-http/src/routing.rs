@@ -90,6 +90,62 @@ pub async fn by_host(State(s): State<Arc<AppState>>, req: Request<Body>, next: N
     }
 }
 
+/// Paths whose bodies are record writes (the larger limit).
+const REPO_WRITES: &[&str] = &[
+    "/xrpc/com.atproto.repo.createRecord",
+    "/xrpc/com.atproto.repo.putRecord",
+    "/xrpc/com.atproto.repo.deleteRecord",
+    "/xrpc/com.atproto.repo.applyWrites",
+];
+
+/// Request body limits, live from settings: record writes get
+/// `limits.repo_write_body`, uploads their own limit (checked while
+/// streaming), everything else `limits.json_body`. A declared length over
+/// the limit is refused before reading; a chunked body is cut off at it.
+pub async fn limit_body(
+    State(s): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if path == "/xrpc/com.atproto.repo.uploadBlob" {
+        return next.run(req).await;
+    }
+    let snap = s.snapshot();
+    let limit = usize::try_from(if REPO_WRITES.contains(&path) {
+        snap.int("limits.repo_write_body")
+    } else {
+        snap.int("limits.json_body")
+    })
+    .unwrap_or(usize::MAX);
+    let declared = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > limit) {
+        return too_large();
+    }
+    let (parts, body) = req.into_parts();
+    let req = Request::from_parts(parts, Body::new(http_body_util::Limited::new(body, limit)));
+    let res = next.run(req).await;
+    // A cut-off body surfaces as a 413 from the extractor; give it the
+    // XRPC shape.
+    if res.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return too_large();
+    }
+    res
+}
+
+fn too_large() -> Response {
+    crate::error::XrpcError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "PayloadTooLarge",
+        "request entity too large",
+    )
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_internal_name;

@@ -2343,3 +2343,58 @@ impl Harness {
         self.call("GET", &path, None, None).await
     }
 }
+
+#[tokio::test]
+async fn bodies_and_records_have_live_limits() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("eli.pds.example.com", "eli@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    // Other endpoints take 150 KB; record writes 2 MB.
+    let big = json!({"identifier": "x".repeat(200_000), "password": "pw"});
+    let (st, v) = h.post("com.atproto.server.createSession", None, big).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::PAYLOAD_TOO_LARGE, Some("PayloadTooLarge"))
+    );
+    let record = json!({"repo": did, "collection": "com.example.big", "record": {"blob": "x".repeat(200_000)}});
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            record.clone(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // Lowered live.
+    h.state
+        .settings
+        .set("limits.record_size", json!(100_000), "test")
+        .await
+        .unwrap();
+    let (st, v) = h
+        .post("com.atproto.repo.createRecord", Some(&access), record)
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Record too large"),
+        "{v}"
+    );
+    h.state
+        .settings
+        .set("limits.repo_write_body", json!(50_000), "test")
+        .await
+        .unwrap();
+    let small = json!({"repo": did, "collection": "com.example.big", "record": {"blob": "x".repeat(60_000)}});
+    let (st, _) = h
+        .post("com.atproto.repo.createRecord", Some(&access), small)
+        .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+}

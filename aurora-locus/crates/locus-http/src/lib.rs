@@ -140,10 +140,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/xrpc/com.atproto.repo.describeRepo",
             get(repo::describe_repo),
         )
-        .route(
-            "/xrpc/com.atproto.repo.uploadBlob",
-            post(repo::upload_blob).layer(axum::extract::DefaultBodyLimit::disable()),
-        )
+        .route("/xrpc/com.atproto.repo.uploadBlob", post(repo::upload_blob))
         .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
         .route("/blob/{did}/{cid}", get(repo::get_blob_path))
         .route(
@@ -175,6 +172,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            routing::limit_body,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routing::by_host,

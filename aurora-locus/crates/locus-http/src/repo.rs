@@ -43,6 +43,10 @@ fn commit_error(e: CommitError) -> XrpcError {
     }
 }
 
+fn record_limit(s: &AppState) -> usize {
+    usize::try_from(s.snapshot().int("limits.record_size")).unwrap_or(usize::MAX)
+}
+
 fn invalid_record(e: records::InvalidRecord) -> XrpcError {
     XrpcError::invalid_request(e.0)
 }
@@ -183,6 +187,7 @@ pub async fn create_record(
         &rkey,
         records::parse_json(&input.record).map_err(invalid_record)?,
         input.validate,
+        record_limit(&s),
     )
     .map_err(invalid_record)?;
     let write = prepared(Action::Create, &input.collection, &rkey, Some(&rec), None);
@@ -240,6 +245,7 @@ pub async fn put_record(
         &input.rkey,
         records::parse_json(&input.record).map_err(invalid_record)?,
         input.validate,
+        record_limit(&s),
     )
     .map_err(invalid_record)?;
     let swap = swap_record(input.swap_record.as_ref())?;
@@ -358,8 +364,14 @@ pub async fn apply_writes(
                     }
                 };
                 let value = records::parse_json(&w["value"]).map_err(invalid_record)?;
-                let rec = records::prepare_record(collection, &rkey, value, input.validate)
-                    .map_err(invalid_record)?;
+                let rec = records::prepare_record(
+                    collection,
+                    &rkey,
+                    value,
+                    input.validate,
+                    record_limit(&s),
+                )
+                .map_err(invalid_record)?;
                 let action = if create {
                     Action::Create
                 } else {

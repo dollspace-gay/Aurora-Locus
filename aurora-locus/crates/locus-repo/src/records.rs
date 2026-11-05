@@ -134,6 +134,7 @@ pub fn prepare_record(
     rkey: &str,
     value: LexValue,
     validate: Option<bool>,
+    max_bytes: usize,
 ) -> Result<PreparedRecord, InvalidRecord> {
     let LexValue::Map(mut map) = value else {
         return Err(bad("Invalid record: expected an object"));
@@ -158,6 +159,12 @@ pub fn prepare_record(
     let blobs = blob_uses(&value)?;
     let bytes =
         proto_blue_lex_cbor::encode(&value).map_err(|e| bad(format!("Invalid record: {e}")))?;
+    if bytes.len() > max_bytes {
+        return Err(bad(format!(
+            "Record too large: {} bytes, the limit is {max_bytes}",
+            bytes.len()
+        )));
+    }
     let cid = Cid::for_cbor(&bytes);
     Ok(PreparedRecord {
         value,
@@ -300,7 +307,7 @@ mod tests {
         v: Value,
         validate: Option<bool>,
     ) -> Result<PreparedRecord, InvalidRecord> {
-        prepare_record(collection, rkey, parse_json(&v)?, validate)
+        prepare_record(collection, rkey, parse_json(&v)?, validate, 1_100_000)
     }
 
     const TID: &str = "3jzfcijpj2z2a";
@@ -408,6 +415,14 @@ mod tests {
                 .0
                 .starts_with("Legacy blobs")
         );
+    }
+
+    #[test]
+    fn records_have_a_size_limit() {
+        let v = parse_json(&json!({"text": "x".repeat(2000)})).unwrap();
+        let err = prepare_record("com.example.thing", "x", v.clone(), None, 1024).unwrap_err();
+        assert!(err.0.starts_with("Record too large"), "{}", err.0);
+        assert!(prepare_record("com.example.thing", "x", v, None, 4096).is_ok());
     }
 
     #[test]

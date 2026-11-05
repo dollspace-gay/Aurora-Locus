@@ -34,6 +34,7 @@ hex.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 axum = "0.8"
+http-body-util = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
