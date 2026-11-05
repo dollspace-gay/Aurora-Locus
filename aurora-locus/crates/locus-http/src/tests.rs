@@ -61,7 +61,7 @@ async fn mock_plc() -> (String, Plc) {
                 |State(plc): State<Plc>, Path(did): Path<String>| async move {
                     match plc.lock().unwrap().last(&did) {
                         Some(op) if op["type"] != "plc_tombstone" => {
-                            (StatusCode::OK, axum::Json(json!({"id": did}))).into_response()
+                            (StatusCode::OK, axum::Json(plc_document(&did, &op))).into_response()
                         }
                         _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))).into_response(),
                     }
@@ -86,6 +86,28 @@ async fn mock_plc() -> (String, Plc) {
     (format!("http://{addr}"), plc)
 }
 
+/// The DID document the directory serves for an op's state.
+fn plc_document(did: &str, op: &Value) -> Value {
+    let key = op["verificationMethods"]["atproto"]
+        .as_str()
+        .unwrap_or_default();
+    json!({
+        "id": did,
+        "alsoKnownAs": op["alsoKnownAs"],
+        "verificationMethod": [{
+            "id": format!("{did}#atproto"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": key.strip_prefix("did:key:").unwrap_or_default(),
+        }],
+        "service": [{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": op["services"]["atproto_pds"]["endpoint"],
+        }],
+    })
+}
+
 struct Harness {
     app: Router,
     state: Arc<AppState>,
@@ -101,6 +123,11 @@ async fn harness(invite_required: bool) -> Harness {
 
 /// With `email` false, no sender is configured.
 async fn harness_with(invite_required: bool, email: bool) -> Harness {
+    harness_at("pds.example.com", invite_required, email).await
+}
+
+/// A PDS at `hostname`.
+async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
         .await
@@ -119,7 +146,7 @@ async fn harness_with(invite_required: bool, email: bool) -> Harness {
         .await
         .unwrap();
     let settings = Settings::load(store.clone()).await.unwrap();
-    let hostname = "pds.example.com".to_owned();
+    let hostname = hostname.to_owned();
     let service_did = format!("did:web:{hostname}");
     let sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
     let (mailer, mail) = if email {
@@ -162,8 +189,8 @@ impl Harness {
         auth: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        self.call_host(method, path, auth, body, "pds.example.com")
-            .await
+        let host = self.state.hostname.clone();
+        self.call_host(method, path, auth, body, &host).await
     }
 
     async fn call_host(
@@ -1555,4 +1582,155 @@ async fn delete_after_is_enforced() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn an_account_migrates_in_with_service_auth_and_activates_once_its_did_points_here() {
+    let old = harness_at("pds.example.com", false, true).await;
+    let new = harness_at("pds2.example.com", false, true).await;
+    let acct = old
+        .create_account("vic.pds.example.com", "vic@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let old_access = acct["accessJwt"].as_str().unwrap().to_owned();
+    // The new PDS reads the same directory.
+    let log = old.plc.lock().unwrap().log[&did].clone();
+    new.plc.lock().unwrap().log.insert(did.clone(), log);
+
+    let (st, v) = old
+        .service_token(
+            &old_access,
+            "did:web:pds2.example.com",
+            "com.atproto.server.createAccount",
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let token = v["token"].as_str().unwrap().to_owned();
+    let (st, v) = old
+        .service_token(
+            &old_access,
+            "did:web:pds2.example.com",
+            "com.atproto.server.getSession",
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "protected method: {v}");
+
+    let body = json!({"did": did, "handle": "vic.pds2.example.com", "email": "vic@example.com", "password": "pw"});
+    let (st, v) = new
+        .post("com.atproto.server.createAccount", None, body.clone())
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "no auth: {v}");
+    let (_, wrong_aud) = old
+        .service_token(
+            &old_access,
+            "did:web:pds.example.com",
+            "com.atproto.server.createAccount",
+        )
+        .await;
+    let (st, v) = new
+        .post(
+            "com.atproto.server.createAccount",
+            wrong_aud["token"].as_str(),
+            body.clone(),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("BadJwtAudience")),
+        "{v}"
+    );
+    let (st, created) = new
+        .post("com.atproto.server.createAccount", Some(&token), body)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    let new_access = created["accessJwt"].as_str().unwrap().to_owned();
+    assert!(
+        new.outbox_kinds(&did).await.is_empty(),
+        "nothing emitted while migrating"
+    );
+    let (_, status) = new
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            Some(&new_access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status["activated"].as_bool(), status["validDid"].as_bool()),
+        (Some(false), Some(false))
+    );
+    let (st, _) = new
+        .post(
+            "com.atproto.server.activateAccount",
+            Some(&new_access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "the DID still points at the old PDS"
+    );
+
+    // Move the DID: the new PDS recommends, the old one signs, the new one submits.
+    let (_, rec) = new
+        .call(
+            "GET",
+            "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
+            Some(&new_access),
+            None,
+        )
+        .await;
+    old.post(
+        "com.atproto.identity.requestPlcOperationSignature",
+        Some(&old_access),
+        json!({}),
+    )
+    .await;
+    let (_, code) = old.last_mail("vic@example.com");
+    let mut sign = rec.clone();
+    sign["token"] = json!(code);
+    let (st, signed) = old
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            Some(&old_access),
+            sign,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{signed}");
+    // The op names the new PDS's key; the old PDS signed it with its own.
+    let (st, v) = new
+        .post(
+            "com.atproto.identity.submitPlcOperation",
+            Some(&new_access),
+            json!({"operation": signed["operation"]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (st, v) = new
+        .post(
+            "com.atproto.server.activateAccount",
+            Some(&new_access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        new.outbox_kinds(&did).await,
+        vec!["account", "identity", "sync"]
+    );
+}
+
+impl Harness {
+    async fn service_token(&self, access: &str, aud: &str, lxm: &str) -> (StatusCode, Value) {
+        self.call(
+            "GET",
+            &format!("/xrpc/com.atproto.server.getServiceAuth?aud={aud}&lxm={lxm}"),
+            Some(access),
+            None,
+        )
+        .await
+    }
 }

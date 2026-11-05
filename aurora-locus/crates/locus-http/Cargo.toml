@@ -17,6 +17,7 @@ hmac.workspace = true
 sha2.workspace = true
 proto-blue-crypto.workspace = true
 proto-blue-common.workspace = true
+proto-blue-syntax.workspace = true
 proto-blue-lex-data.workspace = true
 proto-blue-repo.workspace = true
 serde.workspace = true

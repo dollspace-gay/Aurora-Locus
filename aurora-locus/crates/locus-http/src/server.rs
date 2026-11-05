@@ -131,20 +131,40 @@ fn session_json(account: &Account, tokens: &Tokens, did_doc: Option<Value>) -> V
 
 pub async fn create_account(
     State(s): St,
+    headers: HeaderMap,
     Json(input): Json<CreateAccountInput>,
 ) -> XrpcResult<Json<Value>> {
-    if input.did.is_some() {
-        return Err(XrpcError::invalid_request(
-            "Creating an account with an existing DID (migration) is not supported yet",
-        ));
-    }
+    // Migrating in: the DID must authorize this with a service JWT, and the
+    // account starts deactivated, emitting nothing until it's activated.
+    let migrating = match input.did.as_deref() {
+        Some(did) => {
+            let requester = if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                Some(
+                    auth::user_service_auth(&s, &headers, "com.atproto.server.createAccount")
+                        .await?,
+                )
+            } else {
+                None
+            };
+            if requester.as_deref() != Some(did) {
+                return Err(XrpcError::auth_required(format!(
+                    "Missing auth to create account with did: {did}"
+                )));
+            }
+            if s.store.account_by_did(did).await?.is_some() {
+                return Err(XrpcError::invalid_request("Account already exists"));
+            }
+            Some(did.to_owned())
+        }
+        None => None,
+    };
     let email = check_email(
         input
             .email
             .as_deref()
             .ok_or_else(|| XrpcError::invalid_request("Email is required"))?,
     )?;
-    let handle = crate::identity::validate_handle(&s, &input.handle, None).await?;
+    let handle = crate::identity::validate_handle(&s, &input.handle, migrating.as_deref()).await?;
     let password_hash = match &input.password {
         Some(p) if p.len() > password::MAX_NEW_PASSWORD => {
             return Err(XrpcError::invalid_request("Password too long"));
@@ -171,13 +191,19 @@ pub async fn create_account(
         return Err(XrpcError::invalid_request("Email already taken"));
     }
 
-    let method = input
-        .locus_did_method
-        .as_deref()
-        .unwrap_or_else(|| snap.text("accounts.default_did_method"))
-        .to_owned();
+    let method = match &migrating {
+        Some(did) if did.starts_with("did:plc:") => "plc".to_owned(),
+        Some(did) if did.starts_with("did:web:") => "web".to_owned(),
+        Some(_) => return Err(XrpcError::invalid_request("Unsupported DID method")),
+        None => input
+            .locus_did_method
+            .as_deref()
+            .unwrap_or_else(|| snap.text("accounts.default_did_method"))
+            .to_owned(),
+    };
     let signing = K256Keypair::generate();
     let (did, web_doc, rotation_keys) = match method.as_str() {
+        _ if migrating.is_some() => (migrating.clone().unwrap_or_default(), None, Vec::new()),
         "plc" => {
             let (did, keys) =
                 register_plc_did(&s, &handle, &signing, input.recovery_key.as_deref()).await?;
@@ -220,6 +246,9 @@ pub async fn create_account(
             }
             other => other.into(),
         })?;
+        if migrating.is_some() {
+            tx.deactivate_account(&did, None).await?;
+        }
         if let Some(doc) = &web_doc {
             tx.insert_hosted_did_web(&did, &handle, doc)
                 .await
@@ -236,31 +265,37 @@ pub async fn create_account(
                 other => other.into(),
             })?;
         }
-        // Events in the reference's order: #identity, #account, #commit, #sync.
+        // Events in the reference's order: #identity, #account, #commit, #sync,
+        // only for an account created active.
+        let emit = migrating.is_none();
         let enc = |e: proto_blue_repo::error::RepoError| XrpcError::internal(e.to_string());
-        tx.insert_outbox(
-            &did,
-            "identity",
-            &identity_body(&did, Some(&handle)).map_err(enc)?,
-        )
-        .await?;
-        tx.insert_outbox(
-            &did,
-            "account",
-            &account_body(&did, true, None).map_err(enc)?,
-        )
-        .await?;
+        if emit {
+            tx.insert_outbox(
+                &did,
+                "identity",
+                &identity_body(&did, Some(&handle)).map_err(enc)?,
+            )
+            .await?;
+            tx.insert_outbox(
+                &did,
+                "account",
+                &account_body(&did, true, None).map_err(enc)?,
+            )
+            .await?;
+        }
         let repo = s
             .repo
-            .create_repo_in(&mut tx, &did, &signing, true)
+            .create_repo_in(&mut tx, &did, &signing, emit)
             .await
             .map_err(|e| XrpcError::internal(e.to_string()))?;
-        tx.insert_outbox(
-            &did,
-            "sync",
-            &sync_body(&did, &repo.rev, &repo.commit_cid, &repo.commit_bytes).map_err(enc)?,
-        )
-        .await?;
+        if emit {
+            tx.insert_outbox(
+                &did,
+                "sync",
+                &sync_body(&did, &repo.rev, &repo.commit_cid, &repo.commit_bytes).map_err(enc)?,
+            )
+            .await?;
+        }
         let tokens = s
             .sessions
             .create_in(&mut tx, &did, SCOPE_ACCESS, None, true)
@@ -278,7 +313,7 @@ pub async fn create_account(
     let (account, tokens) = match result {
         Ok(v) => v,
         Err(e) => {
-            if method == "plc" {
+            if method == "plc" && migrating.is_none() {
                 // Locus created this DID; tombstone it so it doesn't dangle.
                 tombstone_or_queue(&s, &did).await;
             }
@@ -690,4 +725,99 @@ mod tests {
         assert_eq!(iso8601(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
         assert_eq!(iso8601(951_782_400_000), "2000-02-29T00:00:00.000Z");
     }
+}
+
+/// Methods only full access or a privileged app password can get a token
+/// for, as the reference.
+fn is_privileged_method(lxm: &str) -> bool {
+    lxm.starts_with("chat.bsky.") || lxm == "com.atproto.server.createAccount"
+}
+
+/// Account-management methods that are used directly, never through
+/// service auth, as the reference.
+const PROTECTED_METHODS: &[&str] = &[
+    "com.atproto.admin.sendEmail",
+    "com.atproto.identity.requestPlcOperationSignature",
+    "com.atproto.identity.signPlcOperation",
+    "com.atproto.identity.updateHandle",
+    "com.atproto.server.activateAccount",
+    "com.atproto.server.confirmEmail",
+    "com.atproto.server.createAppPassword",
+    "com.atproto.server.deactivateAccount",
+    "com.atproto.server.getAccountInviteCodes",
+    "com.atproto.server.getSession",
+    "com.atproto.server.listAppPasswords",
+    "com.atproto.server.requestAccountDelete",
+    "com.atproto.server.requestEmailConfirmation",
+    "com.atproto.server.requestEmailUpdate",
+    "com.atproto.server.revokeAppPassword",
+    "com.atproto.server.updateEmail",
+];
+
+#[derive(Deserialize)]
+pub struct GetServiceAuthParams {
+    aud: String,
+    exp: Option<i64>,
+    lxm: Option<String>,
+}
+
+pub async fn get_service_auth(
+    State(s): St,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<GetServiceAuthParams>,
+) -> XrpcResult<Json<Value>> {
+    let authed = auth::access_with(&s, &headers, auth::STANDARD, &[SCOPE_TAKENDOWN]).await?;
+    let lxm = p.lxm.as_deref().filter(|l| !l.is_empty() && *l != "*");
+    let (aud_did, fragment) = match p.aud.split_once('#') {
+        Some((d, f)) => (d, Some(f)),
+        None => (p.aud.as_str(), None),
+    };
+    if proto_blue_syntax::Did::new(aud_did).is_err() || fragment.is_some_and(str::is_empty) {
+        return Err(XrpcError::invalid_request(
+            "aud must be a valid atproto DID or did#serviceId reference",
+        ));
+    }
+    // A taken-down account can only get the token that moves it away.
+    if authed.scope == SCOPE_TAKENDOWN && lxm != Some("com.atproto.server.createAccount") {
+        return Err(XrpcError::named("InvalidToken", "Bad token scope"));
+    }
+    if let Some(m) = lxm
+        && is_privileged_method(m)
+        && !auth::PRIVILEGED.contains(&authed.scope.as_str())
+    {
+        return Err(XrpcError::invalid_request(format!(
+            "insufficient access to request a service auth token for the following method: {m}"
+        )));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    if let Some(exp) = p.exp {
+        let diff = exp.saturating_mul(1000) - now_ms;
+        if diff < 0 {
+            return Err(XrpcError::named("BadExpiration", "expiration is in past"));
+        } else if diff > 60 * 60 * 1000 {
+            return Err(XrpcError::named(
+                "BadExpiration",
+                "cannot request a token with an expiration more than an hour in the future",
+            ));
+        } else if lxm.is_none() && diff > 60 * 1000 {
+            return Err(XrpcError::named(
+                "BadExpiration",
+                "cannot request a method-less token with an expiration more than a minute in the future",
+            ));
+        }
+    }
+    if let Some(m) = lxm
+        && PROTECTED_METHODS.contains(&m)
+    {
+        return Err(XrpcError::invalid_request(format!(
+            "cannot request a service auth token for the following protected method: {m}"
+        )));
+    }
+    let key = s.signing_key(&authed.did).await?;
+    let token =
+        locus_auth::service_jwt::create(&key, &authed.did, &p.aud, p.exp, lxm, now_ms / 1000)
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(json!({ "token": token })))
 }

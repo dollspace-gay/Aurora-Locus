@@ -56,6 +56,41 @@ pub async fn access_with(
     }
 }
 
+/// A service JWT from a user for `lxm`, as the reference's `userServiceAuth`:
+/// checked against the issuer's DID document (refreshed once if the
+/// signature doesn't match), with this PDS as the audience. Returns the
+/// issuer's DID.
+pub async fn user_service_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    lxm: &str,
+) -> XrpcResult<String> {
+    use locus_auth::service_jwt;
+    let token = bearer(headers)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let unauthorized = |e: service_jwt::ServiceJwtError| {
+        XrpcError::new(StatusCode::UNAUTHORIZED, e.name(), e.to_string())
+    };
+    let jwt = service_jwt::parse(token, Some(lxm), now).map_err(unauthorized)?;
+    let (did, key_id) = jwt.issuer_key_ref();
+    for force in [false, true] {
+        let Some(doc) = state.resolve_did_doc(did, force).await? else {
+            return Err(XrpcError::auth_required("could not resolve iss did"));
+        };
+        let key = proto_blue_common::did_doc::get_verification_material(&doc, key_id)
+            .map(|k| format!("did:key:{}", k.public_key_multibase));
+        if key.is_some_and(|k| jwt.verifies_with(&k)) {
+            if jwt.aud != state.service_did {
+                return Err(unauthorized(service_jwt::ServiceJwtError::BadJwtAudience));
+            }
+            return Ok(did.to_owned());
+        }
+    }
+    Err(unauthorized(service_jwt::ServiceJwtError::BadJwtSignature))
+}
+
 /// A verified access token with a standard scope (full access or an app password).
 pub async fn access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
     access_with(state, headers, STANDARD, &[]).await

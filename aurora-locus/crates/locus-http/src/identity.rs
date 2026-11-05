@@ -617,14 +617,23 @@ pub async fn submit_plc_operation(
         .store
         .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&fields.rotation_keys))
         .await;
-    let (_lock, mut tx) = s
-        .repo
-        .locked_tx(did)
-        .await
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
-    let body = identity_body(did, None).map_err(|e| XrpcError::internal(e.to_string()))?;
-    tx.insert_outbox(did, "identity", &body).await?;
-    tx.commit().await?;
+    // An account migrating in (deactivated) emits nothing until it's
+    // activated, which emits #identity itself.
+    let active = s
+        .store
+        .account_by_did(did)
+        .await?
+        .is_some_and(|a| a.status == Status::Active);
+    if active {
+        let (_lock, mut tx) = s
+            .repo
+            .locked_tx(did)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        let body = identity_body(did, None).map_err(|e| XrpcError::internal(e.to_string()))?;
+        tx.insert_outbox(did, "identity", &body).await?;
+        tx.commit().await?;
+    }
     let _ = s.store.clear_did_doc(did).await;
     Ok(())
 }

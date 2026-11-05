@@ -85,6 +85,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(email::reset_password),
         )
         .route(
+            "/xrpc/com.atproto.server.getServiceAuth",
+            get(server::get_service_auth),
+        )
+        .route(
             "/xrpc/com.atproto.server.deactivateAccount",
             post(account::deactivate_account),
         )

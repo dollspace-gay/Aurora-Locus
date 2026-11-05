@@ -288,6 +288,24 @@ impl AppState {
             .map_err(|e| crate::error::XrpcError::internal(e.to_string()))
     }
 
+    /// A DID's document: one locus hosts is read from the database, any
+    /// other is resolved (from the shared cache unless `force`).
+    pub async fn resolve_did_doc(
+        &self,
+        did: &str,
+        force: bool,
+    ) -> Result<Option<proto_blue_common::DidDocument>, crate::error::XrpcError> {
+        if let Some(hosted) = self.store.hosted_did_web(did).await? {
+            return Ok(hosted.doc.and_then(|d| serde_json::from_str(&d).ok()));
+        }
+        self.resolvers()?
+            .resolve_did(did, force)
+            .await
+            .map_err(|e| {
+                crate::error::XrpcError::auth_required(format!("could not resolve iss did: {e}"))
+            })
+    }
+
     /// An account's repo signing key.
     pub async fn signing_key(&self, did: &str) -> Result<K256Keypair, crate::error::XrpcError> {
         let (_, sk) = self

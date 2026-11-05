@@ -140,6 +140,15 @@ kryphocron built in.
   and the account row last, freeing its handle and email. A node that
   stops mid-way leaves the job to another. A deactivated account is
   deleted once its `deleteAfter` passes.
+- `getServiceAuth`, and service-JWT checks for requests from users'
+  services (signature against the issuer's DID document, refreshed once on
+  a mismatch; audience; method), as the reference.
+- Migrating an account in: `createAccount` with an existing `did` and a
+  service JWT from it. The account starts deactivated and emits nothing
+  until `activateAccount` finds its DID document pointing here.
+- did:plc documents are fetched from the configured PLC directory through
+  the operator client (so a local directory on plain HTTP works);
+  did:web documents go through the SSRF-safe client.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

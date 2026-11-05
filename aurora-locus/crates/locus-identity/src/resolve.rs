@@ -23,6 +23,26 @@ use proto_blue_identity::types::{CacheResult, DidDocument};
 use serde_json::{Value, json};
 
 use crate::fetch::{FetchPolicy, SafeFetcher};
+use proto_blue_common::fetch::{FetchError, FetchHandler, HttpRequest, HttpResponse};
+
+/// Sends requests under the operator-configured PLC directory through the
+/// operator client, and everything else through the user-influenced one.
+struct RoutedFetcher {
+    prefix: String,
+    operator: SafeFetcher,
+    user: Arc<SafeFetcher>,
+}
+
+#[async_trait::async_trait]
+impl FetchHandler for RoutedFetcher {
+    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, FetchError> {
+        if req.url.starts_with(&self.prefix) {
+            self.operator.fetch(req).await
+        } else {
+            self.user.fetch(req).await
+        }
+    }
+}
 
 /// How long a resolved handle is trusted.
 const HANDLE_POSITIVE_MS: i64 = 10 * 60 * 1000;
@@ -59,6 +79,18 @@ impl Resolvers {
             })
             .map_err(IdentityError::Fetch)?,
         );
+        // did:plc documents come from the directory the operator configured,
+        // which may be a local one on plain HTTP; everything else (did:web
+        // hosts) is user-influenced.
+        let did_fetcher: Arc<dyn FetchHandler> = Arc::new(RoutedFetcher {
+            prefix: format!("{}/", config.plc_url.trim_end_matches('/')),
+            operator: SafeFetcher::new(FetchPolicy {
+                ssrf_protection: false,
+                strict: false,
+            })
+            .map_err(IdentityError::Fetch)?,
+            user: Arc::clone(&fetcher),
+        });
         let cache: Arc<dyn DidCache> = Arc::new(DbDidCache {
             store: store.clone(),
             stale_ms: config.did_stale_ms,
@@ -68,7 +100,7 @@ impl Resolvers {
             Some(&config.plc_url),
             config.timeout_ms,
             Some(cache),
-            fetcher.clone(),
+            did_fetcher,
         );
         // Without proto-blue's `dns` feature this resolver is HTTPS only; the
         // DNS method is ours, over one shared resolver.
