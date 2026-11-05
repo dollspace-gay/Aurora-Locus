@@ -178,6 +178,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         ssrf_protection: true,
         resolvers: crate::state::ResolverCache::default(),
         limits: crate::ratelimit::Limiter::default(),
+        oauth_clients: crate::oauth::ClientCache::default(),
     });
     Harness {
         app: crate::router(state.clone()),
@@ -4260,4 +4261,62 @@ async fn oauth_metadata_and_jwks() {
     );
     assert!(key.get("d").is_none(), "public only");
     assert_eq!(key["kid"], h.state.secrets.oauth_key.kid());
+}
+
+#[tokio::test]
+async fn oauth_clients_resolve_from_metadata_or_loopback_ids() {
+    let h = harness(false).await;
+    let lb = crate::oauth::get_client(&h.state, "http://localhost")
+        .await
+        .unwrap();
+    assert_eq!(lb.metadata.application_type, "native");
+    assert!(!lb.is_confidential());
+    let id = "https://app.example.org/client-metadata.json";
+    let md = json!({
+        "client_id": id,
+        "client_name": "Example",
+        "scope": "atproto transition:generic",
+        "redirect_uris": ["https://app.example.org/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_method": "none",
+        "dpop_bound_access_tokens": true,
+    });
+    h.state.oauth_clients.seed(id, md.clone());
+    let c = crate::oauth::get_client(&h.state, id).await.unwrap();
+    assert_eq!(c.metadata.client_name(), Some("Example"));
+    assert!(!c.is_trusted);
+    h.state
+        .settings
+        .set("oauth.trusted_clients", json!([id]), "test")
+        .await
+        .unwrap();
+    assert!(
+        crate::oauth::get_client(&h.state, id)
+            .await
+            .unwrap()
+            .is_trusted
+    );
+    // Bad metadata and ids are refused.
+    let bad = "https://bad.example.org/client-metadata.json";
+    let mut m = md.clone();
+    m["client_id"] = json!(bad);
+    m["dpop_bound_access_tokens"] = json!(false);
+    h.state.oauth_clients.seed(bad, m);
+    let e = crate::oauth::get_client(&h.state, bad).await.unwrap_err();
+    assert_eq!(e.error, "invalid_client_metadata");
+    assert!(
+        crate::oauth::get_client(&h.state, "not-a-client")
+            .await
+            .is_err()
+    );
+    // An unreachable (here: IP-literal, refused) metadata URL.
+    let e = crate::oauth::get_client(&h.state, "https://unreachable.invalid.example.com/m.json")
+        .await
+        .unwrap_err();
+    assert!(
+        e.description
+            .starts_with("Unable to obtain client metadata"),
+        "{}",
+        e.description
+    );
 }

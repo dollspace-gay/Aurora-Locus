@@ -241,6 +241,8 @@ pub struct AppState {
     pub resolvers: ResolverCache,
     /// Rate-limit counters (in-process backend) and firehose subscriber counts.
     pub limits: crate::ratelimit::Limiter,
+    /// Fetched OAuth client metadata and keys.
+    pub oauth_clients: crate::oauth::ClientCache,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

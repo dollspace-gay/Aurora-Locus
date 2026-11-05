@@ -167,6 +167,7 @@ impl Node {
             ssrf_protection: !self.bootstrap.ssrf_protection_disabled(),
             resolvers: ResolverCache::default(),
             limits: locus_http::ratelimit::Limiter::default(),
+            oauth_clients: locus_http::oauth::ClientCache::default(),
         });
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));

@@ -442,6 +442,13 @@ pub static REGISTRY: &[Def] = &[
         description: "Ask proxied services for compressed responses when the PDS reads them itself.",
     },
     Def {
+        key: "oauth.trusted_clients",
+        kind: Kind::TextList { max_len: 2048 },
+        default: "[]",
+        env: Some("PDS_OAUTH_TRUSTED_CLIENTS"),
+        description: "OAuth client ids treated as trusted (longer sessions, as first-party).",
+    },
+    Def {
         key: "http.request_deadline_ms",
         kind: Kind::Int {
             min: 1_000,

@@ -124,3 +124,113 @@ pub async fn dpop_proof(
     }
     Ok(proof)
 }
+
+// ---------------------------------------------------------------- clients
+
+use locus_auth::oauth::client::{self as oclient, Client, ClientMetadata};
+
+/// How long fetched client metadata and keys are kept (as the reference).
+const CLIENT_CACHE_MS: i64 = 10 * 60_000;
+
+/// Fetched client metadata (and `jwks_uri` keys), per node.
+#[derive(Default)]
+pub struct ClientCache {
+    map: std::sync::Mutex<std::collections::HashMap<String, (i64, Value)>>,
+}
+
+impl ClientCache {
+    fn get(&self, key: &str, now: i64) -> Option<Value> {
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(key)
+            .filter(|(exp, _)| *exp > now)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn put(&self, key: &str, v: Value, now: i64) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() > 10_000 {
+            map.retain(|_, (exp, _)| *exp > now);
+        }
+        map.insert(key.to_owned(), (now + CLIENT_CACHE_MS, v));
+    }
+
+    /// Stands in for a fetched document (tests).
+    pub fn seed(&self, url: &str, v: Value) {
+        self.put(url, v, locus_core::time::now_ms());
+    }
+}
+
+/// Fetches a JSON document a client points at, with the user-influenced
+/// client under the stricter rule (no IP-literal hosts).
+async fn fetch_json(s: &AppState, url: &str) -> Result<Value, String> {
+    use proto_blue_common::fetch::{FetchHandler, HttpRequest};
+    let now = locus_core::time::now_ms();
+    if let Some(v) = s.oauth_clients.get(url, now) {
+        return Ok(v);
+    }
+    let fetcher = locus_identity::fetch::SafeFetcher::new(locus_identity::fetch::FetchPolicy {
+        ssrf_protection: s.ssrf_protection,
+        strict: true,
+    })
+    .map_err(|e| e.to_string())?;
+    let mut req = HttpRequest::get(url);
+    req.headers
+        .insert("accept".into(), "application/json".into());
+    let res = fetcher.fetch(req).await.map_err(|e| e.to_string())?;
+    if res.status != 200 {
+        return Err(format!("Unexpected status code {}", res.status));
+    }
+    let v: Value = serde_json::from_slice(&res.body).map_err(|_| "Invalid JSON".to_owned())?;
+    s.oauth_clients.put(url, v.clone(), now);
+    Ok(v)
+}
+
+/// A client by id, as the reference's `ClientManager.getClient`.
+pub async fn get_client(s: &AppState, client_id: &str) -> Result<Client, OAuthError> {
+    let unable = |e: &str| {
+        OAuthError::invalid_client_metadata(format!(
+            "Unable to obtain client metadata for \"{client_id}\": {e}"
+        ))
+    };
+    let raw = if oclient::is_loopback_client_id(client_id) {
+        oclient::loopback_metadata(client_id)?
+    } else if oclient::is_discoverable_client_id(client_id) {
+        let url = oclient::metadata_url(client_id)?;
+        fetch_json(s, url.as_str()).await.map_err(|e| unable(&e))?
+    } else {
+        return Err(OAuthError::invalid_client_metadata(format!(
+            "Invalid client ID \"{client_id}\""
+        )));
+    };
+    let metadata = ClientMetadata::parse(&raw).map_err(|e| unable(&e.description))?;
+    oclient::validate_metadata(client_id, &metadata)?;
+    let jwks = match (&metadata.jwks, &metadata.jwks_uri) {
+        (Some(j), _) => Some(j.clone()),
+        (None, Some(uri)) => {
+            let raw = fetch_json(s, uri).await.map_err(|e| {
+                OAuthError::invalid_client_metadata(format!(
+                    "Unable to obtain jwks from \"{uri}\" for \"{client_id}\": {e}"
+                ))
+            })?;
+            Some(oclient::public_jwks(&raw)?)
+        }
+        (None, None) => None,
+    };
+    let is_trusted = s
+        .snapshot()
+        .list("oauth.trusted_clients")
+        .contains(&client_id);
+    Ok(Client {
+        id: client_id.to_owned(),
+        metadata,
+        jwks,
+        is_trusted,
+        is_first_party: false,
+    })
+}
