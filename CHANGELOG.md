@@ -441,6 +441,25 @@ kryphocron built in.
   `account`, `invite`, `settings` (including export and import),
   `operator`, `moderation`, `crawl request`, `jobs list`, `kryphocron`,
   `call` for any XRPC method, and `healthcheck`.
+- Health: `/xrpc/_health` answers 503 when the database doesn't,
+  `/healthz` (liveness) and `/readyz` (database and blob store).
+- `/tls-check?domain=` approves certificates only for the PDS hostname,
+  hosted did:web hosts and existing handles.
+- Cloudflare mode (`deploy.proxy_mode`, env `LOCUS_PROXY_MODE`): the
+  client is `CF-Connecting-IP` only when the hop before the trusted proxy
+  is one of Cloudflare's ranges (bundled, refreshed daily).
+- `aurora-locus deploy caddyfile` prints a Caddyfile for on-demand
+  certificates, a DNS-01 wildcard or Cloudflare's origin certificate, every
+  variant with `strict_sni_host`.
+- Direct TLS (`LOCUS_TLS=true`): locus serves HTTPS itself with ACME
+  certificates (Let's Encrypt by default) ordered on demand for names
+  `/tls-check` approves, the PDS hostname's at start, renewed after 60
+  days; port 80 answers HTTP-01 challenges and redirects to HTTPS.
+- Deployment files in `deploy/`: a multi-stage image running as a non-root
+  user (with `goat`), a compose file with Caddy at a fixed address on its
+  own network and locus published on localhost only, a Caddy image with
+  DNS provider modules, an installer for a fresh server, a hardened
+  systemd unit, and notes for Caddy, nginx, Traefik and HAProxy.
 
 ### Changed
 
