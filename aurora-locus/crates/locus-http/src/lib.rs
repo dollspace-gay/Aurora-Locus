@@ -10,6 +10,7 @@ pub mod repo;
 pub mod routing;
 pub mod server;
 pub mod state;
+pub mod sync;
 
 #[cfg(test)]
 mod tests;
@@ -142,6 +143,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/xrpc/com.atproto.repo.uploadBlob", post(repo::upload_blob))
         .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
+        .route(
+            "/xrpc/com.atproto.sync.subscribeRepos",
+            get(sync::subscribe_repos),
+        )
         .route("/blob/{did}/{cid}", get(repo::get_blob_path))
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",

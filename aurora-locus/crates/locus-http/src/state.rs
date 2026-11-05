@@ -203,6 +203,8 @@ pub struct AppState {
     pub mailer: locus_mail::Mailer,
     /// Blob bytes.
     pub blobs: locus_blob::DiskStore,
+    /// This node's view of the event log.
+    pub firehose: Arc<locus_sync::Firehose>,
     pub repo: RepoEngine,
     /// The PDS hostname (no scheme or port).
     pub hostname: String,

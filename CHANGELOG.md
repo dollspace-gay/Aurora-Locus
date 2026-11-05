@@ -191,6 +191,20 @@ kryphocron built in.
 - Live request and record limits: 2,000,000-byte bodies for record writes
   (the reference allows 1,000,000), 150 KB for other JSON bodies, and
   1.1 MB per record (`limits.*` settings).
+- The firehose: `com.atproto.sync.subscribeRepos` on every node. A leased
+  sequencer moves events from the outbox (written in the same transaction
+  as each change) into a numbered log with gapless seqs, so a consumer can
+  never skip an event that commits late. Cursors backfill from the log and
+  switch to live; a cursor ahead of the log gets `FutureCursor`, one behind
+  retention `#info OutdatedCursor` and the oldest retained event; a
+  subscriber too far behind gets `ConsumerTooSlow`. WebSocket pings every
+  30 s keep proxies from cutting idle subscribers.
+- Event retention (`sync.retention_hours`, default 72) and removal of a
+  deleted account's earlier events (after
+  `sync.deleted_history_preservation_days`, default at once).
+- Crawler notification: `requestCrawl` to each relay in `sync.crawlers`
+  (`PDS_CRAWLERS`) on new events, at most every 20 minutes each, with a
+  call inside the window scheduled rather than dropped.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

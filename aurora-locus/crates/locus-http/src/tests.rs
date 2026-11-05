@@ -157,6 +157,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
             Arc::default(),
         )
     };
+    let firehose = locus_sync::Firehose::new(store.clone(), 500);
     let state = Arc::new(AppState {
         repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0))),
         store,
@@ -166,6 +167,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         sessions,
         mailer,
         blobs: locus_blob::DiskStore::new(dir.path().join("blobs")),
+        firehose,
         public_url: format!("https://{hostname}"),
         hostname,
         service_did,
@@ -2397,4 +2399,144 @@ async fn bodies_and_records_have_live_limits() {
         .post("com.atproto.repo.createRecord", Some(&access), small)
         .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Reads the next binary firehose frame, with a timeout.
+async fn next_frame<S>(ws: &mut S) -> proto_blue_ws::frame::Frame
+where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("a frame within 5 s")
+            .expect("stream open")
+            .expect("no error");
+        if let tokio_tungstenite::tungstenite::Message::Binary(b) = msg {
+            return proto_blue_ws::frame::Frame::decode(&b).unwrap();
+        }
+    }
+}
+
+fn message(frame: proto_blue_ws::frame::Frame) -> (String, i64) {
+    match frame {
+        proto_blue_ws::frame::Frame::Message(m) => (
+            m.r#type.unwrap_or_default(),
+            m.body.as_map().unwrap()["seq"].as_integer().unwrap(),
+        ),
+        proto_blue_ws::frame::Frame::Error(e) => panic!("error frame {}", e.error),
+    }
+}
+
+#[tokio::test]
+async fn the_firehose_backfills_then_streams_live() {
+    let h = harness(false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, h.app.clone()).into_future());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(
+        Arc::clone(&h.state.firehose)
+            .run_tail(cancel.clone(), std::time::Duration::from_millis(20)),
+    );
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease("sequencer", "test", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let sequence = || async {
+        let n = locus_sync::sequence_once(&h.state.store, &lease, 500, 0)
+            .await
+            .unwrap();
+        h.state.firehose.wake();
+        n
+    };
+
+    let acct = h
+        .create_account("fay.pds.example.com", "fay@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    assert_eq!(sequence().await, 4);
+    assert!(h.outbox_kinds(&did).await.is_empty(), "the outbox drained");
+
+    // Backfill from the start, in order, with gapless seqs.
+    let url = |q: &str| format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos{q}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url("?cursor=0"))
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(message(next_frame(&mut ws).await));
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("#identity".into(), 1),
+            ("#account".into(), 2),
+            ("#commit".into(), 3),
+            ("#sync".into(), 4)
+        ]
+    );
+
+    // Then live: a new commit arrives on the same stream, and on a
+    // live-only subscriber connected before it.
+    let (mut live_only, _) = tokio_tungstenite::connect_async(url("")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h.post(
+        "com.atproto.repo.createRecord",
+        Some(&access),
+        json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("live")}),
+    )
+    .await;
+    assert_eq!(sequence().await, 1);
+    assert_eq!(message(next_frame(&mut ws).await), ("#commit".into(), 5));
+    assert_eq!(
+        message(next_frame(&mut live_only).await),
+        ("#commit".into(), 5)
+    );
+
+    // A cursor ahead of the log is refused.
+    let (mut future, _) = tokio_tungstenite::connect_async(url("?cursor=999"))
+        .await
+        .unwrap();
+    match next_frame(&mut future).await {
+        proto_blue_ws::frame::Frame::Error(e) => assert_eq!(e.error, "FutureCursor"),
+        other => panic!("expected FutureCursor, got {other:?}"),
+    }
+
+    // Behind retention: OutdatedCursor, then the oldest retained event.
+    assert_eq!(h.state.store.prune_seq_events(-1).await.unwrap(), 5);
+    h.post(
+        "com.atproto.repo.createRecord",
+        Some(&access),
+        json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("after prune")}),
+    )
+    .await;
+    sequence().await;
+    let (mut old, _) = tokio_tungstenite::connect_async(url("?cursor=1"))
+        .await
+        .unwrap();
+    match next_frame(&mut old).await {
+        proto_blue_ws::frame::Frame::Message(m) => {
+            assert_eq!(m.r#type.as_deref(), Some("#info"));
+            assert_eq!(
+                m.body.as_map().unwrap()["name"].as_str(),
+                Some("OutdatedCursor")
+            );
+        }
+        other => panic!("expected #info, got {other:?}"),
+    }
+    assert_eq!(message(next_frame(&mut old).await), ("#commit".into(), 6));
+    cancel.cancel();
 }

@@ -382,6 +382,40 @@ pub static REGISTRY: &[Def] = &[
         description: "How long a replaced or collected copy stays on storage before deletion, so reads in flight finish.",
     },
     Def {
+        key: "sync.retention_hours",
+        kind: Kind::Int {
+            min: 1,
+            max: 24 * 365,
+        },
+        default: "72",
+        env: None,
+        description: "How long the firehose keeps events for backfilling consumers, in hours.",
+    },
+    Def {
+        key: "sync.subscriber_buffer",
+        kind: Kind::Int {
+            min: 10,
+            max: 100_000,
+        },
+        default: "500",
+        env: None,
+        description: "How many events a firehose subscriber may fall behind before it's dropped as too slow (applies on restart).",
+    },
+    Def {
+        key: "sync.ws_ping_interval_s",
+        kind: Kind::Int { min: 5, max: 600 },
+        default: "30",
+        env: None,
+        description: "Seconds between WebSocket pings to firehose subscribers.",
+    },
+    Def {
+        key: "sync.crawlers",
+        kind: Kind::TextList { max_len: 512 },
+        default: "[]",
+        env: Some("PDS_CRAWLERS"),
+        description: "Relays asked to crawl this PDS when there are new events (at most every 20 minutes each).",
+    },
+    Def {
         key: "sync.deleted_history_preservation_days",
         kind: Kind::Int { min: 0, max: 90 },
         default: "0",

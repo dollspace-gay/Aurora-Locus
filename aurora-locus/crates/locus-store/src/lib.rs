@@ -15,6 +15,7 @@ pub mod lease;
 pub mod repo;
 pub mod runtime;
 pub mod secrets;
+pub mod seq;
 pub mod settings;
 
 #[cfg(test)]

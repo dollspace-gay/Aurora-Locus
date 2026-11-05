@@ -6,5 +6,6 @@ pub mod error;
 pub mod keys;
 pub mod lease;
 pub mod settings;
+pub mod time;
 
 pub use error::{CoreError, CoreResult};

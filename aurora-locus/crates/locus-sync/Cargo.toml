@@ -8,6 +8,16 @@ publish.workspace = true
 
 [dependencies]
 locus-core.workspace = true
+locus-store.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-lex-cbor.workspace = true
+proto-blue-ws.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 
 [lints]
 workspace = true

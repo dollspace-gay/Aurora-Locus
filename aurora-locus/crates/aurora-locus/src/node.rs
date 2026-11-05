@@ -144,6 +144,12 @@ impl Node {
         let mailer = locus_mail::Mailer::new(self.store.clone(), Arc::clone(&self.master_key));
         let env: HashMap<String, String> = std::env::vars().collect();
         mailer.import_env_and_check(&env).await?;
+        let buffer =
+            usize::try_from(self.settings.current().int("sync.subscriber_buffer")).unwrap_or(500);
+        let firehose = locus_sync::Firehose::new(self.store.clone(), buffer);
+        self.tasks.push(tokio::spawn(
+            Arc::clone(&firehose).run_tail(self.cancel.clone(), Duration::from_millis(250)),
+        ));
         let state = Arc::new(AppState {
             repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id))),
             store: self.store.clone(),
@@ -153,6 +159,7 @@ impl Node {
             sessions,
             mailer,
             blobs: locus_blob::DiskStore::new(self.bootstrap.data_dir.clone()),
+            firehose,
             hostname,
             public_url,
             service_did,
@@ -163,6 +170,7 @@ impl Node {
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
         self.spawn_blob_jobs(Arc::clone(&state));
+        self.spawn_sync_jobs(Arc::clone(&state));
         let addr = self.bootstrap.listen;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -176,6 +184,138 @@ impl Node {
             }
         }));
         Ok(())
+    }
+
+    /// The sequencer (outbox → event log, polled every 20 ms and woken by
+    /// itself while there's a backlog), log retention and deleted
+    /// accounts' history purges, and crawler requests; each on one node at
+    /// a time.
+    fn spawn_sync_jobs(&mut self, state: Arc<AppState>) {
+        const BATCH: i64 = 500;
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "sequencer".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |lease, cancel| {
+                    let state = Arc::clone(&st);
+                    async move {
+                        loop {
+                            let days = state
+                                .snapshot()
+                                .int("sync.deleted_history_preservation_days");
+                            let n = locus_sync::sequence_once(
+                                &state.store,
+                                &lease,
+                                BATCH,
+                                days * 86_400_000,
+                            )
+                            .await?;
+                            if n > 0 {
+                                state.firehose.wake();
+                                if n as i64 == BATCH {
+                                    continue;
+                                }
+                            }
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
+
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "seq-retention".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&st);
+                    async move {
+                        loop {
+                            let hours = state.snapshot().int("sync.retention_hours");
+                            let result = async {
+                                let pruned =
+                                    state.store.prune_seq_events(hours * 3_600_000).await?;
+                                let purged = state.store.run_seq_purges().await?;
+                                Ok::<_, CoreError>(pruned + purged)
+                            }
+                            .await;
+                            match &result {
+                                Ok(n) if *n > 0 => tracing::info!(events = n, "event log pruned"),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("event log pruning failed: {e}"),
+                            }
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state
+                                .store
+                                .record_job_run("seq-retention", err.as_deref(), None)
+                                .await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(300)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
+
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "crawlers".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&st);
+                    async move {
+                        let http = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(10))
+                            .build()
+                            .map_err(|e| CoreError::Config(e.to_string()))?;
+                        let mut schedule =
+                            locus_sync::CrawlSchedule::new(Duration::from_secs(20 * 60));
+                        let mut seen = state.store.seq_state().await?.last_seq;
+                        loop {
+                            let crawlers: Vec<String> = state
+                                .snapshot()
+                                .list("sync.crawlers")
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect();
+                            let now = std::time::Instant::now();
+                            if let Ok(st) = state.store.seq_state().await
+                                && st.last_seq > seen
+                            {
+                                seen = st.last_seq;
+                                schedule.on_events(&crawlers, now);
+                            }
+                            for c in schedule.due(now) {
+                                match locus_sync::request_crawl(&http, &c, &state.hostname).await {
+                                    Ok(()) => tracing::info!(crawler = c, "crawl requested"),
+                                    Err(e) => {
+                                        tracing::warn!(crawler = c, "crawl request failed: {e}")
+                                    }
+                                }
+                            }
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(10)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// Blob upkeep, each on one node at a time: finishing moves a crash or

@@ -50,6 +50,7 @@ proto-blue-common = { version = "0.3", default-features = false }
 # Without its `dns` feature the handle resolver is HTTPS only; locus does
 # the DNS method itself over one shared resolver.
 proto-blue-identity = { version = "0.3", default-features = false }
+proto-blue-ws = { version = "0.3", default-features = false }
 
 # kryphocron, pinned exactly. kryphocron-lexicons 0.3.5 isn't on
 # crates.io, so it's pinned to its release commit through [patch.crates-io].

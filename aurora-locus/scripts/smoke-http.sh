@@ -98,6 +98,44 @@ x POST createRecord-image -H "authorization: Bearer $access" -H 'content-type: a
 echo "> GET getBlob (bytes match: $(curl -s "$base/com.atproto.sync.getBlob?did=$did&cid=$cid" | cmp -s - "$data/img.png" && echo yes || echo no))"
 echo "> stored under: $(find "$data/blobs" -type f | sed "s|$data/||")"
 
+# The firehose from the start: a minimal WebSocket client (stdlib only)
+# that reads frames for two seconds and lists their event types.
+sleep 1
+echo "> firehose from cursor=0"
+python3 -I - "$port" <<'PY'
+import base64, os, socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+key = base64.b64encode(os.urandom(16)).decode()
+s.sendall((f"GET /xrpc/com.atproto.sync.subscribeRepos?cursor=0 HTTP/1.1\r\nHost: localhost\r\n"
+           f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+           f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    buf += s.recv(4096)
+head, buf = buf.split(b"\r\n\r\n", 1)
+print(head.split(b"\r\n")[0].decode())
+s.settimeout(0.2)
+end, kinds = time.time() + 2, []
+while time.time() < end:
+    try:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    except socket.timeout:
+        pass
+    while len(buf) >= 2:
+        n, off = buf[1] & 0x7F, 2
+        if n == 126: n, off = int.from_bytes(buf[2:4], "big"), 4
+        elif n == 127: n, off = int.from_bytes(buf[2:10], "big"), 10
+        if len(buf) < off + n: break
+        payload, buf = buf[off:off + n], buf[off + n:]
+        for k in (b"#identity", b"#account", b"#commit", b"#sync", b"#info"):
+            if k in payload[:40]:
+                kinds.append(k.decode()); break
+print(len(kinds), "events:", " ".join(kinds))
+PY
+
 # A handle elsewhere on the network, through DNS or HTTPS.
 x GET resolveHandle-network "$base/com.atproto.identity.resolveHandle?handle=atproto.com"
 
