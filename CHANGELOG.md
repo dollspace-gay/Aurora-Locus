@@ -168,6 +168,26 @@ kryphocron built in.
   unknown ones. `$type` must match the collection, record keys must match
   the schema's key type and pass the slur filter, records are strict data
   model (no floats, safe integers), and legacy blob refs are refused.
+- Record endpoints: `createRecord`, `putRecord`, `deleteRecord`,
+  `applyWrites` (up to 200 writes), `getRecord`, `listRecords` and
+  `describeRepo`, as the reference: an identical `putRecord` and a
+  `deleteRecord` of a missing record commit nothing, and `createRecord`
+  replaces the account's earlier follow, block, like or repost of the same
+  subject in the same commit.
+- Blobs: `uploadBlob` (streamed; a sniffed MIME type wins over the request's,
+  as the reference; `PDS_BLOB_UPLOAD_LIMIT`, default 300 MiB; user
+  credentials or service auth), `getBlob` and a `/blob/<did>/<cid>` alias
+  with `Range` support and the reference's safety headers. Stored on disk
+  under the data directory, each copy under its own key, written atomically
+  and verified against its CID when copied.
+- Records that reference blobs are checked in the commit: the blob must be
+  uploaded and not taken down, with the same MIME type and size
+  (`BlobNotFound`, `InvalidMimeType`, `InvalidSize`). The first reference
+  makes a blob permanent; removing the last one starts a grace period.
+  Unreferenced blobs are collected (uploads never used after 6 hours,
+  dropped blobs after an hour), and their bytes are deleted after a further
+  grace so reads in flight finish. Account deletion removes the account's
+  blobs too.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod email;
 pub mod error;
 pub mod identity;
+pub mod repo;
 pub mod routing;
 pub mod server;
 pub mod state;
@@ -117,6 +118,34 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/xrpc/com.atproto.server.deleteAccount",
             post(account::delete_account),
         )
+        .route(
+            "/xrpc/com.atproto.repo.createRecord",
+            post(repo::create_record),
+        )
+        .route("/xrpc/com.atproto.repo.putRecord", post(repo::put_record))
+        .route(
+            "/xrpc/com.atproto.repo.deleteRecord",
+            post(repo::delete_record),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.applyWrites",
+            post(repo::apply_writes),
+        )
+        .route("/xrpc/com.atproto.repo.getRecord", get(repo::get_record))
+        .route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(repo::list_records),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.describeRepo",
+            get(repo::describe_repo),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.uploadBlob",
+            post(repo::upload_blob).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
+        .route("/blob/{did}/{cid}", get(repo::get_blob_path))
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",
             get(identity::resolve_handle),

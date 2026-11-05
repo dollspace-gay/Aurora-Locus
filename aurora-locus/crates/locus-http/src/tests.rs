@@ -165,6 +165,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         secrets,
         sessions,
         mailer,
+        blobs: locus_blob::DiskStore::new(dir.path().join("blobs")),
         public_url: format!("https://{hostname}"),
         hostname,
         service_did,
@@ -1874,4 +1875,471 @@ async fn disposable_addresses_are_refused() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "operator-added domains too");
     let (st, v) = create("zed.pds.example.com", "zed@example.net").await;
     assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+impl Harness {
+    /// A request with a raw body; returns status, headers and body bytes.
+    async fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", self.state.hostname.clone());
+        if let Some(t) = auth {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = self
+            .app
+            .clone()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, headers, bytes)
+    }
+
+    async fn upload(&self, access: &str, bytes: &[u8], content_type: &str) -> Value {
+        let (st, _, body) = self
+            .raw(
+                "POST",
+                "/xrpc/com.atproto.repo.uploadBlob",
+                Some(access),
+                bytes.to_vec(),
+                &[("content-type", content_type)],
+            )
+            .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["blob"].clone()
+    }
+}
+
+fn post_record(text: &str) -> Value {
+    json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-11-05T00:00:00.000Z"})
+}
+
+#[tokio::test]
+async fn records_are_written_read_listed_and_deleted() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("abe.pds.example.com", "abe@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+
+    let (st, created) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("first")}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(created["validationStatus"], "valid");
+    let uri = created["uri"].as_str().unwrap().to_owned();
+    let rkey = uri.rsplit('/').next().unwrap().to_owned();
+    assert!(proto_blue_syntax::Tid::new(&rkey).is_ok(), "a TID rkey");
+    assert_eq!(h.outbox_kinds(&did).await.last().unwrap(), "commit");
+
+    let (st, got) = h
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{got}");
+    assert_eq!(got["value"], post_record("first"));
+    assert_eq!(got["cid"], created["cid"]);
+
+    // Validation, $type and rkey refusals.
+    for (body, why) in [
+        (
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": {"text": "no date"}}),
+            "invalid",
+        ),
+        (
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.like"}}),
+            "type",
+        ),
+        (
+            json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "self", "record": post_record("x")}),
+            "rkey",
+        ),
+        (
+            json!({"repo": did, "collection": "com.example.unknown", "record": {"a": 1}, "validate": true}),
+            "unknown",
+        ),
+    ] {
+        let (st, v) = h
+            .post("com.atproto.repo.createRecord", Some(&access), body)
+            .await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{why}: {v}"
+        );
+    }
+    let (_, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "com.example.unknown", "rkey": "k1", "record": {"a": 1}}),
+        )
+        .await;
+    assert_eq!(v["validationStatus"], "unknown");
+
+    // putRecord: create, update, and a no-op for the same record.
+    let put = |text: &'static str| {
+        h.post(
+            "com.atproto.repo.putRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {"displayName": text}}),
+        )
+    };
+    let (st, p1) = put("Abe").await;
+    assert_eq!(st, StatusCode::OK, "{p1}");
+    assert!(p1["commit"].is_object());
+    let (_, p2) = put("Abe").await;
+    assert!(
+        p2.get("commit").is_none(),
+        "identical put commits nothing: {p2}"
+    );
+    let (_, p3) = put("Abe 2").await;
+    assert!(p3["commit"].is_object());
+    assert_ne!(p3["cid"], p1["cid"]);
+
+    // A stale swapCommit is refused.
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x"),
+                   "swapCommit": created["commit"]["cid"]}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidSwap"))
+    );
+
+    // applyWrites: several ops, one commit, typed results.
+    let (st, applied) = h
+        .post(
+            "com.atproto.repo.applyWrites",
+            Some(&access),
+            json!({"repo": did, "writes": [
+                {"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "rkey": "3m2aaaaaaaaaa", "value": post_record("a")},
+                {"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "rkey": "3m2aaaaaaaaab", "value": post_record("b")},
+                {"$type": "com.atproto.repo.applyWrites#update", "collection": "app.bsky.feed.post", "rkey": "3m2aaaaaaaaab", "value": post_record("b2")},
+                {"$type": "com.atproto.repo.applyWrites#delete", "collection": "app.bsky.feed.post", "rkey": rkey},
+            ]}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{applied}");
+    let types: Vec<&str> = applied["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["$type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types.last(),
+        Some(&"com.atproto.repo.applyWrites#deleteResult")
+    );
+
+    // listRecords: newest first, with a cursor; reverse is oldest first.
+    let list = |extra: &str| {
+        h.get(format!(
+            "/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post{extra}"
+        ))
+    };
+    let (_, page) = list("&limit=1").await;
+    assert_eq!(page["records"][0]["value"]["text"], "b2");
+    assert_eq!(page["cursor"], "3m2aaaaaaaaab");
+    let (_, next) = list("&limit=1&cursor=3m2aaaaaaaaab").await;
+    assert_eq!(next["records"][0]["value"]["text"], "a");
+    let (_, rev) = list("&reverse=true").await;
+    assert_eq!(rev["records"][0]["value"]["text"], "a");
+    assert_eq!(
+        rev["records"].as_array().unwrap().len(),
+        2,
+        "the deleted post is gone"
+    );
+
+    // deleteRecord of a missing record commits nothing.
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.deleteRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v.get("commit").is_none(), "{v}");
+
+    let (_, desc) = h
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.repo.describeRepo?repo={did}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        desc["collections"],
+        json!([
+            "app.bsky.actor.profile",
+            "app.bsky.feed.post",
+            "com.example.unknown"
+        ])
+    );
+    assert_eq!(desc["handleIsCorrect"], true);
+
+    // Another account can't write here; a deactivated one can't write at all.
+    let other = h
+        .create_account("bea.pds.example.com", "bea@example.com", "pw")
+        .await;
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            other["accessJwt"].as_str(),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    h.post(
+        "com.atproto.server.deactivateAccount",
+        Some(&access),
+        json!({}),
+    )
+    .await;
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("AccountDeactivated"))
+    );
+}
+
+#[tokio::test]
+async fn create_record_replaces_duplicate_follows_and_likes() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("cal.pds.example.com", "cal@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let follow = json!({"$type": "app.bsky.graph.follow", "subject": "did:plc:abcdefghijklmnopqrstuvwx", "createdAt": "2026-11-05T00:00:00.000Z"});
+    let make = |record: Value| {
+        h.post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.graph.follow", "record": record}),
+        )
+    };
+    let (_, first) = make(follow.clone()).await;
+    let (st, second) = make(follow.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{second}");
+    let (_, list) = h
+        .call(
+            "GET",
+            &format!(
+                "/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.graph.follow"
+            ),
+            None,
+            None,
+        )
+        .await;
+    let uris: Vec<&str> = list["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        vec![second["uri"].as_str().unwrap()],
+        "the first follow went in the same commit"
+    );
+    assert_ne!(first["uri"], second["uri"]);
+}
+
+#[tokio::test]
+async fn blobs_upload_get_referenced_promoted_served_and_collected() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("dee.pds.example.com", "dee@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let mut png = vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H', b'D', b'R',
+    ];
+    png.extend(std::iter::repeat_n(7u8, 1000));
+    let blob = h.upload(&access, &png, "application/octet-stream").await;
+    assert_eq!(blob["mimeType"], "image/png", "sniffed type wins");
+    assert_eq!(blob["size"], png.len());
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    assert_eq!(
+        cid,
+        proto_blue_lex_data::Cid::for_raw(&png).to_string_base32()
+    );
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    assert_eq!(row.state, "temp");
+
+    let post_with = |b: Value| {
+        let mut p = post_record("look");
+        p["embed"] =
+            json!({"$type": "app.bsky.embed.images", "images": [{"image": b, "alt": "a picture"}]});
+        p
+    };
+    let create = |record: Value| {
+        h.post(
+            "com.atproto.repo.createRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "app.bsky.feed.post", "record": record}),
+        )
+    };
+    // References must match the stored blob.
+    let mut wrong_mime = blob.clone();
+    wrong_mime["mimeType"] = json!("image/jpeg");
+    let (st, v) = create(post_with(wrong_mime)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidMimeType")),
+        "{v}"
+    );
+    let mut wrong_size = blob.clone();
+    wrong_size["size"] = json!(1);
+    let (_, v) = create(post_with(wrong_size)).await;
+    assert_eq!(v["error"], "InvalidSize");
+    let mut missing = blob.clone();
+    missing["ref"]["$link"] =
+        json!(proto_blue_lex_data::Cid::for_raw(b"never uploaded").to_string_base32());
+    let (_, v) = create(post_with(missing)).await;
+    assert_eq!(v["error"], "BlobNotFound");
+
+    let (st, post) = create(post_with(blob.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{post}");
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    assert_eq!(row.state, "permanent");
+    assert!(
+        row.storage_key.starts_with(&format!("blobs/{did}/{cid}.")),
+        "moved: {}",
+        row.storage_key
+    );
+    assert!(row.pending_move.is_none());
+
+    // Served with the reference's headers, and in ranges.
+    let path = format!("/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}");
+    let (st, headers, body) = h.raw("GET", &path, None, Vec::new(), &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, png);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(
+        headers["content-security-policy"],
+        "default-src 'none'; sandbox"
+    );
+    let (st, headers, body) = h
+        .raw(
+            "GET",
+            &format!("/blob/{did}/{cid}"),
+            None,
+            Vec::new(),
+            &[("range", "bytes=0-3")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, &png[..4]);
+    assert_eq!(headers["content-range"], format!("bytes 0-3/{}", png.len()));
+
+    // Dropping the last reference starts the grace period; GC then removes it.
+    let rkey = post["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    h.post(
+        "com.atproto.repo.deleteRecord",
+        Some(&access),
+        json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey}),
+    )
+    .await;
+    assert!(
+        h.state
+            .store
+            .blob(&did, &cid)
+            .await
+            .unwrap()
+            .unwrap()
+            .unreferenced_since
+            .is_some()
+    );
+    let mut tx = h.state.store.begin().await.unwrap();
+    assert_eq!(tx.gc_blob_batch(3_600_000, 0, 100, 1).await.unwrap(), 1);
+    tx.commit().await.unwrap();
+    let (st, _, _) = h.raw("GET", &path, None, Vec::new(), &[]).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "gone");
+    // Its bytes go after the delete grace.
+    assert!(
+        locus_blob::run_deletes(&h.state.store, &h.state.blobs, 0, 100)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        h.state
+            .blobs
+            .open(&row.storage_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A temp blob nobody references is collected after its TTL.
+    let other = h.upload(&access, b"just some text", "text/plain").await;
+    let other_cid = other["ref"]["$link"].as_str().unwrap();
+    let mut tx = h.state.store.begin().await.unwrap();
+    assert_eq!(
+        tx.gc_blob_batch(3_600_000, 3_600_000, 100, 1)
+            .await
+            .unwrap(),
+        0,
+        "young temp blob kept"
+    );
+    assert_eq!(tx.gc_blob_batch(-1, 3_600_000, 100, 1).await.unwrap(), 1);
+    tx.commit().await.unwrap();
+    assert!(h.state.store.blob(&did, other_cid).await.unwrap().is_none());
+}
+
+impl Harness {
+    async fn get(&self, path: String) -> (StatusCode, Value) {
+        self.call("GET", &path, None, None).await
+    }
 }

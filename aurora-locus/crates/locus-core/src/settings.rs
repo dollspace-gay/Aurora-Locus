@@ -312,6 +312,46 @@ pub static REGISTRY: &[Def] = &[
         description: "From address of moderation emails. Empty uses the account email address.",
     },
     Def {
+        key: "blobs.upload_limit",
+        kind: Kind::Int {
+            min: 1,
+            max: 1 << 40,
+        },
+        default: "314572800",
+        env: Some("PDS_BLOB_UPLOAD_LIMIT"),
+        description: "Largest blob upload, in bytes.",
+    },
+    Def {
+        key: "blobs.temp_ttl_ms",
+        kind: Kind::Int {
+            min: 60_000,
+            max: 30 * 24 * 3_600_000,
+        },
+        default: "21600000",
+        env: None,
+        description: "How long an uploaded blob no record references is kept, in milliseconds.",
+    },
+    Def {
+        key: "blobs.unreferenced_grace_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: 30 * 24 * 3_600_000,
+        },
+        default: "3600000",
+        env: None,
+        description: "How long a blob whose last reference went is kept, in milliseconds.",
+    },
+    Def {
+        key: "blobs.delete_grace_ms",
+        kind: Kind::Int {
+            min: 0,
+            max: 24 * 3_600_000,
+        },
+        default: "300000",
+        env: None,
+        description: "How long a replaced or collected copy stays on storage before deletion, so reads in flight finish.",
+    },
+    Def {
         key: "sync.deleted_history_preservation_days",
         kind: Kind::Int { min: 0, max: 90 },
         default: "0",

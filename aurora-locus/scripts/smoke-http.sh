@@ -81,6 +81,23 @@ for m in json.load(sys.stdin)["messages"][:1]:
     print(m["Subject"], "| to", [t["Address"] for t in m["To"]], "| from", m["From"]["Address"], "|", m["Snippet"][:90])'
 fi
 
+did=$(echo "$acct" | python3 -c 'import json,sys; print(json.load(sys.stdin)["did"])')
+x POST createRecord -H "authorization: Bearer $access" -H 'content-type: application/json' \
+  -d "{\"repo\":\"$did\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"3m3smokeaaaaa\",\"record\":{\"text\":\"hello from smoke\",\"createdAt\":\"2026-11-05T00:00:00.000Z\"}}" \
+  "$base/com.atproto.repo.createRecord"
+x GET getRecord "$base/com.atproto.repo.getRecord?repo=$did&collection=app.bsky.feed.post&rkey=3m3smokeaaaaa"
+printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDRsmoke-image-bytes' >"$data/img.png"
+blob=$(curl -s -H "authorization: Bearer $access" -H 'content-type: image/png' \
+  --data-binary "@$data/img.png" "$base/com.atproto.repo.uploadBlob")
+echo "> POST uploadBlob"; echo "$blob"
+blobref=$(echo "$blob" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["blob"]))')
+cid=$(echo "$blob" | python3 -c 'import json,sys; print(json.load(sys.stdin)["blob"]["ref"]["$link"])')
+x POST createRecord-image -H "authorization: Bearer $access" -H 'content-type: application/json' \
+  -d "{\"repo\":\"$did\",\"collection\":\"app.bsky.feed.post\",\"record\":{\"text\":\"pic\",\"createdAt\":\"2026-11-05T00:00:00.000Z\",\"embed\":{\"\$type\":\"app.bsky.embed.images\",\"images\":[{\"image\":$blobref,\"alt\":\"\"}]}}}" \
+  "$base/com.atproto.repo.createRecord"
+echo "> GET getBlob (bytes match: $(curl -s "$base/com.atproto.sync.getBlob?did=$did&cid=$cid" | cmp -s - "$data/img.png" && echo yes || echo no))"
+echo "> stored under: $(find "$data/blobs" -type f | sed "s|$data/||")"
+
 # A handle elsewhere on the network, through DNS or HTTPS.
 x GET resolveHandle-network "$base/com.atproto.identity.resolveHandle?handle=atproto.com"
 

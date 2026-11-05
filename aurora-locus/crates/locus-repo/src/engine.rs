@@ -7,7 +7,7 @@
 //! stored blocks inside the transaction, so a write reads only the paths it
 //! changes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use locus_core::CoreError;
@@ -22,7 +22,9 @@ use proto_blue_repo::mst::{Mst, MstOp};
 use thiserror::Error;
 
 use crate::event::{CommitEvent, EventOp, MAX_EVENT_BLOCKS_BYTES};
+use crate::records::BlobUse;
 use crate::tid::TidClock;
+pub use locus_store::blob::PendingMove;
 
 #[derive(Debug, Error)]
 pub enum CommitError {
@@ -35,12 +37,20 @@ pub enum CommitError {
     InvalidRequest(String),
     #[error("repository not found: {0}")]
     RepoNotFound(String),
+    /// Nothing to commit: every write was a no-op (a put of the record the
+    /// path already holds, a delete of a missing record).
+    #[error("no changes")]
+    Unchanged,
     /// A bulk job (an import or deletion) holds the account's writes; retry.
     #[error("the repository's writes are blocked while another operation runs")]
     WriteBlocked,
     /// The tree didn't come out as the ops say it should. Nothing was written.
     #[error("invalid MST: {0}")]
     InvalidMst(String),
+    /// A referenced blob is missing or doesn't match (`BlobNotFound`,
+    /// `InvalidMimeType`, `InvalidSize`, the reference's names).
+    #[error("{message}")]
+    Blob { name: &'static str, message: String },
     #[error(transparent)]
     Core(#[from] CoreError),
 }
@@ -57,16 +67,11 @@ pub enum Action {
     Create,
     Update,
     Delete,
-}
-
-impl Action {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Create => "create",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
+    /// Create, or update if the path holds a record (`putRecord`); a no-op
+    /// if it holds this exact record.
+    Put,
+    /// Delete if the path holds a record (`deleteRecord`), else a no-op.
+    DeleteIfPresent,
 }
 
 /// A validated, encoded write.
@@ -80,6 +85,10 @@ pub struct PreparedWrite {
     /// `swapRecord`: None = no check; Some(None) = the path must be empty;
     /// Some(Some(cid)) = the path must hold `cid`.
     pub swap_record: Option<Option<Cid>>,
+    /// Blobs the record references (create and update).
+    pub blobs: Vec<BlobUse>,
+    /// What the record points at, `(path, target)` (create and update).
+    pub backlinks: Vec<(String, String)>,
 }
 
 impl PreparedWrite {
@@ -95,7 +104,19 @@ pub struct CommitRequest<'a> {
     /// `swapCommit`: the commit the repository must be at.
     pub swap_commit: Option<Cid>,
     pub signer: &'a dyn Signer,
+    /// The reference's `createRecord` cleanup: delete the account's other
+    /// follows, blocks, likes and reposts of the same subject in the same
+    /// commit.
+    pub dedupe_backlinks: bool,
 }
+
+/// The collections whose duplicates `createRecord` removes.
+const DEDUPED: &[&str] = &[
+    "app.bsky.graph.follow",
+    "app.bsky.graph.block",
+    "app.bsky.feed.like",
+    "app.bsky.feed.repost",
+];
 
 /// What a commit did.
 #[derive(Debug, Clone)]
@@ -103,6 +124,8 @@ pub struct CommitOutcome {
     pub commit_cid: Cid,
     pub rev: String,
     pub outbox_id: i64,
+    /// Blob copies promoted by this commit, to finish after it.
+    pub moves: Vec<PendingMove>,
 }
 
 /// A newly created repository.
@@ -204,6 +227,7 @@ impl RepoEngine {
             commit_cid: created.commit_cid,
             rev: created.rev,
             outbox_id: created.commit_outbox_id.unwrap_or_default(),
+            moves: Vec::new(),
         })
     }
 
@@ -327,9 +351,37 @@ impl RepoEngine {
             )));
         }
 
+        // The batch, with the duplicates createRecord removes put first.
+        let mut writes: Vec<PreparedWrite> = Vec::with_capacity(req.writes.len());
+        if req.dedupe_backlinks {
+            for w in &req.writes {
+                if w.action != Action::Create || !DEDUPED.contains(&w.collection.as_str()) {
+                    continue;
+                }
+                for (path, target) in &w.backlinks {
+                    for rkey in tx
+                        .backlinked_records(did, &w.collection, path, target)
+                        .await?
+                    {
+                        if rkey != w.rkey {
+                            writes.push(PreparedWrite {
+                                action: Action::DeleteIfPresent,
+                                collection: w.collection.clone(),
+                                rkey,
+                                record: None,
+                                swap_record: None,
+                                blobs: Vec::new(),
+                                backlinks: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        writes.extend(req.writes.iter().cloned());
+
         // Current CIDs of every touched path, before the batch.
-        let mut paths: Vec<(String, String)> = req
-            .writes
+        let mut paths: Vec<(String, String)> = writes
             .iter()
             .map(|w| (w.collection.clone(), w.rkey.clone()))
             .collect();
@@ -343,9 +395,9 @@ impl RepoEngine {
             let cid = initial.get(p).map(|s| parse_cid(s)).transpose()?;
             overlay.insert(p.clone(), cid);
         }
-        let mut event_ops = Vec::with_capacity(req.writes.len());
+        let mut event_ops = Vec::with_capacity(writes.len());
         let mut record_deltas: Vec<BlockDelta> = Vec::new();
-        for w in &req.writes {
+        for w in &writes {
             let key = (w.collection.clone(), w.rkey.clone());
             let current = overlay.get(&key).cloned().flatten();
             if let Some(swap) = &w.swap_record {
@@ -359,7 +411,17 @@ impl RepoEngine {
                     return Err(CommitError::InvalidSwap(format!("Record was at {at}")));
                 }
             }
-            let new = match w.action {
+            // Put and DeleteIfPresent resolve against the overlay.
+            let action = match w.action {
+                Action::Put if current.is_none() => Action::Create,
+                Action::Put if current == w.record.as_ref().map(|(c, _)| c.clone()) => continue,
+                Action::Put => Action::Update,
+                Action::DeleteIfPresent if current.is_none() => continue,
+                Action::DeleteIfPresent => Action::Delete,
+                a => a,
+            };
+            let new = match action {
+                Action::Put | Action::DeleteIfPresent => unreachable!("resolved above"),
                 Action::Create => {
                     if current.is_some() {
                         return Err(CommitError::InvalidRequest(format!(
@@ -415,7 +477,11 @@ impl RepoEngine {
                 }
             };
             event_ops.push(EventOp {
-                action: w.action.as_str(),
+                action: match action {
+                    Action::Create => "create",
+                    Action::Update => "update",
+                    _ => "delete",
+                },
                 path: w.path(),
                 cid: new.clone(),
                 prev: current,
@@ -458,8 +524,11 @@ impl RepoEngine {
             });
             expected.push((path, before, fin.clone()));
         }
-        if req.writes.is_empty() {
+        if writes.is_empty() {
             return Err(CommitError::InvalidRequest("no writes".into()));
+        }
+        if event_ops.is_empty() {
+            return Err(CommitError::Unchanged);
         }
 
         // MST update, diff and proofs, reading only the paths they need.
@@ -502,7 +571,7 @@ impl RepoEngine {
         let mut event_blocks = BlockMap::new();
         event_blocks.set(commit_cid.clone(), commit_bytes.clone());
         event_blocks.add_map(&diff.added);
-        for w in &req.writes {
+        for w in &writes {
             if let Some((cid, bytes)) = &w.record {
                 event_blocks.set(cid.clone(), bytes.clone());
             }
@@ -555,6 +624,7 @@ impl RepoEngine {
         tx.apply_block_deltas(did, &rev, &net_deltas(deltas))
             .await?;
         tx.apply_record_changes(did, &rev, &record_changes).await?;
+        let moves = apply_references(&mut tx, did, &writes, &paths).await?;
         tx.set_repo_root(
             did,
             &RepoRoot {
@@ -570,8 +640,126 @@ impl RepoEngine {
             commit_cid,
             rev,
             outbox_id,
+            moves,
         })
     }
+}
+
+fn blob_error(name: &'static str, message: String) -> CommitError {
+    CommitError::Blob { name, message }
+}
+
+/// Blob references and backlinks for every path the batch touched, under
+/// the repo lock (in the commit's transaction).
+///
+/// Every blob any write names is checked: the row must exist and be
+/// referenceable, with the MIME type and size the record says. Blobs the
+/// paths reference after the batch take a reference (a row update, so GC's
+/// conditional delete can't win a race), and a temp blob is promoted with a
+/// pending move to a permanent key. References net across the batch: a
+/// blob referenced and dropped within it takes no reference. A blob whose
+/// last reference went is marked unreferenced.
+async fn apply_references(
+    tx: &mut Tx,
+    did: &str,
+    writes: &[PreparedWrite],
+    paths: &[(String, String)],
+) -> Result<Vec<PendingMove>, CommitError> {
+    // Each path's final write (None: deleted).
+    let mut last: BTreeMap<(String, String), Option<&PreparedWrite>> = BTreeMap::new();
+    for w in writes {
+        last.insert(
+            (w.collection.clone(), w.rkey.clone()),
+            (w.action != Action::Delete).then_some(w),
+        );
+    }
+    let old = tx.record_blob_cids(did, paths).await?;
+    let named: BTreeMap<String, Vec<&BlobUse>> =
+        writes
+            .iter()
+            .flat_map(|w| &w.blobs)
+            .fold(BTreeMap::new(), |mut m, b| {
+                m.entry(cid_str(&b.cid)).or_default().push(b);
+                m
+            });
+    let mut moves = Vec::new();
+    if !named.is_empty() || !old.is_empty() {
+        let backend = tx.blob_backend().await?;
+        let referenced: BTreeSet<String> = last
+            .values()
+            .flatten()
+            .flat_map(|w| w.blobs.iter().map(|b| cid_str(&b.cid)))
+            .collect();
+        // In (did, cid) order: BTreeMap keys are sorted.
+        for (cid, uses) in &named {
+            let row = if referenced.contains(cid) {
+                let key = locus_store::blob::permanent_key(did, cid);
+                let row = tx.reference_blob(did, cid, &key, backend.epoch).await?;
+                if let Some(r) = &row
+                    && r.pending_move.as_deref() == Some(key.as_str())
+                {
+                    moves.push(PendingMove {
+                        did: did.to_owned(),
+                        cid: cid.clone(),
+                        from: r.storage_key.clone(),
+                        to: key,
+                    });
+                }
+                row
+            } else {
+                tx.blob_for_update(did, cid).await?.filter(|r| {
+                    r.takedown_ref.is_none()
+                        && (r.state == "temp" || r.state == "permanent")
+                        && !r.review_hold
+                })
+            };
+            let row = row
+                .ok_or_else(|| blob_error("BlobNotFound", format!("Could not find blob: {cid}")))?;
+            for b in uses {
+                if b.mime_type != row.mime_type {
+                    return Err(blob_error(
+                        "InvalidMimeType",
+                        format!(
+                            "Referenced Mimetype does not match stored blob. Expected: {}, Got: {}",
+                            row.mime_type, b.mime_type
+                        ),
+                    ));
+                }
+                if b.size != row.size {
+                    return Err(blob_error(
+                        "InvalidSize",
+                        format!(
+                            "Referenced Size does not match stored blob. Expected: {}, Got: {}",
+                            row.size, b.size
+                        ),
+                    ));
+                }
+            }
+        }
+        for (path, w) in &last {
+            let cids: Vec<String> = w
+                .map(|w| w.blobs.iter().map(|b| cid_str(&b.cid)).collect())
+                .unwrap_or_default();
+            let had = old.get(path).cloned().unwrap_or_default();
+            if cids != had {
+                tx.replace_record_blobs(did, &path.0, &path.1, &cids)
+                    .await?;
+            }
+        }
+        let dropped: BTreeSet<&String> = old
+            .values()
+            .flatten()
+            .filter(|c| !referenced.contains(*c))
+            .collect();
+        for cid in dropped {
+            tx.orphan_blob_if_unreferenced(did, cid).await?;
+        }
+    }
+    for (path, w) in &last {
+        let links = w.map(|w| w.backlinks.as_slice()).unwrap_or_default();
+        tx.replace_backlinks(did, &path.0, &path.1, links).await?;
+    }
+    Ok(moves)
 }
 
 /// Sums deltas per block, keeping bytes from any increment, so a block that

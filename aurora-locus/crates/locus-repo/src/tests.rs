@@ -72,6 +72,8 @@ fn write(action: Action, collection: &str, rkey: &str, n: Option<u64>) -> Prepar
         rkey: rkey.to_owned(),
         record: n.map(|n| record(collection, n)),
         swap_record: None,
+        blobs: Vec::new(),
+        backlinks: Vec::new(),
     }
 }
 
@@ -207,6 +209,7 @@ async fn random_batches_match_the_model_and_the_eager_tree() {
                     writes,
                     swap_commit: None,
                     signer: &key,
+                    dedupe_backlinks: false,
                 })
                 .await
                 .unwrap_or_else(|e| panic!("{} round {round}: {e}", b.name));
@@ -231,6 +234,7 @@ async fn swaps_and_conflicts_are_refused_without_writing() {
             writes,
             swap_commit: None,
             signer: &key,
+            dedupe_backlinks: false,
         };
         engine
             .commit(c(vec![write(Action::Create, "a.b.c", "one", Some(1))]))
@@ -245,6 +249,7 @@ async fn swaps_and_conflicts_are_refused_without_writing() {
                 writes: vec![write(Action::Create, "a.b.c", "two", Some(2))],
                 swap_commit: Some(first.commit_cid.clone()),
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await;
         assert!(
@@ -303,6 +308,7 @@ async fn a_batch_that_nets_out_still_commits_with_both_ops() {
                 ],
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -344,6 +350,7 @@ async fn commit_events_carry_what_consumers_need() {
                 writes,
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -361,6 +368,7 @@ async fn commit_events_carry_what_consumers_need() {
                 ],
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -440,6 +448,7 @@ async fn gc_removes_only_unreferenced_blocks() {
                 writes,
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -455,6 +464,7 @@ async fn gc_removes_only_unreferenced_blocks() {
                 writes,
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -481,6 +491,7 @@ async fn gc_removes_only_unreferenced_blocks() {
                 writes: vec![write(Action::Create, "a.b.c", "3m00000000000", Some(0))],
                 swap_commit: None,
                 signer: &key,
+                dedupe_backlinks: false,
             })
             .await
             .unwrap();
@@ -510,6 +521,7 @@ async fn concurrent_commits_to_one_repo_serialize() {
                         )],
                         swap_commit: None,
                         signer: key.as_ref(),
+                        dedupe_backlinks: false,
                     })
                     .await
                     .unwrap()

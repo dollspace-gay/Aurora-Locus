@@ -57,7 +57,7 @@ kryphocron = "=0.4.5"
 kryphocron-lexicons = "0.3"
 
 # Runtime and common
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -249,10 +249,20 @@ impl Tx {
     /// the final step is left ([`Tx::delete_account_finally`]).
     pub async fn delete_account_batch(&mut self, did: &str, limit: i64) -> CoreResult<u64> {
         // Large tables in bounded slices.
+        // Blobs first: their keys are queued for deletion in this batch.
+        let epoch = self.blob_backend().await?.epoch;
+        let n = self.delete_account_blobs(did, limit, epoch).await?;
+        if n > 0 {
+            return Ok(n);
+        }
         let sliced = [
             "DELETE FROM repo_block WHERE did = {1} AND cid IN (SELECT cid FROM repo_block WHERE did = {1} LIMIT {2})",
             "DELETE FROM record WHERE did = {1} AND (collection, rkey) IN \
              (SELECT collection, rkey FROM record WHERE did = {1} LIMIT {2})",
+            "DELETE FROM record_blob WHERE did = {1} AND (blob_cid, collection, rkey) IN \
+             (SELECT blob_cid, collection, rkey FROM record_blob WHERE did = {1} LIMIT {2})",
+            "DELETE FROM backlink WHERE did = {1} AND (collection, rkey, path) IN \
+             (SELECT collection, rkey, path FROM backlink WHERE did = {1} LIMIT {2})",
         ];
         for template in sliced {
             let sqlite = template.replace("{1}", "?1").replace("{2}", "?2");

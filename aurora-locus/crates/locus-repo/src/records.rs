@@ -211,6 +211,32 @@ fn check_key_type(collection: &str, key: Option<&str>, rkey: &str) -> Result<(),
     }
 }
 
+/// What a record points at, as the reference's `getBacklinks`: a follow
+/// or block's `subject` DID, a like or repost's `subject.uri`.
+#[must_use]
+pub fn backlinks(collection: &str, value: &LexValue) -> Vec<(String, String)> {
+    let Some(map) = value.as_map() else {
+        return Vec::new();
+    };
+    match collection {
+        "app.bsky.graph.follow" | "app.bsky.graph.block" => map
+            .get("subject")
+            .and_then(LexValue::as_str)
+            .filter(|s| proto_blue_syntax::Did::new(s).is_ok())
+            .map(|s| vec![("subject".to_owned(), s.to_owned())])
+            .unwrap_or_default(),
+        "app.bsky.feed.like" | "app.bsky.feed.repost" => map
+            .get("subject")
+            .and_then(LexValue::as_map)
+            .and_then(|s| s.get("uri"))
+            .and_then(LexValue::as_str)
+            .filter(|s| proto_blue_syntax::AtUri::new(s).is_ok())
+            .map(|s| vec![("subject.uri".to_owned(), s.to_owned())])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Every blob the record references (typed refs anywhere in it, deduped).
 /// A legacy `{cid, mimeType}` ref is refused, as the reference.
 pub fn blob_uses(value: &LexValue) -> Result<Vec<BlobUse>, InvalidRecord> {

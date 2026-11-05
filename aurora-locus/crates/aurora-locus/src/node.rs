@@ -152,6 +152,7 @@ impl Node {
             secrets,
             sessions,
             mailer,
+            blobs: locus_blob::DiskStore::new(self.bootstrap.data_dir.clone()),
             hostname,
             public_url,
             service_did,
@@ -161,6 +162,7 @@ impl Node {
         });
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
+        self.spawn_blob_jobs(Arc::clone(&state));
         let addr = self.bootstrap.listen;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -174,6 +176,73 @@ impl Node {
             }
         }));
         Ok(())
+    }
+
+    /// Blob upkeep, each on one node at a time: finishing moves a crash or
+    /// failure left, deleting queued keys after their grace period, and GC
+    /// of never-referenced temp blobs and long-unreferenced ones.
+    fn spawn_blob_jobs(&mut self, state: Arc<AppState>) {
+        const EVERY: Duration = Duration::from_secs(60);
+        for name in ["blob-moves", "blob-deletes", "blob-gc"] {
+            let state = Arc::clone(&state);
+            self.tasks
+                .push(tokio::spawn(locus_store::runtime::run_leased(
+                    self.store.clone(),
+                    name.into(),
+                    self.node_id.clone(),
+                    DEFAULT_LEASE_TTL,
+                    self.cancel.clone(),
+                    move |lease, cancel| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            loop {
+                                let snap = state.snapshot();
+                                let result = match name {
+                                    "blob-moves" => locus_blob::run_pending_moves(
+                                        &state.store,
+                                        &state.blobs,
+                                        500,
+                                    )
+                                    .await
+                                    .map(|n| n as u64),
+                                    "blob-deletes" => locus_blob::run_deletes(
+                                        &state.store,
+                                        &state.blobs,
+                                        snap.int("blobs.delete_grace_ms"),
+                                        1000,
+                                    )
+                                    .await
+                                    .map(|n| n as u64),
+                                    _ => {
+                                        locus_blob::run_gc(
+                                            &state.store,
+                                            &lease,
+                                            snap.int("blobs.temp_ttl_ms"),
+                                            snap.int("blobs.unreferenced_grace_ms"),
+                                            500,
+                                        )
+                                        .await
+                                    }
+                                };
+                                match &result {
+                                    Ok(n) if *n > 0 => {
+                                        tracing::info!(job = name, blobs = n, "done")
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(job = name, "failed: {e}"),
+                                }
+                                let err = result.as_ref().err().map(ToString::to_string);
+                                let _ =
+                                    state.store.record_job_run(name, err.as_deref(), None).await;
+                                tokio::select! {
+                                    () = cancel.cancelled() => return Ok(()),
+                                    () = tokio::time::sleep(EVERY) => {}
+                                }
+                            }
+                        }
+                    },
+                )));
+        }
     }
 
     /// The bulk-job resumer (finishes deletions a stopped node started) and

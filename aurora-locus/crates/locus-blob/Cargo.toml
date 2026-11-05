@@ -8,6 +8,17 @@ publish.workspace = true
 
 [dependencies]
 locus-core.workspace = true
+locus-store.workspace = true
+proto-blue-lex-data.workspace = true
+tokio.workspace = true
+futures.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+infer = "0.16"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

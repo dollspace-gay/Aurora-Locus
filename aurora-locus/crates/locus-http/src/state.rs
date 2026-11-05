@@ -201,6 +201,8 @@ pub struct AppState {
     pub secrets: ServerSecrets,
     pub sessions: LegacySessions,
     pub mailer: locus_mail::Mailer,
+    /// Blob bytes.
+    pub blobs: locus_blob::DiskStore,
     pub repo: RepoEngine,
     /// The PDS hostname (no scheme or port).
     pub hostname: String,

@@ -416,6 +416,126 @@ impl Store {
         Ok(rows.into_iter().collect())
     }
 
+    /// One record's CID and takedown, if the record exists.
+    pub async fn record_entry(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> CoreResult<Option<(String, Option<String>)>> {
+        let q = |p: [&str; 3]| {
+            format!(
+                "SELECT cid, takedown_ref FROM record WHERE did = {} AND collection = {} AND rkey = {}",
+                p[0], p[1], p[2]
+            )
+        };
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_as(&q(["?1", "?2", "?3"]))
+                    .bind(did)
+                    .bind(collection)
+                    .bind(rkey)
+                    .fetch_optional(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_as(&q(["$1", "$2", "$3"]))
+                    .bind(did)
+                    .bind(collection)
+                    .bind(rkey)
+                    .fetch_optional(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
+    /// A page of a collection's records that aren't taken down, by rkey:
+    /// newest first unless `reverse`, after `cursor` (an rkey). Returns
+    /// (rkey, cid) pairs.
+    pub async fn list_records(
+        &self,
+        did: &str,
+        collection: &str,
+        limit: i64,
+        cursor: Option<&str>,
+        reverse: bool,
+    ) -> CoreResult<Vec<(String, String)>> {
+        let (cmp, order) = if reverse { (">", "ASC") } else { ("<", "DESC") };
+        let q = |p: [&str; 4]| {
+            format!(
+                "SELECT rkey, cid FROM record WHERE did = {} AND collection = {} AND takedown_ref IS NULL \
+                 AND ({} IS NULL OR rkey {cmp} {}) ORDER BY rkey {order} LIMIT {}",
+                p[0], p[1], p[2], p[2], p[3]
+            )
+        };
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_as(&q(["?1", "?2", "?3", "?4"]))
+                    .bind(did)
+                    .bind(collection)
+                    .bind(cursor)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_as(&q(["$1", "$2", "$3::text", "$4"]))
+                    .bind(did)
+                    .bind(collection)
+                    .bind(cursor)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
+    /// A stored block's bytes.
+    pub async fn block(&self, did: &str, cid: &str) -> CoreResult<Option<Vec<u8>>> {
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_scalar("SELECT content FROM repo_block WHERE did = ?1 AND cid = ?2")
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_scalar("SELECT content FROM repo_block WHERE did = $1 AND cid = $2")
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
+    /// The collections a repository has records in.
+    pub async fn collections(&self, did: &str) -> CoreResult<Vec<String>> {
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_scalar(
+                    "SELECT DISTINCT collection FROM record WHERE did = ?1 ORDER BY collection",
+                )
+                .bind(did)
+                .fetch_all(p)
+                .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_scalar(
+                    "SELECT DISTINCT collection FROM record WHERE did = $1 ORDER BY collection",
+                )
+                .bind(did)
+                .fetch_all(p)
+                .await
+            }
+        }
+        .map_err(db_err)
+    }
+
     /// A repository's commit, rev, live block count and record count
     /// (`checkAccountStatus`), if it has a repository.
     pub async fn repo_stats(&self, did: &str) -> CoreResult<Option<(String, String, i64, i64)>> {

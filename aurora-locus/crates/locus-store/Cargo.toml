@@ -16,10 +16,10 @@ tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
 zeroize.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rand.workspace = true
 
 [lints]
 workspace = true
