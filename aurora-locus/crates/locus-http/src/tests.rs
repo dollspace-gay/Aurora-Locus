@@ -5821,3 +5821,203 @@ async fn the_appview_decides_who_may_write_private_posts() {
         "outage with no answer at all"
     );
 }
+
+impl Harness {
+    /// Commits a record as stored, skipping kryphocron's step (as an import
+    /// would bring it).
+    async fn commit_raw(&self, did: &str, collection: &str, rkey: &str, value: Value) {
+        let account = self.state.store.account_by_did(did).await.unwrap().unwrap();
+        let rec = locus_repo::records::prepare_record(
+            collection,
+            rkey,
+            locus_repo::records::parse_json(&value).unwrap(),
+            Some(false),
+            usize::MAX,
+        )
+        .unwrap();
+        let mut w = crate::repo::prepared(
+            locus_repo::Action::Create,
+            collection,
+            rkey,
+            Some(&rec),
+            None,
+        );
+        w.lenient_blobs = true;
+        crate::repo::commit(&self.state, &account, vec![w], None, false)
+            .await
+            .unwrap();
+    }
+
+    async fn record_value(&self, did: &str, collection: &str, rkey: &str) -> Value {
+        let (st, v) = self
+            .get(format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={rkey}"
+            ))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["value"].clone()
+    }
+}
+
+#[tokio::test]
+async fn rotation_re_encodes_private_posts_under_the_new_generation() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("ines.pds.example.com", "ines@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let audience = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    h.with_prism().await;
+    let mut rkeys = Vec::new();
+    for text in ["first", "second"] {
+        let (st, v) = h
+            .post(
+                "tools.kryphocron.feed.createPostPrivate",
+                Some(&access),
+                json!({"repo": did, "record": private_post(text, &audience)}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        rkeys.push(
+            v["uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let before = h.record_value(&did, POST_PRIVATE, &rkeys[0]).await;
+
+    // Imported plaintext, its image not uploaded yet; and an undecodable one.
+    let missing = proto_blue_lex_data::Cid::for_raw(b"not uploaded yet").to_string_base32();
+    let mut legacy = private_post("an imported plaintext post", &audience);
+    legacy["embed"] = json!({"$type": "app.bsky.embed.images", "images": [{"alt": "",
+        "image": {"$type": "blob", "ref": {"$link": missing}, "mimeType": "image/png", "size": 9}}]});
+    h.commit_raw(&did, POST_PRIVATE, "3m6legacylega", legacy)
+        .await;
+    let garbage = json!({"$type": POST_PRIVATE, "createdAt": "2024-01-01T00:00:00.000Z", "audienceList": audience,
+        "encodedContent": {"$bytes": "AAECAwQFBgc"}, "encodedContentCodec": "laquna/0.2"});
+    h.commit_raw(&did, POST_PRIVATE, "3m6garbagegar", garbage)
+        .await;
+    assert!(
+        h.state
+            .store
+            .private_record(&did, POST_PRIVATE, "3m6legacylega")
+            .await
+            .unwrap()
+            .unwrap()
+            .legacy_text
+    );
+
+    // A new generation, made just under a period ago, so every account is
+    // past its spread offset.
+    let now = locus_core::time::now_ms();
+    let next = locus_kryphocron::rotation::new_mark(u64::try_from(now / 1000).unwrap() + 1);
+    h.state
+        .store
+        .add_generation(&next, now - 60 * 86_400_000 + 60_000)
+        .await
+        .unwrap();
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease(
+            "kr-rotation",
+            "test-node",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    h.state
+        .settings
+        .set(
+            "kryphocron.rotation_max_commits_per_minute",
+            json!(10_000),
+            "test",
+        )
+        .await
+        .unwrap();
+    let report = crate::kryphocron::rotation_pass(&h.state, &lease, &cancel)
+        .await
+        .unwrap();
+    assert_eq!((report.rewritten, report.flagged), (3, 1), "{report:?}");
+    assert_eq!(
+        h.state.store.current_generation().await.unwrap().unwrap().0,
+        next,
+        "no extra generation"
+    );
+
+    // Encoded posts: new content and mark, everything else as it was.
+    let after = h.record_value(&did, POST_PRIVATE, &rkeys[0]).await;
+    assert_eq!(after["encodedContentGeneration"], json!(next));
+    assert_ne!(after["encodedContent"], before["encodedContent"]);
+    for k in ["createdAt", "audienceList", "encodedContentCodec", "$type"] {
+        assert_eq!(after[k], before[k], "{k}");
+    }
+    let decode = |v: &Value, rkey: &str| {
+        let lex = proto_blue_lex_json::json_to_lex_with(
+            v,
+            proto_blue_lex_json::LexParseOptions::strict(),
+        )
+        .unwrap();
+        let bytes = lex.as_map().unwrap()["encodedContent"]
+            .as_bytes()
+            .unwrap()
+            .to_vec();
+        let (h, rkey, did) = (&h, rkey.to_owned(), did.clone());
+        async move {
+            let plain = h
+                .state
+                .kr
+                .encoder
+                .trial_decode(&did, POST_PRIVATE, &rkey, bytes)
+                .await
+                .unwrap();
+            locus_kryphocron::kryphocron::post_content::PostContent::from_payload(&plain).unwrap()
+        }
+    };
+    assert_eq!(decode(&after, &rkeys[0]).await.text, "first");
+
+    // The imported plaintext is encoded now, its blob reference kept.
+    let legacy = h.record_value(&did, POST_PRIVATE, "3m6legacylega").await;
+    assert!(
+        legacy.get("text").is_none() && legacy.get("embed").is_none(),
+        "{legacy}"
+    );
+    assert_eq!(legacy["mediaKinds"], json!(["image"]));
+    assert_eq!(legacy["embedBlobs"][0]["ref"]["$link"], json!(missing));
+    let content = decode(&legacy, "3m6legacylega").await;
+    assert_eq!(content.text, "an imported plaintext post");
+    assert!(content.embed.is_some());
+    let entry = h
+        .state
+        .store
+        .private_record(&did, POST_PRIVATE, "3m6legacylega")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (entry.legacy_text, entry.generation.as_deref()),
+        (false, Some(next.as_str()))
+    );
+
+    // The undecodable one is flagged and left alone.
+    let flagged = h.state.store.flagged_private_records(10).await.unwrap();
+    assert_eq!(
+        flagged.iter().map(|r| r.rkey.as_str()).collect::<Vec<_>>(),
+        ["3m6garbagegar"]
+    );
+
+    // Nothing left to do.
+    let again = crate::kryphocron::rotation_pass(&h.state, &lease, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(again.rewritten, 0);
+}

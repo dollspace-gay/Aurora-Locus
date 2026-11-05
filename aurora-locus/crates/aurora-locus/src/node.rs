@@ -180,6 +180,7 @@ impl Node {
         // Encodes need the current generation: read it before serving.
         locus_http::kryphocron::refresh_oracle(&state).await?;
         self.spawn_oracle_refresh(Arc::clone(&state));
+        self.spawn_kryphocron_jobs(Arc::clone(&state));
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
         self.spawn_blob_jobs(Arc::clone(&state));
@@ -507,6 +508,61 @@ impl Node {
                 }
             }
         }));
+    }
+
+    /// Kryphocron upkeep, each on one node at a time: new rotation
+    /// generations and the rewrite-on-rotate passes, and audit retention.
+    fn spawn_kryphocron_jobs(&mut self, state: Arc<AppState>) {
+        const EVERY: Duration = Duration::from_secs(60);
+        for name in ["kr-rotation", "kr-audit-retention"] {
+            let state = Arc::clone(&state);
+            self.tasks
+                .push(tokio::spawn(locus_store::runtime::run_leased(
+                    self.store.clone(),
+                    name.into(),
+                    self.node_id.clone(),
+                    DEFAULT_LEASE_TTL,
+                    self.cancel.clone(),
+                    move |lease, cancel| {
+                        let state = Arc::clone(&state);
+                        async move {
+                            loop {
+                                let result = if name == "kr-rotation" {
+                                    locus_http::kryphocron::rotation_pass(&state, &lease, &cancel)
+                                        .await
+                                        .map(|r| r.rewritten)
+                                } else {
+                                    let days =
+                                        state.snapshot().int("kryphocron.audit_retention_days");
+                                    let before = locus_core::time::now_ms() - days * 86_400_000;
+                                    let mut total = 0;
+                                    loop {
+                                        match state.store.prune_kr_audit(before, 5_000).await {
+                                            Ok(0) => break Ok(total),
+                                            Ok(n) => total += n,
+                                            Err(e) => break Err(e),
+                                        }
+                                    }
+                                };
+                                match &result {
+                                    Ok(n) if *n > 0 => {
+                                        tracing::info!(job = name, records = n, "done")
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!(job = name, "failed: {e}"),
+                                }
+                                let err = result.as_ref().err().map(ToString::to_string);
+                                let _ =
+                                    state.store.record_job_run(name, err.as_deref(), None).await;
+                                tokio::select! {
+                                    () = cancel.cancelled() => return Ok(()),
+                                    () = tokio::time::sleep(EVERY) => {}
+                                }
+                            }
+                        }
+                    },
+                )));
+        }
     }
 
     /// Retries identity changes that didn't finish (handle changes after an

@@ -89,6 +89,10 @@ pub struct PreparedWrite {
     pub blobs: Vec<BlobUse>,
     /// What the record points at, `(path, target)` (create and update).
     pub backlinks: Vec<(String, String)>,
+    /// Keep the record's blob references without checking the blobs exist
+    /// or match (a rewrite of an imported record whose blobs may arrive
+    /// later).
+    pub lenient_blobs: bool,
 }
 
 impl PreparedWrite {
@@ -449,6 +453,7 @@ impl RepoEngine {
                                 swap_record: None,
                                 blobs: Vec::new(),
                                 backlinks: Vec::new(),
+                                lenient_blobs: false,
                             });
                         }
                     }
@@ -760,6 +765,11 @@ async fn apply_references(
                 m.entry(cid_str(&b.cid)).or_default().push(b);
                 m
             });
+    let lenient: BTreeSet<String> = writes
+        .iter()
+        .filter(|w| w.lenient_blobs)
+        .flat_map(|w| w.blobs.iter().map(|b| cid_str(&b.cid)))
+        .collect();
     let mut moves = Vec::new();
     if !named.is_empty() || !old.is_empty() {
         let backend = tx.blob_backend().await?;
@@ -791,6 +801,9 @@ async fn apply_references(
                         && !r.review_hold
                 })
             };
+            if lenient.contains(cid) {
+                continue;
+            }
             let row = row
                 .ok_or_else(|| blob_error("BlobNotFound", format!("Could not find blob: {cid}")))?;
             for b in uses {

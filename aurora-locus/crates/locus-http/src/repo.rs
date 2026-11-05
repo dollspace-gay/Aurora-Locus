@@ -112,6 +112,7 @@ pub(crate) fn prepared(
         backlinks: rec
             .map(|r| records::backlinks(collection, &r.value))
             .unwrap_or_default(),
+        lenient_blobs: false,
     }
 }
 

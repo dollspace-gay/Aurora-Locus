@@ -584,3 +584,260 @@ pub async fn refresh_oracle(s: &AppState) -> locus_core::CoreResult<()> {
     s.kr.encoder.oracle().set(&mark);
     Ok(())
 }
+
+// ---------------------------------------------------------------- rotation
+
+/// Most ops, and record bytes, in one rotation commit: headroom under the
+/// 2 MB event cap.
+const ROTATION_OPS: usize = 200;
+const ROTATION_BYTES: usize = 1_500_000;
+
+/// Marks dated more than this far ahead are due whatever the generation.
+const FUTURE_SKEW_SECS: u64 = 300;
+
+/// What one rotation pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RotationReport {
+    pub rewritten: u64,
+    pub flagged: u64,
+    pub commits: u64,
+}
+
+/// Starts a new generation when the current one is older than the period
+/// (under the job's fence), then refreshes this node's oracle.
+pub async fn ensure_generation(
+    s: &AppState,
+    lease: &locus_core::lease::LeaseToken,
+) -> locus_core::CoreResult<()> {
+    let now = locus_core::time::now_ms();
+    let period = s.snapshot().int("kryphocron.rotation_period_days") * 86_400_000;
+    let due = match s.store.current_generation().await? {
+        Some((_, created)) => now - created >= period,
+        None => true,
+    };
+    if due {
+        let mark = locus_kryphocron::rotation::new_mark(u64::try_from(now / 1000).unwrap_or(0));
+        let mut tx = s.store.begin().await?;
+        tx.fence(lease).await?;
+        tx.add_generation(&mark, now).await?;
+        tx.commit().await?;
+        s.kr.audit
+            .record_locus("rotation.generation", format!("generation={mark}"));
+        tracing::info!(generation = mark, "new rotation generation");
+    }
+    refresh_oracle(s).await
+}
+
+/// Where in the period an account's stale records are rewritten, so the
+/// firehose doesn't spike when a generation starts.
+fn spread_offset(did: &str, period_ms: i64) -> i64 {
+    use sha2::Digest;
+    let h = sha2::Sha256::digest(did.as_bytes());
+    let n = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
+    i64::try_from(n % u64::try_from(period_ms.max(1)).unwrap_or(1)).unwrap_or(0)
+}
+
+/// One pass of the rewrite-on-rotate job: every active account's due
+/// private posts are re-encoded under the current generation, in batched
+/// commits with CAS against the CIDs read, so a concurrent user write is
+/// never clobbered (that record is found again next pass). Records that
+/// can't be rewritten are flagged, one by one.
+pub async fn rotation_pass(
+    s: &AppState,
+    lease: &locus_core::lease::LeaseToken,
+    cancel: &CancellationToken,
+) -> locus_core::CoreResult<RotationReport> {
+    ensure_generation(s, lease).await?;
+    let mut report = RotationReport::default();
+    let Some(current) = s.kr.encoder.oracle().current() else {
+        return Ok(report);
+    };
+    let Some((_, created_at)) = s.store.current_generation().await? else {
+        return Ok(report);
+    };
+    let snap = s.snapshot();
+    let period = snap.int("kryphocron.rotation_period_days") * 86_400_000;
+    let per_minute = snap
+        .int("kryphocron.rotation_max_commits_per_minute")
+        .max(1);
+    let pause = Duration::from_millis(u64::try_from(60_000 / per_minute).unwrap_or(500));
+    let now = locus_core::time::now_ms();
+    let future = locus_kryphocron::rotation::mark_floor(
+        u64::try_from(now / 1000).unwrap_or(0) + FUTURE_SKEW_SECS,
+    );
+    let mut after = String::new();
+    loop {
+        let dids = s
+            .store
+            .rotation_due_accounts(&current, &future, &after, 100)
+            .await?;
+        let Some(last) = dids.last() else {
+            break;
+        };
+        after.clone_from(last);
+        for did in dids {
+            if cancel.is_cancelled() {
+                return Ok(report);
+            }
+            let active = s
+                .store
+                .account_by_did(&did)
+                .await?
+                .is_some_and(|a| a.status == locus_store::accounts::Status::Active);
+            if !active {
+                continue;
+            }
+            let urgent_only = now < created_at + spread_offset(&did, period);
+            loop {
+                let mut due = s
+                    .store
+                    .rotation_due_records(&did, &current, urgent_only, ROTATION_OPS as i64)
+                    .await?;
+                if due.len() < ROTATION_OPS {
+                    let more = s
+                        .store
+                        .rotation_future_dated(&did, &future, (ROTATION_OPS - due.len()) as i64)
+                        .await?;
+                    due.extend(more);
+                }
+                if due.is_empty() {
+                    break;
+                }
+                match rotate_batch(s, &did, &due, &mut report).await? {
+                    BatchOutcome::Committed => {
+                        report.commits += 1;
+                        tokio::time::sleep(pause).await;
+                    }
+                    // Only flags this time: the loop continues with the rest.
+                    BatchOutcome::NothingToCommit => {}
+                    // A concurrent write, a write block, a stale oracle: try
+                    // this account again next pass.
+                    BatchOutcome::Later => break,
+                }
+            }
+        }
+    }
+    if report.rewritten > 0 || report.flagged > 0 {
+        s.kr.audit.record_locus(
+            "rotation.pass",
+            format!(
+                "generation={current} rewritten={} flagged={} commits={}",
+                report.rewritten, report.flagged, report.commits
+            ),
+        );
+    }
+    Ok(report)
+}
+
+enum BatchOutcome {
+    Committed,
+    NothingToCommit,
+    Later,
+}
+
+/// Rewrites one batch of an account's due records in one commit.
+async fn rotate_batch(
+    s: &AppState,
+    did: &str,
+    due: &[locus_store::kryphocron::PrivateRecord],
+    report: &mut RotationReport,
+) -> locus_core::CoreResult<BatchOutcome> {
+    let mut writes = Vec::new();
+    let mut bytes = 0usize;
+    let mut rewritten = 0u64;
+    for rec in due {
+        let flag = |why: &'static str| async move {
+            s.store
+                .flag_private_record(did, &rec.collection, &rec.rkey, why)
+                .await
+        };
+        let Some((cid, _)) = s
+            .store
+            .record_entry(did, &rec.collection, &rec.rkey)
+            .await?
+        else {
+            // Gone meanwhile; the index follows the record index.
+            continue;
+        };
+        let Some(block) = s.store.block(did, &cid).await? else {
+            continue;
+        };
+        let Ok(LexValue::Map(map)) = proto_blue_lex_cbor::decode(&block) else {
+            flag("malformed").await?;
+            report.flagged += 1;
+            continue;
+        };
+        let rewritten_map = if rec.legacy_text {
+            // An imported plaintext record: the full pipeline, without the
+            // lexicon check (it's signed history) or blob checks.
+            let skip = |_: &BTreeMap<String, LexValue>| Ok(());
+            s.kr.encoder
+                .prepare_post(&s.kr.audit, did, &rec.rkey, map, &skip)
+                .await
+        } else {
+            s.kr.encoder
+                .reencode(&s.kr.audit, did, &rec.rkey, map)
+                .await
+        };
+        let value = match rewritten_map {
+            Ok(m) => LexValue::Map(m),
+            Err(PipelineError::Invalid(_)) => {
+                flag("undecodable").await?;
+                report.flagged += 1;
+                continue;
+            }
+            Err(PipelineError::Retry(_)) => return Ok(BatchOutcome::Later),
+        };
+        let Ok(prepared) =
+            records::prepare_record(&rec.collection, &rec.rkey, value, None, usize::MAX)
+        else {
+            flag("invalid").await?;
+            report.flagged += 1;
+            continue;
+        };
+        bytes += prepared.bytes.len();
+        if !writes.is_empty() && bytes > ROTATION_BYTES {
+            break;
+        }
+        let read = proto_blue_lex_data::Cid::from_str_multibase(&cid)
+            .map_err(|_| locus_core::CoreError::Storage("a stored CID doesn't parse".into()))?;
+        let mut write = repo::prepared(
+            Action::Update,
+            &rec.collection,
+            &rec.rkey,
+            Some(&prepared),
+            Some(Some(read)),
+        );
+        write.lenient_blobs = rec.legacy_text;
+        writes.push(write);
+        rewritten += 1;
+    }
+    if writes.is_empty() {
+        return Ok(BatchOutcome::NothingToCommit);
+    }
+    let key = s
+        .signing_key(did)
+        .await
+        .map_err(|e| locus_core::CoreError::Storage(e.message))?;
+    let outcome = s
+        .repo
+        .commit(locus_repo::CommitRequest {
+            did,
+            writes,
+            swap_commit: None,
+            signer: &key,
+            dedupe_backlinks: false,
+        })
+        .await;
+    match outcome {
+        Ok(o) => {
+            repo::finish_moves(s, &o.moves).await;
+            report.rewritten += rewritten;
+            Ok(BatchOutcome::Committed)
+        }
+        Err(e) => {
+            tracing::info!(did, "rotation commit deferred: {e}");
+            Ok(BatchOutcome::Later)
+        }
+    }
+}

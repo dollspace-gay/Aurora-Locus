@@ -12,5 +12,6 @@ pub mod rotation;
 pub mod rules;
 
 pub use content::{Encoder, PipelineError};
+pub use kryphocron;
 pub use nsid::{Kind, classify};
 pub use rotation::SharedOracle;

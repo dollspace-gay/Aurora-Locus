@@ -74,6 +74,7 @@ fn write(action: Action, collection: &str, rkey: &str, n: Option<u64>) -> Prepar
         swap_record: None,
         blobs: Vec::new(),
         backlinks: Vec::new(),
+        lenient_blobs: false,
     }
 }
 

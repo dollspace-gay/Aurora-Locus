@@ -1075,22 +1075,32 @@ async fn kryphocron_tables_on_both_backends() {
         }
         tx.commit().await.unwrap();
         let current = "laquna/00000000000000000002/aa";
-        let due: Vec<String> = s
-            .rotation_due_records("did:plc:a", current, 10)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.rkey)
-            .collect();
+        let due = |urgent: bool| async move {
+            s.rotation_due_records("did:plc:a", current, urgent, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.rkey)
+                .collect::<Vec<String>>()
+        };
         assert_eq!(
-            due,
+            due(false).await,
             ["3m6aaaaaaaaa2", "3m6aaaaaaaaa4"],
             "{n}: older, or legacy text"
         );
+        assert_eq!(due(true).await, ["3m6aaaaaaaaa4"], "{n}: legacy text only");
+        let far = "laquna/00000000000000000099/ff";
         assert_eq!(
-            s.rotation_due_accounts(current, "", 10).await.unwrap(),
+            s.rotation_due_accounts(current, far, "", 10).await.unwrap(),
             ["did:plc:a"],
             "{n}"
+        );
+        assert!(
+            s.rotation_due_accounts(current, far, "did:plc:a", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{n}: paged by DID"
         );
         let future = s
             .rotation_future_dated("did:plc:a", "laquna/00000000000000000005/ff", 10)
@@ -1106,7 +1116,7 @@ async fn kryphocron_tables_on_both_backends() {
         .await
         .unwrap();
         assert_eq!(
-            s.rotation_due_records("did:plc:a", current, 10)
+            s.rotation_due_records("did:plc:a", current, false, 10)
                 .await
                 .unwrap()
                 .len(),

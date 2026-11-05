@@ -301,37 +301,43 @@ impl Store {
     }
 
     /// Accounts with private records due for rotation (a generation older
-    /// than `current`, none, or legacy text), not flagged, after `after`.
+    /// than `current` or dated past `future`, none, or legacy text), not
+    /// flagged, after `after`.
     pub async fn rotation_due_accounts(
         &self,
         current: &str,
+        future: &str,
         after: &str,
         limit: i64,
     ) -> CoreResult<Vec<String>> {
         let q = sql(
             "SELECT DISTINCT did FROM kr_private_record WHERE flagged IS NULL AND did > {2} \
-             AND (generation IS NULL OR generation < {1} OR legacy_text = {4}) ORDER BY did LIMIT {3}",
+             AND (generation IS NULL OR generation < {1} OR generation > {5} OR legacy_text = {4}) \
+             ORDER BY did LIMIT {3}",
             self.is_postgres(),
         );
-        scalar!(self, q, fetch_all, current, after, limit, true)
+        scalar!(self, q, fetch_all, current, after, limit, true, future)
     }
 
-    /// One account's private records due for rotation, oldest key first.
+    /// One account's private records due for rotation, oldest key first:
+    /// the urgent ones (legacy text, no generation) and, unless
+    /// `urgent_only`, those under a generation older than `current`.
     pub async fn rotation_due_records(
         &self,
         did: &str,
         current: &str,
+        urgent_only: bool,
         limit: i64,
     ) -> CoreResult<Vec<PrivateRecord>> {
         let q = sql(
             &format!(
                 "SELECT {PRIVATE_COLS} FROM kr_private_record WHERE did = {{1}} AND flagged IS NULL \
-                 AND (generation IS NULL OR generation < {{2}} OR legacy_text = {{4}}) \
+                 AND (generation IS NULL OR legacy_text = {{4}} OR ({{5}} AND generation < {{2}})) \
                  ORDER BY collection, rkey LIMIT {{3}}"
             ),
             self.is_postgres(),
         );
-        run!(self, q, fetch_all, did, current, limit, true)
+        run!(self, q, fetch_all, did, current, limit, true, !urgent_only)
     }
 
     /// Records with a generation dated past `future_limit` (a mark the
