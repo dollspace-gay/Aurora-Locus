@@ -7137,3 +7137,379 @@ async fn a_queued_edit_loses_to_a_newer_prism_version() {
         ("none", "[\"did:plc:theirs\"]", Some("newer"))
     );
 }
+
+impl Harness {
+    async fn add_audience_with(
+        &self,
+        did: &str,
+        rkey: &str,
+        mode: &str,
+        members: &[&str],
+    ) -> String {
+        let uri = self.add_audience(did, rkey).await;
+        let mut row = self
+            .state
+            .store
+            .kr_audience(did, rkey)
+            .await
+            .unwrap()
+            .unwrap();
+        row.mode = mode.into();
+        row.members_json = serde_json::to_string(members).unwrap();
+        self.state.store.put_kr_audience(&row).await.unwrap();
+        // A copy just checked, so membership answers from it.
+        self.state
+            .store
+            .note_listing(did, self.state.store.db_now().await.unwrap(), true, None)
+            .await
+            .unwrap();
+        uri
+    }
+
+    async fn user(&self, handle: &str) -> (String, String) {
+        let a = self
+            .create_account(
+                handle,
+                &format!("{}@example.com", handle.split('.').next().unwrap()),
+                "pw",
+            )
+            .await;
+        (
+            a["did"].as_str().unwrap().to_owned(),
+            a["accessJwt"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    async fn private_post_as(&self, did: &str, access: &str, record: Value) -> (StatusCode, Value) {
+        self.post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(access),
+            json!({"repo": did, "record": record}),
+        )
+        .await
+    }
+
+    async fn reply_as(
+        &self,
+        did: &str,
+        access: &str,
+        parent: &Value,
+        audience: &str,
+    ) -> (StatusCode, Value) {
+        let mut rec = private_post("a reply", audience);
+        rec["reply"] = json!({"root": {"uri": parent["uri"], "cid": parent["cid"]}, "parent": {"uri": parent["uri"], "cid": parent["cid"]}});
+        self.post(
+            "tools.kryphocron.actor.participatePrivate",
+            Some(access),
+            json!({"repo": did, "record": rec}),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn private_replies_go_under_the_parents_audience_for_its_members() {
+    let h = harness(false).await;
+    let (owner, owner_access) = h.user("oona.pds.example.com").await;
+    let (writer, writer_access) = h.user("wren.pds.example.com").await;
+    let (other, other_access) = h.user("otto.pds.example.com").await;
+    let (script, _) = h.with_prism().await;
+    let audience = h
+        .add_audience_with(&owner, "3m6aaaaaaaaaa", "list", &[&writer])
+        .await;
+    let (st, parent) = h
+        .private_post_as(&owner, &owner_access, private_post("the parent", &audience))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{parent}");
+    // The writer's own first private-tier write makes them a known member.
+    let mine = h.add_audience(&writer, "3m6wwwwwwwwww").await;
+    assert_eq!(
+        h.private_post_as(&writer, &writer_access, private_post("x", &mine))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mine_other = h.add_audience(&other, "3m6oooooooooo").await;
+    assert_eq!(
+        h.private_post_as(&other, &other_access, private_post("x", &mine_other))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // A member replies; the reply is stored encoded under the parent's audience.
+    let (st, v) = h
+        .reply_as(&writer, &writer_access, &parent, &audience)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let reply = h
+        .record_value(
+            &writer,
+            POST_PRIVATE,
+            v["uri"].as_str().unwrap().rsplit('/').next().unwrap(),
+        )
+        .await;
+    assert_eq!(reply["audienceList"], json!(audience));
+    assert!(reply.get("text").is_none() && reply["reply"]["parent"]["uri"] == parent["uri"]);
+
+    // Not in the list, or naming another audience: the same Forbidden.
+    let (st, v) = h.reply_as(&other, &other_access, &parent, &audience).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("Forbidden"))
+    );
+    let (st, v2) = h.reply_as(&writer, &writer_access, &parent, &mine).await;
+    assert_eq!((st, &v2), (StatusCode::FORBIDDEN, &v), "identical refusals");
+    // The generic endpoints run the same checks.
+    let mut rec = private_post("generic reply", &audience);
+    rec["reply"] = json!({"root": {"uri": parent["uri"], "cid": parent["cid"]}, "parent": {"uri": parent["uri"], "cid": parent["cid"]}});
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&other_access),
+            json!({"repo": other, "collection": POST_PRIVATE, "record": rec}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // A mapped local URI is the same audience, and the reply names prism's.
+    h.state
+        .store
+        .put_audience_alias(&owner, "3m6llllllllll", "3m6aaaaaaaaaa")
+        .await
+        .unwrap();
+    let local_uri = format!("at://{owner}/{AUD}/3m6llllllllll");
+    let (st, v) = h
+        .reply_as(&writer, &writer_access, &parent, &local_uri)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let reply = h
+        .record_value(
+            &writer,
+            POST_PRIVATE,
+            v["uri"].as_str().unwrap().rsplit('/').next().unwrap(),
+        )
+        .await;
+    assert_eq!(reply["audienceList"], json!(audience));
+
+    // A member who isn't ready in prism is refused.
+    let mut row = h
+        .state
+        .store
+        .kr_permission(&writer, "membership")
+        .await
+        .unwrap()
+        .unwrap();
+    row.private_read = false;
+    h.state.store.put_kr_permission(&row).await.unwrap();
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &parent, &audience)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    row.private_read = true;
+    h.state.store.put_kr_permission(&row).await.unwrap();
+
+    // A block either way.
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.createRecord",
+            Some(&owner_access),
+            json!({"repo": owner, "collection": "app.bsky.graph.block",
+        "record": {"subject": writer, "createdAt": "2024-01-01T00:00:00.000Z"}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &parent, &audience)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    // The root's threadgate: nobody but mentions.
+    let (owner2, owner2_access) = h.user("pia.pds.example.com").await;
+    let aud2 = h
+        .add_audience_with(&owner2, "3m6bbbbbbbbbb", "list", &[&writer])
+        .await;
+    let mut gated = private_post("gated", &aud2);
+    gated["facets"] = json!([{"index": {"byteStart": 0, "byteEnd": 1},
+        "features": [{"$type": "app.bsky.richtext.facet#mention", "did": writer}]}]);
+    let (_, p2) = h.private_post_as(&owner2, &owner2_access, gated).await;
+    let p2_rkey = p2["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let gate = |allow: Value| {
+        let (h, a, d, p2, rkey) = (
+            &h,
+            owner2_access.clone(),
+            owner2.clone(),
+            p2.clone(),
+            p2_rkey.clone(),
+        );
+        async move {
+            h.post("com.atproto.repo.putRecord", Some(&a), json!({"repo": d, "collection": "tools.kryphocron.feed.threadgate", "rkey": rkey,
+                "record": {"post": {"uri": p2["uri"], "cid": p2["cid"]}, "allow": allow, "createdAt": "2024-01-01T00:00:00.000Z"}})).await
+        }
+    };
+    assert_eq!(gate(json!([])).await.0, StatusCode::OK);
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &p2, &aud2).await.0,
+        StatusCode::FORBIDDEN,
+        "no one may reply"
+    );
+    assert_eq!(
+        gate(json!([{"$type": "tools.kryphocron.feed.threadgate#mentionRule"}]))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &p2, &aud2).await.0,
+        StatusCode::OK,
+        "mentioned"
+    );
+
+    // Non-list modes: only a post prism served counts.
+    let (owner3, owner3_access) = h.user("quin.pds.example.com").await;
+    let aud3 = h
+        .add_audience_with(&owner3, "3m6cccccccccc", "everyone", &[])
+        .await;
+    let (_, p3) = h
+        .private_post_as(&owner3, &owner3_access, private_post("for everyone", &aud3))
+        .await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.getPosts",
+        200,
+        json!({"posts": []}),
+    );
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &p3, &aud3).await.0,
+        StatusCode::FORBIDDEN,
+        "a miss proves nothing"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    h.state.kr.membership.clear_probes();
+    set_script(
+        &script,
+        "app.nearhorizon.private.getPosts",
+        200,
+        json!({"posts": [{"uri": p3["uri"], "record": {"text": "dropped"}}]}),
+    );
+    assert_eq!(
+        h.reply_as(&writer, &writer_access, &p3, &aud3).await.0,
+        StatusCode::OK,
+        "served"
+    );
+}
+
+#[tokio::test]
+async fn membership_assertions_are_issued_to_members_and_verified() {
+    let h = harness(false).await;
+    let (owner, _) = h.user("rae.pds.example.com").await;
+    let (member, member_access) = h.user("sam.pds.example.com").await;
+    let (stranger, stranger_access) = h.user("tia.pds.example.com").await;
+    h.with_prism().await;
+    let audience = h
+        .add_audience_with(&owner, "3m6aaaaaaaaaa", "list", &[&member])
+        .await;
+    // The member is a known ready member.
+    let mine = h.add_audience(&member, "3m6mmmmmmmmmm").await;
+    assert_eq!(
+        h.private_post_as(&member, &member_access, private_post("x", &mine))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mine2 = h.add_audience(&stranger, "3m6ssssssssss").await;
+    assert_eq!(
+        h.private_post_as(&stranger, &stranger_access, private_post("x", &mine2))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let ask = |access: String| {
+        let (h, audience) = (&h, audience.clone());
+        async move {
+            let (_, t) = h
+                .service_token(
+                    &access,
+                    "did:web:pds.example.com",
+                    crate::membership::ASSERTION_LXM,
+                )
+                .await;
+            let token = t["token"].as_str().unwrap().to_owned();
+            let path = format!(
+                "/xrpc/{}?audienceUri={}&aud={}",
+                crate::membership::ASSERTION_LXM,
+                url::form_urlencoded::byte_serialize(audience.as_bytes()).collect::<String>(),
+                url::form_urlencoded::byte_serialize(b"did:web:pds.example.com")
+                    .collect::<String>(),
+            );
+            h.call("GET", &path, Some(&token), None).await
+        }
+    };
+    let (st, v) = ask(member_access.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let assertion = v["token"].as_str().unwrap().to_owned();
+    let (st, v) = ask(stranger_access).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("Forbidden"))
+    );
+
+    // Verified against the issuer's #kryphocron_audience key, its claims bound.
+    let (_, doc) = h
+        .call_host(
+            "GET",
+            "/.well-known/did.json",
+            None,
+            None,
+            "pds.example.com",
+        )
+        .await;
+    let key = doc["verificationMethod"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str().unwrap().ends_with("#kryphocron_audience"))
+        .unwrap()["publicKeyMultibase"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.state
+        .kr
+        .membership
+        .seed_issuer_key("pds.example.com", &format!("did:key:{key}"));
+    assert!(crate::membership::verify_assertion(&h.state, &assertion, &member, &audience).await);
+    assert!(
+        !crate::membership::verify_assertion(&h.state, &assertion, &stranger, &audience).await,
+        "sub is bound"
+    );
+    let other_aud = format!("at://{owner}/{AUD}/3m6zzzzzzzzzz");
+    assert!(
+        !crate::membership::verify_assertion(&h.state, &assertion, &member, &other_aud).await,
+        "audienceUri is bound"
+    );
+    h.state
+        .kr
+        .membership
+        .seed_issuer_key("pds.example.com", &h.state.service_did_key());
+    assert!(
+        !crate::membership::verify_assertion(&h.state, &assertion, &member, &audience).await,
+        "the service key doesn't sign them"
+    );
+
+    // An assertion never passes as service auth.
+    assert!(matches!(
+        locus_auth::service_jwt::parse(&assertion, None, 0),
+        Err(locus_auth::service_jwt::ServiceJwtError::BadJwtType)
+    ));
+}

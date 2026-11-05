@@ -744,6 +744,16 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Most commits per minute the re-point job makes (posts moved from a local audience URI to the AppView's).",
     },
+    Def {
+        key: "kryphocron.remote_block_scan_max",
+        kind: Kind::Int {
+            min: 100,
+            max: 1_000_000,
+        },
+        default: "50000",
+        env: None,
+        description: "Most kryphocron block records read from another PDS to check a reply; past it the reply is refused.",
+    },
 ];
 
 /// Looks up a setting definition.

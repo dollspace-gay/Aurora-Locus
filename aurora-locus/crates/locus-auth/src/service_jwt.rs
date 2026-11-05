@@ -133,7 +133,7 @@ pub fn parse(token: &str, lxm: Option<&str>, now: i64) -> Result<Unverified, Ser
     let header = decode(h)?;
     if matches!(
         header["typ"].as_str(),
-        Some("at+jwt" | "refresh+jwt" | "dpop+jwt")
+        Some("at+jwt" | "refresh+jwt" | "dpop+jwt" | "kryphocron-audience+jwt")
     ) {
         return Err(ServiceJwtError::BadJwtType);
     }

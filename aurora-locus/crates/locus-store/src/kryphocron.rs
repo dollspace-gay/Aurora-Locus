@@ -1251,3 +1251,22 @@ impl Store {
         run!(self, q, fetch_all, limit)
     }
 }
+
+impl Store {
+    /// Whether `did` has a record in `collection` whose `path` links to
+    /// `target` (a block, a follow).
+    pub async fn has_backlink(
+        &self,
+        did: &str,
+        collection: &str,
+        path: &str,
+        target: &str,
+    ) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT 1 FROM backlink WHERE did = {1} AND collection = {2} AND path = {3} AND link_to = {4} LIMIT 1",
+            self.is_postgres(),
+        );
+        let r: Option<i32> = scalar!(self, q, fetch_optional, did, collection, path, target)?;
+        Ok(r.is_some())
+    }
+}

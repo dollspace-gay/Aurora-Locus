@@ -25,6 +25,7 @@ pub mod secret_names {
     pub const OAUTH_KEY: &str = "oauth_signing_key";
     pub const DPOP_SECRET: &str = "dpop_secret";
     pub const CORRELATION_KEY: &str = "kryphocron_correlation_key";
+    pub const AUDIENCE_KEY: &str = "kryphocron_audience_key";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -41,6 +42,9 @@ pub struct ServerSecrets {
     pub dpop_nonces: locus_auth::oauth::dpop::Nonces,
     /// Keys correlation ids in kryphocron audit rows.
     pub correlation_key: [u8; 32],
+    /// Signs membership assertions (`#kryphocron_audience`), never service
+    /// auth.
+    pub audience_key: K256Keypair,
 }
 
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
@@ -188,6 +192,10 @@ impl ServerSecrets {
         let correlation_key: [u8; 32] = correlation.as_slice().try_into().map_err(|_| {
             CoreError::Config("stored kryphocron correlation key isn't 32 bytes".into())
         })?;
+        let audience = load_or(store, key, secret_names::AUDIENCE_KEY, || {
+            K256Keypair::generate().export_private_key()
+        })
+        .await?;
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -199,6 +207,7 @@ impl ServerSecrets {
             oauth_key,
             dpop_nonces: locus_auth::oauth::dpop::Nonces::new(&dpop),
             correlation_key,
+            audience_key: keypair(&audience, "membership assertion key")?,
             jwt,
             app_password_pepper,
             email_token_pepper,

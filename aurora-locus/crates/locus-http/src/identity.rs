@@ -708,10 +708,17 @@ fn service_document(s: &AppState) -> DidDocument {
     DidDocument {
         id: s.service_did.clone(),
         also_known_as: Vec::new(),
-        verification_methods: vec![VerificationMethod {
-            fragment: "atproto".into(),
-            did_key: s.service_did_key(),
-        }],
+        verification_methods: vec![
+            VerificationMethod {
+                fragment: "atproto".into(),
+                did_key: s.service_did_key(),
+            },
+            // Membership assertions are signed with their own key.
+            VerificationMethod {
+                fragment: "kryphocron_audience".into(),
+                did_key: s.secrets.audience_key.did(),
+            },
+        ],
         services: vec![ServiceEntry {
             fragment: "atproto_pds".into(),
             kind: "AtprotoPersonalDataServer".into(),

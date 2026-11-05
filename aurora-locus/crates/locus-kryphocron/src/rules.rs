@@ -75,7 +75,9 @@ pub fn check_record(
             }
             let audience =
                 str_field(map, "audienceList").ok_or_else(|| bad("audienceList is required"))?;
-            if !in_repo(audience, did, Some(nsid::AUDIENCE)) {
+            // A reply names its parent's audience (checked against the
+            // parent, participatePrivate).
+            if !map.contains_key("reply") && !in_repo(audience, did, Some(nsid::AUDIENCE)) {
                 return Err(bad(
                     "audienceList must name one of the writer's own audiences",
                 ));

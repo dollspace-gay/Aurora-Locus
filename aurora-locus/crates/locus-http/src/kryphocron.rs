@@ -32,6 +32,8 @@ pub struct Kr {
     pub prism: crate::audience::PrismHealth,
     /// Wakes the audience sync job (prism back, a mapping to re-point).
     pub audience_sync_wake: tokio::sync::Notify,
+    /// Short-lived membership answers (probes, misses, remote blocks).
+    pub membership: crate::membership::Caches,
 }
 
 impl std::fmt::Debug for Kr {
@@ -50,6 +52,7 @@ impl Kr {
             audit,
             prism: crate::audience::PrismHealth::default(),
             audience_sync_wake: tokio::sync::Notify::new(),
+            membership: crate::membership::Caches::default(),
         };
         (Arc::new(kr), rx)
     }
@@ -308,11 +311,13 @@ pub(crate) async fn prepare_write(
         return Ok(Some(LexValue::Map(map)));
     }
     if map.contains_key("reply") {
-        return Err(XrpcError::invalid_request(
-            "Replies to private posts are written with tools.kryphocron.actor.participatePrivate",
-        ));
+        // A reply goes under its parent's audience (participatePrivate's
+        // checks), never one of the writer's own by choice.
+        let audience = crate::membership::check_reply(s, did, &map).await?;
+        map.insert("audienceList".into(), LexValue::String(audience));
+    } else {
+        check_audience(s, did, &mut map).await?;
     }
-    check_audience(s, did, &mut map).await?;
     let validate = validate_plain(rkey);
     let out =
         s.kr.encoder
@@ -827,4 +832,21 @@ async fn rotate_batch(
             Ok(BatchOutcome::Later)
         }
     }
+}
+
+/// `tools.kryphocron.actor.participatePrivate`: a private reply under the
+/// parent post's audience, after the reply checks (every refusal the same
+/// `Forbidden`).
+pub async fn participate_private(
+    state: St,
+    headers: HeaderMap,
+    Json(input): Json<CreatePostPrivateInput>,
+) -> XrpcResult<Json<Value>> {
+    let has_parent = input.record["reply"]["parent"]["uri"].is_string();
+    if !has_parent || !input.record["audienceList"].is_string() {
+        return Err(XrpcError::invalid_request(
+            "A reply needs reply.parent and audienceList",
+        ));
+    }
+    create_post_private(state, headers, Json(input)).await
 }

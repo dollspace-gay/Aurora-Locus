@@ -12,6 +12,7 @@ pub mod identity;
 pub mod import;
 pub mod kryphocron;
 pub mod lexicon;
+pub mod membership;
 pub mod oauth;
 pub mod oauth_ui;
 pub mod pipethrough;
@@ -176,6 +177,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/tools.kryphocron.feed.deletePostPrivate",
             post(kryphocron::delete_post_private),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.actor.participatePrivate",
+            post(kryphocron::participate_private),
+        )
+        .route(
+            "/xrpc/app.nearhorizon.locus.audience.getMembershipAssertion",
+            get(membership::get_membership_assertion),
         )
         .route(
             "/xrpc/tools.kryphocron.policy.manageAudience",
