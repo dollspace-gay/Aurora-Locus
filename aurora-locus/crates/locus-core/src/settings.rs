@@ -442,6 +442,13 @@ pub static REGISTRY: &[Def] = &[
         description: "Ask proxied services for compressed responses when the PDS reads them itself.",
     },
     Def {
+        key: "oauth.lexicon_authority_did",
+        kind: Kind::Text { max_len: 2048 },
+        default: r#""""#,
+        env: Some("PDS_LEXICON_AUTHORITY_DID"),
+        description: "The DID permission sets for include: scopes are resolved from, instead of DNS. Empty: DNS.",
+    },
+    Def {
         key: "oauth.trusted_clients",
         kind: Kind::TextList { max_len: 2048 },
         default: "[]",

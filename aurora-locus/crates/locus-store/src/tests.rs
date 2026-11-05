@@ -823,3 +823,118 @@ async fn oauth_replay_windows() {
         assert_eq!(s.prune_oauth(100).await.unwrap(), 1, "{}", b.name);
     }
 }
+
+#[tokio::test]
+async fn oauth_requests_tokens_and_refresh_rotation() {
+    use crate::oauth::{RequestRow, TokenRow};
+    for b in backends().await {
+        let s = &b.store;
+        let mut r = RequestRow {
+            id: "req-1".into(),
+            did: None,
+            device_id: None,
+            client_id: "c".into(),
+            client_auth: None,
+            parameters: "{}".into(),
+            expires_at: 1,
+            code: None,
+        };
+        s.oauth_create_request(&r).await.unwrap();
+        r.did = Some("did:plc:a".into());
+        r.code = Some("cod-1".into());
+        s.oauth_update_request(&r).await.unwrap();
+        assert_eq!(
+            s.oauth_read_request("req-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("cod-1")
+        );
+        assert_eq!(
+            s.oauth_consume_code("cod-1").await.unwrap().unwrap().id,
+            "req-1",
+            "{}",
+            b.name
+        );
+        assert!(
+            s.oauth_consume_code("cod-1").await.unwrap().is_none(),
+            "{}: a code works once",
+            b.name
+        );
+
+        let t = TokenRow {
+            id: 0,
+            did: "did:plc:a".into(),
+            token_id: "tok-1".into(),
+            created_at: 10,
+            updated_at: 10,
+            expires_at: 20,
+            client_id: "c".into(),
+            client_auth: "{\"method\":\"none\"}".into(),
+            device_id: None,
+            parameters: "{}".into(),
+            details: None,
+            code: Some("cod-1".into()),
+            current_refresh_token: Some("ref-1".into()),
+            scope: Some("atproto".into()),
+        };
+        s.oauth_create_token(&t).await.unwrap();
+        let row = s.oauth_token("tok-1").await.unwrap().unwrap();
+        assert_eq!(
+            s.oauth_token_by_code("cod-1").await.unwrap().unwrap().id,
+            row.id
+        );
+        s.oauth_rotate_token(
+            row.id,
+            "tok-2",
+            "ref-2",
+            30,
+            40,
+            "{\"method\":\"none\"}",
+            Some("atproto"),
+        )
+        .await
+        .unwrap();
+        assert!(s.oauth_token("tok-1").await.unwrap().is_none());
+        let now = s.oauth_token("tok-2").await.unwrap().unwrap();
+        assert_eq!(
+            (now.current_refresh_token.as_deref(), now.expires_at),
+            (Some("ref-2"), 40)
+        );
+        // The spent refresh token still finds the grant (a replay).
+        let spent = s.oauth_token_by_refresh("ref-1").await.unwrap().unwrap();
+        assert_eq!(
+            (spent.id, spent.current_refresh_token.as_deref()),
+            (now.id, Some("ref-2")),
+            "{}",
+            b.name
+        );
+        s.oauth_delete_token(now.id).await.unwrap();
+        assert!(s.oauth_token_by_refresh("ref-1").await.unwrap().is_none());
+        assert!(s.oauth_token_by_refresh("ref-2").await.unwrap().is_none());
+
+        s.oauth_upsert_device("dev-1", "ses-1", Some("ua"), "1.2.3.4")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.oauth_device_session("dev-1").await.unwrap().as_deref(),
+            Some("ses-1")
+        );
+        s.oauth_touch_account_device("did:plc:a", "dev-1")
+            .await
+            .unwrap();
+        assert_eq!(s.oauth_device_accounts("dev-1").await.unwrap().len(), 1);
+        s.oauth_set_authorized_client("did:plc:a", "c", "{\"authorizedScopes\":[\"atproto\"]}")
+            .await
+            .unwrap();
+        assert!(
+            s.oauth_authorized_client("did:plc:a", "c")
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("atproto")
+        );
+    }
+}

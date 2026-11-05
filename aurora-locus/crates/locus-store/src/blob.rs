@@ -130,7 +130,7 @@ macro_rules! on_pool {
 /// written with `{1}`, `{2}`, … and `{now}`.
 pub(crate) fn sql(template: &str, pg: bool) -> String {
     let mut out = template.replace("{now}", if pg { PG_NOW_MS } else { SQLITE_NOW_MS });
-    for i in (1..=9).rev() {
+    for i in (1..=19).rev() {
         out = out.replace(
             &format!("{{{i}}}"),
             &format!("{}{i}", if pg { '$' } else { '?' }),

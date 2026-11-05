@@ -6,5 +6,6 @@ pub mod dpop;
 pub mod error;
 pub mod jose;
 pub mod metadata;
+pub mod request;
 
 pub use error::OAuthError;

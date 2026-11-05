@@ -4320,3 +4320,422 @@ async fn oauth_clients_resolve_from_metadata_or_loopback_ids() {
         e.description
     );
 }
+
+/// An OAuth client for tests: a DPoP key and the nonce it last got.
+struct DpopClient {
+    key: locus_auth::oauth::jose::Es256Key,
+    nonce: Mutex<Option<String>>,
+}
+
+impl DpopClient {
+    fn new() -> Self {
+        Self {
+            key: locus_auth::oauth::jose::Es256Key::generate(),
+            nonce: Mutex::new(None),
+        }
+    }
+
+    fn jkt(&self) -> String {
+        let mut jwk = self.key.jwk();
+        for k in ["kid", "use", "alg"] {
+            jwk.as_object_mut().unwrap().remove(k);
+        }
+        locus_auth::oauth::jose::thumbprint(jwk.as_object().unwrap()).unwrap()
+    }
+
+    fn proof(&self, method: &str, url: &str, access_token: Option<&str>) -> String {
+        use sha2::Digest;
+        let mut jwk = self.key.jwk();
+        for k in ["kid", "use", "alg"] {
+            jwk.as_object_mut().unwrap().remove(k);
+        }
+        let mut header = serde_json::Map::new();
+        header.insert("typ".into(), json!("dpop+jwt"));
+        header.insert("jwk".into(), jwk);
+        let mut claims = json!({
+            "jti": hex::encode(rand::random::<[u8; 12]>()),
+            "htm": method,
+            "htu": url,
+            "iat": locus_core::time::now_ms() / 1000,
+        });
+        if let Some(n) = self.nonce.lock().unwrap().clone() {
+            claims["nonce"] = json!(n);
+        }
+        if let Some(t) = access_token {
+            claims["ath"] = json!(locus_auth::oauth::jose::b64(&sha2::Sha256::digest(
+                t.as_bytes()
+            )));
+        }
+        self.key.sign(header, &claims)
+    }
+
+    /// A form POST to an OAuth endpoint, retried once if a nonce is asked for.
+    async fn post(
+        &self,
+        h: &Harness,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let body: String = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form.iter().copied())
+            .finish();
+        for _ in 0..2 {
+            let proof = self.proof("POST", &format!("https://pds.example.com{path}"), None);
+            let (st, headers, bytes) = h
+                .raw(
+                    "POST",
+                    path,
+                    None,
+                    body.clone().into_bytes(),
+                    &[
+                        ("content-type", "application/x-www-form-urlencoded"),
+                        ("dpop", &proof),
+                    ],
+                )
+                .await;
+            if let Some(n) = headers.get("dpop-nonce") {
+                *self.nonce.lock().unwrap() = Some(n.to_str().unwrap().to_owned());
+            }
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            if v["error"] == "use_dpop_nonce" {
+                continue;
+            }
+            return (st, headers, v);
+        }
+        panic!("the nonce retry didn't succeed");
+    }
+}
+
+fn pkce() -> (String, String) {
+    use sha2::Digest;
+    let verifier = hex::encode(rand::random::<[u8; 32]>());
+    let challenge = locus_auth::oauth::jose::b64(&sha2::Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+#[tokio::test]
+async fn oauth_par_code_token_refresh_and_revoke() {
+    const LB: &str = "http://localhost?scope=atproto+transition%3Ageneric";
+    let h = harness(false).await;
+    let acct = h
+        .create_account("oli.pds.example.com", "oli@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let client = DpopClient::new();
+    let (verifier, challenge) = pkce();
+    let redirect = "http://127.0.0.1:5173/";
+
+    // The first call has no nonce: the server asks for one.
+    let first = client.proof("POST", "https://pds.example.com/oauth/par", None);
+    let (st, headers, v) = h
+        .raw(
+            "POST",
+            "/oauth/par",
+            None,
+            b"client_id=http%3A%2F%2Flocalhost&response_type=code".to_vec(),
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("dpop", &first),
+            ],
+        )
+        .await;
+    let v: Value = serde_json::from_slice(&v).unwrap();
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("use_dpop_nonce"))
+    );
+    assert!(headers.contains_key("dpop-nonce"));
+    assert_eq!(headers["cache-control"], "no-store");
+
+    let par = |extra: &'static [(&'static str, &'static str)], challenge: String| {
+        let client = &client;
+        let h = &h;
+        async move {
+            let mut form = vec![
+                ("client_id", LB),
+                ("response_type", "code"),
+                ("scope", "atproto transition:generic"),
+                ("redirect_uri", redirect),
+                ("code_challenge_method", "S256"),
+                ("state", "s1"),
+            ];
+            form.push(("code_challenge", &challenge));
+            form.extend_from_slice(extra);
+            client.post(h, "/oauth/par", &form).await
+        }
+    };
+    let (st, _, v) = par(&[], challenge.clone()).await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let request_uri = v["request_uri"].as_str().unwrap().to_owned();
+    assert_eq!(v["expires_in"], 300);
+    let (st, _, v) = par(&[("prompt", "none")], challenge.clone()).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_request")),
+        "consent_required becomes invalid_request at PAR"
+    );
+
+    // The sign-in page's steps: open the request on a device, approve it.
+    let id = locus_auth::oauth::request::request_id_from_uri(&request_uri)
+        .unwrap()
+        .to_owned();
+    let (_, p) = crate::oauth::open_request(&h.state, &id, "dev-test", LB)
+        .await
+        .unwrap();
+    assert_eq!(
+        p.dpop_jkt.as_deref(),
+        Some(client.jkt().as_str()),
+        "bound to the PAR's DPoP key"
+    );
+    assert!(
+        crate::oauth::consent_required(&h.state, &did, &p)
+            .await
+            .unwrap()
+    );
+    let (code, _) = crate::oauth::authorize(
+        &h.state,
+        &id,
+        "dev-test",
+        &did,
+        Some("atproto transition:generic"),
+    )
+    .await
+    .unwrap();
+
+    // Exchange the code (a wrong verifier first fails without spending it?
+    // no: the code is consumed either way, as the reference).
+    let (st, _, tok) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", &verifier),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{tok}");
+    assert_eq!(
+        (tok["token_type"].as_str(), tok["sub"].as_str()),
+        (Some("DPoP"), Some(did.as_str()))
+    );
+    assert_eq!(tok["scope"], "atproto transition:generic");
+    let access = tok["access_token"].as_str().unwrap().to_owned();
+    let refresh = tok["refresh_token"].as_str().unwrap().to_owned();
+    let jws = locus_auth::oauth::jose::Jws::decode(&access).unwrap();
+    h.state.secrets.oauth_key.verify(&jws).unwrap();
+    assert_eq!(jws.payload["cnf"]["jkt"], client.jkt());
+    assert_eq!(jws.payload["aud"], "did:web:pds.example.com");
+    assert!(jws.typ_is("at+jwt"));
+
+    // A replayed code is refused and revokes what it was exchanged for.
+    let (st, _, v) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", &verifier),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+    );
+    assert!(
+        h.state
+            .store
+            .oauth_token_by_code(&code)
+            .await
+            .unwrap()
+            .is_none(),
+        "revoked"
+    );
+
+    // A second grant to test refresh rotation and replay.
+    let (verifier, challenge) = pkce();
+    let (_, _, v) = par(&[], challenge).await;
+    let id = locus_auth::oauth::request::request_id_from_uri(v["request_uri"].as_str().unwrap())
+        .unwrap()
+        .to_owned();
+    crate::oauth::open_request(&h.state, &id, "dev-test", LB)
+        .await
+        .unwrap();
+    let (code, _) = crate::oauth::authorize(&h.state, &id, "dev-test", &did, Some("atproto"))
+        .await
+        .unwrap();
+    let (_, _, tok) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", &verifier),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(tok["scope"], "atproto", "only what was approved");
+    let _ = (access, refresh);
+    let r1 = tok["refresh_token"].as_str().unwrap().to_owned();
+    let (st, _, tok2) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &r1),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{tok2}");
+    let r2 = tok2["refresh_token"].as_str().unwrap().to_owned();
+    assert_ne!(r1, r2);
+    let (_, _, v) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &r1),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(v["error_description"], "Refresh token replayed");
+    let (_, _, v) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &r2),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(v["error"], "invalid_grant", "the replay ended the session");
+
+    // Another key can't use the grant; revoke always answers {}.
+    let (verifier, challenge) = pkce();
+    let (_, _, v) = par(&[], challenge).await;
+    let id = locus_auth::oauth::request::request_id_from_uri(v["request_uri"].as_str().unwrap())
+        .unwrap()
+        .to_owned();
+    crate::oauth::open_request(&h.state, &id, "dev-test", LB)
+        .await
+        .unwrap();
+    let (code, _) = crate::oauth::authorize(&h.state, &id, "dev-test", &did, Some("atproto"))
+        .await
+        .unwrap();
+    let thief = DpopClient::new();
+    let (_, _, v) = thief
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", &verifier),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(
+        v["error_description"],
+        "DPoP proof does not match the expected JKT"
+    );
+    let (st, _, v) = client
+        .post(
+            &h,
+            "/oauth/revoke",
+            &[("token", "ref-nonexistent"), ("client_id", LB)],
+        )
+        .await;
+    assert_eq!((st, v), (StatusCode::OK, json!({})));
+    // A request can't be opened twice once authorized, or from another device.
+    let (_verifier, challenge) = pkce();
+    let (_, _, v) = par(&[], challenge).await;
+    let id = locus_auth::oauth::request::request_id_from_uri(v["request_uri"].as_str().unwrap())
+        .unwrap()
+        .to_owned();
+    crate::oauth::open_request(&h.state, &id, "dev-a", LB)
+        .await
+        .unwrap();
+    let e = crate::oauth::open_request(&h.state, &id, "dev-b", LB)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.description,
+        "This request was initiated from another device"
+    );
+    let e = crate::oauth::open_request(&h.state, &id, "dev-a", LB)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.description, "Unknown request_uri",
+        "deleted by the refusal"
+    );
+}
+
+#[tokio::test]
+async fn include_scopes_expand_from_a_published_permission_set() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("lexi.pds.example.com", "lexi@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let nsid = "com.example.cal.auth";
+    let (st, v) = h
+        .post(
+            "com.atproto.repo.putRecord",
+            Some(&access),
+            json!({"repo": did, "collection": "com.atproto.lexicon.schema", "rkey": nsid, "record": {
+                "$type": "com.atproto.lexicon.schema",
+                "lexicon": 1,
+                "id": nsid,
+                "defs": {"main": {"type": "permission-set", "permissions": [
+                    {"type": "permission", "resource": "repo", "collection": ["com.example.cal.event"], "action": ["create"]},
+                    {"type": "permission", "resource": "repo", "collection": ["app.bsky.feed.post"]},
+                    {"type": "permission", "resource": "rpc", "inheritAud": true, "lxm": ["com.example.cal.listEvents"]},
+                ]}},
+            }}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    h.state
+        .settings
+        .set("oauth.lexicon_authority_did", json!(did), "test")
+        .await
+        .unwrap();
+    let scope = crate::lexicon::token_scope(
+        &h.state,
+        "atproto include:com.example.cal.auth?aud=did:web:cal.example.com%23svc",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scope,
+        "repo:com.example.cal.event?action=create rpc:com.example.cal.listEvents?aud=did:web:cal.example.com%23svc atproto",
+        "outside its namespace (app.bsky) is dropped"
+    );
+    assert!(
+        crate::lexicon::token_scope(&h.state, "atproto include:com.example.cal.missing")
+            .await
+            .is_err()
+    );
+}

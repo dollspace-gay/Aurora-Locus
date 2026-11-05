@@ -200,6 +200,16 @@ impl Resolvers {
         None
     }
 
+    /// The DID authority of an NSID authority (`_lexicon.<authority>` TXT,
+    /// exactly one `did=` record), as the reference's lexicon resolver.
+    pub async fn lexicon_did_authority(&self, authority: &str) -> Option<String> {
+        let name = format!("_lexicon.{authority}.");
+        let r = self.dns.as_ref()?;
+        self.txt_did(r, &name)
+            .await
+            .filter(|did| proto_blue_syntax::Did::new(did).is_ok())
+    }
+
     /// Exactly one `did=` TXT record, as the spec requires.
     async fn txt_did(&self, resolver: &TokioResolver, name: &str) -> Option<String> {
         let lookup = tokio::time::timeout(self.timeout, resolver.txt_lookup(name))

@@ -8,6 +8,7 @@ pub mod email;
 pub mod error;
 pub mod identity;
 pub mod import;
+pub mod lexicon;
 pub mod oauth;
 pub mod pipethrough;
 pub mod ratelimit;
@@ -222,6 +223,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(oauth::protected_resource_metadata),
         )
         .route("/oauth/jwks", get(oauth::jwks))
+        .route("/oauth/par", post(oauth::par).options(oauth::preflight))
+        .route("/oauth/token", post(oauth::token).options(oauth::preflight))
+        .route(
+            "/oauth/revoke",
+            post(oauth::revoke).options(oauth::preflight),
+        )
         .route(
             "/xrpc/app.bsky.actor.getPreferences",
             get(bsky::get_preferences),
