@@ -269,6 +269,9 @@ pub const PAGES: &[Page] = &[
 /// The pages built so far. A heading with none of them isn't drawn.
 pub const BUILT: &[PageId] = &[
     PageId::Home,
+    PageId::Accounts,
+    PageId::Invites,
+    PageId::Operators,
     PageId::Portal,
     PageId::Settings,
     PageId::Appearance,

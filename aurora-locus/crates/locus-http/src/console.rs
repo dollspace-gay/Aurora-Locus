@@ -160,7 +160,7 @@ pub async fn signed_in(s: &AppState, headers: &HeaderMap) -> Option<Op> {
 }
 
 /// The operator, or a redirect to sign in.
-async fn require_op(s: &AppState, headers: &HeaderMap) -> Result<Op, Response> {
+pub(crate) async fn require_op(s: &AppState, headers: &HeaderMap) -> Result<Op, Response> {
     signed_in(s, headers)
         .await
         .ok_or_else(|| web::redirect("/admin/sign-in"))
@@ -168,7 +168,11 @@ async fn require_op(s: &AppState, headers: &HeaderMap) -> Result<Op, Response> {
 
 /// A form post from this operator: same site, with the session's CSRF
 /// token.
-fn check_form(op: &Op, headers: &HeaderMap, form: &[(String, String)]) -> Result<(), Response> {
+pub(crate) fn check_form(
+    op: &Op,
+    headers: &HeaderMap,
+    form: &[(String, String)],
+) -> Result<(), Response> {
     if web::same_site(headers) && web::ct_eq(web::field(form, "csrf"), &op.csrf) {
         Ok(())
     } else {
@@ -180,7 +184,7 @@ fn check_form(op: &Op, headers: &HeaderMap, form: &[(String, String)]) -> Result
     }
 }
 
-fn brand(s: &AppState) -> String {
+pub(crate) fn brand(s: &AppState) -> String {
     let n = s.snapshot().text("server.service_name").to_owned();
     if n.is_empty() { s.hostname.clone() } else { n }
 }
@@ -216,7 +220,7 @@ async fn banners(s: &AppState, op: &Op) -> Vec<Banner> {
 }
 
 /// The frame of a console page.
-async fn shell(s: &AppState, op: &Op, page: PageId) -> Shell {
+pub(crate) async fn shell(s: &AppState, op: &Op, page: PageId) -> Shell {
     let theme = theme_of(s, &op.row).await;
     let nav = menu::nav(
         &op.row.username,
@@ -229,7 +233,7 @@ async fn shell(s: &AppState, op: &Op, page: PageId) -> Shell {
     Shell::signed_in(page.title(), brand(s), nav)
 }
 
-fn refused(why: &str) -> Response {
+pub(crate) fn refused(why: &str) -> Response {
     (StatusCode::FORBIDDEN, why.to_owned()).into_response()
 }
 
@@ -240,7 +244,7 @@ pub fn when(ms: i64) -> String {
     format!("{} UTC", iso[..16].replace('T', " "))
 }
 
-fn back_or(form: &[(String, String)], default: &str) -> String {
+pub(crate) fn back_or(form: &[(String, String)], default: &str) -> String {
     let b = web::field(form, "back");
     if menu::safe_back(b) {
         b.to_owned()
@@ -1203,7 +1207,7 @@ pub async fn security_page(State(s): St, headers: HeaderMap) -> Response {
     security_render(&s, &op, None, Vec::new(), StatusCode::OK).await
 }
 
-async fn form_op(
+pub(crate) async fn form_op(
     s: &AppState,
     headers: &HeaderMap,
     body: &Bytes,
@@ -1244,7 +1248,8 @@ pub async fn change_password(State(s): St, headers: HeaderMap, body: Bytes) -> R
     let hash = match password::hash(&new) {
         Ok(h) => h,
         Err(e) => {
-            return security_render(&s, &op, None, vec![e], StatusCode::INTERNAL_SERVER_ERROR).await;
+            return security_render(&s, &op, None, vec![e], StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
         }
     };
     let this = session_hash(&op.id);

@@ -173,3 +173,130 @@ pub struct PortalPage {
     pub notice: Option<String>,
     pub errors: Vec<String>,
 }
+
+/// A row of the accounts table.
+#[derive(Debug, Clone)]
+pub struct AccountRow {
+    pub href: String,
+    pub handle: String,
+    pub did: String,
+    pub email: String,
+    pub status: String,
+    /// The status pill's class.
+    pub class: &'static str,
+    pub created: String,
+}
+
+/// Accounts: search, and create.
+#[derive(Template)]
+#[template(path = "console_accounts.html")]
+pub struct AccountsPage {
+    pub shell: Shell,
+    pub csrf: String,
+    pub q: String,
+    pub rows: Vec<AccountRow>,
+    /// The next page's link, if there's more.
+    pub more: Option<String>,
+    pub can_create: bool,
+    /// Handle domains, as `.example.com`, for the create form's hint.
+    pub domains: String,
+    pub notice: Option<String>,
+    pub errors: Vec<String>,
+}
+
+/// An invite code as a row.
+#[derive(Debug, Clone)]
+pub struct InviteRow {
+    pub code: String,
+    pub available: i64,
+    pub uses: usize,
+    pub for_account: String,
+    pub created: String,
+    pub disabled: bool,
+}
+
+/// One app password.
+#[derive(Debug, Clone)]
+pub struct AppPasswordRow {
+    pub name: String,
+    pub created: String,
+    pub privileged: bool,
+}
+
+/// One account and what can be done to it.
+#[derive(Template)]
+#[template(path = "console_account.html")]
+pub struct AccountPage {
+    pub shell: Shell,
+    pub csrf: String,
+    pub did: String,
+    pub handle: String,
+    pub base: String,
+    pub facts: Vec<Fact>,
+    pub stats: Vec<Fact>,
+    pub private: Vec<Fact>,
+    pub app_passwords: Vec<AppPasswordRow>,
+    pub invites: Vec<InviteRow>,
+    pub taken_down: bool,
+    pub deactivated: bool,
+    pub blocked: bool,
+    pub invites_disabled: bool,
+    pub email: String,
+    pub can_moderate: bool,
+    pub can_admin: bool,
+    pub notice: Option<String>,
+    pub errors: Vec<String>,
+}
+
+/// Invite codes.
+#[derive(Template)]
+#[template(path = "console_invites.html")]
+pub struct InvitesPage {
+    pub shell: Shell,
+    pub csrf: String,
+    pub rows: Vec<InviteRow>,
+    pub sort: String,
+    pub more: Option<String>,
+    pub can_moderate: bool,
+    pub required: bool,
+    pub new_codes: Vec<String>,
+    pub notice: Option<String>,
+    pub errors: Vec<String>,
+}
+
+/// One of an operator's API tokens.
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub last_used: String,
+    pub expires: String,
+}
+
+/// An operator as a row.
+#[derive(Debug, Clone)]
+pub struct OperatorView {
+    pub username: String,
+    pub role: String,
+    pub roles: Vec<Choice>,
+    pub disabled: bool,
+    pub totp: bool,
+    pub created: String,
+    pub tokens: Vec<TokenRow>,
+    pub me: bool,
+}
+
+/// Operators and their API tokens (owners only).
+#[derive(Template)]
+#[template(path = "console_operators.html")]
+pub struct OperatorsPage {
+    pub shell: Shell,
+    pub csrf: String,
+    pub rows: Vec<OperatorView>,
+    pub roles: Vec<Choice>,
+    /// A token just made: its operator and value, shown once.
+    pub new_token: Option<(String, String)>,
+    pub notice: Option<String>,
+    pub errors: Vec<String>,
+}

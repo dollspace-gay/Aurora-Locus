@@ -9532,3 +9532,387 @@ async fn console_settings_save_through_the_admin_api_by_role() {
         .await;
     assert_eq!(headers["location"], "/admin");
 }
+
+/// Makes every console session's last confirmation old.
+async fn age_console_confirmations(h: &Harness) {
+    let locus_store::Store::Sqlite(p) = &h.state.store else {
+        panic!("tests use SQLite")
+    };
+    sqlx::query("UPDATE operator_session SET confirmed_at = 0")
+        .execute(p)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn console_people_pages_act_through_the_admin_api() {
+    let h = harness(true).await;
+    h.console_operator("alice", "owner", "correct horse battery")
+        .await;
+    h.console_operator("mo", "moderator", "a moderator password")
+        .await;
+    let b = Browser::default();
+    h.console_sign_in(&b, "alice", "correct horse battery")
+        .await;
+    let (_, _, page) = b.get(&h, "/admin/accounts").await;
+    assert!(
+        page.contains("No accounts yet") && page.contains("Create an account"),
+        "{page}"
+    );
+    let csrf = hidden(&page, "csrf");
+
+    // Create, with an invite the console makes (sign-ups need one here).
+    let (st, headers, body) = b
+        .post(
+            &h,
+            "/admin/accounts/create",
+            &[
+                ("csrf", &csrf),
+                ("handle", "carol.pds.example.com"),
+                ("email", "carol@example.com"),
+                ("password", "carols password"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+    let href = headers["location"]
+        .to_str()
+        .unwrap()
+        .split('?')
+        .next()
+        .unwrap()
+        .to_owned();
+    let carol = h
+        .state
+        .store
+        .account_by_handle("carol.pds.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(href, format!("/admin/accounts/{}", carol.did));
+    assert!(
+        h.state
+            .store
+            .invited_by(&carol.did)
+            .await
+            .unwrap()
+            .is_some(),
+        "an invite was made and used"
+    );
+    let (_, _, page) = b.get(&h, "/admin/accounts?q=carol").await;
+    assert!(page.contains("@carol.pds.example.com"), "{page}");
+    let (st, _, page) = b.get(&h, &href).await;
+    assert!(
+        st == StatusCode::OK && page.contains("Take down") && page.contains("Reset password"),
+        "{page}"
+    );
+    assert!(
+        page.contains(r#"href="/admin/accounts" aria-current="page""#)
+            || page.contains("aria-current=\"page\""),
+        "Accounts is current"
+    );
+
+    // Takedown and its reversal, by the API, audited as the operator.
+    let (st, _, _) = b
+        .post(
+            &h,
+            &format!("{href}/takedown"),
+            &[("csrf", &csrf), ("applied", "true"), ("ref", "case-1")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let a = h
+        .state
+        .store
+        .account_by_did(&carol.did)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (a.status, a.status_ref.as_deref()),
+        (locus_store::accounts::Status::Takendown, Some("case-1"))
+    );
+    let audit = h.state.store.audit_entries(None, 50).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "admin.updateSubjectStatus" && e.actor == "operator:alice")
+    );
+    let (_, _, page) = b.get(&h, &href).await;
+    assert!(
+        page.contains("Reverse the takedown") && page.contains("case-1"),
+        "{page}"
+    );
+    b.post(
+        &h,
+        &format!("{href}/takedown"),
+        &[("csrf", &csrf), ("applied", "false")],
+    )
+    .await;
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&carol.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        locus_store::accounts::Status::Active
+    );
+    b.post(
+        &h,
+        &format!("{href}/private-block"),
+        &[("csrf", &csrf), ("blocked", "true")],
+    )
+    .await;
+    assert!(
+        h.state
+            .store
+            .private_tier_blocked(&carol.did)
+            .await
+            .unwrap()
+    );
+    let (st, _, _) = b
+        .post(
+            &h,
+            &format!("{href}/handle"),
+            &[("csrf", &csrf), ("handle", "carla.pds.example.com")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&carol.did)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "carla.pds.example.com"
+    );
+
+    // A moderator can take down but not change credentials.
+    let m = Browser::default();
+    h.console_sign_in(&m, "mo", "a moderator password").await;
+    let (_, _, page) = m.get(&h, &href).await;
+    assert!(
+        page.contains("Take down") && !page.contains("Reset password"),
+        "{page}"
+    );
+    assert!(!page.contains(r#"href="/admin/operators""#), "owners only");
+    let mcsrf = hidden(&page, "csrf");
+    let (st, _, page) = m
+        .post(
+            &h,
+            &format!("{href}/password"),
+            &[("csrf", &mcsrf), ("password", "stolen password")],
+        )
+        .await;
+    assert!(
+        st == StatusCode::BAD_REQUEST && page.contains("admin role"),
+        "{page}"
+    );
+    assert_eq!(m.get(&h, "/admin/operators").await.0, StatusCode::FORBIDDEN);
+    let (st, _, _) = m
+        .post(
+            &h,
+            "/admin/operators/create",
+            &[
+                ("csrf", &mcsrf),
+                ("username", "evil"),
+                ("password", "long enough password"),
+                ("role", "owner"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(h.state.store.operator("evil").await.unwrap().is_none());
+
+    // Invites: create, see, disable.
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/invites/create",
+            &[("csrf", &csrf), ("count", "2"), ("uses", "3")],
+        )
+        .await;
+    assert!(st == StatusCode::OK && page.contains("New codes"), "{page}");
+    let code = page
+        .split("<p><code>")
+        .nth(1)
+        .unwrap()
+        .split('<')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        h.state
+            .store
+            .invite_code(&code)
+            .await
+            .unwrap()
+            .unwrap()
+            .available,
+        3
+    );
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/invites/disable",
+            &[("csrf", &csrf), ("code", &code)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(
+        h.state
+            .store
+            .invite_code(&code)
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled
+    );
+
+    // Operators: freshly confirmed owners only.
+    let (st, _, page) = b.get(&h, "/admin/operators").await;
+    assert!(st == StatusCode::OK && page.contains("mo"), "{page}");
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/operators/token",
+            &[
+                ("csrf", &csrf),
+                ("operator", "mo"),
+                ("name", "script"),
+                ("days", "30"),
+            ],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("lop_"),
+        "the token is shown once: {page}"
+    );
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/operators/disable",
+            &[("csrf", &csrf), ("username", "mo"), ("disabled", "true")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        m.get(&h, "/admin").await.0,
+        StatusCode::SEE_OTHER,
+        "a disabled operator is signed out"
+    );
+    let (_, _, page) = b
+        .post(
+            &h,
+            "/admin/operators/disable",
+            &[("csrf", &csrf), ("username", "alice"), ("disabled", "true")],
+        )
+        .await;
+    assert!(page.contains("disable yourself"), "{page}");
+    age_console_confirmations(&h).await;
+    let (st, headers, _) = b.get(&h, "/admin/operators").await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(
+        headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/admin/confirm-identity?next=%2Fadmin%2Foperators")
+    );
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/admin/operators/create",
+            &[
+                ("csrf", &csrf),
+                ("username", "zed"),
+                ("password", "long enough password"),
+                ("role", "viewer"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "an action needs it too");
+    assert!(
+        headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/admin/confirm-identity")
+    );
+    assert!(h.state.store.operator("zed").await.unwrap().is_none());
+    b.post(
+        &h,
+        "/admin/confirm-identity",
+        &[
+            ("csrf", &csrf),
+            ("next", "/admin/operators"),
+            ("password", "correct horse battery"),
+        ],
+    )
+    .await;
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/operators/create",
+            &[
+                ("csrf", &csrf),
+                ("username", "zed"),
+                ("password", "long enough password"),
+                ("role", "viewer"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state.store.operator("zed").await.unwrap().unwrap().role,
+        "viewer"
+    );
+
+    // Deleting an account: the typed word, freshly confirmed.
+    let (st, _, page) = b.get(&h, &format!("{href}/delete")).await;
+    assert!(
+        st == StatusCode::OK && page.contains("<code>delete</code>"),
+        "{page}"
+    );
+    let (st, _, _) = b
+        .post(
+            &h,
+            &format!("{href}/delete"),
+            &[("csrf", &csrf), ("typed", "nope")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, headers, _) = b
+        .post(
+            &h,
+            &format!("{href}/delete"),
+            &[("csrf", &csrf), ("typed", "delete")],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/admin/accounts?done=deleted")
+    );
+    for _ in 0..50 {
+        if h.state
+            .store
+            .account_by_did(&carol.did)
+            .await
+            .unwrap()
+            .is_none_or(|a| a.status == locus_store::accounts::Status::Deleted)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        h.state
+            .store
+            .account_by_did(&carol.did)
+            .await
+            .unwrap()
+            .is_none_or(|a| a.status == locus_store::accounts::Status::Deleted)
+    );
+}

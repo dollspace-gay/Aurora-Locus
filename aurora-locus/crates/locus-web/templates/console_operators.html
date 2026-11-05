@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<p class="muted">Operators run this PDS. Owners can do everything, admins everything but operators and keys, moderators take content down and manage invites, and viewers only look.</p>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+{% if let Some((who, token)) = new_token %}<div class="card"><h2>New API token for {{ who }}</h2><p>Copy it now; it isn't shown again.</p><p><code>{{ token }}</code></p></div>{% endif %}
+<div class="scroll"><table>
+<thead><tr><th class="name">Operator</th><th class="state">Role</th><th class="state">Code app</th><th class="when">Added</th><th class="actions"></th></tr></thead>
+<tbody>
+{% for o in rows %}<tr><td class="name">{{ o.username }}{% if o.me %} <span class="pill info">you</span>{% endif %}{% if o.disabled %} <span class="pill off">disabled</span>{% endif %}</td>
+<td class="state"><form class="inline" method="post" action="/admin/operators/role"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="username" value="{{ o.username }}"><select name="role" aria-label="Role of {{ o.username }}">{% for r in o.roles %}<option value="{{ r.value }}"{% if r.checked %} selected{% endif %}>{{ r.label }}</option>{% endfor %}</select> <button type="submit" class="secondary">Set</button></form></td>
+<td class="state">{% if o.totp %}<span class="pill on">on</span>{% else %}<span class="pill amber">off</span>{% endif %}</td>
+<td class="when">{{ o.created }}</td>
+<td class="actions">{% if !o.me %}<form class="inline" method="post" action="/admin/operators/disable"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="username" value="{{ o.username }}"><input type="hidden" name="disabled" value="{% if o.disabled %}false{% else %}true{% endif %}"><button type="submit" class="secondary">{% if o.disabled %}Enable{% else %}Disable{% endif %}</button></form>{% endif %}</td></tr>
+{% endfor %}</tbody>
+</table></div>
+
+<h2>API tokens</h2>
+<p class="muted">For the command line over HTTP and for automation. A token acts with its operator's role.</p>
+<div class="scroll"><table>
+<thead><tr><th class="name">Operator</th><th class="name">Token</th><th class="when">Created</th><th class="when">Last used</th><th class="when">Expires</th><th class="actions"></th></tr></thead>
+<tbody>
+{% for o in rows %}{% for t in o.tokens %}<tr><td class="name">{{ o.username }}</td><td class="name">{{ t.name }}</td><td class="when">{{ t.created }}</td><td class="when">{{ t.last_used }}</td><td class="when">{{ t.expires }}</td><td class="actions"><form class="inline" method="post" action="/admin/operators/revoke-token"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ t.id }}"><button type="submit" class="secondary">Revoke</button></form></td></tr>
+{% endfor %}{% endfor %}</tbody>
+</table></div>
+
+<div class="settings-cards">
+<div class="card">
+<h2>Add an operator</h2>
+<form class="stack" method="post" action="/admin/operators/create">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" spellcheck="false" autocomplete="off" required>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<div class="hint">At least 12 characters. They can change it, and add a code app, once signed in.</div>
+<label for="role">Role</label>
+<select id="role" name="role">{% for r in roles %}<option value="{{ r.value }}"{% if r.checked %} selected{% endif %}>{{ r.label }}</option>{% endfor %}</select>
+<div class="row"><button type="submit">Add</button></div>
+</form>
+</div>
+<div class="card">
+<h2>Make an API token</h2>
+<form class="stack" method="post" action="/admin/operators/token">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="operator">For</label>
+<select id="operator" name="operator">{% for o in rows %}<option value="{{ o.username }}"{% if o.me %} selected{% endif %}>{{ o.username }}</option>{% endfor %}</select>
+<label for="name">Name</label>
+<input type="text" id="name" name="name" placeholder="backup script" required>
+<label for="days">Expires after (days, empty for never)</label>
+<input type="number" id="days" name="days" min="1" max="3650">
+<div class="row"><button type="submit" class="secondary">Make a token</button></div>
+</form>
+</div>
+</div>
+{% endblock %}

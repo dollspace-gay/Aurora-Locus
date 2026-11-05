@@ -222,6 +222,21 @@ impl Store {
         Ok(exec!(self, q, operator, step)? == 1)
     }
 
+    /// An account's records, blobs and blob bytes.
+    pub async fn account_stats(&self, did: &str) -> CoreResult<(i64, i64, i64)> {
+        let q = sql(
+            "SELECT COUNT(*) FROM record WHERE did = {1}",
+            self.is_postgres(),
+        );
+        let (records,): (i64,) = run!(self, q, fetch_one, did)?;
+        let q = sql(
+            "SELECT COUNT(*), CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM blob WHERE did = {1}",
+            self.is_postgres(),
+        );
+        let (blobs, bytes): (i64, i64) = run!(self, q, fetch_one, did)?;
+        Ok((records, blobs, bytes))
+    }
+
     /// The dashboard's counts.
     pub async fn console_counts(&self) -> CoreResult<Counts> {
         let accounts: Vec<(String, i64)> = run!(

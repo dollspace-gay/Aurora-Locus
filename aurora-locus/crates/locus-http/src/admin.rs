@@ -44,7 +44,7 @@ fn internal(e: impl std::fmt::Display) -> XrpcError {
 }
 
 /// An account as an admin sees it (gone accounts are absent).
-async fn any_account(s: &AppState, did: &str) -> XrpcResult<Option<Account>> {
+pub(crate) async fn any_account(s: &AppState, did: &str) -> XrpcResult<Option<Account>> {
     Ok(s.store
         .account_by_did(did)
         .await?

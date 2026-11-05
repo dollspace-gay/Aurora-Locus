@@ -9,6 +9,7 @@ pub mod audience_sync;
 pub mod auth;
 pub mod bsky;
 pub mod console;
+pub mod console_people;
 pub mod email;
 pub mod error;
 pub mod identity;
@@ -384,6 +385,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Locus's operator methods, and the console.
         .merge(locus_admin::routes())
         .merge(console::routes())
+        .merge(console_people::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(

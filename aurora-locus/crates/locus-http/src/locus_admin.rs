@@ -528,6 +528,13 @@ pub async fn update_operator(
             input.disabled,
         )
         .await?;
+    // A new password or a disabled account ends the operator's console
+    // sign-ins.
+    if hash.is_some() || input.disabled == Some(true) {
+        s.store
+            .delete_operator_sessions(&input.username, None)
+            .await?;
+    }
     admin_auth::audit(
         &s,
         &who,

@@ -51,6 +51,7 @@ proto-blue-ws.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+sqlx.workspace = true
 
 [lints]
 workspace = true
