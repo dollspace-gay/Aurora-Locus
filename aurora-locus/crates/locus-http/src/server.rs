@@ -27,7 +27,7 @@ use crate::error::{XrpcError, XrpcResult};
 use crate::state::AppState;
 
 /// Logins take at least this long, so timing doesn't reveal which accounts exist.
-const LOGIN_FLOOR: Duration = Duration::from_millis(350);
+pub(crate) const LOGIN_FLOOR: Duration = Duration::from_millis(350);
 
 type St = State<Arc<AppState>>;
 
@@ -461,7 +461,7 @@ pub struct CreateSessionInput {
     auth_factor_token: Option<String>,
 }
 
-async fn find_account(s: &AppState, identifier: &str) -> XrpcResult<Option<Account>> {
+pub(crate) async fn find_account(s: &AppState, identifier: &str) -> XrpcResult<Option<Account>> {
     let id = identifier.trim();
     Ok(if id.starts_with("did:") {
         s.store.account_by_did(id).await?
@@ -473,12 +473,12 @@ async fn find_account(s: &AppState, identifier: &str) -> XrpcResult<Option<Accou
 }
 
 /// How a login's password matched.
-enum Credential {
+pub(crate) enum Credential {
     Account,
     AppPassword { name: String, privileged: bool },
 }
 
-async fn check_password(
+pub(crate) async fn check_password(
     s: &AppState,
     account: &Account,
     pw: &str,

@@ -486,3 +486,27 @@ impl Store {
         Ok(())
     }
 }
+
+/// A device row: (session id, user agent, IP, last seen ms).
+pub type DeviceRow = (String, Option<String>, String, i64);
+
+impl Store {
+    pub async fn oauth_device(&self, id: &str) -> CoreResult<Option<DeviceRow>> {
+        let q = sql(
+            "SELECT session_id, user_agent, ip_address, last_seen_at FROM oauth_device WHERE id = {1}",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_optional, id)
+    }
+
+    pub async fn oauth_delete_device(&self, id: &str) -> CoreResult<()> {
+        for q in [
+            "DELETE FROM oauth_account_device WHERE device_id = {1}",
+            "DELETE FROM oauth_device WHERE id = {1}",
+        ] {
+            let q = sql(q, self.is_postgres());
+            exec!(self, q, id)?;
+        }
+        Ok(())
+    }
+}

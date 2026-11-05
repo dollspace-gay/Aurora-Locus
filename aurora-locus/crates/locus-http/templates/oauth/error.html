@@ -1,0 +1,7 @@
+{% extends "oauth/base.html" %}
+{% block title %}Sign-in error · {{ service_name }}{% endblock %}
+{% block content %}
+<h1>Something went wrong</h1>
+<p class="error" role="alert">{{ message }}</p>
+<p class="muted">Go back to the app you came from and try again.</p>
+{% endblock %}

@@ -1,0 +1,30 @@
+{% extends "oauth/base.html" %}
+{% block title %}Allow access · {{ service_name }}{% endblock %}
+{% block content %}
+<h1>{{ client_name }} wants access</h1>
+<p class="muted">Signed in as <strong>@{{ handle }}</strong>. {{ client_host }} is asking to:</p>
+<form method="post" action="/oauth/authorize/accept" class="stack">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<input type="hidden" name="did" value="{{ did }}">
+<ul class="scopes">
+{% for sc in scopes %}
+<li>
+{% if sc.required %}
+<input type="hidden" name="scope" value="{{ sc.value }}">
+<span class="scope">{{ sc.label }}</span>
+{% else %}
+<label class="check"><input type="checkbox" name="scope" value="{{ sc.value }}" checked> <span class="scope">{{ sc.label }}</span></label>
+{% endif %}
+{% if !sc.detail.is_empty() %}<p class="muted small">{{ sc.detail }}</p>{% endif %}
+</li>
+{% endfor %}
+</ul>
+<button type="submit" class="primary">Allow</button>
+</form>
+<form method="post" action="/oauth/authorize/reject">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<button type="submit" class="secondary">Deny</button>
+</form>
+{% endblock %}

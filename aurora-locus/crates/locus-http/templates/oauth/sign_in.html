@@ -1,0 +1,51 @@
+{% extends "oauth/base.html" %}
+{% block title %}Sign in · {{ service_name }}{% endblock %}
+{% block content %}
+<h1>Sign in to {{ client_name }}</h1>
+<p class="muted">{{ client_host }} wants to use your account on {{ service_name }}.</p>
+{% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+{% if !notice.is_empty() %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+
+{% if !accounts.is_empty() && !code_required %}
+<section aria-labelledby="picker">
+<h2 id="picker">Continue as</h2>
+<ul class="accounts">
+{% for a in accounts %}
+<li>
+<form method="post" action="/oauth/authorize/select">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<input type="hidden" name="did" value="{{ a.did }}">
+<button type="submit" class="account">
+<span class="handle">@{{ a.handle }}</span>
+{% if a.login_required %}<span class="muted">Password needed</span>{% endif %}
+</button>
+</form>
+</li>
+{% endfor %}
+</ul>
+<h2>Or use another account</h2>
+</section>
+{% endif %}
+
+<form method="post" action="/oauth/authorize/sign-in" class="stack">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<label>Handle, email or DID
+<input name="identifier" value="{{ identifier }}" autocomplete="username" required{% if !code_required %} autofocus{% endif %}></label>
+<label>Password
+<input name="password" type="password" autocomplete="current-password" required></label>
+{% if code_required %}
+<label>Sign-in code from your email
+<input name="code" inputmode="text" autocomplete="one-time-code" placeholder="XXXXX-XXXXX" required autofocus></label>
+{% endif %}
+<label class="check"><input type="checkbox" name="remember" value="1"{% if remember %} checked{% endif %}> Remember this device</label>
+<button type="submit" class="primary">Sign in</button>
+</form>
+
+<form method="post" action="/oauth/authorize/reject">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<button type="submit" class="link">Cancel</button>
+</form>
+{% endblock %}

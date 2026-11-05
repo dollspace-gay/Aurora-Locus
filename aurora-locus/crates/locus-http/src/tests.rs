@@ -5079,3 +5079,293 @@ async fn oauth_tokens_reach_endpoints_their_scopes_allow() {
         .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
+
+/// A browser for the OAuth pages: cookies, the last page's CSRF token and
+/// request id.
+#[derive(Default)]
+struct Browser {
+    jar: Mutex<Vec<(String, String)>>,
+}
+
+impl Browser {
+    fn cookie_header(&self) -> String {
+        self.jar
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn keep(&self, headers: &axum::http::HeaderMap) {
+        let mut jar = self.jar.lock().unwrap();
+        for v in headers.get_all("set-cookie") {
+            let c = v.to_str().unwrap();
+            let (pair, attrs) = c.split_once(';').unwrap_or((c, ""));
+            let (k, val) = pair.split_once('=').unwrap();
+            jar.retain(|(n, _)| n != k);
+            if !attrs.contains("Max-Age=0") {
+                jar.push((k.to_owned(), val.to_owned()));
+            }
+        }
+    }
+
+    async fn get(&self, h: &Harness, path: &str) -> (StatusCode, axum::http::HeaderMap, String) {
+        let cookie = self.cookie_header();
+        let (st, headers, body) = h
+            .raw("GET", path, None, vec![], &[("cookie", &cookie)])
+            .await;
+        self.keep(&headers);
+        (st, headers, String::from_utf8(body).unwrap())
+    }
+
+    async fn post(
+        &self,
+        h: &Harness,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let cookie = self.cookie_header();
+        let body: String = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form.iter().copied())
+            .finish();
+        let (st, headers, body) = h
+            .raw(
+                "POST",
+                path,
+                None,
+                body.into_bytes(),
+                &[
+                    ("cookie", &cookie),
+                    ("content-type", "application/x-www-form-urlencoded"),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            )
+            .await;
+        self.keep(&headers);
+        (st, headers, String::from_utf8(body).unwrap())
+    }
+}
+
+/// A hidden field's value in a page.
+fn hidden(html: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let i = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {name} field in {html}"));
+    let rest = &html[i + marker.len()..];
+    rest[..rest.find('"').unwrap()].to_owned()
+}
+
+#[tokio::test]
+async fn the_sign_in_pages_take_a_user_from_par_to_a_code() {
+    const LB: &str = "http://localhost?scope=atproto+transition%3Ageneric";
+    let h = harness(false).await;
+    let acct = h
+        .create_account("yuna.pds.example.com", "yuna@example.com", "hunter22")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let client = DpopClient::new();
+    let par = || async {
+        let (verifier, challenge) = pkce();
+        let (_, _, v) = client
+            .post(
+                &h,
+                "/oauth/par",
+                &[
+                    ("client_id", LB),
+                    ("response_type", "code"),
+                    ("scope", "atproto transition:generic"),
+                    ("redirect_uri", "http://127.0.0.1/"),
+                    ("code_challenge", &challenge),
+                    ("code_challenge_method", "S256"),
+                    ("state", "st8"),
+                ],
+            )
+            .await;
+        (v["request_uri"].as_str().unwrap().to_owned(), verifier)
+    };
+    let authorize_path = |uri: &str| {
+        format!(
+            "/oauth/authorize?client_id={}&request_uri={}",
+            url::form_urlencoded::byte_serialize(LB.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(uri.as_bytes()).collect::<String>()
+        )
+    };
+
+    // A new browser gets the sign-in page and its cookies.
+    let browser = Browser::default();
+    let (uri, verifier) = par().await;
+    let (st, headers, html) = browser.get(&h, &authorize_path(&uri)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(html.contains("Sign in to"), "{html}");
+    let csp = headers["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("frame-ancestors 'none'") && csp.contains("script-src 'self'"));
+    let jar = browser.cookie_header();
+    assert!(
+        jar.contains("dev-id=dev-") && jar.contains("ses-id=ses-") && jar.contains("csrf-token=")
+    );
+    let (csrf, request_id) = (hidden(&html, "csrf"), hidden(&html, "request_id"));
+
+    // CSRF and password checks.
+    let (st, _, _) = browser
+        .post(
+            &h,
+            "/oauth/authorize/sign-in",
+            &[
+                ("csrf", "wrong"),
+                ("request_id", &request_id),
+                ("identifier", "yuna.pds.example.com"),
+                ("password", "hunter22"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (_, _, html) = browser
+        .post(
+            &h,
+            "/oauth/authorize/sign-in",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &request_id),
+                ("identifier", "yuna.pds.example.com"),
+                ("password", "nope"),
+            ],
+        )
+        .await;
+    assert!(html.contains("Invalid identifier or password"));
+
+    // Sign in; a public client always gets the consent page.
+    let (st, _, html) = browser
+        .post(
+            &h,
+            "/oauth/authorize/sign-in",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &request_id),
+                ("identifier", "yuna.pds.example.com"),
+                ("password", "hunter22"),
+                ("remember", "1"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        html.contains("wants access") && html.contains("Read and write your account data"),
+        "{html}"
+    );
+    // Keep only atproto: the grant has only what was approved.
+    let (st, headers, _) = browser
+        .post(
+            &h,
+            "/oauth/authorize/accept",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &request_id),
+                ("did", &did),
+                ("scope", "atproto"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let location = url::Url::parse(headers["location"].to_str().unwrap()).unwrap();
+    let q: HashMap<String, String> = location.query_pairs().into_owned().collect();
+    assert_eq!(
+        (location.host_str(), q["state"].as_str(), q["iss"].as_str()),
+        (Some("127.0.0.1"), "st8", "https://pds.example.com")
+    );
+    let (st, _, tok) = client
+        .post(
+            &h,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &q["code"]),
+                ("redirect_uri", "http://127.0.0.1/"),
+                ("code_verifier", &verifier),
+                ("client_id", LB),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, tok["scope"].as_str()),
+        (StatusCode::OK, Some("atproto")),
+        "{tok}"
+    );
+
+    // The same browser now sees the account in the picker; deny this time.
+    let (uri, _) = par().await;
+    let (_, _, html) = browser.get(&h, &authorize_path(&uri)).await;
+    assert!(
+        html.contains("@yuna.pds.example.com") && html.contains("Continue as"),
+        "{html}"
+    );
+    let request_id = hidden(&html, "request_id");
+    let csrf = hidden(&html, "csrf");
+    let (_, _, html) = browser
+        .post(
+            &h,
+            "/oauth/authorize/select",
+            &[("csrf", &csrf), ("request_id", &request_id), ("did", &did)],
+        )
+        .await;
+    assert!(html.contains("wants access"), "{html}");
+    let (st, headers, _) = browser
+        .post(
+            &h,
+            "/oauth/authorize/reject",
+            &[("csrf", &csrf), ("request_id", &request_id)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let loc = headers["location"].to_str().unwrap();
+    assert!(
+        loc.contains("error=access_denied") && loc.contains("state=st8"),
+        "{loc}"
+    );
+
+    // Email 2FA on a device the account hasn't used.
+    {
+        let mut tx = h.state.store.begin().await.unwrap();
+        tx.set_email_confirmed(&did).await.unwrap();
+        tx.set_email_auth_factor(&did, "yuna@example.com", true)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let other = Browser::default();
+    let (uri, _) = par().await;
+    let (_, _, html) = other.get(&h, &authorize_path(&uri)).await;
+    let (csrf, request_id) = (hidden(&html, "csrf"), hidden(&html, "request_id"));
+    let creds = [
+        ("csrf", csrf.as_str()),
+        ("request_id", request_id.as_str()),
+        ("identifier", "yuna@example.com"),
+        ("password", "hunter22"),
+    ];
+    let (_, _, html) = other.post(&h, "/oauth/authorize/sign-in", &creds).await;
+    assert!(html.contains("A sign-in code has been sent"), "{html}");
+    let (_, code) = h.last_mail("yuna@example.com");
+    let mut with_code = creds.to_vec();
+    with_code.push(("code", &code));
+    let (_, _, html) = other.post(&h, "/oauth/authorize/sign-in", &with_code).await;
+    assert!(html.contains("wants access"), "{html}");
+    // The first browser (seen in the last 30 days) skips the code.
+    let (uri, _) = par().await;
+    let (_, _, html) = browser.get(&h, &authorize_path(&uri)).await;
+    let (csrf, request_id) = (hidden(&html, "csrf"), hidden(&html, "request_id"));
+    let (_, _, html) = browser
+        .post(
+            &h,
+            "/oauth/authorize/sign-in",
+            &[
+                ("csrf", &csrf),
+                ("request_id", &request_id),
+                ("identifier", "yuna.pds.example.com"),
+                ("password", "hunter22"),
+            ],
+        )
+        .await;
+    assert!(html.contains("wants access"), "{html}");
+}

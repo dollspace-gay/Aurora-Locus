@@ -38,6 +38,8 @@ rand.workspace = true
 zeroize.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 http-body-util = "0.1"
+askama = "0.12"
+subtle = "2"
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

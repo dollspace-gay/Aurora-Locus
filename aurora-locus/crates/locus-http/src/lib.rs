@@ -10,6 +10,7 @@ pub mod identity;
 pub mod import;
 pub mod lexicon;
 pub mod oauth;
+pub mod oauth_ui;
 pub mod pipethrough;
 pub mod ratelimit;
 pub mod raw;
@@ -229,6 +230,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/oauth/revoke",
             post(oauth::revoke).options(oauth::preflight),
         )
+        .route("/oauth/authorize", get(oauth_ui::authorize_page))
+        .route("/oauth/authorize/sign-in", post(oauth_ui::sign_in))
+        .route("/oauth/authorize/select", post(oauth_ui::select))
+        .route("/oauth/authorize/accept", post(oauth_ui::accept))
+        .route("/oauth/authorize/reject", post(oauth_ui::reject))
+        .route("/oauth/assets/style.css", get(oauth_ui::style))
+        .route("/oauth/assets/form-post.js", get(oauth_ui::form_post_js))
         .route(
             "/xrpc/app.bsky.actor.getPreferences",
             get(bsky::get_preferences),
