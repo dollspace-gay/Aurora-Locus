@@ -97,6 +97,7 @@ async fn section(s: &AppState, op: &Op, page: PageId, intro: &str) -> SectionPag
         fields: Vec::new(),
         advanced: Vec::new(),
         pre: None,
+        frames: Vec::new(),
         can_edit: op.role >= Role::Admin,
         back: page.href().into(),
     }

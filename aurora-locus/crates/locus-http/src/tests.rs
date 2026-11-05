@@ -216,6 +216,7 @@ async fn harness_build(
             crate::setup::Gate::finished()
         }),
         logs: Arc::new(locus_core::logs::LogRing::new(100)),
+        branding: crate::branding::Cache::default(),
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -9944,10 +9945,12 @@ async fn every_console_page_renders_for_each_role_under_the_csp() {
                 continue;
             }
             assert_eq!(st, StatusCode::OK, "{who} {}: {body}", page.href);
-            assert_eq!(
-                headers["content-security-policy"],
-                locus_web::assets::CSP,
-                "{}",
+            // The base policy; the branding editor adds frame-src 'self' for its previews.
+            let csp = headers["content-security-policy"].to_str().unwrap();
+            assert!(
+                csp == locus_web::assets::CSP
+                    || csp == format!("{}; frame-src 'self'", locus_web::assets::CSP),
+                "{}: {csp}",
                 page.href
             );
             assert!(
@@ -10610,4 +10613,417 @@ async fn oauth_prompt_create_signs_a_new_account_up_and_on_to_consent() {
         )
         .await;
     assert!(html.contains("Sign in to"), "{html}");
+}
+
+/// A multipart body: text fields, then one file.
+fn multipart(fields: &[(&str, &str)], file: (&str, &str, &[u8])) -> (String, Vec<u8>) {
+    let boundary = "locus-test-boundary";
+    let mut body = Vec::new();
+    for (k, v) in fields {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+                .as_bytes(),
+        );
+    }
+    let (name, filename, bytes) = file;
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+impl Harness {
+    async fn upload_brand(
+        &self,
+        b: &Browser,
+        csrf: &str,
+        kind: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let (ct, body) = multipart(&[("csrf", csrf), ("kind", kind)], ("file", filename, bytes));
+        let cookie = b.cookie_header();
+        let (st, headers, out) = self
+            .raw(
+                "POST",
+                "/admin/branding/upload",
+                None,
+                body,
+                &[
+                    ("cookie", &cookie),
+                    ("content-type", &ct),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            )
+            .await;
+        (st, headers, String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+/// The draft form's fields, every one, with `over` set.
+fn brand_form<'a>(csrf: &'a str, over: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut f: Vec<(&str, &str)> = vec![
+        ("csrf", csrf),
+        ("service_name", ""),
+        ("logo", ""),
+        ("favicon", ""),
+        ("background_light", ""),
+        ("background_dark", ""),
+        ("light_primary", ""),
+        ("light_error", ""),
+        ("light_warning", ""),
+        ("light_info", ""),
+        ("light_success", ""),
+        ("dark_primary", ""),
+        ("dark_error", ""),
+        ("dark_warning", ""),
+        ("dark_info", ""),
+        ("dark_success", ""),
+        ("font", "system"),
+        ("uploaded_font", ""),
+        ("radius", "default"),
+        ("spacing", "default"),
+        ("link_home", ""),
+        ("link_terms", ""),
+        ("link_privacy", ""),
+        ("link_support", ""),
+        ("text_sign_in_heading", ""),
+        ("text_sign_in_blurb", ""),
+        ("text_sign_up_blurb", ""),
+        ("text_portal_blurb", ""),
+        ("text_footer", ""),
+        ("custom_css", ""),
+    ];
+    for (k, v) in over {
+        if let Some(e) = f.iter_mut().find(|(n, _)| n == k) {
+            e.1 = v;
+        }
+    }
+    f
+}
+
+#[tokio::test]
+async fn branding_is_drafted_checked_published_and_dresses_the_right_pages() {
+    let h = harness(false).await;
+    h.console_operator("ada", "admin", "an admin password")
+        .await;
+    h.console_operator("vic", "viewer", "a viewer password!")
+        .await;
+    let b = Browser::default();
+    h.console_sign_in(&b, "ada", "an admin password").await;
+    let (st, headers, page) = b.get(&h, "/admin/branding").await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-src 'self'")
+    );
+    assert!(
+        page.contains("/admin/branding/preview/consent?mode=dark")
+            && page.contains(r#"width="375""#),
+        "{page}"
+    );
+    let csrf = hidden(&page, "csrf");
+
+    // Uploads: what a file is decides what it may be.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR rest of a png";
+    let (st, _, body) = h.upload_brand(&b, &csrf, "logo", "logo.png", PNG).await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+    let (st, _, body) = h
+        .upload_brand(
+            &b,
+            &csrf,
+            "logo",
+            "evil.svg",
+            b"<svg onload=alert(1)></svg>",
+        )
+        .await;
+    assert!(
+        st == StatusCode::BAD_REQUEST && body.contains("isn"),
+        "{body}"
+    );
+    let (st, _, _) = h.upload_brand(&b, &csrf, "font", "logo.png", PNG).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a PNG isn't a font");
+    let (st, _, _) = h.upload_brand(&b, "forged", "logo", "logo.png", PNG).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let logo = h
+        .state
+        .store
+        .branding_assets()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (logo.kind.as_str(), logo.mime.as_str()),
+        ("logo", "image/png")
+    );
+    let (st, headers, bytes) = h
+        .raw("GET", &format!("/branding/{}", logo.id), None, vec![], &[])
+        .await;
+    assert_eq!(
+        (st, headers["content-type"].to_str().unwrap()),
+        (StatusCode::OK, "image/png")
+    );
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("sandbox")
+    );
+    assert_eq!(bytes, PNG);
+
+    // A faint colour and a stylesheet import block publishing, not saving.
+    let logo_id = logo.id.clone();
+    let bad = brand_form(
+        &csrf,
+        &[
+            ("logo", &logo_id),
+            ("light_primary", "#eeeeee"),
+            ("custom_css", "@import url(https://evil.example/x.css);"),
+        ],
+    );
+    let (st, _, _) = b.post(&h, "/admin/branding/save", &bad).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let (_, _, page) = b.get(&h, "/admin/branding").await;
+    assert!(
+        page.contains("too faint") && page.contains("@import"),
+        "{page}"
+    );
+    let (st, _, _) = b
+        .post(&h, "/admin/branding/publish", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(h.state.store.branding_active().await.unwrap().is_none());
+
+    // A good draft publishes.
+    let good = brand_form(
+        &csrf,
+        &[
+            ("logo", &logo_id),
+            ("service_name", "Example Social"),
+            ("light_primary", "#1f6feb"),
+            ("dark_primary", "#4d8dff"),
+            ("link_terms", "https://example.com/terms"),
+            ("text_footer", "Run by Example & friends"),
+            ("text_sign_in_heading", "Welcome back"),
+            ("custom_css", ".brand-blurb { color: #333333 }"),
+        ],
+    );
+    b.post(&h, "/admin/branding/save", &good).await;
+    let (st, _, body) = b
+        .post(&h, "/admin/branding/publish", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+    let v1 = h
+        .state
+        .store
+        .branding_active()
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(
+        h.state
+            .store
+            .audit_entries(None, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.action == "branding.publish" && e.actor == "operator:ada")
+    );
+
+    // The OAuth pages get the checked variables only; the portal gets it all.
+    let (_, _, vars) = h
+        .raw(
+            "GET",
+            &format!("/branding/theme/{v1}/vars.css"),
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    let vars = String::from_utf8(vars).unwrap();
+    assert!(
+        vars.contains("--primary: #1f6feb") && !vars.contains("brand-blurb"),
+        "{vars}"
+    );
+    let (_, headers, full) = h
+        .raw(
+            "GET",
+            &format!("/branding/theme/{v1}/full.css"),
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    assert!(String::from_utf8(full).unwrap().contains(".brand-blurb"));
+    assert!(
+        headers["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+    let p = Browser::default();
+    let (_, _, page) = p.get(&h, "/account/sign-in").await;
+    assert!(
+        page.contains(&format!("/branding/theme/{v1}/full.css"))
+            && page.contains(&format!("/branding/{logo_id}")),
+        "{page}"
+    );
+    assert!(
+        page.contains("Welcome back")
+            && page.contains("Example Social")
+            && page.contains("Run by Example &amp; friends"),
+        "{page}"
+    );
+    assert!(page.contains(r#"href="https://example.com/terms""#));
+    let html = oauth_sign_in_page(&h).await;
+    assert!(
+        html.contains(&format!("/branding/theme/{v1}/vars.css")) && !html.contains("full.css"),
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!("/branding/{logo_id}")) && html.contains("Example Social"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("Welcome back"),
+        "no page text on OAuth sign-in"
+    );
+
+    // Previews (the editor's), and only for operators.
+    let (st, headers, page) = b.get(&h, "/admin/branding/preview/consent?mode=dark").await;
+    assert!(
+        st == StatusCode::OK
+            && page.contains("Example App")
+            && page.contains("draft.css?kind=vars&amp;mode=dark"),
+        "{page}"
+    );
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'self'")
+    );
+    let (_, _, page) = b.get(&h, "/admin/branding/preview/portal?mode=dark").await;
+    assert!(
+        page.contains(r#"class="mode-dark"#) && page.contains("draft.css?kind=full"),
+        "{page}"
+    );
+    assert_eq!(
+        p.get(&h, "/admin/branding/preview/consent").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        p.get(&h, "/admin/branding/draft.css?kind=full").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Emails carry the footer.
+    let acct = h
+        .create_account("ivy.pds.example.com", "ivy@example.com", "ivys password")
+        .await;
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    h.call(
+        "POST",
+        "/xrpc/com.atproto.server.requestEmailConfirmation",
+        Some(&access),
+        None,
+    )
+    .await;
+    let sent = h.mail.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        sent.email.text.contains("Run by Example & friends")
+            && sent.email.html.contains("Run by Example &amp; friends"),
+        "{}",
+        sent.email.text
+    );
+
+    // Another version, then back to the first; then off.
+    let second = brand_form(
+        &csrf,
+        &[("light_primary", "#0b5cad"), ("dark_primary", "#4d8dff")],
+    );
+    b.post(&h, "/admin/branding/save", &second).await;
+    b.post(&h, "/admin/branding/publish", &[("csrf", &csrf)])
+        .await;
+    let v2 = h
+        .state
+        .store
+        .branding_active()
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(v2 > v1);
+    let v1s = v1.to_string();
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/branding/rollback",
+            &[("csrf", &csrf), ("version", &v1s)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state
+            .store
+            .branding_active()
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        v1
+    );
+    b.post(&h, "/admin/branding/off", &[("csrf", &csrf)]).await;
+    let (_, _, page) = p.get(&h, "/account/sign-in").await;
+    assert!(
+        !page.contains("/branding/theme/"),
+        "the built-in look again: {page}"
+    );
+
+    // A viewer sees it but can't change it.
+    let v = Browser::default();
+    h.console_sign_in(&v, "vic", "a viewer password!").await;
+    let (st, _, page) = v.get(&h, "/admin/branding").await;
+    assert!(
+        st == StatusCode::OK && !page.contains("Save the draft"),
+        "{page}"
+    );
+    let vcsrf = hidden(&page, "csrf");
+    let (st, _, _) = v
+        .post(&h, "/admin/branding/publish", &[("csrf", &vcsrf)])
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+/// An OAuth sign-in page, fetched the way a browser would.
+async fn oauth_sign_in_page(h: &Harness) -> String {
+    const LB: &str = "http://localhost?scope=atproto";
+    let client = DpopClient::new();
+    let (_, challenge) = pkce();
+    let (_, _, v) = client
+        .post(
+            h,
+            "/oauth/par",
+            &[
+                ("client_id", LB),
+                ("response_type", "code"),
+                ("scope", "atproto"),
+                ("redirect_uri", "http://127.0.0.1/"),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+            ],
+        )
+        .await;
+    let path = format!(
+        "/oauth/authorize?client_id={}&request_uri={}",
+        url::form_urlencoded::byte_serialize(LB.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(v["request_uri"].as_str().unwrap().as_bytes())
+            .collect::<String>()
+    );
+    Browser::default().get(h, &path).await.2
 }

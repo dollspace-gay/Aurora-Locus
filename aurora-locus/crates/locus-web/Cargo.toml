@@ -11,6 +11,9 @@ locus-core.workspace = true
 askama = "0.12"
 sha2.workspace = true
 hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cssparser = "0.34"
 
 [lints]
 workspace = true

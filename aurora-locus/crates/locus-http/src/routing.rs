@@ -114,6 +114,8 @@ pub async fn limit_body(
     let snap = s.snapshot();
     let limit = usize::try_from(if REPO_WRITES.contains(&path) {
         snap.int("limits.repo_write_body")
+    } else if path == crate::branding::UPLOAD_PATH {
+        crate::branding::MAX_UPLOAD_BODY
     } else {
         snap.int("limits.json_body")
     })

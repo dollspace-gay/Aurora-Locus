@@ -290,6 +290,8 @@ pub struct AppState {
     pub setup: Arc<crate::setup::Gate>,
     /// This node's recent log lines.
     pub logs: Arc<locus_core::logs::LogRing>,
+    /// The published branding theme, re-read every few seconds.
+    pub branding: crate::branding::Cache,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

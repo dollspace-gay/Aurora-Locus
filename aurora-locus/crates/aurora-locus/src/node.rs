@@ -336,6 +336,7 @@ impl Node {
                 locus_http::setup::Gate::finished()
             }),
             logs: Arc::clone(&self.logs),
+            branding: locus_http::branding::Cache::default(),
         });
         self.setup_done = state.setup.completed.clone();
         if self.setup_mode {
@@ -469,6 +470,11 @@ impl Node {
                             };
                             let result = match result {
                                 Ok(t) => state.store.prune_portal_sessions().await.map(|n| t + n),
+                                e => e,
+                            };
+                            // Branding uploads no version has used for a week.
+                            let result = match result {
+                                Ok(t) => locus_http::branding::collect(&state).await.map(|n| t + n),
                                 e => e,
                             };
                             if let Err(e) = &result {

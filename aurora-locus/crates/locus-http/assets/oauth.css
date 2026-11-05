@@ -31,7 +31,7 @@ body {
   justify-content: center;
   background: var(--bg);
   color: var(--text);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 16px/1.5 var(--brand-font, system-ui, -apple-system, "Segoe UI", sans-serif);
   padding: 16px;
 }
 .card {
@@ -67,3 +67,5 @@ button.account { text-align: left; display: flex; justify-content: space-between
 ul.accounts, ul.scopes { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
 ul.scopes li { padding: 8px 0; border-bottom: 1px solid var(--border); }
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.logo { display: block; max-height: 40px; max-width: 200px; margin: 0 0 8px; }
+.links { margin-top: 20px; font-size: 0.85rem; color: var(--muted); }

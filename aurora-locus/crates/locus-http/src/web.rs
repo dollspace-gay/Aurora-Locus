@@ -150,3 +150,19 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     !a.is_empty() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
+
+/// A page with its own `Content-Security-Policy` (the branding editor
+/// frames its previews; the previews may be framed by it).
+pub fn page_csp(html: String, status: StatusCode, csp: &str) -> Response {
+    let mut res = page(html, status);
+    if let Ok(v) = HeaderValue::from_str(csp) {
+        res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    if csp.contains("frame-ancestors 'self'") {
+        res.headers_mut().insert(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("SAMEORIGIN"),
+        );
+    }
+    res
+}

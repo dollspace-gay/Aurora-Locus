@@ -100,7 +100,7 @@ fn cookie(s: &AppState, name: &str, value: &str, max_age_s: i64) -> String {
 }
 
 fn brand(s: &AppState) -> String {
-    crate::console::brand(s)
+    crate::branding::service_name_cached(s)
 }
 
 /// A signed-in account holder.
@@ -152,6 +152,7 @@ async fn signed_in(s: &AppState, headers: &HeaderMap) -> Option<User> {
 }
 
 async fn require_user(s: &AppState, headers: &HeaderMap, here: &str) -> Result<User, Response> {
+    let _ = crate::branding::published(s).await;
     enabled(s)?;
     signed_in(s, headers).await.ok_or_else(|| {
         web::redirect(&format!(
@@ -230,7 +231,10 @@ async fn page(s: &AppState, u: &User, id: PageId, intro: &str) -> SectionPage {
         banners,
     );
     SectionPage {
-        shell: Shell::signed_in(id.name(), brand(s), nav),
+        shell: Shell {
+            dress: crate::branding::dress_cached(s, crate::branding::Blurb::None),
+            ..Shell::signed_in(id.name(), brand(s), nav)
+        },
         csrf: u.csrf.clone(),
         intro: intro.into(),
         notice: None,
@@ -241,6 +245,7 @@ async fn page(s: &AppState, u: &User, id: PageId, intro: &str) -> SectionPage {
         fields: Vec::new(),
         advanced: Vec::new(),
         pre: None,
+        frames: Vec::new(),
         can_edit: false,
         back: id.href().into(),
     }
@@ -284,7 +289,11 @@ fn sign_in_render(
 ) -> Response {
     web::render(
         &SignInPage {
-            shell: Shell::signed_out("Sign in", brand(s)),
+            shell: Shell {
+                dress: crate::branding::dress_cached(s, crate::branding::Blurb::SignIn),
+                ..Shell::signed_out("Sign in", brand(s))
+            },
+            heading: crate::branding::sign_in_heading(s),
             csrf: csrf.into(),
             error,
             notice,
@@ -311,6 +320,7 @@ fn new_pre(s: &AppState, res: Response, pre: &str) -> Response {
 
 /// `GET /account/sign-in`.
 pub async fn sign_in_page(State(s): St, headers: HeaderMap, Query(q): Query<Q>) -> Response {
+    let _ = crate::branding::published(&s).await;
     if let Err(r) = enabled(&s) {
         return r;
     }
@@ -376,6 +386,7 @@ fn session_of(s: &AppState, access: &str) -> Option<(String, String, String)> {
 /// `POST /account/sign-in`: through `createSession`, so the email code
 /// (when the account has sign-in codes on) and takedowns apply.
 pub async fn sign_in(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let _ = crate::branding::published(&s).await;
     if let Err(r) = enabled(&s) {
         return r;
     }
@@ -477,7 +488,11 @@ fn sign_up_render(
 ) -> Response {
     web::render(
         &SignInPage {
-            shell: Shell::signed_out("Create an account", brand(s)),
+            shell: Shell {
+                dress: crate::branding::dress_cached(s, crate::branding::Blurb::SignUp),
+                ..Shell::signed_out("Create an account", brand(s))
+            },
+            heading: String::new(),
             csrf: csrf.into(),
             error,
             notice: None,
@@ -495,6 +510,7 @@ fn sign_up_render(
 
 /// `GET /account/sign-up`.
 pub async fn sign_up_page(State(s): St) -> Response {
+    let _ = crate::branding::published(&s).await;
     if let Err(r) = enabled(&s) {
         return r;
     }
@@ -522,6 +538,7 @@ pub fn full_handle(s: &AppState, typed: &str) -> String {
 
 /// `POST /account/sign-up`: `createAccount`, then signed in.
 pub async fn sign_up(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    let _ = crate::branding::published(&s).await;
     if let Err(r) = enabled(&s) {
         return r;
     }
@@ -568,6 +585,7 @@ pub async fn overview(State(s): St, headers: HeaderMap) -> Response {
     let a = &u.account;
     let mut p = page(&s, &u, PageId::Overview, "").await;
     p.shell.title = format!("@{}", a.handle);
+    p.shell.dress = crate::branding::dress_cached(&s, crate::branding::Blurb::Portal);
     p.cards.push(Card {
         title: "Your account".into(),
         facts: vec![
@@ -1688,4 +1706,87 @@ pub async fn appearance_save(State(s): St, headers: HeaderMap, body: Bytes) -> R
         )
         .await;
     web::redirect("/account/appearance?done=1")
+}
+
+/// Sign-up or the portal's overview with sample data, dressed in `dress`,
+/// for the branding editor's previews.
+pub fn preview_page(
+    s: &AppState,
+    sign_up: bool,
+    name: &str,
+    mut dress: locus_web::view::Dress,
+    dark: bool,
+) -> String {
+    use askama::Template;
+    dress.html_class = if dark {
+        "mode-dark".into()
+    } else {
+        "mode-light".into()
+    };
+    if sign_up {
+        return SignInPage {
+            shell: Shell {
+                dress: Some(dress),
+                ..Shell::signed_out("Create an account", name)
+            },
+            heading: String::new(),
+            csrf: "preview".into(),
+            error: None,
+            notice: None,
+            identifier: String::new(),
+            code_stage: false,
+            sign_up: true,
+            domains: s.handle_domains(),
+            invite_required: s.snapshot().bool("accounts.invite_required"),
+            handle: String::new(),
+            email: String::new(),
+        }
+        .render()
+        .unwrap_or_default();
+    }
+    let theme = Theme {
+        mode: if dark { Mode::Dark } else { Mode::Light },
+        ..Theme::default()
+    };
+    let nav = menu::nav(
+        "@alice.example.com",
+        "preview",
+        theme,
+        PageId::Overview,
+        Vec::new(),
+    );
+    let page = SectionPage {
+        shell: Shell {
+            dress: Some(dress),
+            ..Shell::signed_in("@alice.example.com", name, nav)
+        },
+        csrf: "preview".into(),
+        intro: String::new(),
+        notice: None,
+        errors: Vec::new(),
+        cards: vec![Card {
+            title: "Your account".into(),
+            facts: vec![
+                Fact::new("Handle", "@alice.example.com"),
+                Fact::new("Email", "alice@example.com"),
+                Fact::new("Email confirmed", "yes").class("ok"),
+                Fact::new("Status", "active").class("ok"),
+            ],
+        }],
+        forms: vec![form(
+            "Change your handle",
+            "",
+            "/account/handle",
+            vec![Input::new("handle", "New handle", "text").value("alice.example.com")],
+            "Change handle",
+        )],
+        tables: Vec::new(),
+        fields: Vec::new(),
+        advanced: Vec::new(),
+        pre: None,
+        frames: Vec::new(),
+        can_edit: false,
+        back: "/account".into(),
+    };
+    page.render().unwrap_or_default()
 }

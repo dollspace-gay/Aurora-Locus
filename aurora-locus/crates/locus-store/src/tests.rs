@@ -1890,3 +1890,105 @@ async fn console_sessions_on_both_backends() {
         assert!(!s.delete_secret("nothing").await.unwrap());
     }
 }
+
+#[tokio::test]
+async fn branding_on_both_backends() {
+    use crate::branding::AssetRow;
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.branding_active().await.unwrap().is_none());
+        assert!(
+            s.publish_branding_draft("op").await.unwrap().is_none(),
+            "{}: no draft",
+            b.name
+        );
+        for id in ["logo1", "bg1"] {
+            s.put_branding_asset(&AssetRow {
+                id: id.into(),
+                kind: if id == "logo1" { "logo" } else { "background" }.into(),
+                name: "x.png".into(),
+                mime: "image/png".into(),
+                size: 10,
+                storage_key: format!("branding/{id}"),
+                created_at: 0,
+                unused_since: None,
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            s.branding_assets()
+                .await
+                .unwrap()
+                .iter()
+                .all(|a| a.unused_since.is_some()),
+            "{}: unused at upload",
+            b.name
+        );
+        let v1 = s
+            .save_branding_draft(r#"{"a":1}"#, &["logo1".into()], "op")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.save_branding_draft(r#"{"a":2}"#, &["logo1".into()], "op")
+                .await
+                .unwrap(),
+            v1,
+            "one draft"
+        );
+        let logo = s.branding_asset("logo1").await.unwrap().unwrap();
+        assert!(logo.unused_since.is_none(), "{}: used by the draft", b.name);
+        assert_eq!(s.publish_branding_draft("op").await.unwrap(), Some(v1));
+        assert_eq!(
+            s.branding_active().await.unwrap().unwrap().theme_json,
+            r#"{"a":2}"#
+        );
+        assert!(s.branding_draft().await.unwrap().is_none());
+        let v2 = s
+            .save_branding_draft(r#"{"a":3}"#, &["bg1".into()], "op")
+            .await
+            .unwrap();
+        assert!(v2 > v1);
+        s.publish_branding_draft("op").await.unwrap();
+        assert_eq!(s.branding_versions(10).await.unwrap().len(), 2);
+        // Rollback to v1; a draft can't be activated.
+        assert!(s.activate_branding(v1).await.unwrap());
+        assert_eq!(s.branding_active().await.unwrap().unwrap().version, v1);
+        let v3 = s.save_branding_draft("{}", &[], "op").await.unwrap();
+        assert!(!s.activate_branding(v3).await.unwrap(), "{}", b.name);
+        // logo1 still used by v1, bg1 by v2: nothing to collect.
+        assert_eq!(
+            s.collect_branding_assets(-1).await.unwrap(),
+            0,
+            "{}",
+            b.name
+        );
+        s.put_branding_asset(&AssetRow {
+            id: "orphan".into(),
+            kind: "font".into(),
+            name: "f.woff2".into(),
+            mime: "font/woff2".into(),
+            size: 1,
+            storage_key: "branding/orphan".into(),
+            created_at: 0,
+            unused_since: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.collect_branding_assets(60_000).await.unwrap(),
+            0,
+            "{}: within the grace",
+            b.name
+        );
+        assert_eq!(
+            s.collect_branding_assets(-1).await.unwrap(),
+            1,
+            "{}",
+            b.name
+        );
+        assert!(s.branding_asset("orphan").await.unwrap().is_none());
+        s.deactivate_branding().await.unwrap();
+        assert!(s.branding_active().await.unwrap().is_none());
+    }
+}

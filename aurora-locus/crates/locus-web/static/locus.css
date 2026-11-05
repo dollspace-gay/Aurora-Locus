@@ -621,3 +621,11 @@ main.narrow { max-width: 30rem; }
 .pill.amber { background: var(--warn-bg); color: var(--warn); }
 .pill.info { background: var(--accent-subtle); color: var(--accent); }
 .pill.fine { background: var(--ok-bg); color: var(--ok); }
+
+/* Branding: the operator's logo, a line under the title, and a footer. */
+.brand-logo { max-height: 28px; max-width: 160px; width: auto; height: auto; }
+.brand-blurb { margin-top: -0.5rem; }
+.brand-foot { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+.previews { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; }
+.previews figure { margin: 0; max-width: 100%; overflow-x: auto; }
+.previews iframe { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); max-width: 100%; }

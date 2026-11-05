@@ -46,6 +46,7 @@ struct AccountChoice {
 #[template(path = "oauth/sign_in.html")]
 struct SignInPage {
     service_name: String,
+    brand: crate::branding::OauthBrand,
     client_name: String,
     client_host: String,
     error: String,
@@ -62,6 +63,7 @@ struct SignInPage {
 #[template(path = "oauth/sign_up.html")]
 struct SignUpPage {
     service_name: String,
+    brand: crate::branding::OauthBrand,
     client_name: String,
     client_host: String,
     error: String,
@@ -84,6 +86,7 @@ struct ScopeLine {
 #[template(path = "oauth/consent.html")]
 struct ConsentPage {
     service_name: String,
+    brand: crate::branding::OauthBrand,
     client_name: String,
     client_host: String,
     csrf: String,
@@ -97,6 +100,7 @@ struct ConsentPage {
 #[template(path = "oauth/error.html")]
 struct ErrorPage {
     service_name: String,
+    brand: crate::branding::OauthBrand,
     message: String,
 }
 
@@ -104,11 +108,17 @@ struct ErrorPage {
 #[template(path = "oauth/form_post.html")]
 struct FormPostPage {
     service_name: String,
+    brand: crate::branding::OauthBrand,
     action: String,
     fields: Vec<(String, String)>,
 }
 
 fn service_name(s: &AppState) -> String {
+    if let Some(p) = crate::branding::cached(s)
+        && !p.theme.service_name.is_empty()
+    {
+        return p.theme.service_name.clone();
+    }
     let n = s.snapshot().text("server.service_name").to_owned();
     if n.is_empty() { s.hostname.clone() } else { n }
 }
@@ -146,6 +156,7 @@ fn page(html: String, status: StatusCode, form_action: Option<&str>) -> Response
 fn error_page(s: &AppState, message: &str, status: StatusCode) -> Response {
     let html = ErrorPage {
         service_name: service_name(s),
+        brand: crate::branding::oauth_brand_cached(s, false),
         message: message.to_owned(),
     }
     .render()
@@ -353,6 +364,7 @@ fn respond_to_client(
             .unwrap_or_default();
         let html = FormPostPage {
             service_name: service_name(s),
+            brand: crate::branding::oauth_brand_cached(s, false),
             action: redirect,
             fields,
         }
@@ -555,6 +567,7 @@ fn sign_in_page(
 ) -> Response {
     let html = SignInPage {
         service_name: service_name(s),
+        brand: crate::branding::oauth_brand_cached(s, false),
         client_name: client_name(&c.client),
         client_host: client_host(&c.client),
         error: error.to_owned(),
@@ -589,6 +602,7 @@ fn sign_up_page(
 ) -> Response {
     let html = SignUpPage {
         service_name: service_name(s),
+        brand: crate::branding::oauth_brand_cached(s, true),
         client_name: client_name(&c.client),
         client_host: client_host(&c.client),
         error: error.to_owned(),
@@ -704,6 +718,7 @@ async fn consent_page(s: &AppState, c: &Ctx, account: &Account, remember: bool) 
         .collect();
     let html = ConsentPage {
         service_name: service_name(s),
+        brand: crate::branding::oauth_brand_cached(s, false),
         client_name: client_name(&c.client),
         client_host: client_host(&c.client),
         csrf: c.csrf.clone(),
@@ -756,6 +771,7 @@ async fn after_sign_in(s: &AppState, c: &Ctx, account: &Account, remember: bool)
 
 /// `GET /oauth/authorize`.
 pub async fn authorize_page(State(s): St, headers: HeaderMap, RawQuery(q): RawQuery) -> Response {
+    let _ = crate::branding::published(&s).await;
     let mut set = Vec::new();
     let query: Map<String, Value> = url::form_urlencoded::parse(q.unwrap_or_default().as_bytes())
         .map(|(k, v)| (k.into_owned(), Value::String(v.into_owned())))
@@ -884,6 +900,7 @@ async fn post_ctx(
     headers: &HeaderMap,
     form: &[(String, String)],
 ) -> Result<Ctx, Response> {
+    let _ = crate::branding::published(s).await;
     check_post(headers, form).map_err(|e| error_page(s, &e, StatusCode::FORBIDDEN))?;
     let mut set = Vec::new();
     let device = load_device(s, headers, &mut set)
@@ -1190,4 +1207,62 @@ pub async fn form_post_js() -> Response {
         HeaderValue::from_static("max-age=3600"),
     );
     res
+}
+
+/// The sign-in or consent page with sample data and `brand`, for the
+/// branding editor's previews.
+pub fn preview_page(
+    s: &AppState,
+    consent: bool,
+    name: &str,
+    brand: crate::branding::OauthBrand,
+) -> String {
+    let (client_name, client_host) = ("Example App".to_owned(), "app.example.com".to_owned());
+    let html = if consent {
+        ConsentPage {
+            service_name: name.to_owned(),
+            brand,
+            client_name,
+            client_host,
+            csrf: "preview".into(),
+            request_id: "preview".into(),
+            did: "did:plc:examplexampleexampleexam".into(),
+            handle: format!(
+                "alice{}",
+                s.handle_domains()
+                    .first()
+                    .map_or(".example.com", String::as_str)
+            ),
+            scopes: ["atproto", "transition:generic"]
+                .into_iter()
+                .map(|v| {
+                    let (label, detail) = describe(v, &[]);
+                    ScopeLine {
+                        value: v.to_owned(),
+                        label,
+                        detail,
+                        required: v == "atproto",
+                    }
+                })
+                .collect(),
+        }
+        .render()
+    } else {
+        SignInPage {
+            service_name: name.to_owned(),
+            brand,
+            client_name,
+            client_host,
+            error: String::new(),
+            notice: String::new(),
+            accounts: Vec::new(),
+            code_required: false,
+            csrf: "preview".into(),
+            request_id: "preview".into(),
+            identifier: String::new(),
+            remember: true,
+        }
+        .render()
+    };
+    html.unwrap_or_default()
 }

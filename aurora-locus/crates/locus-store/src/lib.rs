@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod admin;
 pub mod blob;
+pub mod branding;
 pub mod bulk;
 pub mod console;
 pub mod email;

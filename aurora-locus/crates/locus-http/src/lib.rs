@@ -7,6 +7,7 @@ pub mod admin_auth;
 pub mod audience;
 pub mod audience_sync;
 pub mod auth;
+pub mod branding;
 pub mod bsky;
 pub mod console;
 pub mod console_people;
@@ -399,6 +400,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(console_people::routes())
         .merge(console_sections::routes())
         .merge(portal::routes())
+        .merge(branding::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(

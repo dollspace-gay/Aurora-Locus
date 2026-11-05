@@ -276,6 +276,7 @@ pub const BUILT: &[PageId] = &[
     PageId::Scanning,
     PageId::Private,
     PageId::Portal,
+    PageId::Branding,
     PageId::Identity,
     PageId::Services,
     PageId::Email,

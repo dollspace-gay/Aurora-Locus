@@ -116,7 +116,20 @@ pub async fn send(
         "" => format!("noreply@{}", s.hostname),
         f => f.to_owned(),
     };
-    let email = template.render(&[("service", &service), ("token", token), ("handle", handle)]);
+    let mut email = template.render(&[("service", &service), ("token", token), ("handle", handle)]);
+    // The branding's footer, under every account email.
+    if let Some(footer) = crate::branding::email_footer(s).await {
+        email.text.push_str(&format!("\n--\n{footer}\n"));
+        let escaped = footer
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        email.html = email.html.replacen(
+            "</body>",
+            &format!("<hr><p style=\"color: #666; font-size: 0.85em\">{escaped}</p></body>"),
+            1,
+        );
+    }
     match s.mailer.send(Sender::Main, &from, to, email).await {
         Ok(()) => Ok(()),
         Err(MailError::NotConfigured) => Err(not_configured()),

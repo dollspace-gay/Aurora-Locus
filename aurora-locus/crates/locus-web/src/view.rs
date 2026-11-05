@@ -18,6 +18,24 @@ pub struct Shell {
     pub css: String,
     /// Set when someone is signed in: the sidebar instead of the top bar.
     pub nav: Option<Nav>,
+    /// The operator's branding, on the pages account holders see.
+    pub dress: Option<Dress>,
+}
+
+/// Branding on a page: its stylesheet, icons, links and text.
+#[derive(Debug, Clone, Default)]
+pub struct Dress {
+    /// The theme's stylesheet (after the base one).
+    pub css: String,
+    pub favicon: String,
+    pub logo: String,
+    pub links: Vec<Link>,
+    pub footer: String,
+    /// A line under the page title, where the page has one.
+    pub blurb: String,
+    /// Classes on `<html>` for a page with no signed-in theme (a preview
+    /// forcing dark).
+    pub html_class: String,
 }
 
 impl Shell {
@@ -29,6 +47,7 @@ impl Shell {
             brand: brand.into(),
             css: CSS_HREF.clone(),
             nav: None,
+            dress: None,
         }
     }
 
@@ -40,16 +59,24 @@ impl Shell {
             brand: brand.into(),
             css: CSS_HREF.clone(),
             nav: Some(nav),
+            dress: None,
         }
+    }
+
+    /// Whether the branding has a logo (it replaces the built-in mark).
+    #[must_use]
+    pub fn has_logo(&self) -> bool {
+        self.dress.as_ref().is_some_and(|d| !d.logo.is_empty())
     }
 
     /// The classes on `<html>`: the viewer's theme, or none before sign-in.
     #[must_use]
     pub fn html_class(&self) -> String {
-        self.nav
-            .as_ref()
-            .map(|n| n.theme.class())
-            .unwrap_or_default()
+        match (&self.nav, &self.dress) {
+            (Some(n), _) => n.theme.class(),
+            (None, Some(d)) => d.html_class.clone(),
+            (None, None) => String::new(),
+        }
     }
 }
 

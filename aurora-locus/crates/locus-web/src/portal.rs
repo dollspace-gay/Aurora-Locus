@@ -163,6 +163,8 @@ pub struct SignInPage {
     pub invite_required: bool,
     pub handle: String,
     pub email: String,
+    /// The branding's sign-in heading, if it sets one.
+    pub heading: String,
 }
 
 #[cfg(test)]

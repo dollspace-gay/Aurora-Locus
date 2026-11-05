@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en"{% if shell.nav.is_some() %} class="{{ shell.html_class() }}"{% endif %}>
+<html lang="en"{% if !shell.html_class().is_empty() %} class="{{ shell.html_class() }}"{% endif %}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,13 +7,15 @@
 <meta name="referrer" content="same-origin">
 <title>{{ shell.title }} · {{ shell.brand }}</title>
 <link rel="stylesheet" href="{{ shell.css }}">
-</head>
+{% if let Some(d) = shell.dress %}{% if !d.css.is_empty() %}<link rel="stylesheet" href="{{ d.css }}">
+{% endif %}{% if !d.favicon.is_empty() %}<link rel="icon" href="{{ d.favicon }}">
+{% endif %}{% endif %}</head>
 <body>
 {% if let Some(nav) = shell.nav %}
 <a class="skip" href="#main">Skip to content</a>
 <div class="layout">
 <nav class="sidebar" aria-label="{{ nav.area }} menu">
-<div class="brand"><span>{{ shell.brand }}</span>
+<div class="brand">{% if let Some(d) = shell.dress %}{% if !d.logo.is_empty() %}<img class="brand-logo" src="{{ d.logo }}" alt="">{% endif %}{% endif %}<span>{{ shell.brand }}</span>
 <details class="who"{% if nav.on_own() %} open{% endif %}><summary><span class="who-name">{{ nav.who }}</span> <span aria-hidden="true">▾</span></summary>
 <div class="who-menu">
 {% for i in nav.own %}<a class="item" href="{{ i.href }}"{% if nav.is_current(i) %} aria-current="page"{% endif %}>{{ i.name }}</a>
@@ -32,7 +34,8 @@
 {% else %}
 <header class="top">
 <span class="brand">
-<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>
+{% if let Some(d) = shell.dress %}{% if !d.logo.is_empty() %}<img class="brand-logo" src="{{ d.logo }}" alt="">{% endif %}{% endif %}
+{% if !shell.has_logo() %}<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>{% endif %}
 <span>{{ shell.brand }}</span>
 </span>
 </header>
@@ -44,8 +47,10 @@
 {% endfor %}
 <p class="eyebrow">{{ nav.eyebrow() }}</p>
 {% endif %}
-{% block content %}{% endblock %}
-</main>
+{% if let Some(d) = shell.dress %}{% if !d.blurb.is_empty() %}<p class="muted brand-blurb">{{ d.blurb }}</p>
+{% endif %}{% endif %}{% block content %}{% endblock %}
+{% if let Some(d) = shell.dress %}{% if !d.footer.is_empty() || !d.links.is_empty() %}<footer class="brand-foot">{% if !d.footer.is_empty() %}<p>{{ d.footer }}</p>{% endif %}{% if !d.links.is_empty() %}<p>{% for l in d.links %}{% if !loop.first %} · {% endif %}<a href="{{ l.href }}">{{ l.label }}</a>{% endfor %}</p>{% endif %}</footer>
+{% endif %}{% endif %}</main>
 {% if shell.nav.is_some() %}</div>{% endif %}
 </body>
 </html>

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block main_class %} class="narrow"{% endblock %}
 {% block content %}
-<h1>{% if sign_up %}Create an account{% else if code_stage %}Check your email{% else %}Sign in to your account{% endif %}</h1>
+<h1>{% if sign_up %}Create an account{% else if code_stage %}Check your email{% else if !heading.is_empty() %}{{ heading }}{% else %}Sign in to your account{% endif %}</h1>
 {% if let Some(e) = error %}<div class="banner bad" role="alert">{{ e }}</div>{% endif %}
 {% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
 <div class="card">

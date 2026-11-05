@@ -422,6 +422,23 @@ pub struct Form {
     pub danger: bool,
 }
 
+impl Form {
+    /// Whether it sends a file (and so `multipart/form-data`).
+    #[must_use]
+    pub fn has_file(&self) -> bool {
+        self.inputs.iter().any(|i| i.kind == "file")
+    }
+}
+
+/// A preview of a page in a frame.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub title: String,
+    pub src: String,
+    /// The frame's width in CSS pixels (a phone's, or a desktop's).
+    pub width: u32,
+}
+
 /// A console section: what it says, its facts, tables and forms, and its
 /// settings (the rarely changed folded away).
 #[derive(Template)]
@@ -439,6 +456,7 @@ pub struct SectionPage {
     pub advanced: Vec<SettingField>,
     /// A block of preformatted text (a document, log lines).
     pub pre: Option<(String, String)>,
+    pub frames: Vec<Frame>,
     pub can_edit: bool,
     pub back: String,
 }
