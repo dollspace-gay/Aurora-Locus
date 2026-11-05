@@ -1180,3 +1180,153 @@ async fn kryphocron_tables_on_both_backends() {
         assert_eq!(s.kr_audit(10).await.unwrap().len(), 1, "{n}");
     }
 }
+
+#[tokio::test]
+async fn the_audience_copy_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, RefreshLimiter};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let row = |rkey: &str, origin: &str, pending: &str| AudienceRow {
+            did: "did:plc:o".into(),
+            rkey: rkey.into(),
+            name: None,
+            mode: "list".into(),
+            members_json: "[]".into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-01T00:00:00.000Z".into(),
+            origin: origin.into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: Some("v1".into()),
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: pending.into(),
+            row_version: 1,
+        };
+        assert!(s.db_now().await.unwrap() > 1_600_000_000_000, "{n}");
+        assert!(
+            s.adopt_audience(&row("a", "prism", "none")).await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.adopt_audience(&row("a", "prism", "none")).await.unwrap(),
+            "{n}: already there"
+        );
+        let v = s.audience_versions("did:plc:o").await.unwrap();
+        assert_eq!((v.len(), v[0].row_version), (1, 1), "{n}");
+        // Conditional on the version the listing saw.
+        let newer = AudienceRow {
+            prism_cid: Some("v2".into()),
+            ..row("a", "prism", "none")
+        };
+        assert!(
+            !s.replace_audience_if(&newer, 7).await.unwrap(),
+            "{n}: stale version"
+        );
+        assert!(s.replace_audience_if(&newer, 1).await.unwrap(), "{n}");
+        assert_eq!(
+            s.kr_audience("did:plc:o", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .row_version,
+            2
+        );
+        assert!(
+            !s.delete_audience("did:plc:o", "a", Some(1)).await.unwrap(),
+            "{n}: changed since"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.delete_audience("did:plc:o", "a", Some(2)).await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "a")
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}: tombstoned"
+        );
+        assert_eq!(s.prune_audience_tombstones(0).await.unwrap(), 0);
+        assert_eq!(
+            s.prune_audience_tombstones(i64::MAX).await.unwrap(),
+            1,
+            "{n}"
+        );
+
+        // Limiters.
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::Owner, 60_000)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.take_refresh("did:plc:o", RefreshLimiter::Owner, 60_000)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::ThirdParty, 60_000)
+                .await
+                .unwrap(),
+            "{n}: separate"
+        );
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::Owner, 0)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        s.note_listing("did:plc:o", 5, true, None).await.unwrap();
+        s.note_listing("did:plc:o", 6, false, Some("timeout"))
+            .await
+            .unwrap();
+        let sync = s.audience_sync("did:plc:o").await.unwrap();
+        assert_eq!(sync.last_listing_started_at, Some(6), "{n}");
+        assert!(
+            sync.last_complete_at.is_some(),
+            "{n}: kept from the complete one"
+        );
+        assert_eq!(sync.last_error.as_deref(), Some("timeout"));
+
+        // Aliases, polling and purging.
+        s.put_audience_alias("did:plc:o", "local1", "prism1")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.audience_alias("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("prism1")
+        );
+        s.adopt_audience(&row("b", "local", "none")).await.unwrap();
+        s.set_next_poll("did:plc:o", i64::MAX).await.unwrap();
+        assert!(
+            s.audience_polls_due(1_000, 10).await.unwrap().is_empty(),
+            "{n}"
+        );
+        assert_eq!(s.poll_queued_audiences_now().await.unwrap(), 1, "{n}");
+        assert_eq!(
+            s.audience_polls_due(1_000, 10).await.unwrap(),
+            ["did:plc:o"]
+        );
+        s.purge_audience_copy("did:plc:o").await.unwrap();
+        assert!(s.kr_audiences("did:plc:o").await.unwrap().is_empty(), "{n}");
+        assert!(
+            s.audience_alias("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+    }
+}

@@ -475,3 +475,348 @@ impl Store {
         exec!(self, q, before, limit)
     }
 }
+
+// ---------------------------------------------------------------- the audience copy
+
+/// What a refresh remembers of a row before its first page.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AudienceVersion {
+    pub rkey: String,
+    pub row_version: i64,
+    pub origin: String,
+    pub pending: String,
+    pub prism_cid: Option<String>,
+    pub prism_did: String,
+    pub updated_at: String,
+}
+
+/// An account's refresh state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+pub struct AudienceSync {
+    pub did: String,
+    pub last_listing_started_at: Option<i64>,
+    pub last_complete_at: Option<i64>,
+    pub next_poll_at: i64,
+    pub last_owner_refresh_at: i64,
+    pub last_third_party_refresh_at: i64,
+    pub last_error: Option<String>,
+}
+
+/// Which refresh limiter a refresh counts against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshLimiter {
+    /// The owner's own actions: at most one per interval, retryable when
+    /// throttled.
+    Owner,
+    /// Other accounts' checks: at most one per interval per owner.
+    ThirdParty,
+}
+
+impl Store {
+    /// The database clock, in ms.
+    pub async fn db_now(&self) -> CoreResult<i64> {
+        let q = sql("SELECT {now}", self.is_postgres());
+        scalar!(self, q, fetch_one,)
+    }
+
+    /// Every audience row of an account (pending deletes included), as a
+    /// refresh snapshots them.
+    pub async fn audience_versions(&self, did: &str) -> CoreResult<Vec<AudienceVersion>> {
+        let q = sql(
+            "SELECT rkey, row_version, origin, pending, prism_cid, prism_did, updated_at \
+             FROM kr_audience WHERE did = {1} ORDER BY rkey",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    /// Every audience row of an account, newest key first (pending deletes
+    /// left out).
+    pub async fn kr_audiences(&self, did: &str) -> CoreResult<Vec<AudienceRow>> {
+        let q = sql(
+            &format!(
+                "SELECT {AUDIENCE_COLS} FROM kr_audience WHERE did = {{1}} AND pending <> 'delete' ORDER BY rkey DESC"
+            ),
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    /// Adopts an audience the copy didn't hold. False if a row appeared
+    /// meanwhile.
+    pub async fn adopt_audience(&self, r: &AudienceRow) -> CoreResult<bool> {
+        let q = sql(
+            &format!(
+                "INSERT INTO kr_audience ({AUDIENCE_COLS}, adopted_at, synced_from_appview_at) VALUES ({{1}}, {{2}}, {{3}}, \
+                 {{4}}, {{5}}, {{6}}, {{7}}, {{8}}, {{9}}, {{10}}, {{11}}, {{12}}, {{13}}, {{14}}, {{now}}, {{now}}) \
+                 ON CONFLICT (did, rkey) DO NOTHING"
+            ),
+            self.is_postgres(),
+        );
+        let n = exec!(
+            self,
+            q,
+            &r.did,
+            &r.rkey,
+            &r.name,
+            &r.mode,
+            &r.members_json,
+            &r.created_at,
+            &r.updated_at,
+            &r.origin,
+            &r.prism_did,
+            &r.prism_cid,
+            &r.local_cid,
+            &r.value_cbor,
+            &r.pending,
+            r.row_version
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Replaces a row's value with the AppView's, only if it hasn't changed
+    /// since `version` (a concurrent local write wins). Clears any pending
+    /// edit.
+    pub async fn replace_audience_if(&self, r: &AudienceRow, version: i64) -> CoreResult<bool> {
+        let q = sql(
+            "UPDATE kr_audience SET name = {3}, mode = {4}, members_json = {5}, created_at = {6}, updated_at = {7}, \
+             prism_cid = {8}, local_cid = {9}, value_cbor = {10}, pending = 'none', pending_at = NULL, \
+             prism_did = {11}, origin = 'prism', row_version = row_version + 1, synced_from_appview_at = {now} \
+             WHERE did = {1} AND rkey = {2} AND row_version = {12}",
+            self.is_postgres(),
+        );
+        let n = exec!(
+            self,
+            q,
+            &r.did,
+            &r.rkey,
+            &r.name,
+            &r.mode,
+            &r.members_json,
+            &r.created_at,
+            &r.updated_at,
+            &r.prism_cid,
+            &r.local_cid,
+            &r.value_cbor,
+            &r.prism_did,
+            version
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Deletes a row (only at `version`, if given) and writes its tombstone,
+    /// in one transaction. False if the row changed or was gone.
+    pub async fn delete_audience(
+        &self,
+        did: &str,
+        rkey: &str,
+        version: Option<i64>,
+    ) -> CoreResult<bool> {
+        let mut tx = self.begin().await?;
+        let pg = matches!(tx, Tx::Postgres(_));
+        let q = sql(
+            "DELETE FROM kr_audience WHERE did = {1} AND rkey = {2} AND ({3} OR row_version = {4})",
+            pg,
+        );
+        let n = tx_exec!(
+            &mut tx,
+            q,
+            did,
+            rkey,
+            version.is_none(),
+            version.unwrap_or(0)
+        )?;
+        if n == 1 {
+            let t = sql(
+                "INSERT INTO kr_audience_tombstone (did, rkey, deleted_at) VALUES ({1}, {2}, {now}) \
+                 ON CONFLICT (did, rkey) DO UPDATE SET deleted_at = excluded.deleted_at",
+                pg,
+            );
+            tx_exec!(&mut tx, t, did, rkey)?;
+        }
+        tx.commit().await?;
+        Ok(n == 1)
+    }
+
+    /// When a tombstone names this audience, if one does.
+    pub async fn audience_tombstone(&self, did: &str, rkey: &str) -> CoreResult<Option<i64>> {
+        let q = sql(
+            "SELECT deleted_at FROM kr_audience_tombstone WHERE did = {1} AND rkey = {2}",
+            self.is_postgres(),
+        );
+        scalar!(self, q, fetch_optional, did, rkey)
+    }
+
+    /// Drops tombstones older than `before` (database ms).
+    pub async fn prune_audience_tombstones(&self, before: i64) -> CoreResult<u64> {
+        let q = sql(
+            "DELETE FROM kr_audience_tombstone WHERE deleted_at < {1}",
+            self.is_postgres(),
+        );
+        exec!(self, q, before)
+    }
+
+    /// The AppView rkey a local audience was mapped to.
+    pub async fn audience_alias(&self, did: &str, local_rkey: &str) -> CoreResult<Option<String>> {
+        let q = sql(
+            "SELECT prism_rkey FROM kr_audience_alias WHERE did = {1} AND local_rkey = {2}",
+            self.is_postgres(),
+        );
+        scalar!(self, q, fetch_optional, did, local_rkey)
+    }
+
+    /// Every alias of an account: (local rkey, prism rkey).
+    pub async fn audience_aliases(&self, did: &str) -> CoreResult<Vec<(String, String)>> {
+        let q = sql(
+            "SELECT local_rkey, prism_rkey FROM kr_audience_alias WHERE did = {1}",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    pub async fn flag_audience_alias(
+        &self,
+        did: &str,
+        local_rkey: &str,
+        why: &str,
+    ) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE kr_audience_alias SET flagged = {3} WHERE did = {1} AND local_rkey = {2}",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, local_rkey, why)?;
+        Ok(())
+    }
+
+    pub async fn flag_audience(&self, did: &str, rkey: &str, why: &str) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE kr_audience SET flagged = {3} WHERE did = {1} AND rkey = {2}",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, rkey, why)?;
+        Ok(())
+    }
+
+    /// Discards an account's copy: audiences (local ones included), aliases
+    /// and open attempts.
+    pub async fn purge_audience_copy(&self, did: &str) -> CoreResult<()> {
+        for table in ["kr_audience", "kr_audience_alias", "kr_audience_attempt"] {
+            let q = sql(
+                &format!("DELETE FROM {table} WHERE did = {{1}}"),
+                self.is_postgres(),
+            );
+            exec!(self, q, did)?;
+        }
+        Ok(())
+    }
+
+    /// An account's refresh state (defaults when it has none yet).
+    pub async fn audience_sync(&self, did: &str) -> CoreResult<AudienceSync> {
+        let q = sql(
+            "SELECT did, last_listing_started_at, last_complete_at, next_poll_at, last_owner_refresh_at, \
+             last_third_party_refresh_at, last_error FROM kr_audience_sync WHERE did = {1}",
+            self.is_postgres(),
+        );
+        let row: Option<AudienceSync> = run!(self, q, fetch_optional, did)?;
+        Ok(row.unwrap_or_else(|| AudienceSync {
+            did: did.to_owned(),
+            ..AudienceSync::default()
+        }))
+    }
+
+    /// Takes a refresh from an account's limiter: true (and the limiter
+    /// stamped now) if the last one was at least `interval_ms` ago.
+    pub async fn take_refresh(
+        &self,
+        did: &str,
+        limiter: RefreshLimiter,
+        interval_ms: i64,
+    ) -> CoreResult<bool> {
+        let col = match limiter {
+            RefreshLimiter::Owner => "last_owner_refresh_at",
+            RefreshLimiter::ThirdParty => "last_third_party_refresh_at",
+        };
+        let q = sql(
+            &format!(
+                "INSERT INTO kr_audience_sync (did, {col}) VALUES ({{1}}, {{now}}) \
+                 ON CONFLICT (did) DO UPDATE SET {col} = excluded.{col} \
+                 WHERE kr_audience_sync.{col} <= {{now}} - {{2}} RETURNING 1"
+            ),
+            self.is_postgres(),
+        );
+        let r: Option<i32> = scalar!(self, q, fetch_optional, did, interval_ms)?;
+        Ok(r.is_some())
+    }
+
+    /// Records a listing's start, completion or failure.
+    pub async fn note_listing(
+        &self,
+        did: &str,
+        started_at: i64,
+        complete: bool,
+        error: Option<&str>,
+    ) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO kr_audience_sync (did, last_listing_started_at, last_complete_at, last_error) \
+             VALUES ({1}, {2}, CASE WHEN {3} THEN {now} END, {4}) ON CONFLICT (did) DO UPDATE SET \
+             last_listing_started_at = excluded.last_listing_started_at, \
+             last_complete_at = COALESCE(excluded.last_complete_at, kr_audience_sync.last_complete_at), \
+             last_error = excluded.last_error",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, started_at, complete, error)?;
+        Ok(())
+    }
+
+    /// When the background poll should next look at an account.
+    pub async fn set_next_poll(&self, did: &str, at: i64) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO kr_audience_sync (did, next_poll_at) VALUES ({1}, {2}) \
+             ON CONFLICT (did) DO UPDATE SET next_poll_at = excluded.next_poll_at",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, at)?;
+        Ok(())
+    }
+
+    /// Accounts due a background poll, soonest first.
+    pub async fn audience_polls_due(&self, now: i64, limit: i64) -> CoreResult<Vec<String>> {
+        let q = sql(
+            "SELECT did FROM kr_audience_sync WHERE next_poll_at <= {1} ORDER BY next_poll_at LIMIT {2}",
+            self.is_postgres(),
+        );
+        scalar!(self, q, fetch_all, now, limit)
+    }
+}
+
+impl Store {
+    /// After an outage: accounts with local audiences or pending edits are
+    /// polled first.
+    pub async fn poll_queued_audiences_now(&self) -> CoreResult<u64> {
+        let q = sql(
+            "INSERT INTO kr_audience_sync (did, next_poll_at) SELECT DISTINCT did, 0 FROM kr_audience \
+             WHERE origin = 'local' OR pending <> 'none' \
+             ON CONFLICT (did) DO UPDATE SET next_poll_at = 0",
+            self.is_postgres(),
+        );
+        exec!(self, q,)
+    }
+}
+
+impl Store {
+    /// Maps a local audience rkey to the AppView's (no-op if mapped).
+    pub async fn put_audience_alias(
+        &self,
+        did: &str,
+        local_rkey: &str,
+        prism_rkey: &str,
+    ) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO kr_audience_alias (did, local_rkey, prism_rkey, mapped_at) VALUES ({1}, {2}, {3}, {now}) \
+             ON CONFLICT (did, local_rkey) DO NOTHING",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, local_rkey, prism_rkey)?;
+        Ok(())
+    }
+}

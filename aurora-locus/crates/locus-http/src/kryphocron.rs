@@ -28,6 +28,10 @@ use crate::state::AppState;
 pub struct Kr {
     pub encoder: Encoder,
     pub audit: AuditSinks,
+    /// Whether this node sees prism up.
+    pub prism: crate::audience::PrismHealth,
+    /// Wakes the audience sync job (prism back, a mapping to re-point).
+    pub audience_sync_wake: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for Kr {
@@ -44,6 +48,8 @@ impl Kr {
         let kr = Self {
             encoder: Encoder::new(Arc::new(SharedOracle::default())),
             audit,
+            prism: crate::audience::PrismHealth::default(),
+            audience_sync_wake: tokio::sync::Notify::new(),
         };
         (Arc::new(kr), rx)
     }
@@ -104,52 +110,33 @@ enum PrismAnswer {
 /// `app.nearhorizon.actor.getMembership`, as the account (it answers for
 /// the caller only, and may enrol an eligible caller, so it's called only
 /// when the account itself starts a private-tier action).
-async fn get_membership(s: &AppState, did: &str, appview: &(String, String)) -> PrismAnswer {
-    const LXM: &str = "app.nearhorizon.actor.getMembership";
-    let (url, aud) = appview;
-    let token = match crate::pipethrough::service_token(s, did, aud, LXM).await {
-        Ok(t) => t,
-        Err(e) => return PrismAnswer::Unmapped(e.message),
-    };
-    let client = match crate::pipethrough::client(s, false) {
-        Ok(c) => c,
-        Err(e) => return PrismAnswer::Unmapped(e.message),
-    };
-    let timeout = Duration::from_millis(
-        u64::try_from(s.snapshot().int("kryphocron.prism_request_timeout_ms")).unwrap_or(10_000),
-    );
-    let req = client
-        .get(format!("{}/xrpc/{LXM}", url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .timeout(timeout);
-    let res = match req.send().await {
-        Ok(r) => r,
-        Err(e) if e.is_connect() => return PrismAnswer::Unreachable,
-        Err(e) => return PrismAnswer::Unmapped(e.to_string()),
-    };
-    let status = res.status();
-    let body: Value = res.json().await.unwrap_or(Value::Null);
-    if status.is_success() {
-        return PrismAnswer::Membership {
+async fn get_membership(s: &Arc<AppState>, did: &str) -> PrismAnswer {
+    use crate::audience::Prism;
+    match crate::audience::call(s, did, "app.nearhorizon.actor.getMembership", &[], None).await {
+        Prism::Answer {
+            status: 200, body, ..
+        } => PrismAnswer::Membership {
             status: body["status"].as_str().unwrap_or("notEligible").to_owned(),
             private_indexed: body["permissions"]["privateIndexed"].as_bool() == Some(true),
             private_read: body["permissions"]["privateRead"].as_bool() == Some(true),
             valid_for_secs: body["validForSecs"].as_i64().unwrap_or(60).clamp(5, 3600),
-        };
-    }
-    match body["error"].as_str() {
-        Some(name @ ("AccountTakedown" | "NotEnrolled" | "NotReady" | "Reindexing"))
-            if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE =>
-        {
-            PrismAnswer::Refused(name.to_owned())
-        }
-        _ => PrismAnswer::Unmapped(format!("prism answered {status}")),
+        },
+        a @ Prism::Answer { status, .. } => match a.error_name() {
+            Some(name @ ("AccountTakedown" | "NotEnrolled" | "NotReady" | "Reindexing"))
+                if (400..500).contains(&status) || status == 503 =>
+            {
+                PrismAnswer::Refused(name.to_owned())
+            }
+            _ => PrismAnswer::Unmapped(format!("prism answered {status}")),
+        },
+        Prism::Unreachable => PrismAnswer::Unreachable,
+        Prism::Timeout => PrismAnswer::Unmapped("timeout".into()),
     }
 }
 
 /// `AccountTakedown` from any prism call: both rows say `takedown` for an
 /// hour, so the write gate refuses too.
-async fn record_takedown(s: &AppState, did: &str, prism_did: &str) -> XrpcResult<()> {
+pub(crate) async fn record_takedown(s: &AppState, did: &str, prism_did: &str) -> XrpcResult<()> {
     let now = locus_core::time::now_ms();
     for source in [SOURCE_MEMBERSHIP, SOURCE_PROBE] {
         s.store
@@ -171,7 +158,7 @@ async fn record_takedown(s: &AppState, did: &str, prism_did: &str) -> XrpcResult
 /// The private-tier gates for a non-delete write: an AppView configured
 /// and the host switch on (else `UnsupportedNamespace`), no local block,
 /// and the AppView's permission (`privateIndexed`), else `Forbidden`.
-pub(crate) async fn gate(s: &AppState, did: &str) -> XrpcResult<()> {
+pub(crate) async fn gate(s: &Arc<AppState>, did: &str) -> XrpcResult<()> {
     let Some(appview) = crate::pipethrough::appview(s) else {
         return Err(unsupported());
     };
@@ -190,7 +177,7 @@ pub(crate) async fn gate(s: &AppState, did: &str) -> XrpcResult<()> {
         .filter(|r| r.prism_did == prism_did);
     let row = match last {
         Some(r) if r.expires_at > now => r,
-        last => match get_membership(s, did, &appview).await {
+        last => match get_membership(s, did).await {
             PrismAnswer::Membership {
                 status,
                 private_indexed,
@@ -259,22 +246,20 @@ fn validate_plain(
 }
 
 /// The audience a private post names must be one of the writer's own, held
-/// in the private audience store.
+/// in the private audience store (refreshed from prism on a miss). A mapped
+/// local URI is replaced by the prism URI it maps to.
 async fn check_audience(
-    s: &AppState,
+    s: &Arc<AppState>,
     did: &str,
-    record: &BTreeMap<String, LexValue>,
+    record: &mut BTreeMap<String, LexValue>,
 ) -> XrpcResult<()> {
     let uri = record
         .get("audienceList")
         .and_then(LexValue::as_str)
-        .unwrap_or_default();
-    let rkey = rules::split_uri(uri).map_or("", |(_, _, r)| r);
-    if s.store.kr_audience(did, rkey).await?.is_none() {
-        return Err(XrpcError::invalid_request(
-            "audienceList doesn't name one of the writer's audiences",
-        ));
-    }
+        .unwrap_or_default()
+        .to_owned();
+    let stored = crate::audience::writer_audience(s, did, &uri).await?;
+    record.insert("audienceList".into(), LexValue::String(stored));
     Ok(())
 }
 
@@ -283,7 +268,7 @@ async fn check_audience(
 /// rules, the private-tier gates and, for `feed.postPrivate`, the encode
 /// pipeline. Returns the record to store.
 pub(crate) async fn prepare_write(
-    s: &AppState,
+    s: &Arc<AppState>,
     did: &str,
     collection: &str,
     rkey: &str,
@@ -307,7 +292,7 @@ pub(crate) async fn prepare_write(
             "Audiences aren't stored in repositories; use tools.kryphocron.policy.manageAudience",
         ));
     }
-    let Some(LexValue::Map(map)) = value else {
+    let Some(LexValue::Map(mut map)) = value else {
         return Err(XrpcError::invalid_request(
             "Invalid record: expected an object",
         ));
@@ -325,7 +310,7 @@ pub(crate) async fn prepare_write(
             "Replies to private posts are written with tools.kryphocron.actor.participatePrivate",
         ));
     }
-    check_audience(s, did, &map).await?;
+    check_audience(s, did, &mut map).await?;
     let validate = validate_plain(rkey);
     let out =
         s.kr.encoder
@@ -444,7 +429,7 @@ pub async fn update_post_private(
     rules::check_record(&account.did, nsid::POST_PRIVATE, &input.rkey, &map)
         .map_err(|e| XrpcError::invalid_request(e.0))?;
     gate(&s, &account.did).await?;
-    check_audience(&s, &account.did, &map).await?;
+    check_audience(&s, &account.did, &mut map).await?;
     let rec = records::prepare_record(
         nsid::POST_PRIVATE,
         &input.rkey,

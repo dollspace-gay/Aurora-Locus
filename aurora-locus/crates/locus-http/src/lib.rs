@@ -2,6 +2,7 @@
 //! and every handler.
 
 pub mod account;
+pub mod audience;
 pub mod auth;
 pub mod bsky;
 pub mod email;

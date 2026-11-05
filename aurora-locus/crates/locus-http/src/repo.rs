@@ -119,7 +119,7 @@ pub(crate) fn prepared(
 /// A create or update's record after kryphocron's step (host rules, gates,
 /// the private-post pipeline); other collections pass through.
 async fn kr_value(
-    s: &AppState,
+    s: &Arc<AppState>,
     did: &str,
     collection: &str,
     rkey: &str,

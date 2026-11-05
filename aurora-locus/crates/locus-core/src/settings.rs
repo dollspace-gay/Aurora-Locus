@@ -689,6 +689,51 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "The bound on every call to the AppView's private-tier methods, in milliseconds.",
     },
+    Def {
+        key: "kryphocron.audience_check_ttl_s",
+        kind: Kind::Int { min: 5, max: 3600 },
+        default: "60",
+        env: None,
+        description: "How stale an owner's audience copy may be when a membership check uses it, in seconds; also the limit on refreshes other accounts' checks cause.",
+    },
+    Def {
+        key: "kryphocron.audience_listing_deadline_s",
+        kind: Kind::Int { min: 10, max: 3600 },
+        default: "300",
+        env: None,
+        description: "The hard deadline of one audience listing from the AppView, in seconds.",
+    },
+    Def {
+        key: "kryphocron.audience_poll_interval_s",
+        kind: Kind::Int {
+            min: 60,
+            max: 86_400,
+        },
+        default: "900",
+        env: None,
+        description: "How often each account's audience copy is refreshed in the background, in seconds (stretched to stay within the call budget).",
+    },
+    Def {
+        key: "kryphocron.prism_call_budget",
+        kind: Kind::Int { min: 1, max: 100 },
+        default: "5",
+        env: None,
+        description: "Most background calls per second this node makes to the AppView's private-tier methods.",
+    },
+    Def {
+        key: "kryphocron.audience_max_members",
+        kind: Kind::Int { min: 1, max: 1000 },
+        default: "1000",
+        env: None,
+        description: "Most members in one audience (never above the AppView's 1,000).",
+    },
+    Def {
+        key: "kryphocron.audience_max_per_account",
+        kind: Kind::Int { min: 1, max: 200 },
+        default: "200",
+        env: None,
+        description: "Most audiences per account (never above the AppView's 200).",
+    },
 ];
 
 /// Looks up a setting definition.

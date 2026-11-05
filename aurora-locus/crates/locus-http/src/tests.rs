@@ -3574,7 +3574,18 @@ async fn scripted_appview() -> (String, Script, SeenLog) {
                         headers: parts.headers.clone(),
                         body,
                     });
-                    let entry = script.lock().unwrap().get(&nsid).cloned();
+                    // `nsid#cursor` answers a page of a listing.
+                    let cursor = parts.uri.query().and_then(|q| {
+                        url::form_urlencoded::parse(q.as_bytes())
+                            .find(|(k, _)| k == "cursor")
+                            .map(|(_, v)| v.into_owned())
+                    });
+                    let entry = {
+                        let script = script.lock().unwrap();
+                        cursor
+                            .and_then(|c| script.get(&format!("{nsid}#{c}")).cloned())
+                            .or_else(|| script.get(&nsid).cloned())
+                    };
                     let Some((status, headers, body)) = entry else {
                         return (
                             StatusCode::NOT_IMPLEMENTED,
@@ -5465,7 +5476,7 @@ async fn private_posts_are_gated_encoded_and_indexed() {
         "{v}"
     );
 
-    let (_script, seen) = h.with_prism().await;
+    let (script, seen) = h.with_prism().await;
     let mention = json!([{"index": {"byteStart": 0, "byteEnd": 5},
         "features": [{"$type": "app.bsky.richtext.facet#mention", "did": "did:plc:friendfriendfriend"}]}]);
     let mut rec = private_post("@kira the private sentinel", &audience);
@@ -5562,7 +5573,13 @@ async fn private_posts_are_gated_encoded_and_indexed() {
         .count();
     assert_eq!(asked, 1);
 
-    // Host rules.
+    // Host rules. Prism's complete listing has only the one audience.
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did, "3m6aaaaaaaaaa", "3m6prismcid22", &[])]}),
+    );
     let (st, v) = create(private_post(
         "x",
         &format!("at://{did}/tools.kryphocron.policy.audience/3m6zzzzzzzzzz"),
@@ -6020,4 +6037,322 @@ async fn rotation_re_encodes_private_posts_under_the_new_generation() {
         .await
         .unwrap();
     assert_eq!(again.rewritten, 0);
+}
+
+/// One `listAudiences` entry as prism answers.
+fn prism_audience(did: &str, rkey: &str, cid: &str, members: &[&str]) -> Value {
+    json!({
+        "uri": format!("at://{did}/tools.kryphocron.policy.audience/{rkey}"),
+        "cid": cid,
+        "record": {"$type": "tools.kryphocron.policy.audience", "members": members,
+                   "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z"}
+    })
+}
+
+fn set_script(script: &Script, key: &str, status: u16, body: Value) {
+    script
+        .lock()
+        .unwrap()
+        .insert(key.into(), (status, vec![], body));
+}
+
+#[tokio::test]
+async fn a_post_naming_an_audience_the_copy_lacks_refreshes_it_from_prism() {
+    let h = harness(false).await;
+    let (script, seen) = h.with_prism().await;
+    let account = |handle: &'static str| {
+        let h = &h;
+        async move {
+            let a = h
+                .create_account(handle, &format!("{handle}@x.com"), "pw")
+                .await;
+            (
+                a["did"].as_str().unwrap().to_owned(),
+                a["accessJwt"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+    let post = |did: String, access: String, rkey: &'static str| {
+        let h = &h;
+        async move {
+            h.post(
+                "tools.kryphocron.feed.createPostPrivate",
+                Some(&access),
+                json!({"repo": did, "record": private_post("x", &format!("at://{did}/tools.kryphocron.policy.audience/{rkey}"))}),
+            )
+            .await
+        }
+    };
+
+    // The audience is on the second page of the owner's listing.
+    let (did, access) = account("ana.pds.example.com").await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"cursor": "3m6bbbbbbbbbb", "audiences": [prism_audience(&did, "3m6cccccccccc", "v1", &[])]}),
+    );
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences#3m6bbbbbbbbbb",
+        200,
+        json!({"audiences": [prism_audience(&did, "3m6aaaaaaaaaa", "v1", &["did:plc:friend"])]}),
+    );
+    let (st, v) = post(did.clone(), access.clone(), "3m6aaaaaaaaaa").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, "3m6aaaaaaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            row.origin.as_str(),
+            row.members_json.as_str(),
+            row.prism_cid.as_deref()
+        ),
+        ("prism", "[\"did:plc:friend\"]", Some("v1"))
+    );
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6cccccccccc")
+            .await
+            .unwrap()
+            .is_some(),
+        "the first page is adopted too"
+    );
+    let calls = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.uri.contains("listAudiences"))
+        .count();
+    assert_eq!(calls, 2, "stopped at the page holding the URI");
+
+    // Missing from a complete listing: refused, not retried.
+    let (did2, access2) = account("bea.pds.example.com").await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": []}),
+    );
+    let (st, v) = post(did2.clone(), access2.clone(), "3m6aaaaaaaaaa").await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "{v}"
+    );
+    // The owner's own refreshes are limited: the next miss within 5 s is
+    // retryable rather than another call.
+    let (st, _) = post(did2.clone(), access2.clone(), "3m6aaaaaaaaaa").await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+
+    // A failed listing is retryable.
+    let (did3, access3) = account("cia.pds.example.com").await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        429,
+        json!({"error": "RateLimitExceeded"}),
+    );
+    let (st, _) = post(did3.clone(), access3, "3m6aaaaaaaaaa").await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+
+    // A complete listing deletes what prism no longer has, and a tombstone
+    // keeps a stale page from bringing it back.
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did, "3m6aaaaaaaaaa", "v1", &["did:plc:friend"])]}),
+    );
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let r = crate::audience::refresh(
+        &h.state,
+        &did,
+        crate::audience::Trigger::Background,
+        None,
+        far,
+    )
+    .await
+    .unwrap();
+    assert!(r.complete && r.error.is_none(), "{r:?}");
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6cccccccccc")
+            .await
+            .unwrap()
+            .is_none(),
+        "deleted in prism"
+    );
+    assert!(
+        h.state
+            .store
+            .audience_tombstone(&did, "3m6cccccccccc")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [
+            prism_audience(&did, "3m6aaaaaaaaaa", "v2", &["did:plc:friend", "did:plc:other"]),
+            prism_audience(&did, "3m6cccccccccc", "v1", &[]),
+        ]}),
+    );
+    crate::audience::refresh(
+        &h.state,
+        &did,
+        crate::audience::Trigger::Background,
+        None,
+        far,
+    )
+    .await
+    .unwrap();
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6cccccccccc")
+            .await
+            .unwrap()
+            .is_none(),
+        "the tombstone wins"
+    );
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, "3m6aaaaaaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.prism_cid.as_deref(), row.row_version),
+        (Some("v2"), 2),
+        "a changed version token replaces the copy"
+    );
+
+    // A mapped local URI is stored as the prism URI it maps to.
+    sqlx_alias(&h, &did, "3m6llllllllll", "3m6aaaaaaaaaa").await;
+    let (st, v) = post(did.clone(), access.clone(), "3m6llllllllll").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let rkey = v["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        h.record_value(&did, POST_PRIVATE, &rkey).await["audienceList"],
+        json!(format!(
+            "at://{did}/tools.kryphocron.policy.audience/3m6aaaaaaaaaa"
+        ))
+    );
+
+    // NotEnrolled: the copy and both permission rows are purged.
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        400,
+        json!({"error": "NotEnrolled"}),
+    );
+    crate::audience::refresh(
+        &h.state,
+        &did,
+        crate::audience::Trigger::Background,
+        None,
+        far,
+    )
+    .await
+    .unwrap();
+    assert!(h.state.store.kr_audiences(&did).await.unwrap().is_empty());
+    assert!(
+        h.state
+            .store
+            .kr_permission(&did, "membership")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Inserts an alias row (the mapping transaction comes with the sync job).
+async fn sqlx_alias(h: &Harness, did: &str, local: &str, prism: &str) {
+    h.state
+        .store
+        .put_audience_alias(did, local, prism)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_unreachable_prism_is_marked_down_and_probed_back_up() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("dee.pds.example.com", "dee@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let (_script, _) = h.with_prism().await;
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let live = h.state.snapshot().text("appview.url").to_owned();
+    h.state
+        .settings
+        .set("appview.url", json!(dead), "test")
+        .await
+        .unwrap();
+    let answer = crate::audience::call(
+        &h.state,
+        &did,
+        "app.nearhorizon.private.listAudiences",
+        &[],
+        None,
+    )
+    .await;
+    assert!(matches!(answer, crate::audience::Prism::Unreachable));
+    // The probe (also unreachable) marks it down.
+    for _ in 0..50 {
+        if h.state.kr.prism.is_down() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(h.state.kr.prism.is_down());
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let r = crate::audience::refresh(
+        &h.state,
+        &did,
+        crate::audience::Trigger::Background,
+        None,
+        far,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.error.as_deref(),
+        Some("prism down"),
+        "no calls while down"
+    );
+    // Any HTTP answer brings it back (the mock answers did.json with 404).
+    h.state
+        .settings
+        .set("appview.url", json!(live), "test")
+        .await
+        .unwrap();
+    for _ in 0..700 {
+        if !h.state.kr.prism.is_down() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!h.state.kr.prism.is_down(), "probed back up");
 }

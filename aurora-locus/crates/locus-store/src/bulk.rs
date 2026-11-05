@@ -299,6 +299,10 @@ impl Tx {
             "oauth_account_device WHERE did",
             "oauth_authorized_client WHERE did",
             "kr_permission WHERE did",
+            "kr_audience_alias WHERE did",
+            "kr_audience_tombstone WHERE did",
+            "kr_audience_attempt WHERE did",
+            "kr_audience_sync WHERE did",
         ] {
             let close = if table_col.contains("(SELECT") {
                 ")"
