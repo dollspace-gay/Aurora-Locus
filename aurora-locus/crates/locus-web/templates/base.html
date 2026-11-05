@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"{% if shell.nav.is_some() %} class="{{ shell.html_class() }}"{% endif %}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="same-origin">
+<title>{{ shell.title }} · {{ shell.brand }}</title>
+<link rel="stylesheet" href="{{ shell.css }}">
+</head>
+<body>
+{% if let Some(nav) = shell.nav %}
+<a class="skip" href="#main">Skip to content</a>
+<div class="layout">
+<nav class="sidebar" aria-label="{{ nav.area }} menu">
+<div class="brand"><span>{{ shell.brand }}</span>
+<details class="who"{% if nav.on_appearance() %} open{% endif %}><summary><span class="who-name">{{ nav.who }}</span> <span aria-hidden="true">▾</span></summary>
+<div class="who-menu">
+<a class="item" href="{{ nav.appearance_href() }}"{% if nav.on_appearance() %} aria-current="page"{% endif %}>Appearance</a>
+<form method="post" action="{{ nav.sign_out_action() }}"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="item" type="submit">Sign out</button></form>
+</div>
+</details>
+</div>
+{% for s in nav.sections %}
+<p class="sec" id="sec-{{ s.key }}">{{ s.label }}</p>
+<ul aria-labelledby="sec-{{ s.key }}">
+{% for i in s.items %}<li><a class="item" href="{{ i.href }}"{% if nav.is_current(i) %} aria-current="page"{% endif %}><span>{{ i.name }}</span>{% if let Some(tag) = i.tag %}<span class="tag">{{ tag }}</span>{% endif %}</a></li>
+{% endfor %}</ul>
+{% endfor %}
+</nav>
+{% else %}
+<header class="top">
+<span class="brand">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.5" fill="currentColor"/></svg>
+<span>{{ shell.brand }}</span>
+</span>
+</header>
+{% endif %}
+<main id="main"{% block main_class %}{% endblock %}>
+{% if let Some(nav) = shell.nav %}
+{% for b in nav.banners %}
+<div class="banner{% if b.bad %} bad{% endif %}">{{ b.text }}{% if let Some(link) = b.link %} <a href="{{ link.href }}">{{ link.label }}</a>.{% endif %}</div>
+{% endfor %}
+<p class="eyebrow">{{ nav.eyebrow() }}</p>
+{% endif %}
+{% block content %}{% endblock %}
+</main>
+{% if shell.nav.is_some() %}</div>{% endif %}
+</body>
+</html>

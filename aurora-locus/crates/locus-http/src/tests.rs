@@ -8513,3 +8513,29 @@ async fn the_locus_namespace_is_gated_by_role_group() {
         .await;
     assert_ne!(after["rotation"]["generation"], before);
 }
+
+#[tokio::test]
+async fn the_web_ui_s_assets_are_served_immutable_by_hash() {
+    let h = harness(false).await;
+    let href = locus_web::assets::CSS_HREF.as_str();
+    let (st, headers, body) = h.raw("GET", href, None, vec![], &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/css; charset=utf-8");
+    assert_eq!(headers["cache-control"], locus_web::assets::IMMUTABLE);
+    assert_eq!(body, locus_web::assets::CSS.as_bytes());
+    let (st, headers, _) = h
+        .raw(
+            "GET",
+            "/static/fonts/atkinson-hyperlegible-1.006-400.woff2",
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(headers["content-type"], "font/woff2");
+    for missing in ["/static/locus-000000000000.css", "/static/fonts/nope.woff2"] {
+        let (st, _, _) = h.raw("GET", missing, None, vec![], &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{missing}");
+    }
+}

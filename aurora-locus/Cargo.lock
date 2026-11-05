@@ -1959,6 +1959,7 @@ dependencies = [
  "locus-repo",
  "locus-store",
  "locus-sync",
+ "locus-web",
  "proto-blue-common",
  "proto-blue-crypto",
  "proto-blue-lex-cbor",
@@ -2112,7 +2113,10 @@ dependencies = [
 name = "locus-web"
 version = "0.1.0-dev"
 dependencies = [
+ "askama",
+ "hex",
  "locus-core",
+ "sha2",
 ]
 
 [[package]]

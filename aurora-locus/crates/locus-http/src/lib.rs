@@ -28,6 +28,7 @@ pub mod scanner;
 pub mod server;
 pub mod state;
 pub mod sync;
+pub mod web;
 
 #[cfg(test)]
 mod tests;
@@ -338,6 +339,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/oauth/authorize/reject", post(oauth_ui::reject))
         .route("/oauth/assets/style.css", get(oauth_ui::style))
         .route("/oauth/assets/form-post.js", get(oauth_ui::form_post_js))
+        .route("/static/{*path}", get(web::asset))
         .route(
             "/xrpc/app.bsky.actor.getPreferences",
             get(bsky::get_preferences),
