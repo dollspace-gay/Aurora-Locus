@@ -368,6 +368,25 @@ kryphocron built in.
   scanner): media only private posts use is served only to the owner,
   audience members and `kryphocron.media_trusted_services`, never cached;
   to anyone else it looks like a missing blob.
+- Operators, separate from atproto accounts, with roles owner, admin,
+  moderator and viewer, and API tokens. Every admin method has a minimum
+  role; every operator and moderation action goes to the audit log.
+- The reference admin API: `com.atproto.admin.getAccountInfo(s)`,
+  `getSubjectStatus` and `updateSubjectStatus` (takedowns of accounts,
+  records by URI whatever the CID, and blobs; they apply on the next
+  request, and an account takedown ends its sessions and OAuth grants and
+  emits `#account`), `sendEmail` (through the moderation sender),
+  `deleteAccount`, `updateAccountPassword`/`Email`/`Handle`, the invite
+  methods and `server.createInviteCode(s)`, plus `searchAccounts`. The
+  `admin:<password>` Basic auth (`PDS_ADMIN_PASSWORD`, otherwise
+  generated; `admin.basic_auth_enabled` turns it off) counts as admin, and
+  the moderation service gets the reference's mod-service access. Admin
+  credentials read taken-down repos through the sync methods.
+- Locus operator methods under `app.nearhorizon.locus`, by role:
+  settings, the audit log, jobs, import status and kryphocron status
+  (viewer); the private-tier block and the scanner review queue
+  (moderator); changing settings and starting a rotation generation
+  (admin); operators and API tokens (owner); and `describeCapabilities`.
 
 ### Changed
 
