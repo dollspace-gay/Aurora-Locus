@@ -72,7 +72,13 @@ pub async fn validate_handle(s: &AppState, raw: &str, did: Option<&str>) -> Xrpc
     }
     let domains = s.handle_domains();
     if handle::service_domain(&h, &domains).is_some() {
-        handle::ensure_service_constraints(&h, &domains, LabelLimits::default(), &[], false)
+        let reserved: Vec<String> = s
+            .snapshot()
+            .list("identity.reserved_handles")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        handle::ensure_service_constraints(&h, &domains, LabelLimits::default(), &reserved, false)
             .map_err(handle_error)?;
         return Ok(h);
     }

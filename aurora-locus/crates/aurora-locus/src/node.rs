@@ -34,8 +34,112 @@ pub struct Node {
     /// This node's TID clock id. Holding its slot is what makes the node live.
     pub clock_id: u32,
     clock_lease: LeaseToken,
+    /// Shutdown (signals).
+    outer: CancellationToken,
+    /// This node's own tasks: a child of `outer`, also fired to restart.
     cancel: CancellationToken,
+    /// Fires when setup completes while this node is in setup mode.
+    setup_done: CancellationToken,
+    /// In setup mode until setup completes.
+    pub setup_mode: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// How a node's run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// Shut down.
+    Stopped,
+    /// Setup completed: start again, now in service.
+    Restart,
+}
+
+/// Opens the database and checks the master key before anything is
+/// written (migrations included: a node with another install's key must
+/// not touch it), then migrates.
+pub async fn open_store(
+    bootstrap: &Bootstrap,
+) -> CoreResult<(Store, Arc<locus_core::keys::MasterKey>)> {
+    let store = Store::connect(&bootstrap.database).await?;
+    let empty = store.key_store_empty().await?;
+    let generated_path = match &bootstrap.master_key {
+        locus_core::bootstrap::MasterKeySource::File { path, .. } if !path.exists() => {
+            Some(path.clone())
+        }
+        _ => None,
+    };
+    let master_key = Arc::new(locus_core::keys::load_master_key(bootstrap, empty)?);
+    if let Some(path) = generated_path {
+        tracing::warn!(
+            path = %path.display(),
+            "generated a new master key; back it up: losing it loses every stored secret"
+        );
+    }
+    store.check_master_key(&master_key).await?;
+    tracing::info!(key_id = %master_key.key_id(), source = master_key.source().as_str(), "master key checked");
+    store.migrate().await?;
+    Ok((store, master_key))
+}
+
+/// Where this node writes the setup token: `<data>/setup-token`, when the
+/// data directory persists.
+fn token_path(bootstrap: &Bootstrap) -> Option<std::path::PathBuf> {
+    bootstrap
+        .data_persistent
+        .then(|| bootstrap.data_dir.join("setup-token"))
+}
+
+/// Writes a file only its owner can read.
+pub fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents.as_bytes())
+}
+
+/// Makes the setup token if no node has, printing it and writing it to the
+/// data directory; otherwise says where it is.
+async fn announce_setup_token(store: &Store, bootstrap: &Bootstrap) -> CoreResult<()> {
+    let path = token_path(bootstrap);
+    let token = locus_http::setup::new_token();
+    if store
+        .create_setup_token(&locus_http::setup::token_hash(&token))
+        .await?
+    {
+        tracing::warn!(
+            setup_token = %token,
+            "setup mode: open /setup on this server and enter this one-time setup token"
+        );
+        if let Some(p) = &path {
+            match write_private(p, &format!("{token}\n")) {
+                Ok(()) => {
+                    tracing::warn!(path = %p.display(), "the setup token is also in this file")
+                }
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), "couldn't write the setup token file: {e}")
+                }
+            }
+        }
+    } else {
+        match path.filter(|p| p.exists()) {
+            Some(p) => {
+                tracing::warn!(path = %p.display(), "setup mode: the setup token is in this file")
+            }
+            None => tracing::warn!(
+                "setup mode: the setup token is in the log of the first node that started; \
+                 `aurora-locus setup --new-token` makes a new one"
+            ),
+        }
+    }
+    Ok(())
 }
 
 impl Node {
@@ -44,8 +148,9 @@ impl Node {
     pub async fn start(
         bootstrap: Bootstrap,
         log: LogControl,
-        cancel: CancellationToken,
+        outer: CancellationToken,
     ) -> CoreResult<Self> {
+        let cancel = outer.child_token();
         let node_id = match (&bootstrap.node_id, bootstrap.node_id_path()) {
             (Some(id), _) => id.clone(),
             (None, Some(path)) => bootstrap::load_or_create_node_id(&path)?,
@@ -61,26 +166,7 @@ impl Node {
             tracing::warn!("SSRF protection is OFF for user-influenced requests on this node");
         }
 
-        // The master key is checked before anything is written, migrations
-        // included: a node with another install's key must not touch it.
-        let store = Store::connect(&bootstrap.database).await?;
-        let empty = store.key_store_empty().await?;
-        let generated_path = match &bootstrap.master_key {
-            locus_core::bootstrap::MasterKeySource::File { path, .. } if !path.exists() => {
-                Some(path.clone())
-            }
-            _ => None,
-        };
-        let master_key = Arc::new(locus_core::keys::load_master_key(&bootstrap, empty)?);
-        if let Some(path) = generated_path {
-            tracing::warn!(
-                path = %path.display(),
-                "generated a new master key; back it up: losing it loses every stored secret"
-            );
-        }
-        store.check_master_key(&master_key).await?;
-        tracing::info!(key_id = %master_key.key_id(), source = master_key.source().as_str(), "master key checked");
-        store.migrate().await?;
+        let (store, master_key) = open_store(&bootstrap).await?;
 
         let (clock_id, clock_lease) = store
             .claim_slot(CLOCK_SLOT_FAMILY, CLOCK_SLOTS, &node_id, DEFAULT_LEASE_TTL)
@@ -100,6 +186,38 @@ impl Node {
         let settings = Settings::load(store.clone()).await?;
         log.apply(settings.current().text("log.level"));
 
+        // Setup mode until setup completes; after it, the hostname setup
+        // chose is the one served.
+        let setup = store.setup_state().await?;
+        let setup_mode = setup.as_ref().is_none_or(|r| r.completed_at.is_none());
+        let bootstrap_hostname = bootstrap
+            .hostname
+            .as_deref()
+            .map(locus_core::setup::normalize_host);
+        let hostname = match setup.as_ref().and_then(|r| r.hostname.clone()) {
+            Some(h) if !setup_mode => {
+                if bootstrap_hostname.as_deref().is_some_and(|b| b != h) {
+                    tracing::warn!(
+                        configured = bootstrap_hostname.as_deref().unwrap_or(""),
+                        serving = %h,
+                        "PDS_HOSTNAME differs from the hostname setup chose; it's ignored (the hostname changes only by migration)"
+                    );
+                }
+                h
+            }
+            _ => bootstrap_hostname
+                .clone()
+                .unwrap_or_else(|| "localhost".to_owned()),
+        };
+        if setup_mode {
+            announce_setup_token(&store, &bootstrap).await?;
+        } else if let Some(p) = token_path(&bootstrap).filter(|p| p.exists()) {
+            // The token stopped working when setup completed.
+            if let Err(e) = std::fs::remove_file(&p) {
+                tracing::warn!(path = %p.display(), "couldn't remove the old setup token file: {e}");
+            }
+        }
+
         let mut node = Self {
             bootstrap,
             node_id,
@@ -108,7 +226,10 @@ impl Node {
             master_key,
             clock_id,
             clock_lease,
+            outer,
             cancel,
+            setup_done: CancellationToken::new(),
+            setup_mode,
             tasks: Vec::new(),
         };
         node.spawn_clock_renewal();
@@ -116,20 +237,46 @@ impl Node {
             .push(node.settings.spawn_watcher(node.cancel.clone()));
         node.spawn_log_level(log);
         node.spawn_env_recheck(env_values);
-        node.spawn_block_gc();
-        node.spawn_http().await?;
+        if !setup_mode {
+            node.spawn_block_gc();
+        }
+        node.spawn_http(hostname, bootstrap_hostname).await?;
         Ok(node)
+    }
+
+    /// What setup mode tells the wizard about this node.
+    fn setup_info(&self) -> locus_http::setup::SetupInfo {
+        locus_http::setup::SetupInfo {
+            database: if self.store.is_postgres() {
+                "Postgres".into()
+            } else {
+                "SQLite".into()
+            },
+            blob_store: format!(
+                "On disk, in the data directory ({})",
+                self.bootstrap.data_dir.display()
+            ),
+            data_dir: self.bootstrap.data_dir.clone(),
+            token_path: token_path(&self.bootstrap)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            master_key_path: match &self.bootstrap.master_key {
+                locus_core::bootstrap::MasterKeySource::File { path, .. } => {
+                    path.display().to_string()
+                }
+                _ => String::new(),
+            },
+        }
     }
 
     /// Loads the server secrets and starts serving HTTP. The port is bound
     /// here so a busy port fails the boot rather than a background task.
-    async fn spawn_http(&mut self) -> CoreResult<()> {
-        let hostname = self
-            .bootstrap
-            .hostname
-            .clone()
-            .unwrap_or_else(|| "localhost".to_owned())
-            .to_ascii_lowercase();
+    /// In setup mode only setup is served and no background job runs.
+    async fn spawn_http(
+        &mut self,
+        hostname: String,
+        bootstrap_hostname: Option<String>,
+    ) -> CoreResult<()> {
         let public_url = if bootstrap::is_local_hostname(&hostname) {
             format!("http://{hostname}:{}", self.bootstrap.listen.port())
         } else {
@@ -176,26 +323,61 @@ impl Node {
             limits: locus_http::ratelimit::Limiter::default(),
             oauth_clients: locus_http::oauth::ClientCache::default(),
             kr,
+            setup: Arc::new(if self.setup_mode {
+                locus_http::setup::Gate::setup_mode(
+                    bootstrap_hostname,
+                    self.bootstrap.dev_mode_honored(),
+                    self.setup_info(),
+                )
+            } else {
+                locus_http::setup::Gate::finished()
+            }),
         });
-        // Encodes need the current generation: read it before serving.
-        locus_http::kryphocron::refresh_oracle(&state).await?;
-        self.spawn_oracle_refresh(Arc::clone(&state));
-        self.spawn_kryphocron_jobs(Arc::clone(&state));
-        self.spawn_audience_jobs(Arc::clone(&state));
-        self.spawn_identity_repair(Arc::clone(&state));
-        self.spawn_account_jobs(Arc::clone(&state));
-        self.spawn_blob_jobs(Arc::clone(&state));
-        self.spawn_sync_jobs(Arc::clone(&state));
+        self.setup_done = state.setup.completed.clone();
+        if self.setup_mode {
+            self.tasks.push(tokio::spawn(locus_http::setup::watch(
+                Arc::clone(&state),
+                self.cancel.clone(),
+            )));
+        } else {
+            // Encodes need the current generation: read it before serving.
+            locus_http::kryphocron::refresh_oracle(&state).await?;
+            self.spawn_oracle_refresh(Arc::clone(&state));
+            self.spawn_kryphocron_jobs(Arc::clone(&state));
+            self.spawn_audience_jobs(Arc::clone(&state));
+            self.spawn_identity_repair(Arc::clone(&state));
+            self.spawn_account_jobs(Arc::clone(&state));
+            self.spawn_blob_jobs(Arc::clone(&state));
+            self.spawn_sync_jobs(Arc::clone(&state));
+        }
         let addr = self.bootstrap.listen;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| CoreError::Config(format!("can't listen on {addr}: {e}")))?;
-        tracing::info!(%addr, public_url = %state.public_url, "listening");
-        let cancel = self.cancel.clone();
+        tracing::info!(%addr, public_url = %state.public_url, setup_mode = self.setup_mode, "listening");
+        // Headless setup runs once the listener is up, so its checks can
+        // reach this node through the public URL.
+        if self.setup_mode
+            && self.bootstrap.setup_auto.as_deref().is_some_and(|v| {
+                matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+            })
+        {
+            let st = Arc::clone(&state);
+            self.tasks.push(tokio::spawn(async move {
+                let env: HashMap<String, String> = std::env::vars().collect();
+                match locus_http::setup::headless(&st, &env).await {
+                    Ok(()) => tracing::info!("headless setup completed"),
+                    Err(e) => {
+                        tracing::error!("headless setup didn't complete; still in setup mode: {e}")
+                    }
+                }
+            }));
+        }
+        let (outer, cancel) = (self.outer.clone(), self.cancel.clone());
         self.tasks.push(tokio::spawn(async move {
             if let Err(e) = locus_http::serve(state, listener, cancel.clone()).await {
                 tracing::error!("http server failed; stopping the node: {e}");
-                cancel.cancel();
+                outer.cancel();
             }
         }));
         Ok(())
@@ -763,9 +945,10 @@ impl Node {
         }));
     }
 
-    /// Waits until shutdown is requested, then stops background tasks and
-    /// gives up this node's leases so others can take over at once.
-    pub async fn run_until_stopped(self) {
+    /// Waits until shutdown is requested (or, in setup mode, setup
+    /// completes), then stops background tasks and gives up this node's
+    /// leases so others can take over at once.
+    pub async fn run_until_stopped(self) -> Ended {
         tracing::info!(
             node_id = %self.node_id,
             clock_id = self.clock_id,
@@ -774,8 +957,18 @@ impl Node {
             settings_version = self.settings.current().version(),
             "running"
         );
-        self.cancel.cancelled().await;
-        tracing::info!("stopping");
+        let ended = tokio::select! {
+            () = self.cancel.cancelled() => Ended::Stopped,
+            () = self.setup_done.cancelled() => Ended::Restart,
+        };
+        // A shutdown during the restart wins.
+        let ended = if self.outer.is_cancelled() {
+            Ended::Stopped
+        } else {
+            ended
+        };
+        self.cancel.cancel();
+        tracing::info!(?ended, "stopping");
         for t in self.tasks {
             let _ = t.await;
         }
@@ -784,6 +977,7 @@ impl Node {
         }
         self.store.close().await;
         tracing::info!("stopped");
+        ended
     }
 }
 

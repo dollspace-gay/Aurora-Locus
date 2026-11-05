@@ -278,6 +278,8 @@ pub struct AppState {
     pub oauth_clients: crate::oauth::ClientCache,
     /// The kryphocron codec, rotation oracle and audit sinks.
     pub kr: Arc<crate::kryphocron::Kr>,
+    /// Whether this node is in setup mode.
+    pub setup: Arc<crate::setup::Gate>,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

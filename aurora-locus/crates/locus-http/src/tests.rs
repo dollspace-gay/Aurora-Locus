@@ -131,6 +131,20 @@ async fn harness_with(invite_required: bool, email: bool) -> Harness {
 
 /// A PDS at `hostname`.
 async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harness {
+    harness_build(hostname, invite_required, email, false).await
+}
+
+/// A PDS in setup mode, its bootstrap hostname `hostname`.
+async fn setup_harness(hostname: &str, email: bool) -> Harness {
+    harness_build(hostname, false, email, true).await
+}
+
+async fn harness_build(
+    hostname: &str,
+    invite_required: bool,
+    email: bool,
+    setup_mode: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
         .await
@@ -150,6 +164,7 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         .unwrap();
     let settings = Settings::load(store.clone()).await.unwrap();
     let hostname = hostname.to_owned();
+    let hostname_for_gate = hostname.clone();
     let service_did = format!("did:web:{hostname}");
     let sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
     let (mailer, mail) = if email {
@@ -186,6 +201,20 @@ async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harne
         limits: crate::ratelimit::Limiter::default(),
         oauth_clients: crate::oauth::ClientCache::default(),
         kr,
+        setup: Arc::new(if setup_mode {
+            crate::setup::Gate::setup_mode(
+                Some(hostname_for_gate.clone()),
+                false,
+                crate::setup::SetupInfo {
+                    database: "SQLite".into(),
+                    blob_store: "disk".into(),
+                    data_dir: dir.path().to_path_buf(),
+                    ..crate::setup::SetupInfo::default()
+                },
+            )
+        } else {
+            crate::setup::Gate::finished()
+        }),
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -8537,5 +8566,466 @@ async fn the_web_ui_s_assets_are_served_immutable_by_hash() {
     for missing in ["/static/locus-000000000000.css", "/static/fonts/nope.woff2"] {
         let (st, _, _) = h.raw("GET", missing, None, vec![], &[]).await;
         assert_eq!(st, StatusCode::NOT_FOUND, "{missing}");
+    }
+}
+
+#[tokio::test]
+async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
+    let h = setup_harness("pds.example.com", true).await;
+    assert!(
+        h.state
+            .store
+            .create_setup_token(&crate::setup::token_hash("the-token"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.state
+            .store
+            .create_setup_token(&crate::setup::token_hash("other"))
+            .await
+            .unwrap(),
+        "first node wins"
+    );
+
+    // Only the wizard, health and /tls-check answer.
+    let (st, v) = h
+        .call("GET", "/xrpc/com.atproto.server.describeServer", None, None)
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("ServiceUnavailable"))
+    );
+    assert_eq!(
+        h.call("GET", "/xrpc/_health", None, None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.call("GET", "/readyz", None, None).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        h.call("GET", "/admin", None, None).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        h.call("GET", "/tls-check?domain=pds.example.com", None, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.call("GET", "/tls-check?domain=alice.example.com", None, None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (st, headers, _) = h.raw("GET", "/", None, vec![], &[]).await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/setup")
+    );
+
+    // The token comes first.
+    let b = Browser::default();
+    let (st, _, page) = b.get(&h, "/setup").await;
+    assert!(
+        st == StatusCode::OK && page.contains("setup token"),
+        "{page}"
+    );
+    let (st, _, _) = b.get(&h, "/setup/hostname").await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "no session, no wizard");
+    let (st, _, _) = b.post(&h, "/setup/token", &[("token", "wrong")]).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, headers, _) = b.post(&h, "/setup/token", &[("token", "the-token")]).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let set = headers["set-cookie"].to_str().unwrap();
+    assert!(
+        set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Secure"),
+        "{set}"
+    );
+
+    let (st, _, page) = b.get(&h, "/setup/hostname").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        page.contains(r#"value="pds.example.com""#),
+        "seeded from the bootstrap hostname"
+    );
+    let csrf = hidden(&page, "csrf");
+    let step = |path: &'static str, form: Vec<(&'static str, String)>| {
+        let (b, h, csrf) = (&b, &h, csrf.clone());
+        async move {
+            let mut f: Vec<(&str, &str)> = vec![("csrf", csrf.as_str())];
+            f.extend(form.iter().map(|(k, v)| (*k, v.as_str())));
+            b.post(h, path, &f).await
+        }
+    };
+    let next = |r: &(StatusCode, axum::http::HeaderMap, String)| {
+        assert_eq!(r.0, StatusCode::SEE_OTHER, "{}", r.2);
+        r.1["location"].to_str().unwrap().to_owned()
+    };
+
+    // A forged post is refused.
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/setup/hostname",
+            &[("csrf", "nope"), ("hostname", "evil.example")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    let r = step(
+        "/setup/hostname",
+        vec![("hostname", "https://pds.example.com".into())],
+    )
+    .await;
+    assert!(
+        r.0 == StatusCode::BAD_REQUEST && r.2.contains("no https://"),
+        "{}",
+        r.2
+    );
+    let r = step(
+        "/setup/hostname",
+        vec![
+            ("hostname", "PDS.example.com".into()),
+            ("service_name", "Example PDS".into()),
+        ],
+    )
+    .await;
+    assert_eq!(next(&r), "/setup/storage");
+    let (_, _, page) = b.get(&h, "/setup/storage").await;
+    assert!(page.contains("Tested:"), "{page}");
+    assert_eq!(next(&step("/setup/storage", vec![]).await), "/setup/proxy");
+    assert_eq!(
+        next(&step("/setup/proxy", vec![("proxy", "caddy".into())]).await),
+        "/setup/handles"
+    );
+    let (_, _, page) = b.get(&h, "/setup/handles").await;
+    assert!(
+        page.contains(r#"value=".example.com" checked"#),
+        "the parent wildcard is suggested and chosen: {page}"
+    );
+    let r = step(
+        "/setup/handles",
+        vec![
+            ("domain", ".example.com".into()),
+            ("existing_subdomains", "www\nmail".into()),
+        ],
+    )
+    .await;
+    assert_eq!(next(&r), "/setup/operator");
+    let (_, _, page) = b.get(&h, "/setup/handles").await;
+    assert!(
+        page.contains("<code>*.example.com</code>")
+            && page.contains("<code>www.example.com</code>"),
+        "{page}"
+    );
+
+    let r = step(
+        "/setup/operator",
+        vec![
+            ("username", "alice".into()),
+            ("password", "correct horse battery".into()),
+            ("password2", "different".into()),
+        ],
+    )
+    .await;
+    assert_eq!(r.0, StatusCode::BAD_REQUEST);
+    let r = step(
+        "/setup/operator",
+        vec![
+            ("username", "alice".into()),
+            ("password", "correct horse battery".into()),
+            ("password2", "correct horse battery".into()),
+        ],
+    )
+    .await;
+    assert_eq!(next(&r), "/setup/email");
+    let draft = h
+        .state
+        .store
+        .setup_state()
+        .await
+        .unwrap()
+        .unwrap()
+        .draft_json;
+    assert!(
+        !draft.contains("correct horse") && draft.contains("$argon2id$"),
+        "only a hash is kept: {draft}"
+    );
+
+    // A test email, its code, then on.
+    let r = step(
+        "/setup/email",
+        vec![
+            ("do", "save".into()),
+            ("from_address", "PDS <pds@example.com>".into()),
+        ],
+    )
+    .await;
+    assert_eq!(r.0, StatusCode::OK, "{}", r.2);
+    let r = step(
+        "/setup/email",
+        vec![("do", "send".into()), ("to", "me@example.com".into())],
+    )
+    .await;
+    assert!(r.2.contains("Sent to me@example.com"), "{}", r.2);
+    let sent = h.mail.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (sent.to.as_str(), sent.email.subject.as_str()),
+        ("me@example.com", "Test email")
+    );
+    let code = sent
+        .email
+        .text
+        .split_whitespace()
+        .find(|w| w.len() == 11 && w.as_bytes()[5] == b'-')
+        .unwrap()
+        .to_owned();
+    let r = step(
+        "/setup/email",
+        vec![("do", "verify".into()), ("code", "AAAAA-AAAAA".into())],
+    )
+    .await;
+    assert_eq!(r.0, StatusCode::BAD_REQUEST);
+    let r = step(
+        "/setup/email",
+        vec![("do", "verify".into()), ("code", code.to_lowercase())],
+    )
+    .await;
+    assert!(r.2.contains("email works"), "{}", r.2);
+    assert_eq!(
+        next(&step("/setup/email", vec![("do", "next".into())]).await),
+        "/setup/services"
+    );
+
+    let svc = vec![
+        ("appview_url", "https://api.bsky.app".into()),
+        ("appview_did", "did:web:api.bsky.app".into()),
+        ("crawlers", "https://bsky.network".into()),
+        ("moderation_url", "https://mod.example.com".into()),
+        ("moderation_did", "did:web:mod.example.com".into()),
+        ("report_url", "https://mod.bsky.app".into()),
+        ("report_did", "did:plc:ar7c4by46qjdydhdevvrndac".into()),
+    ];
+    assert_eq!(next(&step("/setup/services", svc).await), "/setup/private");
+    assert_eq!(
+        next(&step("/setup/private", vec![("private_tier", "1".into())]).await),
+        "/setup/keys"
+    );
+    let (_, _, page) = b.get(&h, "/setup/keys").await;
+    assert!(
+        page.contains(&h.state.secrets.plc_keys.current().did()),
+        "the rotation key is shown"
+    );
+    let r = step("/setup/keys", vec![]).await;
+    assert!(
+        r.0 == StatusCode::BAD_REQUEST && r.2.contains("master key"),
+        "{}",
+        r.2
+    );
+    assert_eq!(
+        next(&step("/setup/keys", vec![("keys_ack", "1".into())]).await),
+        "/setup/review"
+    );
+
+    // Review: warnings (no DNS or HTTPS in tests) must be accepted first.
+    let (_, _, page) = b.get(&h, "/setup/review").await;
+    assert!(page.contains("Example PDS") || page.contains("pds.example.com"));
+    let acks: Vec<String> = page
+        .match_indices(r#"name="ack" value=""#)
+        .map(|(i, m)| page[i + m.len()..].split('"').next().unwrap().to_owned())
+        .collect();
+    assert!(acks.contains(&"reachable".to_owned()), "{page}");
+    let r = step("/setup/review", vec![("do", "finish".into())]).await;
+    assert!(
+        r.0 == StatusCode::BAD_REQUEST && r.2.contains("accept each warning"),
+        "{}",
+        r.2
+    );
+    assert!(!h.state.store.setup_completed().await.unwrap());
+    let mut form: Vec<(&str, String)> = vec![("do", "finish".into())];
+    form.extend(acks.iter().map(|a| ("ack", a.clone())));
+    let r = step("/setup/review", form).await;
+    assert!(
+        r.0 == StatusCode::OK && r.2.contains("Setup is complete"),
+        "{}",
+        r.2
+    );
+    assert!(
+        h.state.setup.completed.is_cancelled(),
+        "the node restarts into service"
+    );
+
+    // Everything landed.
+    let row = h.state.store.setup_state().await.unwrap().unwrap();
+    assert_eq!(
+        (row.hostname.as_deref(), row.completed_by.as_deref()),
+        (Some("pds.example.com"), Some("setup"))
+    );
+    let snap = h.state.store.load_snapshot().await.unwrap();
+    assert_eq!(snap.list("identity.handle_domains"), [".example.com"]);
+    assert_eq!(
+        snap.list("identity.reserved_handles"),
+        ["mail", "pds", "www"]
+    );
+    assert_eq!(
+        snap.text("moderation.service_did"),
+        "did:web:mod.example.com"
+    );
+    assert_eq!(snap.text("server.service_name"), "Example PDS");
+    assert_eq!(snap.text("email.from_address"), "PDS <pds@example.com>");
+    assert!(snap.bool("kryphocron.private_tier_enabled"));
+    let op = h.state.store.operator("alice").await.unwrap().unwrap();
+    assert_eq!(op.role, "owner");
+    assert!(locus_auth::password::verify(
+        "correct horse battery",
+        &op.password_hash
+    ));
+    let audit = h.state.store.audit_entries(None, 100).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "setup.complete" && e.actor == "setup")
+    );
+
+    // The token and session are done; a second finish changes nothing.
+    assert!(
+        !h.state
+            .store
+            .setup_token_matches(&crate::setup::token_hash("the-token"))
+            .await
+            .unwrap()
+    );
+    let (_, _, page) = b.get(&h, "/setup/review").await;
+    assert!(page.contains("Setup is complete"));
+    let mut again = crate::setup::seed_plan(&snap, Some("pds.example.com"));
+    again.operator.username = "mallory".into();
+    again.operator.password = Some("another long password".into());
+    again.keys_backup_acknowledged = true;
+    again.email.skipped = true;
+    assert!(matches!(
+        crate::setup::apply(&h.state.store, &h.state.master_key, &again, false).await,
+        Err(crate::setup::ApplyError::AlreadyComplete)
+    ));
+    assert!(
+        h.state.store.operator("mallory").await.unwrap().is_none(),
+        "the loser wrote nothing"
+    );
+}
+
+#[tokio::test]
+async fn headless_setup_builds_its_plan_from_env_and_one_run_wins() {
+    let h = setup_harness("pds.example.com", false).await;
+    h.state
+        .store
+        .create_setup_token(&crate::setup::token_hash("t"))
+        .await
+        .unwrap();
+    let env: std::collections::HashMap<String, String> = [
+        ("PDS_HOSTNAME", "pds.example.com"),
+        ("PDS_ADMIN_PASSWORD", "from-the-reference-env"),
+        ("LOCUS_SETUP_PROXY", "other"),
+        ("LOCUS_SETUP_KEYS_BACKUP_ACKNOWLEDGED", "true"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    let plan = crate::setup::plan_from_env(
+        crate::setup::seed_plan(&h.state.snapshot(), Some("pds.example.com")),
+        &env,
+    );
+    assert!(plan.email.skipped, "no SMTP URL, no email");
+    assert!(!plan.has_operator() && plan.admin_password.is_some());
+    assert_eq!(plan.handle_domains, [".example.com"]);
+
+    // Without the backup acknowledgement nothing is applied.
+    let mut unacked = env.clone();
+    unacked.remove("LOCUS_SETUP_KEYS_BACKUP_ACKNOWLEDGED");
+    let err = crate::setup::headless(&h.state, &unacked)
+        .await
+        .unwrap_err();
+    assert!(err.contains("master key"), "{err}");
+    assert!(!h.state.store.setup_completed().await.unwrap());
+
+    // Two runs at once: exactly one applies.
+    let (a, b) = tokio::join!(
+        crate::setup::apply(&h.state.store, &h.state.master_key, &plan, false),
+        crate::setup::apply(&h.state.store, &h.state.master_key, &plan, false),
+    );
+    let wins = [&a, &b].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(wins, 1, "{a:?} {b:?}");
+    assert!(
+        [&a, &b]
+            .iter()
+            .any(|r| matches!(r, Err(crate::setup::ApplyError::AlreadyComplete)))
+    );
+    let stored = h
+        .state
+        .store
+        .get_secret(
+            crate::state::secret_names::ADMIN_PASSWORD,
+            &h.state.master_key,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&stored[..], b"from-the-reference-env");
+    let snap = h.state.store.load_snapshot().await.unwrap();
+    assert_eq!(snap.text("deploy.proxy_mode"), "other");
+    assert_eq!(snap.list("identity.reserved_handles"), ["pds"]);
+}
+
+#[tokio::test]
+async fn reserved_handles_from_setup_are_refused() {
+    let h = harness(false).await;
+    h.state
+        .store
+        .set_setting("identity.handle_domains", json!([".example.com"]), "test")
+        .await
+        .unwrap();
+    h.state
+        .store
+        .set_setting(
+            "identity.reserved_handles",
+            json!(["kitchen", "orchard"]),
+            "test",
+        )
+        .await
+        .unwrap();
+    h.state.settings.refresh().await.unwrap();
+    for handle in ["kitchen.example.com", "Orchard.example.com"] {
+        assert!(
+            !locus_identity::handle::is_reserved(&handle.to_ascii_lowercase()[..7]),
+            "not on the built-in list"
+        );
+        let (st, v) = h
+            .call(
+                "POST",
+                "/xrpc/com.atproto.server.createAccount",
+                None,
+                Some(json!({"handle": handle, "email": "x@example.com", "password": "pw"})),
+            )
+            .await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("HandleNotAvailable")),
+            "{handle}: {v}"
+        );
+    }
+    h.create_account("kitchens.example.com", "y@example.com", "pw")
+        .await;
+}
+
+#[tokio::test]
+async fn the_wizard_is_gone_after_setup() {
+    let h = harness(false).await;
+    for path in ["/setup", "/setup/hostname", "/setup/probe"] {
+        assert_eq!(
+            h.call("GET", path, None, None).await.0,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
     }
 }

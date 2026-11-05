@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block main_class %} class="narrow"{% endblock %}
+{% block content %}
+<h1>Set up this PDS</h1>
+{% if let Some(e) = error %}<div class="banner bad" role="alert">{{ e }}</div>{% endif %}
+<div class="card">
+<p>To start, enter the setup token. It's in the log of the first node that started{% if !token_path.is_empty() %}, and in <code>{{ token_path }}</code> on that node{% endif %}.</p>
+<form class="stack" method="post" action="/setup/token">
+<label for="token">Setup token</label>
+<input type="password" id="token" name="token" autocomplete="off" spellcheck="false" required autofocus>
+<div class="hint">The token stops anyone else from setting up this server while it waits. It stops working once setup is done. Lost it? Run <code>aurora-locus setup --new-token</code> on the server.</div>
+<div class="row"><button type="submit">Continue</button></div>
+</form>
+</div>
+{% endblock %}

@@ -26,6 +26,7 @@ pub mod repo;
 pub mod routing;
 pub mod scanner;
 pub mod server;
+pub mod setup;
 pub mod state;
 pub mod sync;
 pub mod web;
@@ -340,6 +341,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/oauth/assets/style.css", get(oauth_ui::style))
         .route("/oauth/assets/form-post.js", get(oauth_ui::form_post_js))
         .route("/static/{*path}", get(web::asset))
+        .route("/setup", get(setup::index))
+        .route("/setup/token", post(setup::enter_token))
+        .route("/setup/probe", get(setup::probe_answer))
+        .route(
+            "/setup/{step}",
+            get(setup::show_step).post(setup::save_step),
+        )
         .route(
             "/xrpc/app.bsky.actor.getPreferences",
             get(bsky::get_preferences),
@@ -388,6 +396,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routing::headers_and_deadline,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            setup::gate,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

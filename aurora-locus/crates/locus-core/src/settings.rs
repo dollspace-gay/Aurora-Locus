@@ -796,6 +796,20 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Accept the reference's admin:<password> Basic auth on the reference admin surface (it counts as the admin role).",
     },
+    Def {
+        key: "identity.reserved_handles",
+        kind: Kind::TextList { max_len: 63 },
+        default: "[]",
+        env: None,
+        description: "First labels no one may register under a handle domain, besides the built-in list (setup adds the PDS hostname's label and the domain's existing subdomains).",
+    },
+    Def {
+        key: "deploy.proxy_mode",
+        kind: Kind::Choice(&["caddy", "cloudflare", "other", "direct"]),
+        default: r#""caddy""#,
+        env: None,
+        description: "How requests reach locus: the bundled Caddy, Cloudflare's proxy in front of Caddy, another reverse proxy, or direct TLS.",
+    },
 ];
 
 /// Looks up a setting definition.

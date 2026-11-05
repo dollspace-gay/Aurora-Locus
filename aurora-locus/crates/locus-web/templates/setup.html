@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="eyebrow">Setup · step {{ step.index() + 1 }} of 10</p>
+<h1>{{ step.title() }}</h1>
+<ol class="steps">
+{% for s in steps %}<li{% if s.current %} aria-current="step"{% else if s.done %} class="done"{% endif %}>{% if s.current %}{{ s.title }}{% else %}<a href="{{ s.href }}">{{ s.title }}</a>{% endif %}</li>
+{% endfor %}</ol>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+
+{% if self.is("hostname") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/hostname">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="hostname">The PDS hostname</label>
+<input type="text" id="hostname" name="hostname" value="{{ f.hostname }}" placeholder="pds.example.com" autocomplete="off" spellcheck="false" required autofocus>
+<div class="hint">The name people's apps reach this server at, with no https:// and no path. It's part of every account's identity, so pick one you'll keep.{% if f.dev %} Dev mode is on, so localhost works too.{% endif %}</div>
+<label for="service_name">Service name <span class="muted">(optional)</span></label>
+<input type="text" id="service_name" name="service_name" value="{{ f.service_name }}" placeholder="Example PDS">
+<div class="hint">Shown on sign-in pages and in emails. Empty uses the hostname.</div>
+<label for="contact_email">Contact email <span class="muted">(optional)</span></label>
+<input type="email" id="contact_email" name="contact_email" value="{{ f.contact_email }}" placeholder="admin@example.com">
+<div class="hint">Given to apps that ask how to reach whoever runs this server.</div>
+<div class="row"><button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("storage") %}
+<div class="card">
+<p>Where this PDS keeps its data is fixed when the server starts, so this step only confirms it and tests it.</p>
+<dl class="facts">
+<div class="fact"><dt>Database</dt><dd>{{ f.database }}</dd></div>
+<div class="fact"><dt>Blob storage</dt><dd>{{ f.blob_store }}</dd></div>
+</dl>
+{% if f.storage_ok %}<div class="banner ok">Tested: {{ f.storage_detail }}</div>{% else %}<div class="banner bad">The test failed: {{ f.storage_detail }}</div>{% endif %}
+<form class="stack" method="post" action="/setup/storage">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="hint">To change storage, stop the server, change its configuration, and start it again. Moving later is done with <code>aurora-locus migrate</code>.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("proxy") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/proxy">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<fieldset class="choices column"><legend>How requests reach this server</legend>
+{% for c in f.proxy_options %}<label class="choice"><input type="radio" name="proxy" value="{{ c.value }}"{% if c.checked %} checked{% endif %}> {{ c.label }}</label>
+{% endfor %}</fieldset>
+<div class="hint">With Cloudflare, set its SSL/TLS mode to Full (strict): Flexible sends traffic to this server unencrypted, and the final checks fail on it.</div>
+<label for="trusted_proxies">Trusted proxy addresses <span class="muted">(optional)</span></label>
+<textarea id="trusted_proxies" name="trusted_proxies" rows="3" spellcheck="false" placeholder="172.30.0.0/24">{{ f.trusted_proxies }}</textarea>
+<div class="hint">One range per line. Only these may tell locus a visitor's real address. Empty keeps the default: this machine only (127.0.0.0/8 and ::1), which is right for Caddy on the same host.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("handles") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/handles">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<fieldset class="choices column"><legend>Handles go under</legend>
+{% for c in f.handle_options %}<label class="choice"><input type="checkbox" name="domain" value="{{ c.value }}"{% if c.checked %} checked{% endif %}> {{ c.label }}</label>
+{% endfor %}</fieldset>
+<div class="hint">For a hostname like pds.example.com, handles like alice.example.com are shorter, and one wildcard level is all Cloudflare's free certificate covers.{% if f.cloudflare %} Handles two levels deep would need Cloudflare's Advanced Certificate.{% endif %}</div>
+<label for="other_handle_domains">Other domains <span class="muted">(optional)</span></label>
+<textarea id="other_handle_domains" name="other_handle_domains" rows="2" spellcheck="false" placeholder="example.net">{{ f.other_handle_domains }}</textarea>
+<div class="hint">Any other domain you control, one per line.</div>
+<label for="existing_subdomains">Subdomains already in use</label>
+<textarea id="existing_subdomains" name="existing_subdomains" rows="3" spellcheck="false" placeholder="www&#10;mail">{{ f.existing_subdomains }}</textarea>
+<div class="hint">The handle domain's names that already point somewhere (www, mail, …). No one can take them as a handle, and their DNS records keep working.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% if !f.dns.is_empty() %}
+<h2>DNS records</h2>
+<p>Create these at your DNS provider. The last step checks them.</p>
+<div class="scroll"><table>
+<thead><tr><th class="name">Name</th><th class="text">Points to</th><th class="text">Why</th></tr></thead>
+<tbody>
+{% for r in f.dns %}<tr><td class="name"><code>{{ r.name }}</code></td><td class="text"><div class="cell-text">{{ r.points_to }}</div></td><td class="text"><div class="cell-text">{{ r.note }}</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% endif %}
+{% endif %}
+
+{% if self.is("operator") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/operator">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p>Operators run the PDS from the console at /admin. They aren't accounts on it. This first one is the owner, who can add others.</p>
+<label for="username">Username</label>
+<input type="text" id="username" name="username" value="{{ f.username }}" autocomplete="username" spellcheck="false" required>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password"{% if !f.password_set %} required{% endif %}>
+<label for="password2">The password again</label>
+<input type="password" id="password2" name="password2" autocomplete="new-password"{% if !f.password_set %} required{% endif %}>
+<div class="hint">At least 12 characters.{% if f.password_set %} A password is saved; leave these empty to keep it.{% endif %} After setup, the console asks you to add a sign-in code app (TOTP), which is strongly recommended.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("email") %}
+<div class="card">
+<p>Email sends sign-up confirmations, password resets and sign-in codes. Status: <span class="{{ f.email_class }}">{{ f.email_status }}</span></p>
+<form class="stack" method="post" action="/setup/email">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="do" value="save">
+<label for="smtp_url">SMTP URL</label>
+<input type="password" id="smtp_url" name="smtp_url" autocomplete="off" spellcheck="false" placeholder="smtps://user:password@smtp.example.com"{% if !f.smtp_url_set %} required{% endif %}>
+<div class="hint">It carries the password, so it's stored encrypted and never shown again.{% if f.smtp_url_set %} One is saved; enter a new one to replace it.{% endif %}</div>
+<label for="from_address">Send from</label>
+<input type="text" id="from_address" name="from_address" value="{{ f.from_address }}" placeholder="Example PDS &lt;noreply@example.com&gt;" required>
+<div class="row"><button type="submit" class="secondary">Save and test the connection</button></div>
+</form>
+{% if f.smtp_url_set %}
+<form class="stack" method="post" action="/setup/email">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="do" value="send">
+<label for="to">Send a test email to</label>
+<input type="email" id="to" name="to" value="{{ f.test_sent_to }}" required>
+<div class="row"><button type="submit" class="secondary">Send a test email</button></div>
+</form>
+{% endif %}
+{% if !f.test_sent_to.is_empty() %}
+<form class="stack" method="post" action="/setup/email">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="do" value="verify">
+<label for="code">The code in the test email</label>
+<input type="text" id="code" name="code" autocomplete="one-time-code" spellcheck="false" placeholder="XXXXX-XXXXX" required>
+<div class="row"><button type="submit">Confirm the code</button></div>
+</form>
+{% endif %}
+</div>
+<div class="card">
+<form class="stack" method="post" action="/setup/email">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+{% if f.email_ready %}
+<input type="hidden" name="do" value="next">
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Continue</button></div>
+{% else %}
+<input type="hidden" name="do" value="skip">
+<p>Without email, people can't confirm their address, reset a forgotten password by email or get sign-in codes, and sign-ups can't require a confirmed address. You can set it up later in the console.</p>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit" class="secondary">Continue without email</button></div>
+{% endif %}
+</form>
+</div>
+{% endif %}
+
+{% if self.is("services") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/services">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="appview_url">AppView URL</label>
+<input type="url" id="appview_url" name="appview_url" value="{{ f.appview_url }}">
+<label for="appview_did">AppView DID</label>
+<input type="text" id="appview_did" name="appview_did" value="{{ f.appview_did }}" spellcheck="false">
+<div class="hint">Where timelines, profiles and search come from. The defaults are Bluesky's. Empty both for none.</div>
+<label for="crawlers">Relays to notify</label>
+<textarea id="crawlers" name="crawlers" rows="2" spellcheck="false">{{ f.crawlers }}</textarea>
+<div class="hint">One URL per line. Relays carry this server's posts to the rest of the network.</div>
+<label for="moderation_url">Moderation service URL <span class="muted">(optional)</span></label>
+<input type="url" id="moderation_url" name="moderation_url" value="{{ f.moderation_url }}">
+<label for="moderation_did">Moderation service DID</label>
+<input type="text" id="moderation_did" name="moderation_did" value="{{ f.moderation_did }}" spellcheck="false">
+<div class="hint">A moderation service of your own (for example cairn), which may take down content here.</div>
+<label for="report_url">Reports go to</label>
+<input type="url" id="report_url" name="report_url" value="{{ f.report_url }}">
+<label for="report_did">Its DID</label>
+<input type="text" id="report_did" name="report_did" value="{{ f.report_did }}" spellcheck="false">
+<div class="hint">The defaults are Bluesky's moderation service, as the reference installer sets.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("private") %}
+<div class="card">
+<form class="stack" method="post" action="/setup/private">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p>Private posts are shared only with an audience their author picks. They're stored encoded here and shown only to that audience.</p>
+<label class="check"><input type="checkbox" name="private_tier" value="1"{% if f.private_tier %} checked{% endif %}> Allow private posts</label>
+<div class="hint">They work only with an AppView that supports them{% if !f.appview_set %}, and none is set, so this has no effect until one is{% endif %}.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("keys") %}
+<div class="card">
+<p>This PDS's keys are made and stored encrypted under its master key.</p>
+<dl class="facts">
+<div class="fact"><dt>PLC rotation key</dt><dd><code>{{ f.rotation_key }}</code></dd></div>
+<div class="fact"><dt>Master key</dt><dd>{{ f.master_key_source }}{% if !f.master_key_path.is_empty() %}, at <code>{{ f.master_key_path }}</code>{% endif %} <span class="muted">(id {{ f.master_key_id }})</span></dd></div>
+</dl>
+<div class="banner bad">If the master key is lost, every stored key is lost with it, and this PDS can't sign for its accounts again. Keep a copy somewhere other than this server. <code>aurora-locus keys backup</code> writes an encrypted backup of the keys.</div>
+<form class="stack" method="post" action="/setup/keys">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="recovery_did_key">Your recovery key <span class="muted">(optional)</span></label>
+<input type="text" id="recovery_did_key" name="recovery_did_key" value="{{ f.recovery_did_key }}" placeholder="did:key:z…" spellcheck="false">
+<div class="hint">A did:key you hold offline, added to every new account's identity, so you can recover accounts even without this server's keys.</div>
+<label class="check"><input type="checkbox" name="keys_ack" value="1"{% if f.keys_ack %} checked{% endif %}> I have a copy of the master key</label>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
+</form>
+</div>
+{% endif %}
+
+{% if self.is("review") %}
+<div class="card">
+<dl class="facts">
+{% for (k, v) in f.summary %}<div class="fact"><dt>{{ k }}</dt><dd>{{ v }}</dd></div>
+{% endfor %}</dl>
+</div>
+<h2>Checks</h2>
+<form class="stack" method="post" action="/setup/review">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="scroll"><table>
+<thead><tr><th class="name">Check</th><th class="state">Result</th><th class="text">Details</th><th class="actions">Accept</th></tr></thead>
+<tbody>
+{% for c in f.checks %}<tr><td class="name">{{ c.label }}</td><td class="state"><span class="{{ c.class() }}">{{ c.word() }}</span></td><td class="text"><div class="cell-text">{{ c.detail }}</div></td><td class="actions">{% if c.outcome == "warn" %}<label class="check"><input type="checkbox" name="ack" value="{{ c.id }}"{% if c.acked %} checked{% endif %}> Accept</label>{% endif %}</td></tr>
+{% else %}<tr><td class="text" colspan="4"><div class="cell-text">Nothing checked yet.</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+<div class="hint">Failures must be fixed before finishing. Warnings can be accepted: tick each one you've read.</div>
+<label for="cf_token">Cloudflare API token <span class="muted">(optional, Cloudflare only)</span></label>
+<input type="password" id="cf_token" name="cf_token" autocomplete="off" spellcheck="false">
+<div class="hint">With a token that can read the zone, the check reads Cloudflare's SSL mode instead of asking you to confirm it. It isn't stored.</div>
+<div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit" name="do" value="check" class="secondary">Run the checks again</button><button type="submit" name="do" value="finish"{% if f.blocking %} disabled{% endif %}>Finish setup</button></div>
+</form>
+{% endif %}
+{% endblock %}

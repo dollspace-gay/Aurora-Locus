@@ -11,6 +11,8 @@ pub enum Template {
     DeleteAccount,
     PlcOperation,
     SignInCode,
+    /// Setup's (and the console's) proof that mail arrives.
+    TestEmail,
 }
 
 /// A rendered email.
@@ -60,6 +62,11 @@ impl Template {
                 subject: "Sign-in Confirmation",
                 intro: "Use this code to finish signing in as {{handle}} on {{service}}:",
                 outro: "If this wasn't you, change your password now.",
+            },
+            Self::TestEmail => Parts {
+                subject: "Test email",
+                intro: "This is a test from {{service}}. Enter this code where you set up email, to show mail arrives:",
+                outro: "If you aren't setting up a PDS, you can ignore this email.",
             },
         }
     }

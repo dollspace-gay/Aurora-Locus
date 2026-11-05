@@ -8,5 +8,6 @@
 //! models); the HTTP handlers that fill them live in `locus-http`.
 
 pub mod assets;
+pub mod setup;
 pub mod theme;
 pub mod view;

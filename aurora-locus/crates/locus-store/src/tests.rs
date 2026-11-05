@@ -1669,3 +1669,77 @@ async fn operators_and_admin_queries_on_both_backends() {
         assert!(s.invited_by("did:plc:x").await.unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn setup_state_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.setup_state().await.unwrap().is_none(), "{}", b.name);
+        assert!(!s.setup_completed().await.unwrap());
+        assert!(s.create_setup_token("h1").await.unwrap());
+        assert!(
+            !s.create_setup_token("h2").await.unwrap(),
+            "{}: first wins",
+            b.name
+        );
+        assert!(s.setup_token_matches("h1").await.unwrap());
+        assert!(!s.setup_token_matches("h2").await.unwrap());
+
+        s.add_setup_session("live", 60_000).await.unwrap();
+        s.add_setup_session("old", -1).await.unwrap();
+        assert!(s.setup_session_valid("live").await.unwrap(), "{}", b.name);
+        assert!(
+            !s.setup_session_valid("old").await.unwrap(),
+            "{}: expired",
+            b.name
+        );
+        assert!(s.save_setup_draft(r#"{"seeded":true}"#).await.unwrap());
+        s.set_setup_probe("nonce").await.unwrap();
+        s.record_setup_probe("https").await.unwrap();
+        let row = s.setup_state().await.unwrap().unwrap();
+        assert_eq!(
+            (
+                row.probe_nonce.as_deref(),
+                row.probe_seen.as_deref(),
+                row.draft_json.as_str()
+            ),
+            (Some("nonce"), Some("https"), r#"{"seeded":true}"#)
+        );
+
+        // A new token ends the old one's sessions.
+        assert!(s.replace_setup_token("h3").await.unwrap());
+        assert!(!s.setup_session_valid("live").await.unwrap(), "{}", b.name);
+        s.add_setup_session("live2", 60_000).await.unwrap();
+
+        // Completion is one conditional write, with the operator beside it.
+        let mut tx = s.begin().await.unwrap();
+        assert!(tx.complete_setup("pds.example.com", "setup").await.unwrap());
+        assert!(tx.create_operator("alice", "hash", "owner").await.unwrap());
+        assert!(!tx.create_operator("alice", "hash", "owner").await.unwrap());
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            !tx.complete_setup("other.example.com", "setup")
+                .await
+                .unwrap(),
+            "{}: once",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+        let row = s.setup_state().await.unwrap().unwrap();
+        assert!(row.completed_at.is_some());
+        assert_eq!(
+            (row.hostname.as_deref(), row.draft_json.as_str()),
+            (Some("pds.example.com"), "{}")
+        );
+        assert!(
+            !s.setup_session_valid("live2").await.unwrap(),
+            "{}: sessions end",
+            b.name
+        );
+        assert!(!s.setup_token_matches("h3").await.unwrap());
+        assert!(!s.save_setup_draft("{}").await.unwrap());
+        assert!(!s.replace_setup_token("h4").await.unwrap());
+        assert_eq!(s.operator("alice").await.unwrap().unwrap().role, "owner");
+    }
+}

@@ -64,3 +64,89 @@ pub fn render(t: &impl askama::Template, status: StatusCode) -> Response {
         }
     }
 }
+
+/// A `303 See Other` to `to`, uncached.
+pub fn redirect(to: &str) -> Response {
+    let mut res = StatusCode::SEE_OTHER.into_response();
+    if let Ok(v) = HeaderValue::from_str(to) {
+        res.headers_mut().insert(header::LOCATION, v);
+    }
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(assets::NO_STORE),
+    );
+    res
+}
+
+/// Adds a `Set-Cookie`.
+pub fn with_cookie(mut res: Response, cookie: &str) -> Response {
+    if let Ok(v) = HeaderValue::from_str(cookie) {
+        res.headers_mut().append(header::SET_COOKIE, v);
+    }
+    res
+}
+
+/// The request's cookies.
+pub fn cookies(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|p| {
+            p.trim()
+                .split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        })
+        .collect()
+}
+
+pub fn cookie<'a>(all: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    all.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// A form body's fields, in order.
+pub fn parse_form(body: &[u8]) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(body)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// The first value of a field, trimmed; empty when absent.
+pub fn field<'a>(form: &'a [(String, String)], name: &str) -> &'a str {
+    form.iter()
+        .find(|(k, _)| k == name)
+        .map_or("", |(_, v)| v.trim())
+}
+
+/// Every value of a field (checkbox groups).
+pub fn fields<'a>(form: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    form.iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.trim())
+        .collect()
+}
+
+/// Lines (or commas) of a text area, trimmed, empty ones dropped.
+pub fn lines(s: &str) -> Vec<String> {
+    s.split(['\n', ','])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a form post came from this site (browsers send
+/// `Sec-Fetch-Site`; one that says otherwise is refused).
+pub fn same_site(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| v == "same-origin")
+}
+
+/// Constant-time string equality.
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    !a.is_empty() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}

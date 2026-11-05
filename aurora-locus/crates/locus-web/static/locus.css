@@ -603,7 +603,12 @@ input[type=password]:focus, input[type=email]:focus, input[type=number]:focus, i
   outline: none;
 }
 input[type=checkbox] { accent-color: var(--accent); }
-label.check { display: flex; align-items: center; gap: 0.5rem; font-weight: 400; }
+label.check, form.stack label.check { display: flex; align-items: center; gap: 0.5rem; font-weight: 400; margin: 0.6rem 0; }
+form.stack label.choice { display: flex; margin: 0; font-weight: 400; }
+fieldset.column { flex-direction: column; gap: 0.6rem; }
+.warn { color: var(--warn); }
 main.narrow { max-width: 30rem; }
 .steps { list-style: none; padding: 0; margin: 0 0 1.25rem; display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; font-size: 0.85rem; color: var(--muted); }
 .steps li[aria-current="step"] { color: var(--accent); font-weight: 700; }
+.steps a { color: inherit; }
+.steps li.done { color: var(--fg); }

@@ -186,6 +186,16 @@ impl Mailer {
         Ok(status)
     }
 
+    /// Records that a test email sent with the current URL arrived.
+    pub async fn mark_verified(&self, sender: Sender) -> CoreResult<()> {
+        if let Some(url) = self.url(sender).await? {
+            self.store
+                .set_sender_state(sender, SenderStatus::Verified, &url_hash(&url), None)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Imports `PDS_EMAIL_SMTP_URL` and `PDS_MODERATION_EMAIL_SMTP_URL` when
     /// they differ from what's stored, then checks every stored URL.
     pub async fn import_env_and_check(&self, env: &HashMap<String, String>) -> CoreResult<()> {

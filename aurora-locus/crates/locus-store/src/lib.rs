@@ -24,6 +24,7 @@ pub mod scan;
 pub mod secrets;
 pub mod seq;
 pub mod settings;
+pub mod setup;
 
 #[cfg(test)]
 mod tests;
