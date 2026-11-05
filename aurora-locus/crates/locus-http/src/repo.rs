@@ -70,8 +70,20 @@ async fn local_account(s: &AppState, repo: &str) -> XrpcResult<Option<Account>> 
 
 /// A write's caller and target, as the reference: the token's account must
 /// be `repo`, and active (not deactivated or taken down).
-async fn writer(s: &AppState, headers: &HeaderMap, repo: &str) -> XrpcResult<Account> {
-    let authed = auth::access(s, headers).await?;
+/// What an OAuth token must allow for a write (legacy tokens skip it).
+type RepoCheck<'a> = &'a (
+        dyn Fn(&locus_auth::scopes::Permissions) -> Result<(), locus_auth::scopes::ScopeMissing>
+            + Sync
+    );
+
+async fn writer(
+    s: &AppState,
+    headers: &HeaderMap,
+    repo: &str,
+    check: RepoCheck<'_>,
+) -> XrpcResult<Account> {
+    let authed = auth::authorization(s, headers, auth::STANDARD, &[], auth::any_scope).await?;
+    auth::require(&authed, check)?;
     let account = local_account(s, repo)
         .await?
         .ok_or_else(|| XrpcError::invalid_request(format!("Could not find repo: {repo}")))?;
@@ -179,7 +191,10 @@ pub async fn create_record(
     headers: HeaderMap,
     Json(input): Json<CreateRecordInput>,
 ) -> XrpcResult<Json<Value>> {
-    let account = writer(&s, &headers, &input.repo).await?;
+    let account = writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(&input.collection, "create")
+    })
+    .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 3).await?;
     check_collection(&input.collection)?;
     let rkey = input.rkey.clone().unwrap_or_else(|| s.repo.tids().next());
@@ -239,7 +254,11 @@ pub async fn put_record(
     headers: HeaderMap,
     Json(input): Json<PutRecordInput>,
 ) -> XrpcResult<Json<Value>> {
-    let account = writer(&s, &headers, &input.repo).await?;
+    let account = writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(&input.collection, "create")?;
+        p.assert_repo(&input.collection, "update")
+    })
+    .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 2).await?;
     check_collection(&input.collection)?;
     let rec = records::prepare_record(
@@ -294,7 +313,10 @@ pub async fn delete_record(
     headers: HeaderMap,
     Json(input): Json<DeleteRecordInput>,
 ) -> XrpcResult<Json<Value>> {
-    let account = writer(&s, &headers, &input.repo).await?;
+    let account = writer(&s, &headers, &input.repo, &|p| {
+        p.assert_repo(&input.collection, "delete")
+    })
+    .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 1).await?;
     check_collection(&input.collection)?;
     let swap = input
@@ -339,7 +361,19 @@ pub async fn apply_writes(
     headers: HeaderMap,
     Json(input): Json<ApplyWritesInput>,
 ) -> XrpcResult<Json<Value>> {
-    let account = writer(&s, &headers, &input.repo).await?;
+    let account = writer(&s, &headers, &input.repo, &|p| {
+        for w in &input.writes {
+            let action = match w["$type"].as_str() {
+                Some("com.atproto.repo.applyWrites#create") => "create",
+                Some("com.atproto.repo.applyWrites#update") => "update",
+                Some("com.atproto.repo.applyWrites#delete") => "delete",
+                _ => continue,
+            };
+            p.assert_repo(w["collection"].as_str().unwrap_or(""), action)?;
+        }
+        Ok(())
+    })
+    .await?;
     // As the reference: creates 3 points, updates 2, deletes 1.
     let points: i64 = input
         .writes
@@ -639,7 +673,22 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         }) {
         auth::user_service_auth(&s, &headers, "com.atproto.repo.uploadBlob").await?
     } else {
-        auth::access(&s, &headers).await?.did
+        let mime = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
+            Ok(p.assert_blob(&mime)?)
+        })
+        .await?
+        .did
     };
     let account = auth::account_checked(&s, &did, true).await?;
     crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::UPLOAD_BLOB]).await?;
@@ -789,7 +838,7 @@ async fn serve_blob(
             )
         })?;
     // The owner bypasses the status refusals, as the reference.
-    let owner = auth::access(s, headers)
+    let owner = auth::authorization(s, headers, auth::STANDARD, &[], auth::any_scope)
         .await
         .is_ok_and(|a| a.did == account.did);
     if !owner {

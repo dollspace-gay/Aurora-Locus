@@ -128,7 +128,10 @@ pub async fn send(
 }
 
 pub async fn request_email_confirmation(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
+        Ok(p.assert_account("email", "manage")?)
+    })
+    .await?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestEmailConfirmation-0";
@@ -176,7 +179,16 @@ pub async fn confirm_email(
 }
 
 pub async fn request_email_update(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::FULL,
+        &[],
+        auth::forbid(
+            "Use the account manager interface to update email address associated with an account",
+        ),
+    )
+    .await?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestEmailUpdate-0";
@@ -334,6 +346,8 @@ pub async fn reset_password(State(s): St, Json(input): Json<ResetPasswordInput>)
     // Every session ends, app-password ones included.
     tx.revoke_sessions(&did, SessionFilter::All).await?;
     tx.commit().await?;
+    // OAuth grants too **[deviation]** (the reference's reset leaves them).
+    s.store.oauth_delete_account_tokens(&did).await?;
     Ok(())
 }
 

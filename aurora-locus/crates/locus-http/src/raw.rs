@@ -504,9 +504,15 @@ async fn read_after_write_inner(
     headers: &HeaderMap,
     munge: Munge,
 ) -> Result<Response, Response> {
-    let authed = auth::access(s, headers)
-        .await
-        .map_err(IntoResponse::into_response)?;
+    let authed = auth::authorization(
+        s,
+        headers,
+        auth::STANDARD,
+        &[],
+        pt::rpc_check(s, headers, lxm),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
     let up = forward(s, lxm, uri, headers, &authed.did).await?;
     if up.status().as_u16() >= 400 {
         let e = pt::UpstreamError::read(s, up).await;
@@ -874,9 +880,17 @@ async fn get_feed_inner(
     headers: &HeaderMap,
     feed: &str,
 ) -> Result<Response, Response> {
-    let authed = auth::access(s, headers)
-        .await
-        .map_err(IntoResponse::into_response)?;
+    let feed_check = pt::rpc_check(s, headers, "app.bsky.feed.getFeed");
+    let aud = pt::proxy_to(s, headers, "app.bsky.feed.getFeed");
+    let authed = auth::authorization(s, headers, auth::STANDARD, &[], |p| {
+        feed_check(p)?;
+        if let Some(a) = &aud {
+            p.assert_rpc("app.bsky.feed.getFeedSkeleton", a)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(IntoResponse::into_response)?;
     let parts: Vec<&str> = feed
         .strip_prefix("at://")
         .unwrap_or(feed)
@@ -983,7 +997,7 @@ async fn push_inner(
     body: Bytes,
     extra: &[&str],
 ) -> Result<Response, Response> {
-    let authed = auth::access_with(s, headers, auth::STANDARD, extra)
+    let authed = auth::authorization(s, headers, auth::STANDARD, extra, auth::any_scope)
         .await
         .map_err(IntoResponse::into_response)?;
     let input: Value = serde_json::from_slice(&body)
@@ -995,6 +1009,10 @@ async fn push_inner(
                 .into_response()
         })?
         .to_owned();
+    // The service is only known from the body, so OAuth's rpc scope is
+    // checked here, as the reference.
+    let notif = format!("{service_did}#bsky_notif");
+    auth::require(&authed, |p| p.assert_rpc(lxm, &notif)).map_err(IntoResponse::into_response)?;
     let (url, av_did) =
         pt::appview(s).ok_or_else(|| XrpcError::internal("no AppView").into_response())?;
     let (target, strict) = if service_did == av_did {

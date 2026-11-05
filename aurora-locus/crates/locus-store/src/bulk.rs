@@ -290,9 +290,18 @@ impl Tx {
             "identity_repair WHERE did",
             "did_cache WHERE did",
             "account_pref WHERE did",
+            "oauth_used_refresh WHERE token_id IN (SELECT id FROM oauth_token WHERE did",
+            "oauth_token WHERE did",
+            "oauth_account_device WHERE did",
+            "oauth_authorized_client WHERE did",
         ] {
-            let sqlite = format!("DELETE FROM {table_col} = ?1");
-            let pg = format!("DELETE FROM {table_col} = $1");
+            let close = if table_col.contains("(SELECT") {
+                ")"
+            } else {
+                ""
+            };
+            let sqlite = format!("DELETE FROM {table_col} = ?1{close}");
+            let pg = format!("DELETE FROM {table_col} = $1{close}");
             total += on_tx!(self, sqlite, pg, |q, ex| sqlx::query(q)
                 .bind(did)
                 .execute(ex)

@@ -131,7 +131,10 @@ pub async fn update_handle(
     headers: HeaderMap,
     Json(input): Json<UpdateHandleInput>,
 ) -> XrpcResult<()> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
+        Ok(p.assert_identity("handle")?)
+    })
+    .await?;
     {
         use crate::ratelimit::buckets::{UPDATE_HANDLE_5M, UPDATE_HANDLE_DAY};
         crate::ratelimit::limit(
@@ -422,7 +425,7 @@ pub async fn get_recommended_did_credentials(
     State(s): St,
     headers: HeaderMap,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], auth::any_scope).await?;
     let signing = s.signing_key(&authed.did).await?;
     let mut rotation_keys = Vec::new();
     let recovery = s.snapshot().text("identity.recovery_did_key").to_owned();
@@ -443,11 +446,12 @@ pub async fn get_recommended_did_credentials(
 
 /// Emails a code that `signPlcOperation` needs.
 pub async fn request_plc_operation_signature(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
-    let authed = auth::access_with(
+    let authed = auth::authorization(
         &s,
         &headers,
         auth::FULL,
         &[locus_auth::session::SCOPE_TAKENDOWN],
+        |p| Ok(p.assert_identity("*")?),
     )
     .await?;
     let account = s
@@ -493,11 +497,12 @@ pub async fn sign_plc_operation(
     headers: HeaderMap,
     Json(input): Json<SignPlcOperationInput>,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::access_with(
+    let authed = auth::authorization(
         &s,
         &headers,
         auth::FULL,
         &[locus_auth::session::SCOPE_TAKENDOWN],
+        |p| Ok(p.assert_identity("*")?),
     )
     .await?;
     let did = authed.did.as_str();
@@ -583,7 +588,10 @@ pub async fn submit_plc_operation(
     headers: HeaderMap,
     Json(input): Json<SubmitPlcOperationInput>,
 ) -> XrpcResult<()> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
+        Ok(p.assert_identity("*")?)
+    })
+    .await?;
     let did = authed.did.as_str();
     let invalid = || XrpcError::invalid_request("Invalid operation");
     let op = plc::SignedOp::from_json(&input.operation).map_err(|_| invalid())?;

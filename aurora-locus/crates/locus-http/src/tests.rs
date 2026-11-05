@@ -4739,3 +4739,343 @@ async fn include_scopes_expand_from_a_published_permission_set() {
             .is_err()
     );
 }
+
+impl Harness {
+    /// An OAuth grant for `did` to the loopback client `client_id`, through
+    /// PAR, approval and the code exchange. Returns the token response.
+    async fn oauth_grant(
+        &self,
+        client: &DpopClient,
+        client_id: &str,
+        scope: &str,
+        did: &str,
+    ) -> Value {
+        let (verifier, challenge) = pkce();
+        let redirect = "http://127.0.0.1/";
+        let (st, _, v) = client
+            .post(
+                self,
+                "/oauth/par",
+                &[
+                    ("client_id", client_id),
+                    ("response_type", "code"),
+                    ("scope", scope),
+                    ("redirect_uri", redirect),
+                    ("code_challenge", &challenge),
+                    ("code_challenge_method", "S256"),
+                ],
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{v}");
+        let id =
+            locus_auth::oauth::request::request_id_from_uri(v["request_uri"].as_str().unwrap())
+                .unwrap()
+                .to_owned();
+        crate::oauth::open_request(&self.state, &id, "dev-t", client_id)
+            .await
+            .unwrap();
+        let (code, _) = crate::oauth::authorize(&self.state, &id, "dev-t", did, None)
+            .await
+            .unwrap();
+        let (st, _, tok) = client
+            .post(
+                self,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("code", &code),
+                    ("redirect_uri", redirect),
+                    ("code_verifier", &verifier),
+                    ("client_id", client_id),
+                ],
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{tok}");
+        tok
+    }
+
+    /// An XRPC call with an OAuth access token and a fresh DPoP proof.
+    async fn oauth_call(
+        &self,
+        client: &DpopClient,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let url = format!("https://pds.example.com{}", path.split('?').next().unwrap());
+        let proof = client.proof(method, &url, Some(token));
+        let auth = format!("DPoP {token}");
+        let mut hs: Vec<(&str, &str)> = vec![("authorization", &auth), ("dpop", &proof)];
+        let body_bytes = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+        if !body_bytes.is_empty() {
+            hs.push(("content-type", "application/json"));
+        }
+        let (st, headers, bytes) = self.raw(method, path, None, body_bytes, &hs).await;
+        if let Some(n) = headers.get("dpop-nonce") {
+            *client.nonce.lock().unwrap() = Some(n.to_str().unwrap().to_owned());
+        }
+        (
+            st,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+}
+
+#[tokio::test]
+async fn oauth_tokens_reach_endpoints_their_scopes_allow() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("rsu.pds.example.com", "rsu@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let client = DpopClient::new();
+    let client_id = "http://localhost?scope=atproto+repo%3Aapp.bsky.feed.post%3Faction%3Dcreate";
+    let tok = h
+        .oauth_grant(
+            &client,
+            client_id,
+            "atproto repo:app.bsky.feed.post?action=create",
+            &did,
+        )
+        .await;
+    let at = tok["access_token"].as_str().unwrap().to_owned();
+
+    // getSession works, without the email (no account:email scope).
+    let (st, headers, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["did"], did.as_str());
+    assert!(v.get("email").is_none() && v.get("emailConfirmed").is_none());
+    assert!(
+        headers.contains_key("dpop-nonce"),
+        "a fresh nonce on every response"
+    );
+
+    // Creating a post is granted; deleting isn't.
+    let record = json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "3m7aaaaaaaaad", "record": post_record("via oauth")});
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(record),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "POST",
+            "/xrpc/com.atproto.repo.deleteRecord",
+            Some(json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": "3m7aaaaaaaaad"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str(), v["message"].as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            Some("ScopeMissingError"),
+            Some("Missing required scope \"repo:app.bsky.feed.post?action=delete\"")
+        )
+    );
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "POST",
+            "/xrpc/com.atproto.server.createAppPassword",
+            Some(json!({"name": "x"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str(), v["message"].as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            Some("Forbidden"),
+            Some("OAuth credentials are not supported for this endpoint")
+        )
+    );
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "POST",
+            "/xrpc/com.atproto.server.activateAccount",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("Forbidden"))
+    );
+    // Endpoints with no OAuth path refuse the scheme.
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "POST",
+            "/xrpc/com.atproto.server.updateEmail",
+            Some(json!({"email": "x@example.com"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidToken"))
+    );
+
+    // Proof problems: none, a stale nonce, a replay.
+    let auth = format!("DPoP {at}");
+    let (st, _, b) = h
+        .raw(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+            vec![],
+            &[("authorization", &auth)],
+        )
+        .await;
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("DPoP proof required"))
+    );
+    *client.nonce.lock().unwrap() = Some("stale".into());
+    let proof = client.proof(
+        "GET",
+        "https://pds.example.com/xrpc/com.atproto.server.getSession",
+        Some(&at),
+    );
+    let (st, headers, b) = h
+        .raw(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+            vec![],
+            &[("authorization", &auth), ("dpop", &proof)],
+        )
+        .await;
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("use_dpop_nonce"))
+    );
+    assert!(
+        headers["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .starts_with("DPoP ")
+    );
+    assert!(
+        headers["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .contains("error=\"use_dpop_nonce\"")
+    );
+    *client.nonce.lock().unwrap() = Some(headers["dpop-nonce"].to_str().unwrap().to_owned());
+    let proof = client.proof(
+        "GET",
+        "https://pds.example.com/xrpc/com.atproto.server.getSession",
+        Some(&at),
+    );
+    let hs = [("authorization", auth.as_str()), ("dpop", proof.as_str())];
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+            vec![],
+            &hs,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, b) = h
+        .raw(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+            vec![],
+            &hs,
+        )
+        .await;
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("DPoP proof replayed"))
+    );
+    // Another key can't use the token.
+    let thief = DpopClient::new();
+    *thief.nonce.lock().unwrap() = client.nonce.lock().unwrap().clone();
+    let (st, _, v) = h
+        .oauth_call(
+            &thief,
+            &at,
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("Invalid DPoP key binding"))
+    );
+
+    // Revocation takes effect on the next request; so does a password reset.
+    client
+        .post(
+            &h,
+            "/oauth/revoke",
+            &[
+                ("token", tok["refresh_token"].as_str().unwrap()),
+                ("client_id", client_id),
+            ],
+        )
+        .await;
+    let (st, _, v) = h
+        .oauth_call(
+            &client,
+            &at,
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("invalid_token"))
+    );
+    let tok = h
+        .oauth_grant(
+            &client,
+            client_id,
+            "atproto repo:app.bsky.feed.post?action=create",
+            &did,
+        )
+        .await;
+    let at = tok["access_token"].as_str().unwrap().to_owned();
+    h.state
+        .store
+        .oauth_delete_account_tokens(&did)
+        .await
+        .unwrap();
+    let (st, _, _) = h
+        .oauth_call(
+            &client,
+            &at,
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}

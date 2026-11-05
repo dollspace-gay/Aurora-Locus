@@ -13,6 +13,8 @@ pub struct XrpcError {
     pub status: StatusCode,
     pub error: String,
     pub message: String,
+    /// A `WWW-Authenticate` challenge (OAuth and DPoP errors).
+    pub www_authenticate: Option<String>,
 }
 
 impl XrpcError {
@@ -21,6 +23,7 @@ impl XrpcError {
             status,
             error: error.to_owned(),
             message: message.into(),
+            www_authenticate: None,
         }
     }
 
@@ -47,11 +50,42 @@ impl XrpcError {
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
-        (
+        let mut res = (
             self.status,
             Json(json!({"error": self.error, "message": self.message})),
         )
-            .into_response()
+            .into_response();
+        if let Some(w) = &self.www_authenticate
+            && let Ok(v) = axum::http::HeaderValue::from_str(w)
+        {
+            res.headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, v);
+            res.headers_mut().append(
+                axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                axum::http::HeaderValue::from_static("WWW-Authenticate"),
+            );
+        }
+        res
+    }
+}
+
+impl From<locus_auth::oauth::OAuthError> for XrpcError {
+    /// As the reference's resource server: the OAuth error code as the
+    /// XRPC error name, with its status and challenge.
+    fn from(e: locus_auth::oauth::OAuthError) -> Self {
+        let e = e.for_resource();
+        Self {
+            status: StatusCode::from_u16(e.status).unwrap_or(StatusCode::UNAUTHORIZED),
+            error: e.error,
+            message: e.description,
+            www_authenticate: e.www_authenticate,
+        }
+    }
+}
+
+impl From<locus_auth::scopes::ScopeMissing> for XrpcError {
+    fn from(e: locus_auth::scopes::ScopeMissing) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "ScopeMissingError", e.to_string())
     }
 }
 

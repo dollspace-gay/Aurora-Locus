@@ -629,10 +629,16 @@ pub(crate) async fn proxy_inner(
     } else {
         &[]
     };
-    let authed = auth::access_with(s, headers, auth::STANDARD, extra)
-        .await
-        .map_err(err)?;
-    if is_privileged_method(lxm) && !auth::PRIVILEGED.contains(&authed.scope.as_str()) {
+    let aud = format!("{}#{}", target.did, target.service_id);
+    let authed = auth::authorization(s, headers, auth::STANDARD, extra, |p| {
+        Ok(p.assert_rpc(lxm, &aud)?)
+    })
+    .await
+    .map_err(err)?;
+    if authed.oauth.is_none()
+        && is_privileged_method(lxm)
+        && !auth::PRIVILEGED.contains(&authed.scope.as_str())
+    {
         return Err(err(XrpcError::named("InvalidToken", "Bad token method")));
     }
     let accept = headers
@@ -657,4 +663,31 @@ pub(crate) async fn proxy_inner(
     )
     .await?;
     Ok(stream_back(s, upstream))
+}
+
+/// The `did#service` a request for `lxm` goes to (the reference's
+/// `computeProxyTo`): the `atproto-proxy` header, or the default service.
+/// None when nothing is configured.
+#[must_use]
+pub fn proxy_to(s: &AppState, headers: &HeaderMap, lxm: &str) -> Option<String> {
+    if let Some(v) = headers.get("atproto-proxy").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_owned());
+    }
+    let (service_id, info) = default_service(s, lxm);
+    info.map(|(_, did)| format!("{did}#{service_id}"))
+}
+
+/// The OAuth check for a method answered by (or for) another service:
+/// `rpc:<lxm>` for its `did#service` (skipped when there's no service).
+pub fn rpc_check(
+    s: &AppState,
+    headers: &HeaderMap,
+    lxm: &str,
+) -> impl Fn(&locus_auth::scopes::Permissions) -> XrpcResult<()> {
+    let aud = proxy_to(s, headers, lxm);
+    let lxm = lxm.to_owned();
+    move |p| match &aud {
+        Some(a) => Ok(p.assert_rpc(&lxm, a)?),
+        None => Ok(()),
+    }
 }

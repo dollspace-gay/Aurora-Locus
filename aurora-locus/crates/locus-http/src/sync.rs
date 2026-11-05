@@ -168,11 +168,12 @@ async fn available(s: &AppState, headers: &HeaderMap, did: &str) -> XrpcResult<A
                 format!("Could not find repo for DID: {did}"),
             )
         })?;
-    let owner = crate::auth::access_with(
+    let owner = crate::auth::authorization(
         s,
         headers,
         crate::auth::STANDARD,
         &[locus_auth::session::SCOPE_TAKENDOWN],
+        crate::auth::any_scope,
     )
     .await
     .is_ok_and(|a| a.did == account.did);

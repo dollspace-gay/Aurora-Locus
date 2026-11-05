@@ -136,3 +136,180 @@ pub async fn account_checked(
 pub async fn full_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
     access_with(state, headers, FULL, &[]).await
 }
+
+// ---------------------------------------------------------------- OAuth
+
+use locus_auth::oauth::OAuthError;
+use locus_auth::scopes::Permissions;
+
+/// The scheme of the `Authorization` header (lowercased), if any.
+fn scheme(headers: &HeaderMap) -> Option<String> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    Some(v.split(' ').next().unwrap_or("").to_ascii_lowercase())
+}
+
+/// An endpoint OAuth tokens may not use (as the reference's
+/// `ForbiddenError` in an `authorize` callback).
+pub fn forbid(message: &'static str) -> impl Fn(&Permissions) -> XrpcResult<()> {
+    move |_| Err(XrpcError::new(StatusCode::FORBIDDEN, "Forbidden", message))
+}
+
+pub const OAUTH_UNSUPPORTED: &str = "OAuth credentials are not supported for this endpoint";
+
+/// Any OAuth token with `atproto`.
+pub fn any_scope(_: &Permissions) -> XrpcResult<()> {
+    Ok(())
+}
+
+/// Legacy access tokens (with `scopes` or `extra`) or OAuth access tokens,
+/// as the reference's `authorization()`: `check` is the endpoint's OAuth
+/// permission check (legacy tokens skip it).
+pub async fn authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    scopes: &[&str],
+    extra: &[&str],
+    check: impl Fn(&Permissions) -> XrpcResult<()>,
+) -> XrpcResult<Authed> {
+    match scheme(headers).as_deref() {
+        Some("dpop") => {
+            let authed = oauth_access(state, headers).await?;
+            if let Some(g) = &authed.oauth {
+                check(&g.permissions())?;
+            }
+            Ok(authed)
+        }
+        _ => access_with(state, headers, scopes, extra).await,
+    }
+}
+
+/// Verifies a DPoP-bound OAuth access token, statefully (the grant row is
+/// checked on every request, so a revoked token stops at once).
+pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
+    use locus_auth::session::{OAuthGrant, SCOPE_OAUTH};
+    use serde_json::Value;
+    let invalid = |m: &str| XrpcError::from(OAuthError::invalid_token("DPoP", m));
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' ').map(|(_, t)| t.trim().to_owned()))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| invalid("Malformed token"))?;
+    let jws =
+        locus_auth::oauth::jose::Jws::decode(&token).map_err(|_| invalid("Malformed token"))?;
+    state
+        .secrets
+        .oauth_key
+        .verify(&jws)
+        .map_err(|_| invalid("Invalid token"))?;
+    let p = &jws.payload;
+    if !jws.typ_is("at+jwt")
+        || p.get("iss").and_then(Value::as_str) != Some(crate::oauth::issuer(state).as_str())
+    {
+        return Err(invalid("Invalid token"));
+    }
+    if p.get("aud").and_then(Value::as_str) != Some(state.service_did.as_str()) {
+        return Err(invalid(&format!(
+            "Invalid audience (got: {}, expected one of: {})",
+            p.get("aud").and_then(Value::as_str).unwrap_or(""),
+            state.service_did
+        )));
+    }
+    let now = locus_core::time::now_ms();
+    if p.get("exp")
+        .and_then(Value::as_i64)
+        .is_none_or(|e| e * 1000 <= now)
+    {
+        return Err(invalid("Token expired"));
+    }
+    let info = crate::routing::REQUEST
+        .try_with(Clone::clone)
+        .map_err(|_| XrpcError::internal("no request context"))?;
+    let proof = crate::oauth::dpop_proof(state, &info.method, &info.uri, headers, Some(&token))
+        .await
+        .map_err(XrpcError::from)?;
+    let jkt = p
+        .get("cnf")
+        .and_then(|c| c.get("jkt"))
+        .and_then(Value::as_str);
+    match (jkt, &proof) {
+        (Some(_), None) => return Err(OAuthError::invalid_dpop_proof("DPoP proof required").into()),
+        (Some(j), Some(pr)) if pr.jkt != j => {
+            return Err(OAuthError::invalid_dpop_key_binding().into());
+        }
+        (None, _) => {
+            return Err(OAuthError::invalid_token(
+                "Bearer",
+                "Bearer token type must be used without a DPoP proof",
+            )
+            .into());
+        }
+        _ => {}
+    }
+    let jti = p.get("jti").and_then(Value::as_str).unwrap_or("");
+    let sub = p.get("sub").and_then(Value::as_str).unwrap_or("");
+    let row = state
+        .store
+        .oauth_token(jti)
+        .await?
+        .ok_or_else(|| invalid("Invalid token"))?;
+    let params: locus_auth::oauth::request::Parameters =
+        serde_json::from_str(&row.parameters).unwrap_or_default();
+    if params.dpop_jkt.as_deref() != jkt || row.did != sub {
+        state.store.oauth_delete_token(row.id).await?;
+        return Err(invalid("Invalid token"));
+    }
+    if row.expires_at < now {
+        state.store.oauth_delete_token(row.id).await?;
+        return Err(invalid("Token expired"));
+    }
+    let scope = row.scope.clone().or(params.scope).unwrap_or_default();
+    if !scope.split(' ').any(|s| s == "atproto") {
+        return Err(XrpcError::named(
+            "InvalidToken",
+            "OAuth token does not have \"atproto\" scope",
+        ));
+    }
+    let account = state
+        .store
+        .account_by_did(&row.did)
+        .await?
+        .filter(|a| a.status != Status::Deleted)
+        .ok_or_else(|| {
+            XrpcError::new(
+                StatusCode::FORBIDDEN,
+                "AccountNotFound",
+                "Account not found",
+            )
+        })?;
+    if matches!(account.status, Status::Takendown | Status::Suspended) {
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AccountTakedown",
+            "Account has been taken down",
+        ));
+    }
+    Ok(Authed {
+        did: row.did,
+        scope: SCOPE_OAUTH.to_owned(),
+        session_id: row.token_id.clone(),
+        app_password_name: None,
+        status: account.status,
+        oauth: Some(OAuthGrant {
+            client_id: row.client_id,
+            token_id: row.token_id,
+            scope,
+        }),
+    })
+}
+
+/// Fails an OAuth request lacking a permission (legacy requests pass).
+pub fn require(
+    authed: &Authed,
+    check: impl Fn(&Permissions) -> Result<(), locus_auth::scopes::ScopeMissing>,
+) -> XrpcResult<()> {
+    if let Some(g) = &authed.oauth {
+        check(&g.permissions())?;
+    }
+    Ok(())
+}

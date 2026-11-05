@@ -586,11 +586,12 @@ async fn create_session_inner(s: &AppState, input: &CreateSessionInput) -> XrpcR
 }
 
 pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::access_with(
+    let authed = auth::authorization(
         &s,
         &headers,
         auth::STANDARD,
         &[locus_auth::session::SCOPE_SIGNUP_QUEUED],
+        auth::any_scope,
     )
     .await?;
     let account = s.store.account_by_did(&authed.did).await?.ok_or_else(|| {
@@ -614,6 +615,15 @@ pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Va
     }
     if let Some(d) = did_doc_for(&s, &account).await? {
         out["didDoc"] = d;
+    }
+    // OAuth tokens see the email only with account:email.
+    if let Some(g) = &authed.oauth
+        && !g.permissions().allows_account("email", "read")
+        && let Some(m) = out.as_object_mut()
+    {
+        m.remove("email");
+        m.remove("emailConfirmed");
+        m.remove("emailAuthFactor");
     }
     Ok(Json(out))
 }
@@ -656,7 +666,14 @@ pub async fn create_app_password(
     headers: HeaderMap,
     Json(input): Json<CreateAppPasswordInput>,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::FULL,
+        &[],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
+    )
+    .await?;
     let name = input.name.trim();
     if name.is_empty() || name.len() > 32 {
         return Err(XrpcError::invalid_request("Invalid app password name"));
@@ -693,7 +710,14 @@ pub async fn create_app_password(
 }
 
 pub async fn list_app_passwords(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::STANDARD,
+        &[],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
+    )
+    .await?;
     let list: Vec<Value> = s
         .store
         .app_passwords(&authed.did)
@@ -714,7 +738,14 @@ pub async fn revoke_app_password(
     headers: HeaderMap,
     Json(input): Json<RevokeAppPasswordInput>,
 ) -> XrpcResult<()> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::STANDARD,
+        &[],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
+    )
+    .await?;
     let mut tx = s.store.begin().await?;
     tx.delete_app_password(&authed.did, &input.name).await?;
     tx.revoke_sessions(&authed.did, SessionFilter::AppPassword(&input.name))
@@ -739,7 +770,10 @@ pub async fn get_service_auth(
     headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<GetServiceAuthParams>,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::access_with(&s, &headers, auth::STANDARD, &[SCOPE_TAKENDOWN]).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[SCOPE_TAKENDOWN], |perm| {
+        Ok(perm.assert_rpc(p.lxm.as_deref().unwrap_or("*"), &p.aud)?)
+    })
+    .await?;
     let lxm = p.lxm.as_deref().filter(|l| !l.is_empty() && *l != "*");
     let (aud_did, fragment) = match p.aud.split_once('#') {
         Some((d, f)) => (d, Some(f)),
@@ -843,7 +877,14 @@ pub async fn get_account_invite_codes(
     headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<GetAccountInviteCodesParams>,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::FULL,
+        &[],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
+    )
+    .await?;
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let did = account.did.as_str();
     let snap = s.snapshot();
@@ -900,11 +941,12 @@ pub async fn get_account_invite_codes(
 
 /// As the reference: no signup queue here, so everyone is activated.
 pub async fn check_signup_queue(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    auth::access_with(
+    auth::authorization(
         &s,
         &headers,
         auth::STANDARD,
         &[locus_auth::session::SCOPE_SIGNUP_QUEUED],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
     )
     .await?;
     Ok(Json(json!({ "activated": true })))

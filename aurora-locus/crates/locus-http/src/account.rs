@@ -42,7 +42,10 @@ pub async fn deactivate_account(
     headers: HeaderMap,
     Json(input): Json<DeactivateInput>,
 ) -> XrpcResult<()> {
-    let authed = auth::access_with(&s, &headers, auth::FULL, &[SCOPE_TAKENDOWN]).await?;
+    let authed = auth::authorization(&s, &headers, auth::FULL, &[SCOPE_TAKENDOWN], |p| {
+        Ok(p.assert_account("status", "manage")?)
+    })
+    .await?;
     let delete_after = input
         .delete_after
         .as_deref()
@@ -64,7 +67,10 @@ pub async fn deactivate_account(
 }
 
 pub async fn activate_account(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::FULL, &[], auth::forbid(
+        "Account reactivation is not available with OAuth credentials. Sign in to your account management page to reactivate.",
+    ))
+    .await?;
     let did = authed.did.as_str();
     assert_valid_did_doc(&s, did).await?;
     let account = s
@@ -185,7 +191,7 @@ pub async fn assert_valid_did_doc(s: &AppState, did: &str) -> XrpcResult<()> {
 }
 
 pub async fn check_account_status(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], auth::any_scope).await?;
     let did = authed.did.as_str();
     let account = s
         .store
@@ -212,7 +218,14 @@ pub async fn check_account_status(State(s): St, headers: HeaderMap) -> XrpcResul
 }
 
 pub async fn request_account_delete(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(
+        &s,
+        &headers,
+        auth::FULL,
+        &[],
+        auth::forbid(auth::OAUTH_UNSUPPORTED),
+    )
+    .await?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestAccountDelete-0";

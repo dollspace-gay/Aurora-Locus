@@ -75,6 +75,28 @@ pub struct Authed {
     pub session_id: String,
     pub app_password_name: Option<String>,
     pub status: Status,
+    /// Set for an OAuth access token (then `scope` is [`SCOPE_OAUTH`]).
+    pub oauth: Option<OAuthGrant>,
+}
+
+/// The `scope` of an OAuth-authenticated request (not a legacy scope, so
+/// the legacy scope groups never match it).
+pub const SCOPE_OAUTH: &str = "oauth";
+
+/// An OAuth grant behind a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthGrant {
+    pub client_id: String,
+    pub token_id: String,
+    /// The token's scope (`include:` already expanded).
+    pub scope: String,
+}
+
+impl OAuthGrant {
+    #[must_use]
+    pub fn permissions(&self) -> crate::scopes::Permissions {
+        crate::scopes::Permissions::new(&self.scope)
+    }
 }
 
 /// A freshly issued token pair.
@@ -250,6 +272,7 @@ impl LegacySessions {
             session_id,
             app_password_name: session.app_password_name,
             status: account.status,
+            oauth: None,
         })
     }
 

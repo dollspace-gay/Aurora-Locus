@@ -178,7 +178,14 @@ async fn get_preferences_inner(
             .ok_or_else(|| XrpcError::invalid_request("Invalid or missing did parameter"))?;
         (did, true)
     } else {
-        let authed = auth::access_with(s, headers, auth::STANDARD, &[SCOPE_TAKENDOWN]).await?;
+        let authed = auth::authorization(
+            s,
+            headers,
+            auth::STANDARD,
+            &[SCOPE_TAKENDOWN],
+            pt::rpc_check(s, headers, lxm),
+        )
+        .await?;
         if proxied_elsewhere(s, headers) {
             return Ok(pipe(s, lxm, Method::GET, uri, headers, None, &authed.did).await);
         }
@@ -204,7 +211,14 @@ async fn put_preferences_inner(
     body: Bytes,
 ) -> XrpcResult<Response> {
     let lxm = "app.bsky.actor.putPreferences";
-    let authed = auth::access(s, headers).await?;
+    let authed = auth::authorization(
+        s,
+        headers,
+        auth::STANDARD,
+        &[],
+        pt::rpc_check(s, headers, lxm),
+    )
+    .await?;
     auth::account_checked(s, &authed.did, false).await?;
     if proxied_elsewhere(s, headers) {
         return Ok(pipe(

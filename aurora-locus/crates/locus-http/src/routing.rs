@@ -146,6 +146,18 @@ fn too_large() -> Response {
     .into_response()
 }
 
+/// The method and URI of the request being handled (what DPoP proofs are
+/// checked against).
+#[derive(Debug, Clone)]
+pub struct RequestInfo {
+    pub method: axum::http::Method,
+    pub uri: axum::http::Uri,
+}
+
+tokio::task_local! {
+    pub static REQUEST: RequestInfo;
+}
+
 /// Routes whose work is bounded by their own caps, not the request
 /// deadline (streams and uploads).
 fn streaming(path: &str) -> bool {
@@ -195,12 +207,26 @@ pub async fn headers_and_deadline(
         return res;
     }
     let authed = req.headers().contains_key(header::AUTHORIZATION);
+    let dpop = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.len() > 5 && v[..5].eq_ignore_ascii_case("dpop "));
     let path = req.uri().path().to_owned();
+    let info = RequestInfo {
+        method: req.method().clone(),
+        uri: req.uri().clone(),
+    };
     let mut res = if streaming(&path) {
-        next.run(req).await
+        REQUEST.scope(info, next.run(req)).await
     } else {
         let ms = u64::try_from(s.snapshot().int("http.request_deadline_ms")).unwrap_or(60_000);
-        match tokio::time::timeout(std::time::Duration::from_millis(ms), next.run(req)).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(ms),
+            REQUEST.scope(info, next.run(req)),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => {
                 tracing::warn!(path, "request passed its deadline");
@@ -216,6 +242,10 @@ pub async fn headers_and_deadline(
             }
         }
     };
+    if dpop {
+        // A fresh nonce on every OAuth-authenticated response (RFC 9449 §8.2).
+        crate::oauth::add_nonce(&s, res.headers_mut());
+    }
     let h = res.headers_mut();
     h.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,

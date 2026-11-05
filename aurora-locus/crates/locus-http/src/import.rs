@@ -41,7 +41,10 @@ fn too_large() -> XrpcError {
 /// root; the job's last phase runs in the background, writes blocked until
 /// it ends.
 pub async fn import_repo(State(s): St, headers: HeaderMap, body: Body) -> XrpcResult<()> {
-    let authed = auth::full_access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::FULL, &[], |p| {
+        Ok(p.assert_account("repo", "manage")?)
+    })
+    .await?;
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let snap = s.snapshot();
     if !snap.bool("accounts.accept_imports") {
@@ -153,7 +156,7 @@ pub async fn list_missing_blobs(
     headers: HeaderMap,
     Query(p): Query<MissingParams>,
 ) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], auth::any_scope).await?;
     let limit = p.limit.unwrap_or(500);
     if !(1..=1000).contains(&limit) {
         return Err(XrpcError::invalid_request(
@@ -184,7 +187,11 @@ pub async fn list_missing_blobs(
 /// `app.nearhorizon.locus.account.getImportStatus`: the account's latest
 /// import job.
 pub async fn get_import_status(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let authed = auth::access(&s, &headers).await?;
+    let pds = format!("{}#atproto_pds", s.service_did);
+    let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
+        Ok(p.assert_rpc("app.nearhorizon.locus.account.getImportStatus", &pds)?)
+    })
+    .await?;
     let Some(st) = s.store.latest_import(&authed.did).await? else {
         return Ok(Json(json!({ "import": null })));
     };
