@@ -4,6 +4,7 @@
 //! [`Store`] and [`Tx`].
 
 pub mod accounts;
+pub mod admin;
 pub mod blob;
 pub mod bulk;
 pub mod email;
@@ -15,6 +16,7 @@ pub mod jobs;
 pub mod kryphocron;
 pub mod lease;
 pub mod oauth;
+pub mod operators;
 pub mod prefs;
 pub mod repo;
 pub mod runtime;

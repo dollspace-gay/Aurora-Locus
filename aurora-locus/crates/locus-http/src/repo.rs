@@ -1026,7 +1026,7 @@ async fn serve_blob(
     let owner = auth::authorization(s, headers, auth::STANDARD, &[], auth::any_scope)
         .await
         .is_ok_and(|a| a.did == account.did);
-    if !owner {
+    if !owner && !crate::admin::admin_reader(s, headers).await {
         unavailable(&account)?;
     }
     let not_found = || XrpcError::invalid_request("Blob not found");

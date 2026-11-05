@@ -789,6 +789,13 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Service DIDs (moderation, scanning, labeling) that may fetch gated media with service auth; every fetch is audited.",
     },
+    Def {
+        key: "admin.basic_auth_enabled",
+        kind: Kind::Bool,
+        default: "true",
+        env: None,
+        description: "Accept the reference's admin:<password> Basic auth on the reference admin surface (it counts as the admin role).",
+    },
 ];
 
 /// Looks up a setting definition.

@@ -1570,3 +1570,102 @@ async fn private_only_blobs_on_both_backends() {
         assert_eq!(s.unscanned_blobs(10).await.unwrap().len(), 1, "{n}");
     }
 }
+
+#[tokio::test]
+async fn operators_and_admin_queries_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        assert!(
+            s.create_operator("ana", "hash", "owner").await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.create_operator("ana", "hash", "viewer").await.unwrap(),
+            "{n}: taken"
+        );
+        assert_eq!(s.count_owners().await.unwrap(), 1);
+        s.create_operator_token("t1", "h1", "ana", "cli", None)
+            .await
+            .unwrap();
+        s.create_operator_token("t2", "h2", "ana", "old", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.operator_by_token("h1").await.unwrap().unwrap().role,
+            "owner",
+            "{n}"
+        );
+        assert!(
+            s.operator_by_token("h2").await.unwrap().is_none(),
+            "{n}: expired"
+        );
+        assert!(
+            s.update_operator("ana", Some("admin"), None, Some(true))
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.operator_by_token("h1").await.unwrap().is_none(),
+            "{n}: disabled"
+        );
+        assert_eq!(s.operator("ana").await.unwrap().unwrap().role, "admin");
+        assert_eq!(s.operator_tokens("ana").await.unwrap().len(), 2);
+        assert!(s.revoke_operator_token("t1").await.unwrap());
+        s.audit("operator:ana", "x.one", Some("t"), None)
+            .await
+            .unwrap();
+        s.audit(
+            "operator:ana",
+            "x.two",
+            None,
+            Some(&serde_json::json!({"a": 1})),
+        )
+        .await
+        .unwrap();
+        let entries = s.audit_entries(None, 10).await.unwrap();
+        assert_eq!(entries[0].action, "x.two", "{n}: newest first");
+        assert_eq!(
+            s.audit_entries(Some(entries[0].id), 10).await.unwrap()[0].action,
+            "x.one"
+        );
+
+        // Invites, paged by recency and usage.
+        let mut tx = s.begin().await.unwrap();
+        for (i, code) in ["c1", "c2", "c3"].iter().enumerate() {
+            tx.insert_invite_code(code, 2, "admin", "admin")
+                .await
+                .unwrap();
+            let _ = i;
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        tx.commit().await.unwrap();
+        let page: Vec<String> = s
+            .all_invite_codes(false, None, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
+        assert_eq!(page.len(), 2, "{n}");
+        let rest = s.all_invite_codes(false, Some(&page[1]), 10).await.unwrap();
+        assert_eq!(rest.len(), 1, "{n}");
+        assert_eq!(s.all_invite_codes(true, None, 10).await.unwrap().len(), 3);
+        s.disable_invite_codes(&["c1".into()], &[]).await.unwrap();
+        assert!(s.invite_code("c1").await.unwrap().unwrap().disabled, "{n}");
+        assert_eq!(s.invite_code("c2").await.unwrap().unwrap().available, 2);
+        assert!(
+            s.search_accounts("nobody", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !s.set_record_takedown("did:plc:x", "c", "r", Some("t"))
+                .await
+                .unwrap()
+        );
+        assert!(!s.set_blob_takedown("did:plc:x", "c", None).await.unwrap());
+        assert!(s.invited_by("did:plc:x").await.unwrap().is_none());
+    }
+}

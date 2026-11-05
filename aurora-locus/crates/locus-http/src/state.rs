@@ -26,6 +26,7 @@ pub mod secret_names {
     pub const DPOP_SECRET: &str = "dpop_secret";
     pub const CORRELATION_KEY: &str = "kryphocron_correlation_key";
     pub const AUDIENCE_KEY: &str = "kryphocron_audience_key";
+    pub const ADMIN_PASSWORD: &str = "admin_password";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -45,6 +46,9 @@ pub struct ServerSecrets {
     /// Signs membership assertions (`#kryphocron_audience`), never service
     /// auth.
     pub audience_key: K256Keypair,
+    /// The reference's single admin credential (`admin:<password>` Basic
+    /// auth): `PDS_ADMIN_PASSWORD` when set, otherwise generated and kept.
+    pub admin_password: Zeroizing<Vec<u8>>,
 }
 
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
@@ -196,6 +200,14 @@ impl ServerSecrets {
             K256Keypair::generate().export_private_key()
         })
         .await?;
+        let stored_admin = load_or(store, key, secret_names::ADMIN_PASSWORD, || {
+            hex::encode(rand::random::<[u8; 16]>()).into_bytes()
+        })
+        .await?;
+        let admin_password = match std::env::var("PDS_ADMIN_PASSWORD") {
+            Ok(p) if !p.is_empty() => Zeroizing::new(p.into_bytes()),
+            _ => stored_admin,
+        };
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -208,6 +220,7 @@ impl ServerSecrets {
             dpop_nonces: locus_auth::oauth::dpop::Nonces::new(&dpop),
             correlation_key,
             audience_key: keypair(&audience, "membership assertion key")?,
+            admin_password,
             jwt,
             app_password_pepper,
             email_token_pepper,

@@ -177,7 +177,9 @@ async fn available(s: &AppState, headers: &HeaderMap, did: &str) -> XrpcResult<A
     )
     .await
     .is_ok_and(|a| a.did == account.did);
-    if !owner {
+    // The owner, and admin credentials (as the reference's admin token),
+    // read taken-down and deactivated repos.
+    if !owner && !crate::admin::admin_reader(s, headers).await {
         crate::repo::unavailable(&account)?;
     }
     Ok(account)

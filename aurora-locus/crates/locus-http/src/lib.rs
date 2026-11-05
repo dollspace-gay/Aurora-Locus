@@ -2,6 +2,8 @@
 //! and every handler.
 
 pub mod account;
+pub mod admin;
+pub mod admin_auth;
 pub mod audience;
 pub mod audience_sync;
 pub mod auth;
@@ -179,6 +181,67 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/tools.kryphocron.feed.deletePostPrivate",
             post(kryphocron::delete_post_private),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getAccountInfo",
+            get(admin::get_account_info),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getAccountInfos",
+            get(admin::get_account_infos),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.searchAccounts",
+            get(admin::search_accounts),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getSubjectStatus",
+            get(admin::get_subject_status),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateSubjectStatus",
+            post(admin::update_subject_status),
+        )
+        .route("/xrpc/com.atproto.admin.sendEmail", post(admin::send_email))
+        .route(
+            "/xrpc/com.atproto.admin.deleteAccount",
+            post(admin::delete_account),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountPassword",
+            post(admin::update_account_password),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountEmail",
+            post(admin::update_account_email),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.updateAccountHandle",
+            post(admin::update_account_handle),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.getInviteCodes",
+            get(admin::get_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.disableAccountInvites",
+            post(admin::disable_account_invites),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.enableAccountInvites",
+            post(admin::enable_account_invites),
+        )
+        .route(
+            "/xrpc/com.atproto.admin.disableInviteCodes",
+            post(admin::disable_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCode",
+            post(admin::create_invite_code),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCodes",
+            post(admin::create_invite_codes),
         )
         .route(
             "/xrpc/tools.kryphocron.actor.participatePrivate",

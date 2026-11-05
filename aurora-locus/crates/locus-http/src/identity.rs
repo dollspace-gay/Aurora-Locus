@@ -147,8 +147,19 @@ pub async fn update_handle(
         .await?;
     }
     let account = auth::account_checked(&s, &authed.did, false).await?;
+    change_handle(&s, &account, &input.handle).await
+}
+
+/// Changes an account's handle: validated, then PLC (did:plc), the hosted
+/// document (locus-served did:web), or a check that the document already
+/// names it; then the account row and `#identity`.
+pub(crate) async fn change_handle(
+    s: &AppState,
+    account: &locus_store::accounts::Account,
+    raw: &str,
+) -> XrpcResult<()> {
     let did = account.did.as_str();
-    let handle = validate_handle(&s, &input.handle, Some(did)).await?;
+    let handle = validate_handle(s, raw, Some(did)).await?;
     if let Some(other) = s.store.account_by_handle(&handle).await?
         && other.did != did
     {
@@ -163,7 +174,7 @@ pub async fn update_handle(
         s.store
             .queue_identity_repair(did, RepairKind::Handle, &handle)
             .await?;
-        match plc_set_handle(&s, did, &handle).await {
+        match plc_set_handle(s, did, &handle).await {
             Ok(()) => {}
             Err(PlcStep::Refused(e)) => {
                 s.store
@@ -173,7 +184,7 @@ pub async fn update_handle(
             }
             Err(PlcStep::Ambiguous(e)) => return Err(e),
         }
-        apply_handle(&s, did, &handle, None).await?;
+        apply_handle(s, did, &handle, None).await?;
         s.store
             .finish_identity_repair(did, RepairKind::Handle, &handle)
             .await?;
@@ -184,7 +195,7 @@ pub async fn update_handle(
         let mut doc: Value =
             serde_json::from_str(&doc).map_err(|e| XrpcError::internal(e.to_string()))?;
         set_doc_handle(&mut doc, &handle);
-        apply_handle(&s, did, &handle, Some(&doc.to_string())).await?;
+        apply_handle(s, did, &handle, Some(&doc.to_string())).await?;
     } else {
         // Someone else serves the document: it must already name the handle.
         let doc = s
@@ -198,7 +209,7 @@ pub async fn update_handle(
                 "DID is not properly configured for handle",
             ));
         }
-        apply_handle(&s, did, &handle, None).await?;
+        apply_handle(s, did, &handle, None).await?;
     }
     for h in [&account.handle, &handle] {
         let _ = s.store.clear_handle_cache(h).await;

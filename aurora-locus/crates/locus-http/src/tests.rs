@@ -7858,3 +7858,440 @@ async fn gated_private_media_is_served_only_to_the_audience() {
             .is_none_or(|v| v != "private, no-store")
     );
 }
+
+// ---------------------------------------------------------------- admin
+
+impl Harness {
+    /// An operator with an API token.
+    async fn operator(&self, name: &str, role: &str) -> String {
+        assert!(
+            self.state
+                .store
+                .create_operator(name, "x", role)
+                .await
+                .unwrap()
+        );
+        let token = crate::admin_auth::new_token();
+        self.state
+            .store
+            .create_operator_token(
+                &format!("t-{name}"),
+                &crate::admin_auth::token_hash(&token),
+                name,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+        token
+    }
+
+    fn basic_admin(&self) -> String {
+        let pw = String::from_utf8(self.state.secrets.admin_password.to_vec()).unwrap();
+        format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("admin:{pw}")
+            )
+        )
+    }
+
+    async fn admin_call(
+        &self,
+        method: &str,
+        path: &str,
+        auth: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let bytes = body
+            .map(|b| serde_json::to_vec(&b).unwrap())
+            .unwrap_or_default();
+        let (st, _, out) = self
+            .raw(
+                method,
+                path,
+                None,
+                bytes,
+                &[
+                    ("authorization", auth),
+                    ("content-type", "application/json"),
+                ],
+            )
+            .await;
+        (st, serde_json::from_slice(&out).unwrap_or(Value::Null))
+    }
+}
+
+#[tokio::test]
+async fn the_admin_api_checks_roles_and_takes_subjects_down() {
+    let h = harness(false).await;
+    let (did, access) = h.user("yara.pds.example.com").await;
+    let viewer = format!("Bearer {}", h.operator("vee", "viewer").await);
+    let moderator = format!("Bearer {}", h.operator("mo", "moderator").await);
+    let admin = format!("Bearer {}", h.operator("ad", "admin").await);
+    let info = format!("/xrpc/com.atproto.admin.getAccountInfo?did={did}");
+
+    // Who may call what.
+    let (st, v) = h.admin_call("GET", &info, &viewer, None).await;
+    assert_eq!(
+        (st, v["handle"].as_str()),
+        (StatusCode::OK, Some("yara.pds.example.com")),
+        "{v}"
+    );
+    assert_eq!(v["email"], "yara@example.com");
+    assert_eq!(
+        h.call("GET", &info, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        h.admin_call("GET", &info, "Basic YWRtaW46d3Jvbmc=", None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        h.admin_call("GET", &info, &h.basic_admin(), None).await.0,
+        StatusCode::OK
+    );
+    let takedown = |applied: bool| json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": applied, "ref": "case-1"}});
+    let update = "/xrpc/com.atproto.admin.updateSubjectStatus";
+    assert_eq!(
+        h.admin_call("POST", update, &viewer, Some(takedown(true)))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    // An account takedown ends its sessions and hides its repo, except
+    // from admin credentials.
+    let outbox_before = h.state.store.outbox_for(&did).await.unwrap().len();
+    let (st, v) = h
+        .admin_call("POST", update, &moderator, Some(takedown(true)))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        !h.call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None
+        )
+        .await
+        .0
+        .is_success()
+    );
+    assert_eq!(
+        h.state.store.outbox_for(&did).await.unwrap().len(),
+        outbox_before + 1,
+        "#account"
+    );
+    let status = format!("/xrpc/com.atproto.admin.getSubjectStatus?did={did}");
+    let (_, v) = h.admin_call("GET", &status, &viewer, None).await;
+    assert_eq!(v["takedown"], json!({"applied": true, "ref": "case-1"}));
+    let repo = format!("/xrpc/com.atproto.sync.getRepo?did={did}");
+    let (st, _, _) = h.raw_get(repo.clone()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "RepoTakendown");
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            &repo,
+            None,
+            vec![],
+            &[("authorization", &h.basic_admin())],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "admin credentials read it");
+    assert_eq!(
+        h.admin_call("POST", update, &moderator, Some(takedown(false)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, v) = h.admin_call("GET", &status, &viewer, None).await;
+    assert_eq!(v["takedown"], json!({"applied": false}));
+
+    // Records, by URI whatever the CID; blobs.
+    let access = h.create_session("yara.pds.example.com", "pw").await;
+    let (st, rec) = h
+        .post("com.atproto.repo.createRecord", Some(&access), json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("hide me")}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{rec}");
+    let uri = rec["uri"].as_str().unwrap().to_owned();
+    let rkey = uri.rsplit('/').next().unwrap().to_owned();
+    let subject = json!({"subject": {"$type": "com.atproto.repo.strongRef", "uri": uri, "cid": "bafyanything"}, "takedown": {"applied": true, "ref": "case-2"}});
+    assert_eq!(
+        h.admin_call("POST", update, &moderator, Some(subject))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, v) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"
+        ))
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RecordNotFound"))
+    );
+    let (_, list) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"
+        ))
+        .await;
+    assert!(list["records"].as_array().unwrap().is_empty());
+    let enc = url::form_urlencoded::byte_serialize(uri.as_bytes()).collect::<String>();
+    let (_, v) = h
+        .admin_call(
+            "GET",
+            &format!("/xrpc/com.atproto.admin.getSubjectStatus?uri={enc}"),
+            &viewer,
+            None,
+        )
+        .await;
+    assert_eq!(v["takedown"]["applied"], true);
+    let blob = h.upload(&access, b"some bytes", "image/png").await;
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    let subject = json!({"subject": {"$type": "com.atproto.admin.defs#repoBlobRef", "did": did, "cid": cid}, "takedown": {"applied": true}});
+    assert_eq!(
+        h.admin_call("POST", update, &moderator, Some(subject))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (st, _, _) = h
+        .raw_get(format!(
+            "/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"
+        ))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "taken down");
+
+    // Credentials need admin.
+    let pw = json!({"did": did, "password": "new-password"});
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountPassword",
+            &moderator,
+            Some(pw.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountPassword",
+            &admin,
+            Some(pw)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    h.create_session("yara.pds.example.com", "new-password")
+        .await;
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountHandle",
+            &admin,
+            Some(json!({"did": did, "handle": "yarrow.pds.example.com"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "yarrow.pds.example.com"
+    );
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountEmail",
+            &admin,
+            Some(json!({"account": did, "email": "Yarrow@Example.com"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .email
+            .as_deref(),
+        Some("yarrow@example.com")
+    );
+
+    // Invites.
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.server.createInviteCodes",
+            &moderator,
+            Some(json!({"codeCount": 2, "useCount": 1, "forAccounts": [did]})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let code = v["codes"][0]["codes"][0].as_str().unwrap().to_owned();
+    let (_, v) = h
+        .admin_call(
+            "GET",
+            "/xrpc/com.atproto.admin.getInviteCodes?sort=recent&limit=1",
+            &moderator,
+            None,
+        )
+        .await;
+    assert_eq!(v["codes"].as_array().unwrap().len(), 1);
+    let (_, page2) = h
+        .admin_call(
+            "GET",
+            &format!(
+                "/xrpc/com.atproto.admin.getInviteCodes?sort=recent&limit=5&cursor={}",
+                v["cursor"].as_str().unwrap()
+            ),
+            &moderator,
+            None,
+        )
+        .await;
+    assert_eq!(
+        page2["codes"].as_array().unwrap().len(),
+        1,
+        "paged past the first"
+    );
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.disableInviteCodes",
+            &moderator,
+            Some(json!({"accounts": ["admin"]}))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    h.admin_call(
+        "POST",
+        "/xrpc/com.atproto.admin.disableInviteCodes",
+        &moderator,
+        Some(json!({"codes": [code]})),
+    )
+    .await;
+    assert!(
+        h.state
+            .store
+            .invite_code(&code)
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled
+    );
+    let (_, v) = h.admin_call("GET", &info, &viewer, None).await;
+    assert_eq!(v["invites"].as_array().unwrap().len(), 2);
+
+    // Moderation email.
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.sendEmail",
+            &moderator,
+            Some(json!({"recipientDid": did, "content": "<p>hello</p>", "senderDid": "did:plc:x"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["sent"].as_bool()),
+        (StatusCode::OK, Some(true)),
+        "{v}"
+    );
+    assert!(h.mail.lock().unwrap().iter().any(
+        |m| m.to == "yarrow@example.com" && m.sender == locus_store::email::Sender::Moderation
+    ));
+
+    // The moderation service gets the reference's mod-service access only.
+    let (mod_did, mod_access) = h.user("zed.pds.example.com").await;
+    h.state
+        .settings
+        .set("moderation.service_did", json!(mod_did), "test")
+        .await
+        .unwrap();
+    let (_, t) = h
+        .service_token(
+            &mod_access,
+            &h.state.service_did,
+            "com.atproto.admin.getSubjectStatus",
+        )
+        .await;
+    let svc = format!("Bearer {}", t["token"].as_str().unwrap());
+    assert_eq!(
+        h.admin_call("GET", &status, &svc, None).await.0,
+        StatusCode::OK
+    );
+    let (_, t) = h
+        .service_token(
+            &mod_access,
+            &h.state.service_did,
+            "com.atproto.admin.deleteAccount",
+        )
+        .await;
+    let svc = format!("Bearer {}", t["token"].as_str().unwrap());
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.deleteAccount",
+            &svc,
+            Some(json!({"did": did}))
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Every action is in the audit log, by who did it.
+    let audit = h.state.store.audit_entries(None, 100).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "admin.updateSubjectStatus" && e.actor == "operator:mo")
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "admin.updateAccountPassword" && e.actor == "operator:ad")
+    );
+
+    // Basic auth can be turned off.
+    h.state
+        .settings
+        .set("admin.basic_auth_enabled", json!(false), "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        h.admin_call("GET", &info, &h.basic_admin(), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+impl Harness {
+    /// Signs in; returns the access token.
+    async fn create_session(&self, identifier: &str, password: &str) -> String {
+        let (st, v) = self
+            .post(
+                "com.atproto.server.createSession",
+                None,
+                json!({"identifier": identifier, "password": password}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["accessJwt"].as_str().unwrap().to_owned()
+    }
+}
