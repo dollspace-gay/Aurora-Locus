@@ -353,7 +353,7 @@ pub async fn delete_due_accounts(s: &AppState) -> locus_core::CoreResult<usize> 
 
 /// Parses an RFC 3339 datetime into ms since the epoch (UTC offsets and
 /// fractional seconds accepted).
-fn parse_datetime_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_datetime_ms(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T')?;
     let mut d = date.splitn(3, '-');
     let (y, m, day): (i64, i64, i64) = (

@@ -3,11 +3,13 @@
 
 pub mod account;
 pub mod auth;
+pub mod bsky;
 pub mod email;
 pub mod error;
 pub mod identity;
 pub mod import;
 pub mod pipethrough;
+pub mod raw;
 pub mod repo;
 pub mod routing;
 pub mod server;
@@ -209,6 +211,38 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        .route(
+            "/xrpc/app.bsky.actor.getPreferences",
+            get(bsky::get_preferences),
+        )
+        .route(
+            "/xrpc/app.bsky.actor.putPreferences",
+            post(bsky::put_preferences),
+        )
+        .route("/xrpc/app.bsky.actor.getProfile", get(raw::get_profile))
+        .route("/xrpc/app.bsky.actor.getProfiles", get(raw::get_profiles))
+        .route("/xrpc/app.bsky.feed.getTimeline", get(raw::get_timeline))
+        .route(
+            "/xrpc/app.bsky.feed.getAuthorFeed",
+            get(raw::get_author_feed),
+        )
+        .route(
+            "/xrpc/app.bsky.feed.getActorLikes",
+            get(raw::get_actor_likes),
+        )
+        .route(
+            "/xrpc/app.bsky.feed.getPostThread",
+            get(raw::get_post_thread),
+        )
+        .route("/xrpc/app.bsky.feed.getFeed", get(raw::get_feed))
+        .route(
+            "/xrpc/app.bsky.notification.registerPush",
+            post(raw::register_push),
+        )
+        .route(
+            "/xrpc/app.bsky.notification.unregisterPush",
+            post(raw::unregister_push),
+        )
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         .layer(axum::middleware::from_fn_with_state(

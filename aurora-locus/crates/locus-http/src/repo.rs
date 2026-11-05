@@ -476,6 +476,7 @@ async fn remote_record(
             headers,
             body: None,
             iss: None,
+            aud: None,
             target: &target,
             accept_encoding: headers
                 .get(header::ACCEPT_ENCODING)

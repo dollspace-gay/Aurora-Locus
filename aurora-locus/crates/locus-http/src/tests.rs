@@ -3363,3 +3363,514 @@ async fn unknown_methods_are_piped_through_to_the_configured_services() {
         )
     );
 }
+
+#[tokio::test]
+async fn preferences_replace_their_namespace_with_the_reference_rules() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("pru.pds.example.com", "pru@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let hr = &h;
+    let get = |token: String| async move {
+        hr.call(
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(&token),
+            None,
+        )
+        .await
+    };
+    let put = |token: String, prefs: Value| async move {
+        hr.call(
+            "POST",
+            "/xrpc/app.bsky.actor.putPreferences",
+            Some(&token),
+            Some(json!({ "preferences": prefs })),
+        )
+        .await
+    };
+    let (st, v) = get(access.clone()).await;
+    assert_eq!((st, v), (StatusCode::OK, json!({"preferences": []})));
+
+    let adult = json!({"$type": "app.bsky.actor.defs#adultContentPref", "enabled": true});
+    let personal = json!({"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": "2000-01-01T00:00:00.000Z"});
+    let (st, _) = put(
+        access.clone(),
+        json!([adult, personal, {"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge18": false}]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let age = json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true});
+    let (_, v) = get(access.clone()).await;
+    assert_eq!(
+        v["preferences"],
+        json!([adult, personal, age]),
+        "stored in order, age derived"
+    );
+
+    // App passwords neither see nor touch personal details.
+    let (_, pw) = h
+        .post(
+            "com.atproto.server.createAppPassword",
+            Some(&access),
+            json!({"name": "app"}),
+        )
+        .await;
+    let (_, sess) = h
+        .post(
+            "com.atproto.server.createSession",
+            None,
+            json!({"identifier": did, "password": pw["password"]}),
+        )
+        .await;
+    let app = sess["accessJwt"].as_str().unwrap().to_owned();
+    let (_, v) = get(app.clone()).await;
+    assert_eq!(v["preferences"], json!([adult, age]));
+    let (st, v) = put(app.clone(), json!([personal])).await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some(
+                "Do not have authorization to set preferences: app.bsky.actor.defs#personalDetailsPref"
+            )
+        )
+    );
+    let saved = json!({"$type": "app.bsky.actor.defs#savedFeedsPrefV2", "items": []});
+    put(app.clone(), json!([saved])).await;
+    let (_, v) = get(access.clone()).await;
+    assert_eq!(
+        v["preferences"],
+        json!([personal, saved, age]),
+        "personal details kept"
+    );
+
+    // Refusals.
+    let (_, v) = put(access.clone(), json!([{"$type": "com.example.pref"}])).await;
+    assert_eq!(
+        v["message"],
+        "Some preferences are not in the app.bsky namespace"
+    );
+    let (_, v) = put(access.clone(), json!([{"enabled": true}])).await;
+    assert_eq!(v["message"], "Preference is missing a $type");
+
+    // The moderation service reads any account's, with personal details.
+    let mod_key = proto_blue_crypto::K256Keypair::generate();
+    let mod_did = "did:plc:modmodmodmodmodmodmodmodm";
+    h.plc.lock().unwrap().log.insert(
+        mod_did.into(),
+        vec![json!({
+            "type": "plc_operation",
+            "alsoKnownAs": [],
+            "verificationMethods": {"atproto": mod_key.did()},
+            "services": {},
+        })],
+    );
+    let lxm = "app.bsky.actor.getPreferences";
+    let mod_token = locus_auth::service_jwt::create(
+        &mod_key,
+        mod_did,
+        &h.state.service_did,
+        None,
+        Some(lxm),
+        locus_core::time::now_ms() / 1000,
+    )
+    .unwrap();
+    let path = format!("/xrpc/{lxm}?did={did}");
+    let (st, v) = h.call("GET", &path, Some(&mod_token), None).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("AuthenticationRequired")),
+        "{v}"
+    );
+    h.state
+        .settings
+        .set("moderation.service_did", json!(mod_did), "test")
+        .await
+        .unwrap();
+    let (st, v) = h.call("GET", &path, Some(&mod_token), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["preferences"], json!([personal, saved, age]));
+
+    // atproto-proxy naming another service sends it there.
+    let (url, seen) = mock_service().await;
+    for (k, v) in [
+        ("appview.url", url.as_str()),
+        ("appview.did", "did:web:appview.test"),
+    ] {
+        h.state.settings.set(k, json!(v), "test").await.unwrap();
+    }
+    let (st, _, body) = h
+        .raw(
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", "did:web:appview.test#bsky_appview")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["preferences"],
+        json!([personal, saved, age])
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the configured AppView's own name stays local"
+    );
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(&access),
+            vec![],
+            &[("atproto-proxy", &format!("{mod_did}#bsky_appview"))],
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "another service is resolved (none here)"
+    );
+}
+
+/// A scripted AppView: per method, the status, extra headers and JSON body
+/// it answers with. Records what it was sent.
+type Script = Arc<Mutex<HashMap<String, (u16, Vec<(String, String)>, Value)>>>;
+
+async fn scripted_appview() -> (String, Script, SeenLog) {
+    let script: Script = Arc::default();
+    let log: SeenLog = Arc::default();
+    let app = Router::new()
+        .route(
+            "/xrpc/{nsid}",
+            axum::routing::any(
+                |State((script, log)): State<(Script, SeenLog)>,
+                 Path(nsid): Path<String>,
+                 req: Request<Body>| async move {
+                    let (parts, body) = req.into_parts();
+                    let body = body.collect().await.unwrap().to_bytes().to_vec();
+                    log.lock().unwrap().push(Seen {
+                        method: parts.method.to_string(),
+                        uri: parts.uri.to_string(),
+                        headers: parts.headers.clone(),
+                        body,
+                    });
+                    let entry = script.lock().unwrap().get(&nsid).cloned();
+                    let Some((status, headers, body)) = entry else {
+                        return (
+                            StatusCode::NOT_IMPLEMENTED,
+                            axum::Json(json!({"error": "MethodNotImplemented"})),
+                        )
+                            .into_response();
+                    };
+                    let mut res =
+                        (StatusCode::from_u16(status).unwrap(), axum::Json(body)).into_response();
+                    for (k, v) in headers {
+                        res.headers_mut().insert(
+                            axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                            v.parse().unwrap(),
+                        );
+                    }
+                    res
+                },
+            ),
+        )
+        .with_state((script.clone(), log.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), script, log)
+}
+
+#[tokio::test]
+async fn the_appview_s_answers_include_what_was_just_written_here() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("rae.pds.example.com", "rae@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let (url, script, seen) = scripted_appview().await;
+    for (k, v) in [
+        ("appview.url", url.as_str()),
+        ("appview.did", "did:web:appview.test"),
+    ] {
+        h.state.settings.set(k, json!(v), "test").await.unwrap();
+    }
+    let create = |collection: &'static str, rkey: &'static str, record: Value| {
+        let (h, access, did) = (&h, access.clone(), did.clone());
+        async move {
+            let (st, v) = h
+                .post(
+                    "com.atproto.repo.putRecord",
+                    Some(&access),
+                    json!({"repo": did, "collection": collection, "rkey": rkey, "record": record}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v
+        }
+    };
+    create(
+        "app.bsky.feed.post",
+        "3m7aaaaaaaaaa",
+        post_record("seen by the appview"),
+    )
+    .await;
+    let (_, latest) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+    let seen_rev = latest["rev"].as_str().unwrap().to_owned();
+
+    // Written after the rev the AppView has: a profile edit, a post that
+    // quotes another, and a reply to that post.
+    create(
+        "app.bsky.actor.profile",
+        "self",
+        json!({"$type": "app.bsky.actor.profile", "displayName": "New Name", "description": "new"}),
+    )
+    .await;
+    let quoted = "at://did:plc:otherotherotherotherothe/app.bsky.feed.post/3m7qqqqqqqqqq";
+    let mut p1 = post_record("fresh");
+    p1["embed"] = json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}});
+    let p1v = create("app.bsky.feed.post", "3m7bbbbbbbbbb", p1).await;
+    let p1_uri = p1v["uri"].as_str().unwrap().to_owned();
+    let mut p2 = post_record("reply");
+    p2["reply"] = json!({"root": {"uri": p1_uri, "cid": p1v["cid"]}, "parent": {"uri": p1_uri, "cid": p1v["cid"]}});
+    let p2_uri = create("app.bsky.feed.post", "3m7cccccccccc", p2).await["uri"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let rev = vec![("atproto-repo-rev".to_owned(), seen_rev.clone())];
+    let me = json!({"did": did, "handle": "rae.pds.example.com", "displayName": "Old", "description": "old", "banner": "x"});
+    let other_post = json!({"post": {"uri": "at://did:plc:x/app.bsky.feed.post/1", "cid": "c", "indexedAt": "2000-01-01T00:00:00.000Z", "author": {"did": "did:plc:x", "handle": "x.test"}}});
+    {
+        let mut sc = script.lock().unwrap();
+        sc.insert(
+            "app.bsky.actor.getProfile".into(),
+            (200, rev.clone(), me.clone()),
+        );
+        sc.insert(
+            "app.bsky.feed.getTimeline".into(),
+            (
+                200,
+                rev.clone(),
+                json!({"feed": [other_post], "cursor": "c1"}),
+            ),
+        );
+        sc.insert(
+            "app.bsky.feed.getPosts".into(),
+            (200, vec![], json!({"posts": [{"uri": quoted, "cid": "qc", "author": {"did": "did:plc:otherotherotherotherothe", "handle": "o.test"}, "record": {"text": "quoted"}, "indexedAt": "2001-01-01T00:00:00.000Z"}]})),
+        );
+        sc.insert(
+            "app.bsky.feed.getPostThread".into(),
+            (
+                400,
+                rev.clone(),
+                json!({"error": "NotFound", "message": "Post not found"}),
+            ),
+        );
+    }
+
+    // The profile has the new name and description; the banner is gone.
+    let (st, headers, body) = h
+        .raw(
+            "GET",
+            &format!("/xrpc/app.bsky.actor.getProfile?actor={did}"),
+            Some(&access),
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v,
+        json!({"did": did, "handle": "rae.pds.example.com", "displayName": "New Name", "description": "new"})
+    );
+    assert!(headers.get("atproto-upstream-lag").is_some());
+
+    // The timeline gets the two new posts first, newest first, with the
+    // quote resolved through the AppView.
+    let (_, v) = h
+        .call(
+            "GET",
+            "/xrpc/app.bsky.feed.getTimeline",
+            Some(&access),
+            None,
+        )
+        .await;
+    let uris: Vec<&str> = v["feed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["post"]["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        vec![
+            p2_uri.as_str(),
+            p1_uri.as_str(),
+            "at://did:plc:x/app.bsky.feed.post/1"
+        ]
+    );
+    assert_eq!(v["cursor"], "c1");
+    let p1_view = &v["feed"][1]["post"];
+    assert_eq!(
+        p1_view["author"],
+        json!({"did": did, "handle": "rae.pds.example.com", "displayName": "New Name"})
+    );
+    assert_eq!(p1_view["likeCount"], 0);
+    assert_eq!(
+        p1_view["embed"],
+        json!({"$type": "app.bsky.embed.record#view", "record": {
+            "$type": "app.bsky.embed.record#viewRecord", "uri": quoted, "cid": "qc",
+            "author": {"did": "did:plc:otherotherotherotherothe", "handle": "o.test"},
+            "value": {"text": "quoted"}, "indexedAt": "2001-01-01T00:00:00.000Z"}})
+    );
+    let getposts = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.uri.starts_with("/xrpc/app.bsky.feed.getPosts"))
+        .cloned()
+        .unwrap();
+    assert!(
+        getposts.headers.get("authorization").is_some(),
+        "as the requester"
+    );
+
+    // A thread the AppView hasn't seen yet is built here.
+    let (st, v) = h
+        .call(
+            "GET",
+            &format!(
+                "/xrpc/app.bsky.feed.getPostThread?uri={}",
+                p1_uri.replace(':', "%3A")
+            ),
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["thread"]["post"]["uri"], p1_uri.as_str());
+    assert_eq!(v["thread"]["replies"][0]["post"]["uri"], p2_uri.as_str());
+    // Someone else's missing post stays missing.
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/app.bsky.feed.getPostThread?uri=at%3A%2F%2Fdid%3Aplc%3Ax%2Fapp.bsky.feed.post%2F1",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("NotFound"))
+    );
+
+    // No rev, or a rev that has everything: passed through as is.
+    script.lock().unwrap().insert(
+        "app.bsky.actor.getProfile".into(),
+        (200, vec![], me.clone()),
+    );
+    let (_, v) = h
+        .call(
+            "GET",
+            "/xrpc/app.bsky.actor.getProfile?actor=x",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(v, me);
+    let (_, latest) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+    script.lock().unwrap().insert(
+        "app.bsky.actor.getProfile".into(),
+        (
+            200,
+            vec![(
+                "atproto-repo-rev".into(),
+                latest["rev"].as_str().unwrap().into(),
+            )],
+            me.clone(),
+        ),
+    );
+    let (_, v) = h
+        .call(
+            "GET",
+            "/xrpc/app.bsky.actor.getProfile?actor=x",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(v, me);
+
+    // getFeed: the generator's DID from its record, then a token for it.
+    script.lock().unwrap().insert(
+        "com.atproto.repo.getRecord".into(),
+        (200, vec![], json!({"uri": "at://did:plc:fg/app.bsky.feed.generator/cool", "value": {"did": "did:web:feedgen.test"}})),
+    );
+    script.lock().unwrap().insert(
+        "app.bsky.feed.getFeed".into(),
+        (200, vec![], json!({"feed": []})),
+    );
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/app.bsky.feed.getFeed?feed=at%3A%2F%2Fdid%3Aplc%3Afg%2Fapp.bsky.feed.generator%2Fcool",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!((st, v), (StatusCode::OK, json!({"feed": []})));
+    let req = seen.lock().unwrap().last().cloned().unwrap();
+    let token = req.headers["authorization"].to_str().unwrap()[7..].to_owned();
+    let jwt = locus_auth::service_jwt::parse(
+        &token,
+        Some("app.bsky.feed.getFeedSkeleton"),
+        locus_core::time::now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(jwt.aud, "did:web:feedgen.test");
+
+    // registerPush to the AppView, as the account.
+    script.lock().unwrap().insert(
+        "app.bsky.notification.registerPush".into(),
+        (200, vec![], json!({})),
+    );
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/app.bsky.notification.registerPush",
+            Some(&access),
+            Some(json!({"serviceDid": "did:web:appview.test", "token": "t", "platform": "ios", "appId": "x"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let req = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&req.body).unwrap()["token"],
+        "t"
+    );
+    let token = req.headers["authorization"].to_str().unwrap()[7..].to_owned();
+    let jwt = locus_auth::service_jwt::parse(
+        &token,
+        Some("app.bsky.notification.registerPush"),
+        locus_core::time::now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(
+        (jwt.iss.as_str(), jwt.aud.as_str()),
+        (did.as_str(), "did:web:appview.test")
+    );
+}

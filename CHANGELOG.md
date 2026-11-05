@@ -242,6 +242,21 @@ kryphocron built in.
   to the SSRF rules. Timeouts, response size, HTTP/2 and retries follow the
   reference's `PDS_PROXY_*` settings.
 - `getRecord` for a repo not hosted here is answered by the AppView.
+- Preferences: `app.bsky.actor.getPreferences` and `putPreferences` with
+  the reference's rules (a write replaces the `app.bsky` namespace,
+  personal details only with full access, a derived `declaredAgePref`,
+  moderation-service reads by `did`). Served even before an AppView is
+  configured; piped through when `atproto-proxy` names another service.
+- Read-after-write: the requester's own `getProfile`, `getProfiles`,
+  `getTimeline`, `getAuthorFeed`, `getActorLikes` and `getPostThread`
+  include records written here that the AppView hasn't seen yet (from its
+  `atproto-repo-rev`), with `Atproto-Upstream-Lag`; a just-written post's
+  thread is built locally when the AppView doesn't have it.
+  `appview.cdn_url_pattern` (`PDS_BSKY_APP_VIEW_CDN_URL_PATTERN`) builds
+  their image URLs.
+- `app.bsky.feed.getFeed` asks the feed generator with a token for it, and
+  `registerPush`/`unregisterPush` go to the AppView or the named push
+  service.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.

@@ -289,6 +289,7 @@ impl Tx {
             "plc_key_listing WHERE did",
             "identity_repair WHERE did",
             "did_cache WHERE did",
+            "account_pref WHERE did",
         ] {
             let sqlite = format!("DELETE FROM {table_col} = ?1");
             let pg = format!("DELETE FROM {table_col} = $1");

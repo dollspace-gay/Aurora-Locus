@@ -249,6 +249,9 @@ pub struct Outgoing<'a> {
     pub body: Option<Body>,
     /// Sign a service token as this account.
     pub iss: Option<&'a str>,
+    /// The token's audience, if not the target's DID (`getFeed`'s feed
+    /// generator).
+    pub aud: Option<&'a str>,
     pub target: &'a Target,
     /// `accept-encoding` to send (the client's, or `identity`).
     pub accept_encoding: Option<String>,
@@ -288,6 +291,14 @@ fn forwarded_headers(from: &HeaderMap, out: &mut reqwest::header::HeaderMap, wit
 /// as the error response the client gets: the upstream's `{error, message}`
 /// with its status (500 → 502 `UpstreamFailure`) and forwarded headers.
 pub async fn send(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Response> {
+    let upstream = send_inner(s, o).await?;
+    if upstream.status().as_u16() >= 400 {
+        return Err(UpstreamError::read(s, upstream).await.into_response());
+    }
+    Ok(upstream)
+}
+
+async fn send_inner(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Response> {
     let snap = s.snapshot();
     let base = o.target.url.trim_end_matches('/');
     let url = reqwest::Url::parse(&format!("{base}{}", o.path_and_query))
@@ -310,7 +321,7 @@ pub async fn send(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Respons
             .unwrap_or(reqwest::header::HeaderValue::from_static("identity")),
     );
     if let Some(iss) = o.iss {
-        let token = service_token(s, iss, &o.target.did, o.lxm)
+        let token = service_token(s, iss, o.aud.unwrap_or(&o.target.did), o.lxm)
             .await
             .map_err(err)?;
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
@@ -350,9 +361,6 @@ pub async fn send(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Respons
             }
         }
     };
-    if upstream.status().as_u16() >= 400 {
-        return Err(upstream_error(s, upstream).await);
-    }
     Ok(upstream)
 }
 
@@ -429,46 +437,84 @@ fn type_name(status: u16) -> &'static str {
     }
 }
 
-async fn upstream_error(s: &AppState, upstream: reqwest::Response) -> Response {
-    let code = upstream.status().as_u16();
-    let status = if code == 500 {
-        StatusCode::BAD_GATEWAY
-    } else {
-        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY)
-    };
-    let headers = response_headers(upstream.headers(), false);
-    let json_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE.as_str())
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(is_json_type);
-    let identity = upstream.headers().get("content-encoding").is_none();
-    let max = usize::try_from(s.snapshot().int("proxy.max_response_size")).unwrap_or(usize::MAX);
-    let parsed: Value = if json_type && identity {
-        read_capped(upstream.bytes_stream(), max)
-            .await
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null)
-    } else {
-        Value::Null
-    };
-    let error = parsed["error"]
-        .as_str()
-        .map_or_else(|| type_name(status.as_u16()).to_owned(), str::to_owned);
-    let message = parsed["message"].as_str().map_or_else(
-        || status.canonical_reason().unwrap_or("Unknown").to_owned(),
-        str::to_owned,
-    );
-    let mut res = (
-        status,
-        axum::Json(json!({"error": error, "message": message})),
-    )
-        .into_response();
-    for (n, v) in headers {
-        res.headers_mut().insert(n, v);
+/// An upstream error, as the client gets it: the upstream's status (500 →
+/// 502), its `error` name (or the status's XRPC name) and `message`, and
+/// the forwarded headers.
+#[derive(Debug, Clone)]
+pub struct UpstreamError {
+    pub status: StatusCode,
+    pub error: String,
+    pub message: String,
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl UpstreamError {
+    pub async fn read(s: &AppState, upstream: reqwest::Response) -> Self {
+        let code = upstream.status().as_u16();
+        let status = if code == 500 {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY)
+        };
+        let headers = response_headers(upstream.headers(), false);
+        let json_type = upstream
+            .headers()
+            .get(header::CONTENT_TYPE.as_str())
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_json_type);
+        let identity = upstream.headers().get("content-encoding").is_none();
+        let max =
+            usize::try_from(s.snapshot().int("proxy.max_response_size")).unwrap_or(usize::MAX);
+        let parsed: Value = if json_type && identity {
+            read_capped(upstream.bytes_stream(), max)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        Self {
+            error: parsed["error"]
+                .as_str()
+                .map_or_else(|| type_name(status.as_u16()).to_owned(), str::to_owned),
+            message: parsed["message"].as_str().map_or_else(
+                || status.canonical_reason().unwrap_or("Unknown").to_owned(),
+                str::to_owned,
+            ),
+            status,
+            headers,
+        }
     }
-    res
+
+    /// A forwarded header's value.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .and_then(|(_, v)| v.to_str().ok())
+    }
+}
+
+impl IntoResponse for UpstreamError {
+    fn into_response(self) -> Response {
+        let mut res = (
+            self.status,
+            axum::Json(json!({"error": self.error, "message": self.message})),
+        )
+            .into_response();
+        for (n, v) in self.headers {
+            res.headers_mut().insert(n, v);
+        }
+        res
+    }
+}
+
+/// Like [`send`], but an upstream error comes back as the response itself
+/// (for handlers that look at it, such as `getPostThread`'s `NotFound`).
+pub async fn send_any(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Response> {
+    send_inner(s, o).await
 }
 
 fn is_json_type(ct: &str) -> bool {
@@ -561,7 +607,7 @@ pub async fn proxy(
     }
 }
 
-async fn proxy_inner(
+pub(crate) async fn proxy_inner(
     s: &AppState,
     lxm: &str,
     method: Method,
@@ -603,6 +649,7 @@ async fn proxy_inner(
             path_and_query,
             headers,
             iss: Some(&authed.did),
+            aud: None,
             target: &target,
             accept_encoding: accept,
             strict: target.user_influenced && lxm == "com.atproto.moderation.createReport",
