@@ -20,6 +20,7 @@ use crate::auth;
 use crate::error::{XrpcError, XrpcResult};
 use crate::kryphocron as kr;
 use crate::state::AppState;
+use locus_kryphocron::nsid::AUDIENCE;
 
 type St = State<Arc<AppState>>;
 
@@ -215,6 +216,18 @@ pub async fn create_record(
     .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 3).await?;
     check_collection(&input.collection)?;
+    if input.collection == AUDIENCE {
+        // Audiences live in the private store: no commit.
+        let w = crate::audience::generic_create(
+            &s,
+            &headers,
+            &account.did,
+            input.rkey.as_deref(),
+            &input.record,
+        )
+        .await?;
+        return Ok(Json(json!({"uri": w.uri, "cid": w.cid})));
+    }
     let rkey = input.rkey.clone().unwrap_or_else(|| s.repo.tids().next());
     let value = kr_value(
         &s,
@@ -287,6 +300,11 @@ pub async fn put_record(
     .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 2).await?;
     check_collection(&input.collection)?;
+    if input.collection == AUDIENCE {
+        let swap = input.swap_record.as_ref().and_then(Value::as_str);
+        let w = crate::audience::update(&s, &account.did, &input.rkey, &input.record, swap).await?;
+        return Ok(Json(json!({"uri": w.uri, "cid": w.cid})));
+    }
     let value = kr_value(
         &s,
         &account.did,
@@ -353,6 +371,10 @@ pub async fn delete_record(
     .await?;
     crate::ratelimit::limit_repo_write(&s, &account.did, 1).await?;
     check_collection(&input.collection)?;
+    if input.collection == AUDIENCE {
+        crate::audience::delete(&s, &account.did, &input.rkey).await?;
+        return Ok(Json(json!({})));
+    }
     kr::prepare_write(
         &s,
         &account.did,
@@ -399,6 +421,50 @@ pub struct ApplyWritesInput {
     swap_commit: Option<String>,
 }
 
+/// An `applyWrites` with an audience op: it stands alone **[deviation]**,
+/// since a prism write can't roll back with a database transaction; no
+/// commit, so the output has no `commit`.
+async fn audience_write(
+    s: &Arc<AppState>,
+    headers: &HeaderMap,
+    did: &str,
+    input: &ApplyWritesInput,
+) -> XrpcResult<Json<Value>> {
+    let [w] = input.writes.as_slice() else {
+        return Err(XrpcError::invalid_request(
+            "An audience write must be the only write in applyWrites",
+        ));
+    };
+    if input.swap_commit.is_some() {
+        return Err(XrpcError::invalid_request(
+            "swapCommit doesn't apply to audience writes",
+        ));
+    }
+    let rkey = w["rkey"].as_str();
+    let result = match w["$type"].as_str().unwrap_or_default() {
+        "com.atproto.repo.applyWrites#create" => {
+            let out = crate::audience::generic_create(s, headers, did, rkey, &w["value"]).await?;
+            json!({"$type": "com.atproto.repo.applyWrites#createResult", "uri": out.uri, "cid": out.cid})
+        }
+        "com.atproto.repo.applyWrites#update" => {
+            let rkey = rkey.ok_or_else(|| XrpcError::invalid_request("writes[0]: missing rkey"))?;
+            let out = crate::audience::update(s, did, rkey, &w["value"], None).await?;
+            json!({"$type": "com.atproto.repo.applyWrites#updateResult", "uri": out.uri, "cid": out.cid})
+        }
+        "com.atproto.repo.applyWrites#delete" => {
+            let rkey = rkey.ok_or_else(|| XrpcError::invalid_request("writes[0]: missing rkey"))?;
+            crate::audience::delete(s, did, rkey).await?;
+            json!({"$type": "com.atproto.repo.applyWrites#deleteResult"})
+        }
+        other => {
+            return Err(XrpcError::invalid_request(format!(
+                "writes[0]: unknown write type {other:?}"
+            )));
+        }
+    };
+    Ok(Json(json!({"results": [result]})))
+}
+
 pub async fn apply_writes(
     State(s): St,
     headers: HeaderMap,
@@ -433,6 +499,9 @@ pub async fn apply_writes(
         return Err(XrpcError::invalid_request(format!(
             "Too many writes. Max: {MAX_WRITES}"
         )));
+    }
+    if input.writes.iter().any(|w| w["collection"] == AUDIENCE) {
+        return audience_write(&s, &headers, &account.did, &input).await;
     }
     let mut writes = Vec::with_capacity(input.writes.len());
     let mut results = Vec::with_capacity(input.writes.len());
@@ -538,6 +607,12 @@ pub async fn get_record(
     Query(p): Query<GetRecordParams>,
 ) -> Response {
     match readable_account(&s, &p.repo).await {
+        Ok(Some(account)) if p.collection == AUDIENCE => {
+            crate::audience::owner_record(&s, &headers, &account.did, &p.rkey)
+                .await
+                .map(Json)
+                .into_response()
+        }
         Ok(Some(account)) => local_record(&s, &account, &p).await.into_response(),
         Ok(None) => remote_record(&s, &uri_in, &headers)
             .await
@@ -616,11 +691,17 @@ pub struct ListRecordsParams {
 
 pub async fn list_records(
     State(s): St,
+    headers: HeaderMap,
     Query(p): Query<ListRecordsParams>,
 ) -> XrpcResult<Json<Value>> {
     let account = readable_account(&s, &p.repo)
         .await?
         .ok_or_else(|| XrpcError::invalid_request(format!("Could not find repo: {}", p.repo)))?;
+    if p.collection == AUDIENCE {
+        return crate::audience::owner_list(&s, &headers, &account.did)
+            .await
+            .map(Json);
+    }
     let limit = p.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
         return Err(XrpcError::invalid_request(

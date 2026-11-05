@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod audience;
+pub mod audience_sync;
 pub mod auth;
 pub mod bsky;
 pub mod email;
@@ -175,6 +176,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/tools.kryphocron.feed.deletePostPrivate",
             post(kryphocron::delete_post_private),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.policy.manageAudience",
+            post(audience::manage_audience),
+        )
+        .route(
+            "/xrpc/tools.kryphocron.policy.deleteAudience",
+            post(audience::delete_audience),
         )
         .route("/xrpc/com.atproto.sync.getBlob", get(repo::get_blob))
         .route(

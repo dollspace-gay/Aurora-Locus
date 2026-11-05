@@ -820,3 +820,338 @@ impl Store {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------- audience writes
+
+/// An audience create sent to the AppView.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AudienceAttempt {
+    pub id: String,
+    pub did: String,
+    pub value_json: String,
+    pub created_at_value: String,
+    pub updated_at_value: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub outcome: String,
+    pub local_rkey: Option<String>,
+    pub local_row_version: Option<i64>,
+}
+
+/// A row a refresh adopted and no attempt has claimed yet.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AdoptedRow {
+    pub rkey: String,
+    pub name: Option<String>,
+    pub mode: String,
+    pub members_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub adopted_at: i64,
+}
+
+impl Store {
+    /// Writes an attempt row (`sending`) before the create is sent; its
+    /// `created_at` is the database clock. Returns it.
+    pub async fn create_audience_attempt(
+        &self,
+        id: &str,
+        did: &str,
+        value_json: &str,
+        created_at_value: &str,
+        updated_at_value: &str,
+        local: Option<(&str, i64)>,
+    ) -> CoreResult<i64> {
+        let q = sql(
+            "INSERT INTO kr_audience_attempt (id, did, value_json, created_at_value, updated_at_value, \
+             created_at, expires_at, outcome, local_rkey, local_row_version) \
+             VALUES ({1}, {2}, {3}, {4}, {5}, {now}, {now} + 3600000, 'sending', {6}, {7}) RETURNING created_at",
+            self.is_postgres(),
+        );
+        scalar!(
+            self,
+            q,
+            fetch_one,
+            id,
+            did,
+            value_json,
+            created_at_value,
+            updated_at_value,
+            local.map(|(r, _)| r),
+            local.map(|(_, v)| v)
+        )
+    }
+
+    pub async fn set_attempt_outcome(&self, id: &str, outcome: &str) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE kr_audience_attempt SET outcome = {2} WHERE id = {1}",
+            self.is_postgres(),
+        );
+        exec!(self, q, id, outcome)?;
+        Ok(())
+    }
+
+    pub async fn delete_attempt(&self, id: &str) -> CoreResult<()> {
+        let q = sql(
+            "DELETE FROM kr_audience_attempt WHERE id = {1}",
+            self.is_postgres(),
+        );
+        exec!(self, q, id)?;
+        Ok(())
+    }
+
+    pub async fn audience_attempt(&self, id: &str) -> CoreResult<Option<AudienceAttempt>> {
+        let q = sql(
+            "SELECT id, did, value_json, created_at_value, updated_at_value, created_at, expires_at, outcome, \
+             local_rkey, local_row_version FROM kr_audience_attempt WHERE id = {1}",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_optional, id)
+    }
+
+    /// Open attempts (`sending`, `unknown`) of an account; ones past their
+    /// hour become `expired` first.
+    pub async fn open_attempts(&self, did: &str) -> CoreResult<Vec<AudienceAttempt>> {
+        let expire = sql(
+            "UPDATE kr_audience_attempt SET outcome = 'expired' WHERE did = {1} \
+             AND outcome IN ('sending', 'unknown') AND expires_at <= {now}",
+            self.is_postgres(),
+        );
+        exec!(self, expire, did)?;
+        let q = sql(
+            "SELECT id, did, value_json, created_at_value, updated_at_value, created_at, expires_at, outcome, \
+             local_rkey, local_row_version FROM kr_audience_attempt WHERE did = {1} \
+             AND outcome IN ('sending', 'unknown') ORDER BY created_at",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    /// Rows adopted at or after `since` that no attempt has claimed.
+    pub async fn unlinked_adopted(&self, did: &str, since: i64) -> CoreResult<Vec<AdoptedRow>> {
+        let q = sql(
+            "SELECT rkey, name, mode, members_json, created_at, updated_at, adopted_at FROM kr_audience \
+             WHERE did = {1} AND adopted_at IS NOT NULL AND adopted_at >= {2} AND adopted_by_attempt IS NULL",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did, since)
+    }
+
+    /// Links an adopted row to the attempt that created it, and marks the
+    /// attempt adopted.
+    pub async fn link_attempt(&self, did: &str, rkey: &str, attempt: &str) -> CoreResult<bool> {
+        let q = sql(
+            "UPDATE kr_audience SET adopted_by_attempt = {3} WHERE did = {1} AND rkey = {2} \
+             AND adopted_by_attempt IS NULL",
+            self.is_postgres(),
+        );
+        let n = exec!(self, q, did, rkey, attempt)?;
+        if n == 1 {
+            self.set_attempt_outcome(attempt, "adopted").await?;
+        }
+        Ok(n == 1)
+    }
+
+    /// The row an attempt was linked to.
+    pub async fn attempt_row(&self, did: &str, attempt: &str) -> CoreResult<Option<AudienceRow>> {
+        let q = sql(
+            &format!(
+                "SELECT {AUDIENCE_COLS} FROM kr_audience WHERE did = {{1}} AND adopted_by_attempt = {{2}}"
+            ),
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_optional, did, attempt)
+    }
+
+    /// Sets a row's value from a local write: a write-through prism accepted
+    /// (`pending` none, the new version token), an edit queued during an
+    /// outage (`pending` update), or a local audience's edit. Conditional on
+    /// `version`. Clears a flag (an edit clears it).
+    pub async fn write_audience_value(&self, r: &AudienceRow, version: i64) -> CoreResult<bool> {
+        let q = sql(
+            "UPDATE kr_audience SET name = {3}, mode = {4}, members_json = {5}, created_at = {6}, updated_at = {7}, \
+             prism_cid = {8}, local_cid = {9}, value_cbor = {10}, pending = {11}, \
+             pending_at = CASE WHEN {11} = 'none' THEN NULL ELSE {now} END, flagged = NULL, \
+             row_version = row_version + 1 WHERE did = {1} AND rkey = {2} AND row_version = {12}",
+            self.is_postgres(),
+        );
+        let n = exec!(
+            self,
+            q,
+            &r.did,
+            &r.rkey,
+            &r.name,
+            &r.mode,
+            &r.members_json,
+            &r.created_at,
+            &r.updated_at,
+            &r.prism_cid,
+            &r.local_cid,
+            &r.value_cbor,
+            &r.pending,
+            version
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Queues a delete of a prism audience (an outage, the tier off).
+    pub async fn queue_audience_delete(&self, did: &str, rkey: &str) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE kr_audience SET pending = 'delete', pending_at = {now}, row_version = row_version + 1 \
+             WHERE did = {1} AND rkey = {2}",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, rkey)?;
+        Ok(())
+    }
+
+    /// How many audiences an account holds (local ones included).
+    pub async fn count_audiences(&self, did: &str) -> CoreResult<i64> {
+        let q = sql(
+            "SELECT COUNT(*) FROM kr_audience WHERE did = {1} AND pending <> 'delete'",
+            self.is_postgres(),
+        );
+        scalar!(self, q, fetch_one, did)
+    }
+
+    /// Whether an rkey is used anywhere in an account's copy (a row, an
+    /// alias either way, or a tombstone).
+    pub async fn audience_rkey_taken(&self, did: &str, rkey: &str) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT 1 FROM kr_audience WHERE did = {1} AND rkey = {2} \
+             UNION ALL SELECT 1 FROM kr_audience_alias WHERE did = {1} AND (local_rkey = {2} OR prism_rkey = {2}) \
+             UNION ALL SELECT 1 FROM kr_audience_tombstone WHERE did = {1} AND rkey = {2} LIMIT 1",
+            self.is_postgres(),
+        );
+        let r: Option<i32> = scalar!(self, q, fetch_optional, did, rkey)?;
+        Ok(r.is_some())
+    }
+}
+
+impl Store {
+    /// The mapping transaction, for a local audience `local_rkey` that prism
+    /// now holds at `prism_rkey`:
+    /// 1. prism's row: `prism_row` is written unless a refresh already
+    ///    adopted it (then that row is kept);
+    /// 2. if the local row was edited after its value was sent (its version
+    ///    isn't `sent_version`), its current value goes onto prism's row as
+    ///    a pending update; if it was deleted meanwhile, prism's row is a
+    ///    pending delete;
+    /// 3. the alias `local_rkey → prism_rkey`;
+    /// 4. the local row goes, with a tombstone.
+    ///
+    /// Each step is conditional (no alias yet), so a mapping applied twice
+    /// is a no-op. Returns whether it mapped.
+    pub async fn map_local_audience(
+        &self,
+        did: &str,
+        local_rkey: &str,
+        sent_version: Option<i64>,
+        prism_rkey: &str,
+        prism_row: Option<&AudienceRow>,
+    ) -> CoreResult<bool> {
+        let mut tx = self.begin().await?;
+        let pg = matches!(tx, Tx::Postgres(_));
+        let alias = sql(
+            "INSERT INTO kr_audience_alias (did, local_rkey, prism_rkey, mapped_at) VALUES ({1}, {2}, {3}, {now}) \
+             ON CONFLICT (did, local_rkey) DO NOTHING",
+            pg,
+        );
+        if tx_exec!(&mut tx, alias, did, local_rkey, prism_rkey)? == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(r) = prism_row {
+            let q = sql(
+                &format!(
+                    "INSERT INTO kr_audience ({AUDIENCE_COLS}, adopted_at) VALUES ({{1}}, {{2}}, {{3}}, {{4}}, {{5}}, \
+                     {{6}}, {{7}}, {{8}}, {{9}}, {{10}}, {{11}}, {{12}}, {{13}}, {{14}}, {{now}}) \
+                     ON CONFLICT (did, rkey) DO NOTHING"
+                ),
+                pg,
+            );
+            tx_exec!(
+                &mut tx,
+                q,
+                &r.did,
+                prism_rkey,
+                &r.name,
+                &r.mode,
+                &r.members_json,
+                &r.created_at,
+                &r.updated_at,
+                "prism",
+                &r.prism_did,
+                &r.prism_cid,
+                &r.local_cid,
+                &r.value_cbor,
+                "none",
+                1_i64
+            )?;
+        }
+        let local_q = sql(
+            &format!("SELECT {AUDIENCE_COLS} FROM kr_audience WHERE did = {{1}} AND rkey = {{2}}"),
+            pg,
+        );
+        let local: Option<AudienceRow> = match &mut tx {
+            Tx::Sqlite(t) => {
+                sqlx::query_as(&local_q)
+                    .bind(did)
+                    .bind(local_rkey)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+            Tx::Postgres(t) => {
+                sqlx::query_as(&local_q)
+                    .bind(did)
+                    .bind(local_rkey)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+        }
+        .map_err(db_err)?;
+        match &local {
+            Some(l) if sent_version.is_some_and(|v| v != l.row_version) => {
+                let q = sql(
+                    "UPDATE kr_audience SET name = {3}, mode = {4}, members_json = {5}, updated_at = {6}, \
+                     local_cid = {7}, value_cbor = {8}, pending = 'update', pending_at = {now}, \
+                     row_version = row_version + 1 WHERE did = {1} AND rkey = {2}",
+                    pg,
+                );
+                tx_exec!(
+                    &mut tx,
+                    q,
+                    did,
+                    prism_rkey,
+                    &l.name,
+                    &l.mode,
+                    &l.members_json,
+                    &l.updated_at,
+                    &l.local_cid,
+                    &l.value_cbor
+                )?;
+            }
+            Some(_) => {}
+            None => {
+                let q = sql(
+                    "UPDATE kr_audience SET pending = 'delete', pending_at = {now}, row_version = row_version + 1 \
+                     WHERE did = {1} AND rkey = {2}",
+                    pg,
+                );
+                tx_exec!(&mut tx, q, did, prism_rkey)?;
+            }
+        }
+        if local.is_some() {
+            let del = sql("DELETE FROM kr_audience WHERE did = {1} AND rkey = {2}", pg);
+            tx_exec!(&mut tx, del, did, local_rkey)?;
+            let t = sql(
+                "INSERT INTO kr_audience_tombstone (did, rkey, deleted_at) VALUES ({1}, {2}, {now}) \
+                 ON CONFLICT (did, rkey) DO UPDATE SET deleted_at = excluded.deleted_at",
+                pg,
+            );
+            tx_exec!(&mut tx, t, did, local_rkey)?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+}

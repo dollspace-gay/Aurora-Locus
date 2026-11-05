@@ -6356,3 +6356,515 @@ async fn an_unreachable_prism_is_marked_down_and_probed_back_up() {
     }
     assert!(!h.state.kr.prism.is_down(), "probed back up");
 }
+
+const AUD: &str = "tools.kryphocron.policy.audience";
+
+#[tokio::test]
+async fn audiences_are_written_through_to_prism_and_kept_private() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("eve.pds.example.com", "eve@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let (script, seen) = h.with_prism().await;
+    let prism_uri = format!("at://{did}/{AUD}/3m6prismaaaaa");
+    set_script(
+        &script,
+        "app.nearhorizon.private.createAudience",
+        200,
+        json!({"uri": prism_uri, "cid": "t1"}),
+    );
+    let outbox_before = h.state.store.outbox_for(&did).await.unwrap().len();
+
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "record": {"name": "  Friends ", "members": ["did:plc:friend", "did:plc:friend", did], "extra": 1}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["uri"], json!(prism_uri));
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, "3m6prismaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v["cid"], json!(row.local_cid), "the stored value's CID");
+    assert_eq!(
+        (
+            row.name.as_deref(),
+            row.members_json.as_str(),
+            row.prism_cid.as_deref()
+        ),
+        (Some("Friends"), "[\"did:plc:friend\"]", Some("t1"))
+    );
+    let sent: Value = {
+        let log = seen.lock().unwrap();
+        let s = log
+            .iter()
+            .find(|s| s.uri.contains("createAudience"))
+            .unwrap();
+        serde_json::from_slice(&s.body).unwrap()
+    };
+    assert_eq!(
+        sent["record"]["createdAt"], sent["record"]["updatedAt"],
+        "one instant, stamped by locus"
+    );
+    assert!(
+        sent["record"].get("extra").is_none() && sent["record"].get("mode").is_none(),
+        "prism's canonical form"
+    );
+    assert_eq!(
+        h.state.store.outbox_for(&did).await.unwrap().len(),
+        outbox_before,
+        "no commit, no firehose event"
+    );
+
+    // Only the owner reads it.
+    let path =
+        format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection={AUD}&rkey=3m6prismaaaaa");
+    let (st, mine) = h.call("GET", &path, Some(&access), None).await;
+    assert_eq!(st, StatusCode::OK, "{mine}");
+    assert_eq!(mine["value"]["members"], json!(["did:plc:friend"]));
+    let (st, theirs) = h.call("GET", &path, None, None).await;
+    assert_eq!(
+        (st, theirs["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RecordNotFound"))
+    );
+    let list = format!("/xrpc/com.atproto.repo.listRecords?repo={did}&collection={AUD}");
+    assert_eq!(
+        h.call("GET", &list, Some(&access), None).await.1["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        h.call("GET", &list, None, None).await.1["records"],
+        json!([])
+    );
+
+    // Updates through putRecord, CAS on the stored value's CID.
+    set_script(
+        &script,
+        "app.nearhorizon.private.updateAudience",
+        200,
+        json!({"uri": prism_uri, "cid": "t2"}),
+    );
+    let put = |swap: Value| {
+        let (h, access, did) = (&h, access.clone(), did.clone());
+        async move {
+            h.post(
+                "com.atproto.repo.putRecord",
+                Some(&access),
+                json!({"repo": did, "collection": AUD, "rkey": "3m6prismaaaaa", "swapRecord": swap,
+                       "record": {"members": ["did:plc:friend", "did:plc:new"]}}),
+            )
+            .await
+        }
+    };
+    let (st, v) = put(json!(
+        "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"
+    ))
+    .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidSwap"))
+    );
+    let (st, v) = put(json!(row.local_cid)).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let row2 = h
+        .state
+        .store
+        .kr_audience(&did, "3m6prismaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row2.prism_cid.as_deref(), row2.created_at.as_str()),
+        (Some("t2"), row.created_at.as_str()),
+        "createdAt kept"
+    );
+    let sent: Value = {
+        let log = seen.lock().unwrap();
+        serde_json::from_slice(
+            &log.iter()
+                .rev()
+                .find(|s| s.uri.contains("updateAudience"))
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        sent["swapCid"],
+        json!("t1"),
+        "prism's version token for its own CAS"
+    );
+
+    // createRecord with an rkey the listing lacks; applyWrites alone or not at all.
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did, "3m6prismaaaaa", "t2", &["did:plc:friend", "did:plc:new"])]}),
+    );
+    let (st, _) = h
+        .post("com.atproto.repo.createRecord", Some(&access),
+            json!({"repo": did, "collection": AUD, "rkey": "3m6nopenopeno", "record": {"members": []}}))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "prism mints audience rkeys");
+    let (st, _) = h
+        .post("com.atproto.repo.applyWrites", Some(&access), json!({"repo": did, "writes": [
+            {"$type": "com.atproto.repo.applyWrites#delete", "collection": AUD, "rkey": "3m6prismaaaaa"},
+            {"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")},
+        ]}))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an audience op stands alone");
+
+    // Prism's refusals, and locus's own cap.
+    set_script(
+        &script,
+        "app.nearhorizon.private.createAudience",
+        400,
+        json!({"error": "LimitReached", "message": "200 max"}),
+    );
+    let create = || {
+        let (h, access, did) = (&h, access.clone(), did.clone());
+        async move {
+            h.post(
+                "tools.kryphocron.policy.manageAudience",
+                Some(&access),
+                json!({"repo": did, "record": {"members": []}}),
+            )
+            .await
+        }
+    };
+    let (st, v) = create().await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("200 max"))
+    );
+    h.state
+        .settings
+        .set("kryphocron.audience_max_per_account", json!(1), "test")
+        .await
+        .unwrap();
+    let (_, v) = create().await;
+    assert_eq!(v["error"], "LimitReached", "checked before calling prism");
+    h.state
+        .settings
+        .set("kryphocron.audience_max_per_account", json!(200), "test")
+        .await
+        .unwrap();
+
+    // Deletes, through applyWrites alone: no commit in the output.
+    set_script(
+        &script,
+        "app.nearhorizon.private.deleteAudience",
+        200,
+        json!({}),
+    );
+    let (st, v) = h
+        .post("com.atproto.repo.applyWrites", Some(&access), json!({"repo": did, "writes": [
+            {"$type": "com.atproto.repo.applyWrites#delete", "collection": AUD, "rkey": "3m6prismaaaaa"}]}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v.get("commit").is_none());
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6prismaaaaa")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.state
+            .store
+            .audience_tombstone(&did, "3m6prismaaaaa")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // NotEnrolled: no longer a member; the copy goes.
+    h.add_audience(&did, "3m6bbbbbbbbbb").await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.createAudience",
+        400,
+        json!({"error": "NotEnrolled"}),
+    );
+    assert_eq!(create().await.0, StatusCode::FORBIDDEN);
+    assert!(h.state.store.kr_audiences(&did).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn during_a_prism_outage_the_copy_is_the_authority() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("fay.pds.example.com", "fay@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let (_script, _) = h.with_prism().await;
+    let existing = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    // A first private-tier write while prism is up, so a membership answer
+    // exists to fall back on.
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("x", &existing)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let dead = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    h.state
+        .settings
+        .set("appview.url", json!(dead), "test")
+        .await
+        .unwrap();
+
+    // Creating makes a local audience with a locus-minted TID.
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "record": {"members": ["did:plc:friend"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let local_rkey = v["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, &local_rkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.origin.as_str(), row.prism_cid.as_deref()),
+        ("local", None)
+    );
+    assert!(proto_blue_syntax::Tid::new(&local_rkey).is_ok());
+    for _ in 0..50 {
+        if h.state.kr.prism.is_down() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(h.state.kr.prism.is_down());
+
+    // Posts can name it; editing it changes its row directly.
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("x", v["uri"].as_str().unwrap())}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = h
+        .post("tools.kryphocron.policy.manageAudience", Some(&access),
+            json!({"repo": did, "rkey": local_rkey, "record": {"members": ["did:plc:friend", "did:plc:two"]}}))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, &local_rkey)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((row.pending.as_str(), row.row_version), ("none", 2));
+
+    // A prism audience's edit is queued; its delete too.
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "rkey": "3m6aaaaaaaaaa", "record": {"members": ["did:plc:x"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6aaaaaaaaaa")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending,
+        "update"
+    );
+
+    // Proxied prism calls are answered from the store, in prism's shapes.
+    let proxy = [("atproto-proxy", "did:web:prism.test#bsky_appview")];
+    let (st, _, body) = h
+        .raw(
+            "GET",
+            "/xrpc/app.nearhorizon.private.listAudiences?limit=10",
+            Some(&access),
+            vec![],
+            &proxy,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let listed: Value = serde_json::from_slice(&body).unwrap();
+    let rkeys: Vec<&str> = listed["audiences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["uri"].as_str().unwrap().rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(
+        rkeys,
+        [local_rkey.as_str(), "3m6aaaaaaaaaa"],
+        "newest first, local included"
+    );
+    let (st, _, body) = h
+        .raw("POST", "/xrpc/app.nearhorizon.private.createAudience", Some(&access),
+            serde_json::to_vec(&json!({"record": {"members": [], "createdAt": "2020-01-01T00:00:00Z", "updatedAt": "2020-01-01T00:00:00Z"}})).unwrap(),
+            &[proxy[0], ("content-type", "application/json")])
+        .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let made: Value = serde_json::from_slice(&body).unwrap();
+    let made_rkey = made["uri"].as_str().unwrap().rsplit('/').next().unwrap();
+    assert_eq!(
+        h.state
+            .store
+            .kr_audience(&did, made_rkey)
+            .await
+            .unwrap()
+            .unwrap()
+            .origin,
+        "local"
+    );
+
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.policy.deleteAudience",
+            Some(&access),
+            json!({"repo": did, "rkey": "3m6aaaaaaaaaa"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6aaaaaaaaaa")
+            .await
+            .unwrap()
+            .is_none(),
+        "a pending delete counts as missing"
+    );
+    assert_eq!(
+        h.state
+            .store
+            .audience_versions(&did)
+            .await
+            .unwrap()
+            .iter()
+            .find(|v| v.rkey == "3m6aaaaaaaaaa")
+            .unwrap()
+            .pending,
+        "delete"
+    );
+
+    // With the tier off, a delete is still accepted (queued or local).
+    h.state
+        .settings
+        .set("kryphocron.private_tier_enabled", json!(false), "test")
+        .await
+        .unwrap();
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.policy.deleteAudience",
+            Some(&access),
+            json!({"repo": did, "rkey": local_rkey}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, &local_rkey)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_ambiguous_create_is_linked_to_the_audience_a_refresh_adopts() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("gil.pds.example.com", "gil@example.com", "pw")
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let (script, _) = h.with_prism().await;
+    let stamp = "2024-05-01T10:00:00.123Z";
+    let sent = json!({"$type": AUD, "members": ["did:plc:b", "did:plc:a"], "createdAt": stamp, "updatedAt": stamp});
+    h.state
+        .store
+        .create_audience_attempt("att1", &did, &sent.to_string(), stamp, stamp, None)
+        .await
+        .unwrap();
+    h.state
+        .store
+        .set_attempt_outcome("att1", "unknown")
+        .await
+        .unwrap();
+    // Prism did create it (canonical form: members reordered, offset stamps).
+    let mut entry = prism_audience(&did, "3m6madeitmade", "v1", &["did:plc:a", "did:plc:b"]);
+    entry["record"]["createdAt"] = json!("2024-05-01T12:00:00.123+02:00");
+    entry["record"]["updatedAt"] = json!("2024-05-01T12:00:00.123+02:00");
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [entry]}),
+    );
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    crate::audience::refresh(&h.state, &did, crate::audience::Trigger::Bypass, None, far)
+        .await
+        .unwrap();
+    let row = h
+        .state
+        .store
+        .attempt_row(&did, "att1")
+        .await
+        .unwrap()
+        .expect("linked");
+    assert_eq!(row.rkey, "3m6madeitmade");
+    assert_eq!(
+        h.state
+            .store
+            .audience_attempt("att1")
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "adopted"
+    );
+}

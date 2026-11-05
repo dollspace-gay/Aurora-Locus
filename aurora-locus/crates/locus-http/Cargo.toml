@@ -11,6 +11,7 @@ locus-core.workspace = true
 locus-store.workspace = true
 locus-repo.workspace = true
 locus-kryphocron.workspace = true
+unicode-segmentation = "1"
 locus-auth.workspace = true
 locus-identity.workspace = true
 locus-mail.workspace = true

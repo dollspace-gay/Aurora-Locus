@@ -607,6 +607,9 @@ pub async fn proxy(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if crate::audience::is_prism_audience_call(&s, &headers, &lxm) {
+        return crate::audience::proxied(&s, &lxm, method, &uri, &headers, body).await;
+    }
     match proxy_inner(&s, &lxm, method, &uri, &headers, body).await {
         Ok(r) | Err(r) => r,
     }
