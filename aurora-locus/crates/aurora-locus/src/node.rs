@@ -337,6 +337,7 @@ impl Node {
             }),
             logs: Arc::clone(&self.logs),
             branding: locus_http::branding::Cache::default(),
+            socket_secret: locus_http::socket::new_secret(),
         });
         self.setup_done = state.setup.completed.clone();
         if self.setup_mode {
@@ -360,6 +361,25 @@ impl Node {
             .await
             .map_err(|e| CoreError::Config(format!("can't listen on {addr}: {e}")))?;
         tracing::info!(%addr, public_url = %state.public_url, setup_mode = self.setup_mode, "listening");
+        // The admin socket, for the CLI on this machine.
+        #[cfg(unix)]
+        if let Some(path) = self.bootstrap.admin_socket.clone() {
+            match locus_http::socket::bind(&path) {
+                Ok(l) => {
+                    tracing::info!(path = %path.display(), "admin socket listening");
+                    let (st, cancel) = (Arc::clone(&state), self.cancel.clone());
+                    self.tasks.push(tokio::spawn(async move {
+                        if let Err(e) = locus_http::socket::serve(st, l, path, cancel).await {
+                            tracing::warn!("admin socket stopped: {e}");
+                        }
+                    }));
+                }
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    "admin socket unavailable ({e}); the CLI can use HTTP with an API token instead"
+                ),
+            }
+        }
         // Headless setup runs once the listener is up, so its checks can
         // reach this node through the public URL.
         if self.setup_mode

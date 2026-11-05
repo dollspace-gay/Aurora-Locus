@@ -217,6 +217,7 @@ async fn harness_build(
         }),
         logs: Arc::new(locus_core::logs::LogRing::new(100)),
         branding: crate::branding::Cache::default(),
+        socket_secret: crate::socket::new_secret(),
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -11026,4 +11027,102 @@ async fn oauth_sign_in_page(h: &Harness) -> String {
             .collect::<String>()
     );
     Browser::default().get(h, &path).await.2
+}
+
+#[tokio::test]
+async fn the_admin_socket_is_the_owner_and_tcp_can_not_pretend_to_be_it() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let secret = h.state.socket_secret.clone();
+    // Through the router, the marker is an owner credential; a wrong one is refused.
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            &ns("owner.listOperators"),
+            None,
+            vec![],
+            &[(crate::socket::MARKER, &secret)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            &ns("owner.listOperators"),
+            None,
+            vec![],
+            &[(crate::socket::MARKER, "guess")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // Over TCP the marker is stripped, so even the right value is nothing.
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    tokio::spawn(crate::serve(h.state.clone(), tcp, cancel.clone()));
+    let res = reqwest::Client::new()
+        .get(format!("http://{addr}{}", ns("owner.listOperators")))
+        .header(crate::socket::MARKER, &secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status().as_u16(),
+        401,
+        "the TCP listener strips the marker"
+    );
+
+    // Over the socket, a request works as the owner.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("admin.sock");
+    let listener = crate::socket::bind(&path).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    tokio::spawn(crate::socket::serve(
+        h.state.clone(),
+        listener,
+        path.clone(),
+        cancel.clone(),
+    ));
+    let mut s = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let body = r#"{"username":"cli-made","password":"a long enough password","role":"viewer"}"#;
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        ns("owner.createOperator"),
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(h.state.store.operator("cli-made").await.unwrap().is_some());
+    let audit = h.state.store.audit_entries(None, 10).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "operator.create" && e.actor == "socket")
+    );
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn setup_applies_on_a_database_no_node_has_started() {
+    let h = setup_harness("pds.example.com", false).await;
+    assert!(
+        h.state.store.setup_state().await.unwrap().is_none(),
+        "no setup row yet"
+    );
+    let mut plan = crate::setup::seed_plan(&h.state.snapshot(), Some("pds.example.com"));
+    plan.admin_password = Some("an admin password".into());
+    plan.email.skipped = true;
+    plan.keys_backup_acknowledged = true;
+    crate::setup::apply(&h.state.store, &h.state.master_key, &plan, false)
+        .await
+        .unwrap();
+    assert!(h.state.store.setup_completed().await.unwrap());
 }

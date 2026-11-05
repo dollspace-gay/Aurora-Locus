@@ -5,7 +5,8 @@
 //!   on the reference admin surface only;
 //! - a service JWT from the moderation service: the reference's mod-service
 //!   access (the methods the reference opens to it);
-//! - a console sign-in (`Console <session>`): the operator's role.
+//! - a console sign-in (`Console <session>`): the operator's role;
+//! - the admin socket (its marker, see [`crate::socket`]): owner.
 //!
 //! Every method has a minimum role; a caller below it is refused.
 
@@ -59,6 +60,8 @@ pub enum Via {
     /// A console sign-in (`Console <session>`), as the console's forms call
     /// this API.
     Console,
+    /// The admin socket (root or the service's own user on this machine).
+    Socket,
 }
 
 /// An authenticated admin-API caller.
@@ -129,7 +132,19 @@ pub async fn require(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let caller = if auth.starts_with("Basic ") {
+    let marker = headers
+        .get(crate::socket::MARKER)
+        .and_then(|v| v.to_str().ok());
+    let caller = if let Some(m) = marker {
+        if !crate::web::ct_eq(m, &s.socket_secret) {
+            return Err(unauthorized());
+        }
+        Caller {
+            actor: "socket".into(),
+            role: Role::Owner,
+            via: Via::Socket,
+        }
+    } else if auth.starts_with("Basic ") {
         if !matches!(surface, Surface::Reference { .. }) || !basic_admin(s, headers) {
             return Err(unauthorized());
         }

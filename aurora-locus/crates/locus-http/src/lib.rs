@@ -32,6 +32,7 @@ pub mod routing;
 pub mod scanner;
 pub mod server;
 pub mod setup;
+pub mod socket;
 pub mod state;
 pub mod sync;
 pub mod web;
@@ -435,7 +436,10 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     axum::serve(
         listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        // A socket marker never comes in over TCP.
+        router(state)
+            .layer(axum::middleware::map_request(socket::strip))
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move { cancel.cancelled().await })
     .await

@@ -292,6 +292,8 @@ pub struct AppState {
     pub logs: Arc<locus_core::logs::LogRing>,
     /// The published branding theme, re-read every few seconds.
     pub branding: crate::branding::Cache,
+    /// Marks requests that came over the admin socket (never sent anywhere).
+    pub socket_secret: String,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.

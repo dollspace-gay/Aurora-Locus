@@ -63,6 +63,7 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("moderator.review.resolve"), post(resolve_review))
         .route(at!("admin.setSetting"), post(set_setting))
         .route(at!("admin.kryphocron.rotateNow"), post(rotate_now))
+        .route(at!("admin.requestCrawl"), post(request_crawl))
         .route(at!("owner.listOperators"), get(list_operators))
         .route(at!("owner.createOperator"), post(create_operator))
         .route(at!("owner.updateOperator"), post(update_operator))
@@ -380,6 +381,35 @@ pub async fn set_setting(
     )
     .await;
     Ok(Json(json!({"version": version})))
+}
+
+/// Asks every configured relay to crawl this PDS now.
+pub async fn request_crawl(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    let who = op(&s, &headers, locus_nsid!("admin.requestCrawl")).await?;
+    let crawlers: Vec<String> = s
+        .snapshot()
+        .list("sync.crawlers")
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut results = Vec::new();
+    for c in &crawlers {
+        let r = locus_sync::request_crawl(&http, c, &s.hostname).await;
+        results.push(json!({"crawler": c, "ok": r.is_ok(), "error": r.err()}));
+    }
+    admin_auth::audit(
+        &s,
+        &who,
+        "network.requestCrawl",
+        None,
+        Some(json!({"crawlers": crawlers})),
+    )
+    .await;
+    Ok(Json(json!({"results": results})))
 }
 
 /// Starts a new rotation generation now (the rotation job re-encodes

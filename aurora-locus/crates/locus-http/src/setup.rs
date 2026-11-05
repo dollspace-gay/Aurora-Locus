@@ -307,6 +307,9 @@ pub async fn apply(
         settings.push(("email.from_address", json!(plan.email.from_address)));
     }
 
+    // Offline (no node has started yet) there's no setup row to complete:
+    // make one, as a node would. A row already there stays as it is.
+    store.create_setup_token(&token_hash(&new_token())).await?;
     let mut tx = store.begin().await?;
     // The completion mark first: it's the conditional write that decides
     // which of two runs applies, and the loser writes nothing else.
