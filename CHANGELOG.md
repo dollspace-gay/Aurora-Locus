@@ -281,6 +281,27 @@ kryphocron built in.
 - Access tokens are checked for the scopes each endpoint allows, as the
   reference: takendown and signup-queued sessions only reach the endpoints
   meant for them.
+- OAuth authorization server, as the reference: server and resource
+  metadata, JWKS, pushed authorization requests, the authorization code
+  grant with PKCE, refresh tokens (rotated on use; a replayed refresh token
+  revokes the grant) and revocation. Every token is bound to a DPoP key,
+  with server nonces and a replay check shared by every node.
+- OAuth clients: discoverable client metadata (fetched under the SSRF
+  rules and cached), loopback clients for development, and
+  `private_key_jwt` client authentication. `oauth.trusted_clients`
+  (`PDS_OAUTH_TRUSTED_CLIENTS`) names trusted clients, which may use
+  silent sign-on as in the reference.
+- Granular OAuth scopes (`repo:`, `blob:`, `rpc:`, `account:`, `identity:`,
+  `transition:*`), and `include:` permission sets resolved from published
+  lexicons. Every endpoint checks an OAuth token's scopes as the
+  reference; a missing scope is 403 `ScopeMissingError`.
+- OAuth sign-in pages: sign in (with the email code when email 2FA is on,
+  skipped on a device the account used in the last 30 days), pick a
+  remembered account, and approve or deny the requested permissions.
+  Forms are protected by a CSRF token and same-origin checks; pages send a
+  strict Content-Security-Policy. Responses follow the request's
+  `response_mode` (query, fragment or form post).
+- Password resets and account deletion revoke the account's OAuth grants.
 
 ### Changed
 
