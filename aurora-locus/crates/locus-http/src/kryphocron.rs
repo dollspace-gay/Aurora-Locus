@@ -168,6 +168,8 @@ pub(crate) async fn gate(s: &Arc<AppState>, did: &str) -> XrpcResult<()> {
     if s.store.private_tier_blocked(did).await? {
         return Err(forbidden());
     }
+    // An account that writes privately is polled in the background.
+    s.store.ensure_audience_sync(did).await?;
     let prism_did = appview.1.clone();
     let now = locus_core::time::now_ms();
     let last = s

@@ -41,7 +41,7 @@ impl PrismHealth {
         self.changed_at.load(Ordering::SeqCst)
     }
 
-    fn set(&self, down: bool) -> bool {
+    pub(crate) fn set(&self, down: bool) -> bool {
         let was = self.down.swap(down, Ordering::SeqCst);
         if was != down {
             self.changed_at
@@ -419,6 +419,10 @@ pub struct Refreshed {
     pub error: Option<String>,
     /// Pages fetched (the call budget counts them).
     pub pages: u32,
+    /// What prism listed, by rkey: its version token and value.
+    pub listed: BTreeMap<String, (Option<String>, Audience)>,
+    /// When the listing started (database clock).
+    pub started_at: i64,
 }
 
 impl Refreshed {
@@ -501,7 +505,10 @@ pub async fn refresh(
     local.extend(aliases.iter().map(|(l, _)| l.clone()));
     s.store.note_listing(owner, started, false, None).await?;
 
-    let mut out = Refreshed::default();
+    let mut out = Refreshed {
+        started_at: started,
+        ..Refreshed::default()
+    };
     let mut seen = BTreeSet::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -569,6 +576,8 @@ pub async fn refresh(
                 out.found = true;
             }
             let prism_cid = entry["cid"].as_str().map(str::to_owned);
+            out.listed
+                .insert(rkey.clone(), (prism_cid.clone(), aud.clone()));
             match snapshot.get(&rkey) {
                 None => {
                     // A deleted URI is never re-minted: a tombstone always wins.

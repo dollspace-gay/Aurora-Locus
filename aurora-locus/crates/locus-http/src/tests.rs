@@ -6868,3 +6868,272 @@ async fn an_ambiguous_create_is_linked_to_the_audience_a_refresh_adopts() {
         "adopted"
     );
 }
+
+#[tokio::test]
+async fn outage_audiences_are_created_in_prism_mapped_and_posts_re_pointed() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("hal.pds.example.com", "hal@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let (script, seen) = h.with_prism().await;
+    let existing = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("x", &existing)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // The outage: a local audience, a post under it, and a queued edit.
+    h.state.kr.prism.set(true);
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "record": {"members": ["did:plc:friend"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let local_uri = v["uri"].as_str().unwrap().to_owned();
+    let local = local_uri.rsplit('/').next().unwrap().to_owned();
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("outage post", &local_uri)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let post_rkey = v["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let before = h.record_value(&did, POST_PRIVATE, &post_rkey).await;
+    assert_eq!(before["audienceList"], json!(local_uri));
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "rkey": "3m6aaaaaaaaaa", "record": {"members": ["did:plc:added"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Prism is back. Its listing has the prism audience unchanged since
+    // the outage began.
+    h.state.kr.prism.set(false);
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did, "3m6aaaaaaaaaa", "3m6prismcid22", &[])]}),
+    );
+    set_script(
+        &script,
+        "app.nearhorizon.private.updateAudience",
+        200,
+        json!({"uri": existing, "cid": "after-push"}),
+    );
+    let prism_uri = format!("at://{did}/{AUD}/3m6pmappedmap");
+    set_script(
+        &script,
+        "app.nearhorizon.private.createAudience",
+        200,
+        json!({"uri": prism_uri, "cid": "c1"}),
+    );
+    h.state.store.poll_queued_audiences_now().await.unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let polled = crate::audience_sync::poll_once(&h.state, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(polled, 1);
+
+    // The queued edit was pushed (newer than prism's), CAS on prism's token.
+    let a = h
+        .state
+        .store
+        .kr_audience(&did, "3m6aaaaaaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            a.pending.as_str(),
+            a.prism_cid.as_deref(),
+            a.members_json.as_str()
+        ),
+        ("none", Some("after-push"), "[\"did:plc:added\"]")
+    );
+    let pushed: Value = {
+        let log = seen.lock().unwrap();
+        serde_json::from_slice(
+            &log.iter()
+                .rev()
+                .find(|s| s.uri.contains("updateAudience"))
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    assert_eq!(pushed["swapCid"], json!("3m6prismcid22"));
+
+    // The local audience was created in prism with its own stamps, and
+    // mapped: alias, prism row, local row gone.
+    let created: Value = {
+        let log = seen.lock().unwrap();
+        serde_json::from_slice(
+            &log.iter()
+                .rev()
+                .find(|s| s.uri.contains("createAudience"))
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    assert_eq!(created["record"]["members"], json!(["did:plc:friend"]));
+    assert!(created["record"]["createdAt"].is_string());
+    assert_eq!(
+        h.state
+            .store
+            .audience_alias(&did, &local)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("3m6pmappedmap")
+    );
+    assert!(
+        h.state
+            .store
+            .audience_versions(&did)
+            .await
+            .unwrap()
+            .iter()
+            .all(|v| v.rkey != local)
+    );
+    assert_eq!(
+        h.state
+            .store
+            .kr_audience(&did, "3m6pmappedmap")
+            .await
+            .unwrap()
+            .unwrap()
+            .prism_cid
+            .as_deref(),
+        Some("c1")
+    );
+    // A mapping applied twice is a no-op.
+    assert!(
+        !h.state
+            .store
+            .map_local_audience(&did, &local, None, "3m6pmappedmap", None)
+            .await
+            .unwrap()
+    );
+    // The local URI still resolves (to the prism audience).
+    let (st, v) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("later", &local_uri)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Re-pointing: the outage post now names the prism URI, content intact.
+    h.state
+        .settings
+        .set(
+            "kryphocron.repoint_max_commits_per_minute",
+            json!(10_000),
+            "test",
+        )
+        .await
+        .unwrap();
+    let moved = crate::audience_sync::repoint_pass(&h.state, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+    let after = h.record_value(&did, POST_PRIVATE, &post_rkey).await;
+    assert_eq!(after["audienceList"], json!(prism_uri));
+    assert_eq!(after["encodedContent"], before["encodedContent"]);
+    assert_eq!(
+        after["encodedContentGeneration"],
+        before["encodedContentGeneration"]
+    );
+    assert_eq!(
+        crate::audience_sync::repoint_pass(&h.state, &cancel)
+            .await
+            .unwrap(),
+        0,
+        "nothing left"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_edit_loses_to_a_newer_prism_version() {
+    let h = harness(false).await;
+    let acct = h
+        .create_account("ivy.pds.example.com", "ivy@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let (script, _) = h.with_prism().await;
+    let existing = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.feed.createPostPrivate",
+            Some(&access),
+            json!({"repo": did, "record": private_post("x", &existing)}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    h.state.kr.prism.set(true);
+    let (st, _) = h
+        .post(
+            "tools.kryphocron.policy.manageAudience",
+            Some(&access),
+            json!({"repo": did, "rkey": "3m6aaaaaaaaaa", "record": {"members": ["did:plc:mine"]}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    h.state.kr.prism.set(false);
+    // Prism changed it later than the queued edit.
+    let mut theirs = prism_audience(&did, "3m6aaaaaaaaaa", "newer", &["did:plc:theirs"]);
+    theirs["record"]["updatedAt"] = json!("2999-01-01T00:00:00.000Z");
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [theirs]}),
+    );
+    h.state.store.poll_queued_audiences_now().await.unwrap();
+    crate::audience_sync::poll_once(&h.state, &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let a = h
+        .state
+        .store
+        .kr_audience(&did, "3m6aaaaaaaaaa")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            a.pending.as_str(),
+            a.members_json.as_str(),
+            a.prism_cid.as_deref()
+        ),
+        ("none", "[\"did:plc:theirs\"]", Some("newer"))
+    );
+}

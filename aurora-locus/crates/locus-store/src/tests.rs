@@ -1330,3 +1330,131 @@ async fn the_audience_copy_on_both_backends() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_mapping_transaction_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, PrivateRecord};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let row = |rkey: &str, origin: &str, members: &str| AudienceRow {
+            did: "did:plc:o".into(),
+            rkey: rkey.into(),
+            name: None,
+            mode: "list".into(),
+            members_json: members.into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-02T00:00:00.000Z".into(),
+            origin: origin.into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: None,
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: "none".into(),
+            row_version: 1,
+        };
+        // Edited after its value was sent (version 1 sent, now 2).
+        s.put_kr_audience(&row("local1", "local", "[]"))
+            .await
+            .unwrap();
+        s.put_kr_audience(&row("local1", "local", "[\"did:plc:late\"]"))
+            .await
+            .unwrap();
+        let prism = AudienceRow {
+            prism_cid: Some("c1".into()),
+            ..row("p1", "prism", "[]")
+        };
+        assert!(
+            s.map_local_audience("did:plc:o", "local1", Some(1), "p1", Some(&prism))
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        let p = s.kr_audience("did:plc:o", "p1").await.unwrap().unwrap();
+        assert_eq!(
+            (p.pending.as_str(), p.members_json.as_str()),
+            ("update", "[\"did:plc:late\"]"),
+            "{n}: the late edit queued"
+        );
+        assert!(
+            s.kr_audience("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}"
+        );
+        assert!(
+            !s.map_local_audience("did:plc:o", "local1", Some(1), "p1", Some(&prism))
+                .await
+                .unwrap(),
+            "{n}: twice is a no-op"
+        );
+
+        // Deleted meanwhile: prism's row becomes a pending delete.
+        let prism2 = AudienceRow {
+            prism_cid: Some("c2".into()),
+            ..row("p2", "prism", "[]")
+        };
+        assert!(
+            s.map_local_audience("did:plc:o", "gone", Some(1), "p2", Some(&prism2))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.audience_versions("did:plc:o")
+                .await
+                .unwrap()
+                .iter()
+                .find(|v| v.rkey == "p2")
+                .unwrap()
+                .pending,
+            "delete",
+            "{n}"
+        );
+
+        // Re-point candidates: private records naming a mapped local URI.
+        let mut tx = s.begin().await.unwrap();
+        for (rkey, aud) in [("3m6aaaaaaaaa2", "local1"), ("3m6aaaaaaaaa3", "p1")] {
+            let e = PrivateRecord {
+                did: "did:plc:writer".into(),
+                collection: "tools.kryphocron.feed.postPrivate".into(),
+                rkey: rkey.into(),
+                generation: None,
+                legacy_text: false,
+                flagged: None,
+                audience_did: Some("did:plc:o".into()),
+                audience_rkey: Some(aud.into()),
+            };
+            tx.replace_private_record("did:plc:writer", &e.collection, rkey, Some(&e))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let c = s.repoint_candidates(10).await.unwrap();
+        assert_eq!(c.len(), 1, "{n}");
+        assert_eq!(
+            (
+                c[0].did.as_str(),
+                c[0].rkey.as_str(),
+                c[0].prism_rkey.as_str()
+            ),
+            ("did:plc:writer", "3m6aaaaaaaaa2", "p1")
+        );
+        assert_eq!(
+            s.pending_audiences("did:plc:o").await.unwrap().len(),
+            2,
+            "{n}"
+        );
+        assert!(
+            s.local_audiences("did:plc:o").await.unwrap().is_empty(),
+            "{n}"
+        );
+    }
+}

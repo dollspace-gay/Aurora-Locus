@@ -181,6 +181,7 @@ impl Node {
         locus_http::kryphocron::refresh_oracle(&state).await?;
         self.spawn_oracle_refresh(Arc::clone(&state));
         self.spawn_kryphocron_jobs(Arc::clone(&state));
+        self.spawn_audience_jobs(Arc::clone(&state));
         self.spawn_identity_repair(Arc::clone(&state));
         self.spawn_account_jobs(Arc::clone(&state));
         self.spawn_blob_jobs(Arc::clone(&state));
@@ -508,6 +509,51 @@ impl Node {
                 }
             }
         }));
+    }
+
+    /// The audience sync (polling, queued edits, local audiences created in
+    /// prism) and the re-point job, each on one node at a time.
+    fn spawn_audience_jobs(&mut self, state: Arc<AppState>) {
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "kr-audience-sync".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| locus_http::audience_sync::run(Arc::clone(&st), cancel),
+            )));
+        let st = Arc::clone(&state);
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                "kr-repoint".into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&st);
+                    async move {
+                        loop {
+                            let result =
+                                locus_http::audience_sync::repoint_pass(&state, &cancel).await;
+                            if let Err(e) = &result {
+                                tracing::warn!("re-point pass failed: {e}");
+                            }
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state
+                                .store
+                                .record_job_run("kr-repoint", err.as_deref(), None)
+                                .await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// Kryphocron upkeep, each on one node at a time: new rotation

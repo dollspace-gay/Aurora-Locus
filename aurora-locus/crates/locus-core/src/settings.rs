@@ -734,6 +734,16 @@ pub static REGISTRY: &[Def] = &[
         env: None,
         description: "Most audiences per account (never above the AppView's 200).",
     },
+    Def {
+        key: "kryphocron.repoint_max_commits_per_minute",
+        kind: Kind::Int {
+            min: 1,
+            max: 10_000,
+        },
+        default: "120",
+        env: None,
+        description: "Most commits per minute the re-point job makes (posts moved from a local audience URI to the AppView's).",
+    },
 ];
 
 /// Looks up a setting definition.

@@ -1155,3 +1155,99 @@ impl Store {
         Ok(true)
     }
 }
+
+// ---------------------------------------------------------------- sync and re-pointing
+
+/// A private record naming a mapped local audience URI.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RepointRow {
+    /// The repo holding the record.
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    /// The audience owner.
+    pub audience_did: String,
+    pub local_rkey: String,
+    pub prism_rkey: String,
+}
+
+impl Store {
+    /// An account's prism audiences with a queued edit or delete.
+    pub async fn pending_audiences(&self, did: &str) -> CoreResult<Vec<AudienceRow>> {
+        let q = sql(
+            &format!(
+                "SELECT {AUDIENCE_COLS} FROM kr_audience WHERE did = {{1}} AND origin = 'prism' \
+                 AND pending <> 'none' ORDER BY pending_at"
+            ),
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    /// An account's local audiences not flagged, oldest first.
+    pub async fn local_audiences(&self, did: &str) -> CoreResult<Vec<AudienceRow>> {
+        let q = sql(
+            &format!(
+                "SELECT {AUDIENCE_COLS} FROM kr_audience WHERE did = {{1}} AND origin = 'local' \
+                 AND flagged IS NULL ORDER BY rkey"
+            ),
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, did)
+    }
+
+    /// Clears the `limit` flag of an account's local audiences (a complete
+    /// listing showed room under prism's cap).
+    pub async fn clear_limit_flags(&self, did: &str) -> CoreResult<()> {
+        let q = sql(
+            "UPDATE kr_audience SET flagged = NULL WHERE did = {1} AND origin = 'local' AND flagged = 'limit'",
+            self.is_postgres(),
+        );
+        exec!(self, q, did)?;
+        Ok(())
+    }
+
+    /// The newest attempt that tried to create a local audience in prism.
+    pub async fn latest_local_attempt(
+        &self,
+        did: &str,
+        local_rkey: &str,
+    ) -> CoreResult<Option<AudienceAttempt>> {
+        let q = sql(
+            "SELECT id, did, value_json, created_at_value, updated_at_value, created_at, expires_at, outcome, \
+             local_rkey, local_row_version FROM kr_audience_attempt WHERE did = {1} AND local_rkey = {2} \
+             ORDER BY created_at DESC LIMIT 1",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_optional, did, local_rkey)
+    }
+
+    /// Makes sure the background poll knows about an account.
+    pub async fn ensure_audience_sync(&self, did: &str) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO kr_audience_sync (did) VALUES ({1}) ON CONFLICT (did) DO NOTHING",
+            self.is_postgres(),
+        );
+        exec!(self, q, did)?;
+        Ok(())
+    }
+
+    /// How many accounts the background poll covers.
+    pub async fn count_audience_syncs(&self) -> CoreResult<i64> {
+        let q = String::from("SELECT COUNT(*) FROM kr_audience_sync");
+        scalar!(self, q, fetch_one,)
+    }
+
+    /// Private records (in repos here) naming a mapped local audience URI,
+    /// by repo.
+    pub async fn repoint_candidates(&self, limit: i64) -> CoreResult<Vec<RepointRow>> {
+        let q = sql(
+            "SELECT p.did, p.collection, p.rkey, p.audience_did, a.local_rkey, a.prism_rkey \
+             FROM kr_private_record p JOIN kr_audience_alias a \
+             ON a.did = p.audience_did AND a.local_rkey = p.audience_rkey \
+             WHERE a.flagged IS NULL ORDER BY p.did, p.rkey LIMIT {1}",
+            self.is_postgres(),
+        );
+        run!(self, q, fetch_all, limit)
+    }
+}
