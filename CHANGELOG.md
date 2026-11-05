@@ -269,6 +269,12 @@ kryphocron built in.
   `LOCUS_TRUSTED_PROXIES`; loopback by default).
 - Firehose connections are limited per node and per client IP
   (`sync.max_subscribers`, `sync.max_subscribers_per_ip`).
+- CORS as the reference (any origin, preflights answered), and
+  `Cache-Control: private` with `Vary: Authorization` on authenticated
+  responses.
+- A request deadline (`http.request_deadline_ms`, 60 s): a request that
+  outlasts it gets a retryable 503. Uploads, imports, repo exports, blobs
+  and the firehose have their own caps instead.
 - `app.bsky.feed.getFeed` asks the feed generator with a token for it, and
   `registerPush`/`unregisterPush` go to the AppView or the named push
   service.

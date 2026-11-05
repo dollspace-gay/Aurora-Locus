@@ -136,7 +136,10 @@ pub async fn update_handle(
         use crate::ratelimit::buckets::{UPDATE_HANDLE_5M, UPDATE_HANDLE_DAY};
         crate::ratelimit::limit(
             &s,
-            &[(UPDATE_HANDLE_5M, &authed.did, 1), (UPDATE_HANDLE_DAY, &authed.did, 1)],
+            &[
+                (UPDATE_HANDLE_5M, &authed.did, 1),
+                (UPDATE_HANDLE_DAY, &authed.did, 1),
+            ],
         )
         .await?;
     }

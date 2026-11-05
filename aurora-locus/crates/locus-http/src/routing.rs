@@ -146,6 +146,90 @@ fn too_large() -> Response {
     .into_response()
 }
 
+/// Routes whose work is bounded by their own caps, not the request
+/// deadline (streams and uploads).
+fn streaming(path: &str) -> bool {
+    matches!(
+        path,
+        "/xrpc/com.atproto.repo.uploadBlob"
+            | "/xrpc/com.atproto.repo.importRepo"
+            | "/xrpc/com.atproto.sync.getRepo"
+            | "/xrpc/com.atproto.sync.subscribeRepos"
+            | "/xrpc/com.atproto.sync.getBlob"
+    ) || path.starts_with("/blob/")
+}
+
+/// CORS as the reference's `cors({ maxAge: 1 day })` (any origin;
+/// preflights answered with the requested headers), `Cache-Control:
+/// private` and `Vary: Authorization` on authenticated responses, and the
+/// request deadline (`http.request_deadline_ms`; a request that outlasts
+/// it gets a retryable 503).
+pub async fn headers_and_deadline(
+    State(s): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    use axum::http::{HeaderValue, Method, header};
+    if req.method() == Method::OPTIONS && req.headers().contains_key(header::ORIGIN) {
+        let mut res = StatusCode::NO_CONTENT.into_response();
+        let h = res.headers_mut();
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET,HEAD,PUT,PATCH,POST,DELETE"),
+        );
+        if let Some(asked) = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
+            h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, asked.clone());
+            h.append(
+                header::VARY,
+                HeaderValue::from_static("Access-Control-Request-Headers"),
+            );
+        }
+        h.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("86400"),
+        );
+        return res;
+    }
+    let authed = req.headers().contains_key(header::AUTHORIZATION);
+    let path = req.uri().path().to_owned();
+    let mut res = if streaming(&path) {
+        next.run(req).await
+    } else {
+        let ms = u64::try_from(s.snapshot().int("http.request_deadline_ms")).unwrap_or(60_000);
+        match tokio::time::timeout(std::time::Duration::from_millis(ms), next.run(req)).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(path, "request passed its deadline");
+                let mut r = crate::error::XrpcError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "RequestTimeout",
+                    "The request took too long; try again",
+                )
+                .into_response();
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                r
+            }
+        }
+    };
+    let h = res.headers_mut();
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    if authed {
+        if !h.contains_key(header::CACHE_CONTROL) {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+        }
+        h.append(header::VARY, HeaderValue::from_static("Authorization"));
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_internal_name;

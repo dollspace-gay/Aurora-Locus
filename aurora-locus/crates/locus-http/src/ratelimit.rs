@@ -39,27 +39,79 @@ pub struct Bucket {
 pub mod buckets {
     use super::{Bucket, DAY, HOUR, MINUTE};
 
-    pub const CREATE_SESSION_DAY: Bucket = Bucket { name: "com.atproto.server.createSession-0", window_ms: DAY, points: 300 };
-    pub const CREATE_SESSION_5M: Bucket = Bucket { name: "com.atproto.server.createSession-1", window_ms: 5 * MINUTE, points: 30 };
-    pub const CREATE_ACCOUNT: Bucket = Bucket { name: "com.atproto.server.createAccount-0", window_ms: 5 * MINUTE, points: 100 };
-    pub const DELETE_ACCOUNT: Bucket = Bucket { name: "com.atproto.server.deleteAccount-0", window_ms: 5 * MINUTE, points: 50 };
-    pub const RESET_PASSWORD: Bucket = Bucket { name: "com.atproto.server.resetPassword-0", window_ms: 5 * MINUTE, points: 50 };
-    pub const REQUEST_PASSWORD_RESET_DAY: Bucket = Bucket { name: "com.atproto.server.requestPasswordReset-0", window_ms: DAY, points: 50 };
-    pub const REQUEST_PASSWORD_RESET_HOUR: Bucket = Bucket { name: "com.atproto.server.requestPasswordReset-1", window_ms: HOUR, points: 15 };
-    pub const UPDATE_HANDLE_5M: Bucket = Bucket { name: "com.atproto.identity.updateHandle-0", window_ms: 5 * MINUTE, points: 10 };
-    pub const UPDATE_HANDLE_DAY: Bucket = Bucket { name: "com.atproto.identity.updateHandle-1", window_ms: DAY, points: 50 };
-    pub const UPLOAD_BLOB: Bucket = Bucket { name: "com.atproto.repo.uploadBlob-0", window_ms: DAY, points: 1000 };
-    pub const GET_REPO: Bucket = Bucket { name: "com.atproto.sync.getRepo-0", window_ms: 5 * MINUTE, points: 6000 };
+    pub const CREATE_SESSION_DAY: Bucket = Bucket {
+        name: "com.atproto.server.createSession-0",
+        window_ms: DAY,
+        points: 300,
+    };
+    pub const CREATE_SESSION_5M: Bucket = Bucket {
+        name: "com.atproto.server.createSession-1",
+        window_ms: 5 * MINUTE,
+        points: 30,
+    };
+    pub const CREATE_ACCOUNT: Bucket = Bucket {
+        name: "com.atproto.server.createAccount-0",
+        window_ms: 5 * MINUTE,
+        points: 100,
+    };
+    pub const DELETE_ACCOUNT: Bucket = Bucket {
+        name: "com.atproto.server.deleteAccount-0",
+        window_ms: 5 * MINUTE,
+        points: 50,
+    };
+    pub const RESET_PASSWORD: Bucket = Bucket {
+        name: "com.atproto.server.resetPassword-0",
+        window_ms: 5 * MINUTE,
+        points: 50,
+    };
+    pub const REQUEST_PASSWORD_RESET_DAY: Bucket = Bucket {
+        name: "com.atproto.server.requestPasswordReset-0",
+        window_ms: DAY,
+        points: 50,
+    };
+    pub const REQUEST_PASSWORD_RESET_HOUR: Bucket = Bucket {
+        name: "com.atproto.server.requestPasswordReset-1",
+        window_ms: HOUR,
+        points: 15,
+    };
+    pub const UPDATE_HANDLE_5M: Bucket = Bucket {
+        name: "com.atproto.identity.updateHandle-0",
+        window_ms: 5 * MINUTE,
+        points: 10,
+    };
+    pub const UPDATE_HANDLE_DAY: Bucket = Bucket {
+        name: "com.atproto.identity.updateHandle-1",
+        window_ms: DAY,
+        points: 50,
+    };
+    pub const UPLOAD_BLOB: Bucket = Bucket {
+        name: "com.atproto.repo.uploadBlob-0",
+        window_ms: DAY,
+        points: 1000,
+    };
+    pub const GET_REPO: Bucket = Bucket {
+        name: "com.atproto.sync.getRepo-0",
+        window_ms: 5 * MINUTE,
+        points: 6000,
+    };
 
     /// `requestEmailConfirmation`, `requestEmailUpdate` and
     /// `requestAccountDelete` share this shape (each its own key prefix).
     #[must_use]
     pub const fn email_day(name: &'static str) -> Bucket {
-        Bucket { name, window_ms: DAY, points: 15 }
+        Bucket {
+            name,
+            window_ms: DAY,
+            points: 15,
+        }
     }
     #[must_use]
     pub const fn email_hour(name: &'static str) -> Bucket {
-        Bucket { name, window_ms: HOUR, points: 5 }
+        Bucket {
+            name,
+            window_ms: HOUR,
+            points: 5,
+        }
     }
 }
 
@@ -230,10 +282,17 @@ fn set_headers(res: &mut Response, statuses: &[Status]) {
         }
     };
     put("ratelimit-limit", st.limit.to_string());
-    put("ratelimit-reset", ((now + st.ms_before_next) / 1000).to_string());
+    put(
+        "ratelimit-reset",
+        ((now + st.ms_before_next) / 1000).to_string(),
+    );
     put("ratelimit-remaining", st.remaining.to_string());
-    put("ratelimit-policy", format!("{};w={}", st.limit, st.window_ms / 1000));
-    let mut expose = String::from("RateLimit-Limit, RateLimit-Reset, RateLimit-Remaining, RateLimit-Policy");
+    put(
+        "ratelimit-policy",
+        format!("{};w={}", st.limit, st.window_ms / 1000),
+    );
+    let mut expose =
+        String::from("RateLimit-Limit, RateLimit-Reset, RateLimit-Remaining, RateLimit-Policy");
     if st.exceeded {
         put(
             "retry-after",
@@ -249,7 +308,11 @@ fn set_headers(res: &mut Response, statuses: &[Status]) {
 /// The middleware: resolves the client IP, applies the global bucket to
 /// XRPC requests (not `getRepo`, which has its own), and puts the
 /// `RateLimit-*` headers of whatever the request consumed on the response.
-pub async fn middleware(State(s): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+pub async fn middleware(
+    State(s): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -322,12 +385,20 @@ pub fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
     match (net, ip) {
         (IpAddr::V4(n), IpAddr::V4(i)) => {
             let bits = bits.unwrap_or(32).min(32);
-            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
             u32::from(n) & mask == u32::from(i) & mask
         }
         (IpAddr::V6(n), IpAddr::V6(i)) => {
             let bits = bits.unwrap_or(128).min(128);
-            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
             u128::from(n) & mask == u128::from(i) & mask
         }
         _ => false,
@@ -438,7 +509,8 @@ pub fn subscribe(s: &Arc<AppState>) -> XrpcResult<SubscriberGuard> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total: usize = map.values().sum();
     let mine = map.get(&key).copied().unwrap_or(0);
-    if !bypass && ((total_max > 0 && total >= total_max) || (per_ip_max > 0 && mine >= per_ip_max)) {
+    if !bypass && ((total_max > 0 && total >= total_max) || (per_ip_max > 0 && mine >= per_ip_max))
+    {
         return Err(XrpcError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RateLimitExceeded",

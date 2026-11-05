@@ -134,7 +134,10 @@ pub async fn request_email_confirmation(State(s): St, headers: HeaderMap) -> Xrp
         let n = "com.atproto.server.requestEmailConfirmation-0";
         crate::ratelimit::limit(
             &s,
-            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+            &[
+                (email_day(n), &authed.did, 1),
+                (email_hour(n), &authed.did, 1),
+            ],
         )
         .await?;
     }
@@ -179,7 +182,10 @@ pub async fn request_email_update(State(s): St, headers: HeaderMap) -> XrpcResul
         let n = "com.atproto.server.requestEmailUpdate-0";
         crate::ratelimit::limit(
             &s,
-            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+            &[
+                (email_day(n), &authed.did, 1),
+                (email_hour(n), &authed.did, 1),
+            ],
         )
         .await?;
     }
@@ -291,7 +297,11 @@ pub async fn request_password_reset(
 ) -> XrpcResult<()> {
     {
         use crate::ratelimit::buckets::{REQUEST_PASSWORD_RESET_DAY, REQUEST_PASSWORD_RESET_HOUR};
-        crate::ratelimit::limit_ip(&s, &[REQUEST_PASSWORD_RESET_DAY, REQUEST_PASSWORD_RESET_HOUR]).await?;
+        crate::ratelimit::limit_ip(
+            &s,
+            &[REQUEST_PASSWORD_RESET_DAY, REQUEST_PASSWORD_RESET_HOUR],
+        )
+        .await?;
     }
     require_email(&s).await?;
     let email = input.email.trim().to_ascii_lowercase();

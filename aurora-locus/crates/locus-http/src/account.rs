@@ -218,7 +218,10 @@ pub async fn request_account_delete(State(s): St, headers: HeaderMap) -> XrpcRes
         let n = "com.atproto.server.requestAccountDelete-0";
         crate::ratelimit::limit(
             &s,
-            &[(email_day(n), &authed.did, 1), (email_hour(n), &authed.did, 1)],
+            &[
+                (email_day(n), &authed.did, 1),
+                (email_hour(n), &authed.did, 1),
+            ],
         )
         .await?;
     }

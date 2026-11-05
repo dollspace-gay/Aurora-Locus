@@ -442,6 +442,16 @@ pub static REGISTRY: &[Def] = &[
         description: "Ask proxied services for compressed responses when the PDS reads them itself.",
     },
     Def {
+        key: "http.request_deadline_ms",
+        kind: Kind::Int {
+            min: 1_000,
+            max: 3_600_000,
+        },
+        default: "60000",
+        env: None,
+        description: "Longest a request may run before it gets a retryable error, in ms (streams and uploads have their own caps).",
+    },
+    Def {
         key: "http.trusted_proxies",
         kind: Kind::TextList { max_len: 64 },
         default: r#"["127.0.0.0/8", "::1/128"]"#,

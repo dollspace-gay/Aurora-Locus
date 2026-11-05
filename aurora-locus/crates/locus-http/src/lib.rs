@@ -257,6 +257,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            routing::headers_and_deadline,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             routing::by_host,
         ))
         .with_state(state)
@@ -272,6 +276,6 @@ pub async fn serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await
+    .with_graceful_shutdown(async move { cancel.cancelled().await })
+    .await
 }

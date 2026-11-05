@@ -175,7 +175,12 @@ impl Store {
 impl Store {
     /// Adds `points` to a fixed-window counter, starting a new window when
     /// the last one ended. Returns (consumed in this window, window end ms).
-    pub async fn consume_rate_limit(&self, key: &str, points: i64, window_ms: i64) -> CoreResult<(i64, i64)> {
+    pub async fn consume_rate_limit(
+        &self,
+        key: &str,
+        points: i64,
+        window_ms: i64,
+    ) -> CoreResult<(i64, i64)> {
         let q = sql(
             "INSERT INTO rate_limit (key, consumed, window_end) VALUES ({1}, {2}, {now} + {3}) \
              ON CONFLICT (key) DO UPDATE SET \
@@ -187,8 +192,22 @@ impl Store {
             self.is_postgres(),
         );
         match self {
-            Store::Sqlite(p) => sqlx::query_as(&q).bind(key).bind(points).bind(window_ms).fetch_one(p).await,
-            Store::Postgres(p) => sqlx::query_as(&q).bind(key).bind(points).bind(window_ms).fetch_one(p).await,
+            Store::Sqlite(p) => {
+                sqlx::query_as(&q)
+                    .bind(key)
+                    .bind(points)
+                    .bind(window_ms)
+                    .fetch_one(p)
+                    .await
+            }
+            Store::Postgres(p) => {
+                sqlx::query_as(&q)
+                    .bind(key)
+                    .bind(points)
+                    .bind(window_ms)
+                    .fetch_one(p)
+                    .await
+            }
         }
         .map_err(db_err)
     }
@@ -200,8 +219,16 @@ impl Store {
             self.is_postgres(),
         );
         match self {
-            Store::Sqlite(p) => sqlx::query(&q).bind(limit).execute(p).await.map(|r| r.rows_affected()),
-            Store::Postgres(p) => sqlx::query(&q).bind(limit).execute(p).await.map(|r| r.rows_affected()),
+            Store::Sqlite(p) => sqlx::query(&q)
+                .bind(limit)
+                .execute(p)
+                .await
+                .map(|r| r.rows_affected()),
+            Store::Postgres(p) => sqlx::query(&q)
+                .bind(limit)
+                .execute(p)
+                .await
+                .map(|r| r.rows_affected()),
         }
         .map_err(db_err)
     }
