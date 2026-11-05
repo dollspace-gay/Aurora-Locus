@@ -1,6 +1,7 @@
 //! Repo engine on top of proto-blue: the commit pipeline, block storage
 //! adapter, verification and CAR import/export.
 
+pub mod car;
 pub mod engine;
 pub mod event;
 mod known_lexicons;

@@ -129,3 +129,355 @@ async fn serve(s: Arc<AppState>, socket: WebSocket, cursor: Option<i64>) {
         }
     }
 }
+
+// ── Sync reads ────────────────────────────────────────────────────────
+
+use axum::Json;
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderValue, header};
+use locus_store::accounts::{Account, Status};
+use proto_blue_lex_data::Cid;
+use serde_json::{Value, json};
+
+use crate::error::{XrpcError, XrpcResult};
+
+const CAR: &str = "application/vnd.ipld.car";
+const BLOCK_PAGE: i64 = 1000;
+
+/// The reference's `assertRepoAvailability`: a missing or deleted account
+/// is `RepoNotFound`; for anyone but its owner, a taken-down, suspended or
+/// deactivated one is refused.
+async fn available(s: &AppState, headers: &HeaderMap, did: &str) -> XrpcResult<Account> {
+    let account = s
+        .store
+        .account_by_did(did)
+        .await?
+        .filter(|a| a.status != Status::Deleted)
+        .ok_or_else(|| {
+            XrpcError::named(
+                "RepoNotFound",
+                format!("Could not find repo for DID: {did}"),
+            )
+        })?;
+    let owner = crate::auth::access_with(
+        s,
+        headers,
+        crate::auth::STANDARD,
+        &[locus_auth::session::SCOPE_TAKENDOWN],
+    )
+    .await
+    .is_ok_and(|a| a.did == account.did);
+    if !owner {
+        crate::repo::unavailable(&account)?;
+    }
+    Ok(account)
+}
+
+fn car_response(body: Body) -> Response {
+    let mut res = Response::new(body);
+    res.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(CAR));
+    res
+}
+
+/// A repository as a CAR, streamed in pages: the commit as root, every
+/// live block (or only those introduced after `since`).
+fn repo_car(s: &AppState, did: String, root: Cid, since: Option<String>) -> Response {
+    let store = s.store.clone();
+    let head = futures::stream::once(async move {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from(locus_repo::car::header(Some(
+            &root,
+        ))))
+    });
+    let pages = futures::stream::unfold(Some(None::<String>), move |after| {
+        let (store, did, since) = (store.clone(), did.clone(), since.clone());
+        async move {
+            let after = after?;
+            match store
+                .repo_blocks_page(&did, after.as_deref(), since.as_deref(), BLOCK_PAGE)
+                .await
+            {
+                Ok(page) if page.is_empty() => None,
+                Ok(page) => {
+                    let mut chunk = Vec::new();
+                    for (cid, bytes) in &page {
+                        if let Ok(c) = Cid::from_str_multibase(cid) {
+                            chunk.extend(locus_repo::car::block(&c, bytes));
+                        }
+                    }
+                    let next = (page.len() as i64 == BLOCK_PAGE)
+                        .then(|| page.last().map(|(c, _)| c.clone()));
+                    Some((Ok(axum::body::Bytes::from(chunk)), next))
+                }
+                Err(e) => Some((Err(std::io::Error::other(e.to_string())), None)),
+            }
+        }
+    });
+    car_response(Body::from_stream(head.chain(pages)))
+}
+
+#[derive(Deserialize)]
+pub struct GetRepoParams {
+    did: String,
+    since: Option<String>,
+}
+
+pub async fn get_repo(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<GetRepoParams>,
+) -> XrpcResult<Response> {
+    available(&s, &headers, &p.did).await?;
+    let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
+        XrpcError::named(
+            "RepoNotFound",
+            format!("Could not find repo for DID: {}", p.did),
+        )
+    })?;
+    let cid = Cid::from_str_multibase(&root.commit_cid)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(repo_car(&s, p.did, cid, p.since))
+}
+
+#[derive(Deserialize)]
+pub struct DidParam {
+    did: String,
+}
+
+/// Deprecated: the whole repository, as `getRepo`.
+pub async fn get_checkout(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<DidParam>,
+) -> XrpcResult<Response> {
+    get_repo(
+        State(s),
+        headers,
+        Query(GetRepoParams {
+            did: p.did,
+            since: None,
+        }),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+pub struct SyncGetRecordParams {
+    did: String,
+    collection: String,
+    rkey: String,
+}
+
+/// A record with its proof (or a proof of absence) as a CAR rooted at the
+/// current commit.
+pub async fn get_record(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<SyncGetRecordParams>,
+) -> XrpcResult<Response> {
+    available(&s, &headers, &p.did).await?;
+    let (commit, blocks) = s
+        .repo
+        .record_proof(&p.did, &p.collection, &p.rkey)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .ok_or_else(|| {
+            XrpcError::named(
+                "RepoNotFound",
+                format!("Could not find repo for DID: {}", p.did),
+            )
+        })?;
+    let mut car = locus_repo::car::header(Some(&commit));
+    for (cid, bytes) in blocks.iter() {
+        car.extend(locus_repo::car::block(cid, bytes));
+    }
+    Ok(car_response(Body::from(car)))
+}
+
+#[derive(Deserialize)]
+pub struct GetBlocksParams {
+    did: String,
+    #[serde(default)]
+    cids: Vec<String>,
+}
+
+pub async fn get_blocks(
+    State(s): St,
+    headers: HeaderMap,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> XrpcResult<Response> {
+    // `cids` repeats in the query string.
+    let mut p = GetBlocksParams {
+        did: String::new(),
+        cids: Vec::new(),
+    };
+    for (k, v) in url::form_urlencoded::parse(q.unwrap_or_default().as_bytes()) {
+        match k.as_ref() {
+            "did" => p.did = v.into_owned(),
+            "cids" => p.cids.push(v.into_owned()),
+            _ => {}
+        }
+    }
+    available(&s, &headers, &p.did).await?;
+    let mut car = locus_repo::car::header(None);
+    let mut missing = Vec::new();
+    for c in &p.cids {
+        let cid = Cid::from_str_multibase(c)
+            .map_err(|_| XrpcError::invalid_request(format!("Invalid CID: {c}")))?;
+        match s.store.block(&p.did, &cid.to_string_base32()).await? {
+            Some(bytes) => car.extend(locus_repo::car::block(&cid, &bytes)),
+            None => missing.push(c.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(XrpcError::invalid_request(format!(
+            "Could not find cids: {}",
+            missing.join(",")
+        )));
+    }
+    Ok(car_response(Body::from(car)))
+}
+
+pub async fn get_latest_commit(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<DidParam>,
+) -> XrpcResult<Json<Value>> {
+    available(&s, &headers, &p.did).await?;
+    let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
+        XrpcError::named(
+            "RepoNotFound",
+            format!("Could not find root for DID: {}", p.did),
+        )
+    })?;
+    Ok(Json(json!({ "cid": root.commit_cid, "rev": root.rev })))
+}
+
+/// Deprecated: the current commit.
+pub async fn get_head(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<DidParam>,
+) -> XrpcResult<Json<Value>> {
+    available(&s, &headers, &p.did).await?;
+    let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
+        XrpcError::named(
+            "HeadNotFound",
+            format!("Could not find root for DID: {}", p.did),
+        )
+    })?;
+    Ok(Json(json!({ "root": root.commit_cid })))
+}
+
+fn status_fields(status: Status) -> (bool, Option<&'static str>) {
+    match status {
+        Status::Active => (true, None),
+        other => (false, Some(other.as_str())),
+    }
+}
+
+/// Status for everyone, as the reference (no refusals; `rev` only while active).
+pub async fn get_repo_status(State(s): St, Query(p): Query<DidParam>) -> XrpcResult<Json<Value>> {
+    let account = s
+        .store
+        .account_by_did(&p.did)
+        .await?
+        .filter(|a| a.status != Status::Deleted)
+        .ok_or_else(|| {
+            XrpcError::named(
+                "RepoNotFound",
+                format!("Could not find repo for DID: {}", p.did),
+            )
+        })?;
+    let (active, status) = status_fields(account.status);
+    let mut out = json!({ "did": account.did, "active": active });
+    if let Some(st) = status {
+        out["status"] = json!(st);
+    }
+    if active && let Some(root) = s.store.repo_root_of(&account.did).await? {
+        out["rev"] = json!(root.rev);
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct ListReposParams {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn list_repos(State(s): St, Query(p): Query<ListReposParams>) -> XrpcResult<Json<Value>> {
+    let limit = p.limit.unwrap_or(500);
+    if !(1..=1000).contains(&limit) {
+        return Err(XrpcError::invalid_request(
+            "limit must be between 1 and 1000",
+        ));
+    }
+    let cursor = match p.cursor.as_deref() {
+        Some(c) => {
+            let (at, did) = c
+                .split_once("::")
+                .ok_or_else(|| XrpcError::invalid_request("Malformed cursor"))?;
+            Some((
+                at.parse::<i64>()
+                    .map_err(|_| XrpcError::invalid_request("Malformed cursor"))?,
+                did.to_owned(),
+            ))
+        }
+        None => None,
+    };
+    let rows = s
+        .store
+        .list_repos(limit, cursor.as_ref().map(|(a, d)| (*a, d.as_str())))
+        .await?;
+    let repos: Vec<Value> = rows
+        .iter()
+        .map(|(did, _, head, rev, status)| {
+            let status = Status::parse(status).unwrap_or(Status::Active);
+            let (active, st) = status_fields(status);
+            let mut r = json!({ "did": did, "head": head, "rev": rev, "active": active });
+            if let Some(st) = st {
+                r["status"] = json!(st);
+            }
+            r
+        })
+        .collect();
+    let mut out = json!({ "repos": repos });
+    if rows.len() as i64 == limit
+        && let Some((did, at, ..)) = rows.last()
+    {
+        out["cursor"] = json!(format!("{at}::{did}"));
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct ListBlobsParams {
+    did: String,
+    since: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+pub async fn list_blobs(
+    State(s): St,
+    headers: HeaderMap,
+    Query(p): Query<ListBlobsParams>,
+) -> XrpcResult<Json<Value>> {
+    available(&s, &headers, &p.did).await?;
+    let limit = p.limit.unwrap_or(500);
+    if !(1..=1000).contains(&limit) {
+        return Err(XrpcError::invalid_request(
+            "limit must be between 1 and 1000",
+        ));
+    }
+    let cids = s
+        .store
+        .list_blob_cids(&p.did, p.since.as_deref(), p.cursor.as_deref(), limit)
+        .await?;
+    let mut out = json!({ "cids": cids });
+    if let Some(last) = cids.last() {
+        out["cursor"] = json!(last);
+    }
+    Ok(Json(out))
+}

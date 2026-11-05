@@ -147,6 +147,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/xrpc/com.atproto.sync.subscribeRepos",
             get(sync::subscribe_repos),
         )
+        .route("/xrpc/com.atproto.sync.getRepo", get(sync::get_repo))
+        .route(
+            "/xrpc/com.atproto.sync.getCheckout",
+            get(sync::get_checkout),
+        )
+        .route("/xrpc/com.atproto.sync.getRecord", get(sync::get_record))
+        .route("/xrpc/com.atproto.sync.getBlocks", get(sync::get_blocks))
+        .route(
+            "/xrpc/com.atproto.sync.getLatestCommit",
+            get(sync::get_latest_commit),
+        )
+        .route("/xrpc/com.atproto.sync.getHead", get(sync::get_head))
+        .route(
+            "/xrpc/com.atproto.sync.getRepoStatus",
+            get(sync::get_repo_status),
+        )
+        .route("/xrpc/com.atproto.sync.listRepos", get(sync::list_repos))
+        .route("/xrpc/com.atproto.sync.listBlobs", get(sync::list_blobs))
         .route("/blob/{did}/{cid}", get(repo::get_blob_path))
         .route(
             "/xrpc/com.atproto.identity.resolveHandle",

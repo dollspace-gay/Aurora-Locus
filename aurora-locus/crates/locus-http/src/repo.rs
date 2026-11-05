@@ -537,7 +537,7 @@ pub async fn describe_repo(
 
 /// The reference's `assertRepoAvailability` refusals for callers other
 /// than the owner.
-fn unavailable(account: &Account) -> XrpcResult<()> {
+pub(crate) fn unavailable(account: &Account) -> XrpcResult<()> {
     match account.status {
         Status::Active => Ok(()),
         Status::Takendown => Err(XrpcError::named(

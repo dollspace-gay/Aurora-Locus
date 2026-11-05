@@ -16,6 +16,7 @@ locus-mail.workspace = true
 locus-blob.workspace = true
 locus-sync.workspace = true
 futures.workspace = true
+url.workspace = true
 proto-blue-lex-cbor.workspace = true
 proto-blue-lex-json.workspace = true
 hmac.workspace = true

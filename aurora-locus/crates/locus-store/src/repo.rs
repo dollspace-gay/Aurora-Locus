@@ -416,6 +416,149 @@ impl Store {
         Ok(rows.into_iter().collect())
     }
 
+    /// A repository's root, read without a transaction.
+    pub async fn repo_root_of(&self, did: &str) -> CoreResult<Option<RepoRoot>> {
+        let row: Option<(String, String, String)> = match self {
+            Self::Sqlite(p) => {
+                sqlx::query_as("SELECT commit_cid, rev, data_cid FROM repo_root WHERE did = ?1")
+                    .bind(did)
+                    .fetch_optional(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_as("SELECT commit_cid, rev, data_cid FROM repo_root WHERE did = $1")
+                    .bind(did)
+                    .fetch_optional(p)
+                    .await
+            }
+        }
+        .map_err(db_err)?;
+        Ok(row.map(|(commit_cid, rev, data_cid)| RepoRoot {
+            commit_cid,
+            rev,
+            data_cid,
+        }))
+    }
+
+    /// A page of a repository's live blocks (by CID, after `after`), only
+    /// those introduced after rev `since` when given: what `getRepo` sends.
+    pub async fn repo_blocks_page(
+        &self,
+        did: &str,
+        after: Option<&str>,
+        since: Option<&str>,
+        limit: i64,
+    ) -> CoreResult<Vec<(String, Vec<u8>)>> {
+        let q = |p: [&str; 4]| {
+            format!(
+                "SELECT cid, content FROM repo_block WHERE did = {} AND ref_count > 0 \
+                 AND ({} IS NULL OR cid > {}) AND ({} IS NULL OR rev_introduced > {}) \
+                 ORDER BY cid LIMIT {}",
+                p[0], p[1], p[1], p[2], p[2], p[3]
+            )
+        };
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_as(&q(["?1", "?2", "?3", "?4"]))
+                    .bind(did)
+                    .bind(after)
+                    .bind(since)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_as(&q(["$1", "$2::text", "$3::text", "$4"]))
+                    .bind(did)
+                    .bind(after)
+                    .bind(since)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
+    /// Repositories in creation order after `cursor` (created_at, did):
+    /// (did, created_at, commit_cid, rev, status).
+    pub async fn list_repos(
+        &self,
+        limit: i64,
+        cursor: Option<(i64, &str)>,
+    ) -> CoreResult<Vec<(String, i64, String, String, String)>> {
+        let (at, did) = cursor.map_or((None, None), |(a, d)| (Some(a), Some(d)));
+        let q = |p: [&str; 3]| {
+            format!(
+                "SELECT a.did, a.created_at, r.commit_cid, r.rev, a.status FROM account a \
+                 JOIN repo_root r ON r.did = a.did WHERE a.status <> 'deleted' \
+                 AND ({0} IS NULL OR a.created_at > {0} OR (a.created_at = {0} AND a.did > {1})) \
+                 ORDER BY a.created_at, a.did LIMIT {2}",
+                p[0], p[1], p[2]
+            )
+        };
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_as(&q(["?1", "?2", "?3"]))
+                    .bind(at)
+                    .bind(did)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_as(&q(["$1::bigint", "$2::text", "$3"]))
+                    .bind(at)
+                    .bind(did)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
+    /// The blobs a repository's records reference, by CID after `cursor`,
+    /// only from records written after rev `since` when given.
+    pub async fn list_blob_cids(
+        &self,
+        did: &str,
+        since: Option<&str>,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> CoreResult<Vec<String>> {
+        let q = |p: [&str; 4]| {
+            format!(
+                "SELECT DISTINCT rb.blob_cid FROM record_blob rb \
+                 JOIN record r ON r.did = rb.did AND r.collection = rb.collection AND r.rkey = rb.rkey \
+                 WHERE rb.did = {} AND ({} IS NULL OR r.rev > {}) AND ({} IS NULL OR rb.blob_cid > {}) \
+                 ORDER BY rb.blob_cid LIMIT {}",
+                p[0], p[1], p[1], p[2], p[2], p[3]
+            )
+        };
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_scalar(&q(["?1", "?2", "?3", "?4"]))
+                    .bind(did)
+                    .bind(since)
+                    .bind(cursor)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_scalar(&q(["$1", "$2::text", "$3::text", "$4"]))
+                    .bind(did)
+                    .bind(since)
+                    .bind(cursor)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
     /// One record's CID and takedown, if the record exists.
     pub async fn record_entry(
         &self,

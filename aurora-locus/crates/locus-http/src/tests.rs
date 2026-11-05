@@ -2540,3 +2540,180 @@ async fn the_firehose_backfills_then_streams_live() {
     assert_eq!(message(next_frame(&mut old).await), ("#commit".into(), 6));
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn sync_reads_serve_verifiable_cars_and_status() {
+    use proto_blue_repo::proofs::verify_key_in_proof;
+    let h = harness(false).await;
+    let acct = h
+        .create_account("gus.pds.example.com", "gus@example.com", "pw")
+        .await;
+    let (did, access) = (
+        acct["did"].as_str().unwrap().to_owned(),
+        acct["accessJwt"].as_str().unwrap().to_owned(),
+    );
+    let mut cids = Vec::new();
+    for (rkey, text) in [("3m4aaaaaaaaaa", "one"), ("3m4aaaaaaaaab", "two")] {
+        let (_, v) = h
+            .post(
+                "com.atproto.repo.createRecord",
+                Some(&access),
+                json!({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey, "record": post_record(text)}),
+            )
+            .await;
+        cids.push(v["cid"].as_str().unwrap().to_owned());
+    }
+    let signing = h.state.signing_key(&did).await.unwrap().did();
+
+    // The whole repo verifies against the account's key.
+    let (st, headers, car) = h
+        .raw(
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getRepo?did={did}"),
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/vnd.ipld.car");
+    let repo = proto_blue_repo::sync::verify_repo_car(&car, Some(&did), Some(&signing)).unwrap();
+    let (_, latest) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+    assert_eq!(
+        repo.commit_cid.to_string_base32(),
+        latest["cid"].as_str().unwrap()
+    );
+
+    // A record proof, and a proof of absence.
+    let proof = |rkey: &str| {
+        h.raw_get(format!(
+            "/xrpc/com.atproto.sync.getRecord?did={did}&collection=app.bsky.feed.post&rkey={rkey}"
+        ))
+    };
+    let (_, _, car) = proof("3m4aaaaaaaaab").await;
+    let (root, blocks) = proto_blue_repo::car::read_car_with_root(&car).unwrap();
+    let commit = proto_blue_repo::commit::SignedCommit::from_lex_value(
+        &proto_blue_lex_cbor::decode(blocks.get(&root).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let want = proto_blue_lex_data::Cid::from_str_multibase(&cids[1]).unwrap();
+    assert!(
+        verify_key_in_proof(
+            &blocks,
+            &commit.data,
+            "app.bsky.feed.post/3m4aaaaaaaaab",
+            Some(&want)
+        )
+        .unwrap()
+    );
+    assert!(blocks.get(&want).is_some(), "the record block is included");
+    let (_, _, car) = proof("3m4zzzzzzzzzz").await;
+    let (root, blocks) = proto_blue_repo::car::read_car_with_root(&car).unwrap();
+    let commit = proto_blue_repo::commit::SignedCommit::from_lex_value(
+        &proto_blue_lex_cbor::decode(blocks.get(&root).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        verify_key_in_proof(
+            &blocks,
+            &commit.data,
+            "app.bsky.feed.post/3m4zzzzzzzzzz",
+            None
+        )
+        .unwrap(),
+        "absent"
+    );
+
+    // getBlocks: named blocks, or a refusal naming the missing ones.
+    let (st, _, car) = h
+        .raw(
+            "GET",
+            &format!(
+                "/xrpc/com.atproto.sync.getBlocks?did={did}&cids={}&cids={}",
+                cids[0], cids[1]
+            ),
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        proto_blue_repo::car::read_car(&car)
+            .unwrap()
+            .1
+            .iter()
+            .count(),
+        2
+    );
+    let absent = proto_blue_lex_data::Cid::for_cbor(b"nope").to_string_base32();
+    let (st, _, _) = h
+        .raw(
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getBlocks?did={did}&cids={absent}"),
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Status, listRepos.
+    let (_, status) = h
+        .get(format!("/xrpc/com.atproto.sync.getRepoStatus?did={did}"))
+        .await;
+    assert_eq!(
+        (status["active"].as_bool(), status["rev"].as_str()),
+        (Some(true), latest["rev"].as_str())
+    );
+    let (_, list) = h.get("/xrpc/com.atproto.sync.listRepos".into()).await;
+    assert_eq!(list["repos"][0]["did"], did.as_str());
+    assert_eq!(list["repos"][0]["head"], latest["cid"]);
+
+    // Deactivated: refused to everyone but the owner; status still answers.
+    h.post(
+        "com.atproto.server.deactivateAccount",
+        Some(&access),
+        json!({}),
+    )
+    .await;
+    let (st, v) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RepoDeactivated"))
+    );
+    let (st, _) = h
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"),
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "the owner bypasses");
+    let (_, status) = h
+        .get(format!("/xrpc/com.atproto.sync.getRepoStatus?did={did}"))
+        .await;
+    assert_eq!(
+        (status["active"].as_bool(), status["status"].as_str()),
+        (Some(false), Some("deactivated"))
+    );
+    assert!(status.get("rev").is_none());
+    let (st, v) = h
+        .get("/xrpc/com.atproto.sync.getRepoStatus?did=did:plc:unknownunknownunknown".into())
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RepoNotFound"))
+    );
+}
+
+impl Harness {
+    async fn raw_get(&self, path: String) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        self.raw("GET", &path, None, Vec::new(), &[]).await
+    }
+}

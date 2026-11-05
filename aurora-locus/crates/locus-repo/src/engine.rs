@@ -197,6 +197,54 @@ impl RepoEngine {
         Arc::clone(locks.entry(did.to_owned()).or_default())
     }
 
+    /// What `sync.getRecord` serves: the current commit and a covering proof
+    /// for `collection/rkey` (the record block included when it exists),
+    /// read without a transaction. None if there's no repository.
+    pub async fn record_proof(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<(Cid, BlockMap)>, CommitError> {
+        let Some(root) = self.store.repo_root_of(did).await? else {
+            return Ok(None);
+        };
+        let commit_cid = parse_cid(&root.commit_cid)?;
+        let mut out = BlockMap::new();
+        let commit = self
+            .store
+            .block(did, &root.commit_cid)
+            .await?
+            .ok_or_else(|| CommitError::InvalidMst(format!("commit block of {did} is missing")))?;
+        out.set(commit_cid.clone(), commit);
+        let tree = Mst::load(parse_cid(&root.data_cid)?);
+        let key = format!("{collection}/{rkey}");
+        let mut cache = BlockMap::new();
+        let proof = loop {
+            match tree.covering_proof(&key, &cache) {
+                Ok(p) => break p,
+                Err(RepoError::MissingBlock(cid)) => {
+                    let bytes = self
+                        .store
+                        .block(did, &cid_str(&cid))
+                        .await?
+                        .ok_or_else(|| {
+                            CommitError::InvalidMst(format!("block {cid} of {did} is not stored"))
+                        })?;
+                    cache.set(cid, bytes);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        out.add_map(&proof);
+        if let Some((cid, _)) = self.store.record_entry(did, collection, rkey).await?
+            && let Some(bytes) = self.store.block(did, &cid).await?
+        {
+            out.set(parse_cid(&cid)?, bytes);
+        }
+        Ok(Some((commit_cid, out)))
+    }
+
     /// A transaction holding `did`'s repo lock (in this process and in the
     /// database), for writing events that don't touch the repo, such as
     /// `#identity` and `#account`, in order with the DID's commits. The lock

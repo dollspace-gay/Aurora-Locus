@@ -205,6 +205,13 @@ kryphocron built in.
 - Crawler notification: `requestCrawl` to each relay in `sync.crawlers`
   (`PDS_CRAWLERS`) on new events, at most every 20 minutes each, with a
   call inside the window scheduled rather than dropped.
+- Sync reads: `getRepo` (streamed as a CAR, all live blocks or those since
+  a rev), `getRecord` (the record with its proof, or a proof of absence),
+  `getBlocks`, `getLatestCommit`, `getRepoStatus`, `listRepos`,
+  `listBlobs`, and the deprecated `getHead` and `getCheckout`. A
+  taken-down, suspended or deactivated repo is refused to everyone but its
+  owner (`RepoTakendown`, `RepoSuspended`, `RepoDeactivated`);
+  `getRepoStatus` always answers.
 - Repository writes are refused (retryable `RepoWriteBlocked`) while a
   deletion holds the account.
 - Access tokens are checked for the scopes each endpoint allows, as the
