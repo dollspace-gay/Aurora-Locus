@@ -251,6 +251,17 @@ impl Node {
                                     Err(e) => break Err(e),
                                 }
                             };
+                            // OAuth replay windows and expired requests too.
+                            let result = match result {
+                                Ok(t) => loop {
+                                    match state.store.prune_oauth(5_000).await {
+                                        Ok(0) => break Ok(t),
+                                        Ok(n) => total += n,
+                                        Err(e) => break Err(e),
+                                    }
+                                },
+                                e => e,
+                            };
                             if let Err(e) = &result {
                                 tracing::warn!("rate limit pruning failed: {e}");
                             }

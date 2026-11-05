@@ -13,6 +13,7 @@ pub mod import;
 pub mod invites;
 pub mod jobs;
 pub mod lease;
+pub mod oauth;
 pub mod prefs;
 pub mod repo;
 pub mod runtime;

@@ -791,3 +791,35 @@ async fn rate_limit_counters_use_fixed_windows_and_prune() {
         assert_eq!(s.consume_rate_limit("k", 1, 60_000).await.unwrap().0, 6);
     }
 }
+
+#[tokio::test]
+async fn oauth_replay_windows() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(
+            s.oauth_unique("DPoP", "j1", 60_000).await.unwrap(),
+            "{}",
+            b.name
+        );
+        assert!(
+            !s.oauth_unique("DPoP", "j1", 60_000).await.unwrap(),
+            "{}: replay",
+            b.name
+        );
+        assert!(
+            s.oauth_unique("Other", "j1", 60_000).await.unwrap(),
+            "namespaces are separate"
+        );
+        assert!(s.oauth_unique("DPoP", "short", 1).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            s.oauth_unique("DPoP", "short", 60_000).await.unwrap(),
+            "{}: window ended",
+            b.name
+        );
+        assert!(!s.oauth_unique("DPoP", "short", 60_000).await.unwrap());
+        s.oauth_unique("DPoP", "gone", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(s.prune_oauth(100).await.unwrap(), 1, "{}", b.name);
+    }
+}

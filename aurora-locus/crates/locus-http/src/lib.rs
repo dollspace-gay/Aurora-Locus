@@ -8,6 +8,7 @@ pub mod email;
 pub mod error;
 pub mod identity;
 pub mod import;
+pub mod oauth;
 pub mod pipethrough;
 pub mod ratelimit;
 pub mod raw;
@@ -212,6 +213,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource_metadata),
+        )
+        .route("/oauth/jwks", get(oauth::jwks))
         .route(
             "/xrpc/app.bsky.actor.getPreferences",
             get(bsky::get_preferences),

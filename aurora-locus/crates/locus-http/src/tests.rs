@@ -2307,6 +2307,8 @@ async fn blobs_upload_get_referenced_promoted_served_and_collected() {
             .unreferenced_since
             .is_some()
     );
+    // Grace 0: step past the millisecond it was orphaned in.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let mut tx = h.state.store.begin().await.unwrap();
     assert_eq!(tx.gc_blob_batch(3_600_000, 0, 100, 1).await.unwrap(), 1);
     tx.commit().await.unwrap();
@@ -4220,4 +4222,42 @@ async fn cors_cache_headers_and_the_request_deadline() {
         "RequestTimeout"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn oauth_metadata_and_jwks() {
+    let h = harness(false).await;
+    let (st, md) = h
+        .get("/.well-known/oauth-authorization-server".into())
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(md["issuer"], "https://pds.example.com");
+    assert_eq!(
+        md["pushed_authorization_request_endpoint"],
+        "https://pds.example.com/oauth/par"
+    );
+    assert_eq!(md["require_pushed_authorization_requests"], true);
+    assert_eq!(md["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(
+        md["protected_resources"],
+        json!(["https://pds.example.com"])
+    );
+    let (_, pr) = h.get("/.well-known/oauth-protected-resource".into()).await;
+    assert_eq!(pr["resource"], "https://pds.example.com");
+    assert_eq!(
+        pr["authorization_servers"],
+        json!(["https://pds.example.com"])
+    );
+    let (_, jwks) = h.get("/oauth/jwks".into()).await;
+    let key = &jwks["keys"][0];
+    assert_eq!(
+        (
+            key["kty"].as_str(),
+            key["crv"].as_str(),
+            key["alg"].as_str()
+        ),
+        (Some("EC"), Some("P-256"), Some("ES256"))
+    );
+    assert!(key.get("d").is_none(), "public only");
+    assert_eq!(key["kid"], h.state.secrets.oauth_key.kid());
 }

@@ -22,6 +22,11 @@ zeroize.workspace = true
 proto-blue-crypto.workspace = true
 proto-blue-syntax.workspace = true
 argon2 = "0.5"
+p256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa"] }
+rsa = { version = "0.9", features = ["sha2"] }
 
 [dev-dependencies]
 tempfile.workspace = true

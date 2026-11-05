@@ -22,6 +22,8 @@ pub mod secret_names {
     pub const APP_PASSWORD_PEPPER: &str = "app_password_pepper";
     pub const EMAIL_TOKEN_PEPPER: &str = "email_token_pepper";
     pub const SERVICE_KEY: &str = "service_signing_key";
+    pub const OAUTH_KEY: &str = "oauth_signing_key";
+    pub const DPOP_SECRET: &str = "dpop_secret";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -32,6 +34,10 @@ pub struct ServerSecrets {
     pub email_token_pepper: Zeroizing<Vec<u8>>,
     pub plc_keys: PlcKeys,
     pub service_key: K256Keypair,
+    /// Signs OAuth access tokens (ES256).
+    pub oauth_key: locus_auth::oauth::jose::Es256Key,
+    /// DPoP nonces, from a secret every node shares.
+    pub dpop_nonces: locus_auth::oauth::dpop::Nonces,
 }
 
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
@@ -158,6 +164,20 @@ impl ServerSecrets {
             K256Keypair::generate().export_private_key()
         })
         .await?;
+        let oauth = load_or(store, key, secret_names::OAUTH_KEY, || {
+            locus_auth::oauth::jose::Es256Key::generate().to_bytes()
+        })
+        .await?;
+        let oauth_key = locus_auth::oauth::jose::Es256Key::from_bytes(&oauth)
+            .map_err(|e| CoreError::Config(format!("stored OAuth signing key: {e}")))?;
+        let dpop = load_or(store, key, secret_names::DPOP_SECRET, || {
+            std::env::var("PDS_DPOP_SECRET")
+                .ok()
+                .and_then(|h| hex::decode(h.trim()).ok())
+                .filter(|b| b.len() == 32)
+                .unwrap_or_else(|| rand::random::<[u8; 32]>().to_vec())
+        })
+        .await?;
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -166,6 +186,8 @@ impl ServerSecrets {
         Ok(Self {
             plc_keys,
             service_key: keypair(&service, "service key")?,
+            oauth_key,
+            dpop_nonces: locus_auth::oauth::dpop::Nonces::new(&dpop),
             jwt,
             app_password_pepper,
             email_token_pepper,
