@@ -1,0 +1,30 @@
+<div class="card" id="s-{{ f.key }}">
+<form class="stack" method="post" action="/admin/settings/save">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="key" value="{{ f.key }}">
+<input type="hidden" name="back" value="{{ back }}">
+<h2>{{ f.key }}</h2>
+<p>{{ f.description }}</p>
+<p><span class="pill on">Applies at once</span>{% if f.is_default %} <span class="pill">Default</span>{% endif %}</p>
+{% if f.input == "checkbox" %}
+<label class="check"><input type="checkbox" name="value" value="true"{% if f.checked %} checked{% endif %}{% if !can_edit %} disabled{% endif %}> On</label>
+{% else if f.input == "select" %}
+<label for="v-{{ f.key }}">Value</label>
+<select id="v-{{ f.key }}" name="value"{% if !can_edit %} disabled{% endif %}>
+{% for o in f.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>
+{% endfor %}</select>
+{% else if f.input == "textarea" %}
+<label for="v-{{ f.key }}">One per line</label>
+<textarea id="v-{{ f.key }}" name="value" rows="4" spellcheck="false"{% if !can_edit %} disabled{% endif %}>{{ f.value }}</textarea>
+{% else if f.input == "number" %}
+<label for="v-{{ f.key }}">Value <span class="muted">({{ f.min }} to {{ f.max }})</span></label>
+<input type="number" id="v-{{ f.key }}" name="value" value="{{ f.value }}" min="{{ f.min }}" max="{{ f.max }}"{% if !can_edit %} disabled{% endif %}>
+{% else %}
+<label for="v-{{ f.key }}">Value</label>
+<input type="text" id="v-{{ f.key }}" name="value" value="{{ f.value }}" spellcheck="false"{% if !can_edit %} disabled{% endif %}>
+{% endif %}
+<div class="fact"><span class="l">Default</span><span class="v">{{ f.default }}</span></div>
+{% if !f.env.is_empty() %}<div class="fact"><span class="l">Set from env by</span><span class="v"><code>{{ f.env }}</code></span></div>{% endif %}
+{% if can_edit %}<div class="row"><button type="submit" class="secondary">Save</button></div>{% endif %}
+</form>
+</div>

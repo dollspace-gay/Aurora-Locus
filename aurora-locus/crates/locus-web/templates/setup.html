@@ -30,10 +30,8 @@
 {% if self.is("storage") %}
 <div class="card">
 <p>Where this PDS keeps its data is fixed when the server starts, so this step only confirms it and tests it.</p>
-<dl class="facts">
-<div class="fact"><dt>Database</dt><dd>{{ f.database }}</dd></div>
-<div class="fact"><dt>Blob storage</dt><dd>{{ f.blob_store }}</dd></div>
-</dl>
+<div class="fact"><span class="l">Database</span><span class="v">{{ f.database }}</span></div>
+<div class="fact"><span class="l">Blob storage</span><span class="v">{{ f.blob_store }}</span></div>
 {% if f.storage_ok %}<div class="banner ok">Tested: {{ f.storage_detail }}</div>{% else %}<div class="banner bad">The test failed: {{ f.storage_detail }}</div>{% endif %}
 <form class="stack" method="post" action="/setup/storage">
 <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -194,10 +192,8 @@
 {% if self.is("keys") %}
 <div class="card">
 <p>This PDS's keys are made and stored encrypted under its master key.</p>
-<dl class="facts">
-<div class="fact"><dt>PLC rotation key</dt><dd><code>{{ f.rotation_key }}</code></dd></div>
-<div class="fact"><dt>Master key</dt><dd>{{ f.master_key_source }}{% if !f.master_key_path.is_empty() %}, at <code>{{ f.master_key_path }}</code>{% endif %} <span class="muted">(id {{ f.master_key_id }})</span></dd></div>
-</dl>
+<div class="fact"><span class="l">PLC rotation key</span><span class="v"><code>{{ f.rotation_key }}</code></span></div>
+<div class="fact"><span class="l">Master key</span><span class="v">{{ f.master_key_source }}{% if !f.master_key_path.is_empty() %}, at <code>{{ f.master_key_path }}</code>{% endif %} <span class="muted">(id {{ f.master_key_id }})</span></span></div>
 <div class="banner bad">If the master key is lost, every stored key is lost with it, and this PDS can't sign for its accounts again. Keep a copy somewhere other than this server. <code>aurora-locus keys backup</code> writes an encrypted backup of the keys.</div>
 <form class="stack" method="post" action="/setup/keys">
 <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -212,10 +208,8 @@
 
 {% if self.is("review") %}
 <div class="card">
-<dl class="facts">
-{% for (k, v) in f.summary %}<div class="fact"><dt>{{ k }}</dt><dd>{{ v }}</dd></div>
-{% endfor %}</dl>
-</div>
+{% for (k, v) in f.summary %}<div class="fact"><span class="l">{{ k }}</span><span class="v">{{ v }}</span></div>
+{% endfor %}</div>
 <h2>Checks</h2>
 <form class="stack" method="post" action="/setup/review">
 <input type="hidden" name="csrf" value="{{ csrf }}">

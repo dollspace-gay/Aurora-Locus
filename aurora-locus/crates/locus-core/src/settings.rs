@@ -804,6 +804,20 @@ pub static REGISTRY: &[Def] = &[
         description: "First labels no one may register under a handle domain, besides the built-in list (setup adds the PDS hostname's label and the domain's existing subdomains).",
     },
     Def {
+        key: "portal.enabled",
+        kind: Kind::Bool,
+        default: "true",
+        env: None,
+        description: "Serve the account portal at /account, where people manage their own account. Off, /account answers 404 and sign-in pages don't link to it.",
+    },
+    Def {
+        key: "admin.session_idle_minutes",
+        kind: Kind::Int { min: 5, max: 1440 },
+        default: "30",
+        env: None,
+        description: "Minutes a console sign-in lasts without use (every sign-in ends after 12 hours regardless).",
+    },
+    Def {
         key: "deploy.proxy_mode",
         kind: Kind::Choice(&["caddy", "cloudflare", "other", "direct"]),
         default: r#""caddy""#,

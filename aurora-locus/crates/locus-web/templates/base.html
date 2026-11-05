@@ -14,9 +14,10 @@
 <div class="layout">
 <nav class="sidebar" aria-label="{{ nav.area }} menu">
 <div class="brand"><span>{{ shell.brand }}</span>
-<details class="who"{% if nav.on_appearance() %} open{% endif %}><summary><span class="who-name">{{ nav.who }}</span> <span aria-hidden="true">▾</span></summary>
+<details class="who"{% if nav.on_own() %} open{% endif %}><summary><span class="who-name">{{ nav.who }}</span> <span aria-hidden="true">▾</span></summary>
 <div class="who-menu">
-<a class="item" href="{{ nav.appearance_href() }}"{% if nav.on_appearance() %} aria-current="page"{% endif %}>Appearance</a>
+{% for i in nav.own %}<a class="item" href="{{ i.href }}"{% if nav.is_current(i) %} aria-current="page"{% endif %}>{{ i.name }}</a>
+{% endfor %}
 <form method="post" action="{{ nav.sign_out_action() }}"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="item" type="submit">Sign out</button></form>
 </div>
 </details>

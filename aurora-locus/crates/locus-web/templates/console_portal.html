@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<p class="muted">The account portal is where people manage their own account in a browser: their handle, email, password, app passwords, connected apps, and moving or deleting their account. Their apps keep working whether it's on or off.</p>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<div class="card">
+<h2>The portal</h2>
+{% if enabled %}<p><span class="pill on">On</span> It's at <a href="{{ url }}">{{ url }}</a>.</p>{% else %}<p><span class="pill off">Off</span> /account answers "not found", and sign-in pages don't link to it.</p>{% endif %}
+{% if can_edit %}
+<form method="post" action="/admin/settings/save">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="key" value="portal.enabled">
+<input type="hidden" name="back" value="{{ back }}">
+{% if enabled %}
+<div class="row"><button type="submit" class="secondary">Turn the portal off</button></div>
+{% else %}
+<input type="hidden" name="value" value="true">
+<div class="row"><button type="submit">Turn the portal on</button></div>
+{% endif %}
+</form>
+{% endif %}
+</div>
+{% if !fields.is_empty() %}
+<details class="advanced"><summary>More portal settings</summary>
+<div class="settings-cards">
+{% for f in fields %}{% include "setting_field.html" %}
+{% endfor %}</div>
+</details>
+{% endif %}
+{% endblock %}

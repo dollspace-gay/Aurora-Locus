@@ -88,6 +88,24 @@ impl Store {
         sealed.map(|s| key.open(&secret_aad(name), &s)).transpose()
     }
 
+    /// Removes a named secret; true if there was one.
+    pub async fn delete_secret(&self, name: &str) -> CoreResult<bool> {
+        let n = match self {
+            Self::Sqlite(p) => sqlx::query("DELETE FROM secret WHERE name = ?1")
+                .bind(name)
+                .execute(p)
+                .await
+                .map(|r| r.rows_affected()),
+            Self::Postgres(p) => sqlx::query("DELETE FROM secret WHERE name = $1")
+                .bind(name)
+                .execute(p)
+                .await
+                .map(|r| r.rows_affected()),
+        }
+        .map_err(db_err)?;
+        Ok(n > 0)
+    }
+
     /// Reads and decrypts an account's signing key: (key type, private key).
     pub async fn get_signing_key(
         &self,

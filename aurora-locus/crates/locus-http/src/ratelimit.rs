@@ -94,6 +94,18 @@ pub mod buckets {
         window_ms: 5 * MINUTE,
         points: 6000,
     };
+    /// Console sign-in attempts, per address.
+    pub const CONSOLE_SIGN_IN: Bucket = Bucket {
+        name: "locus.console.signIn-ip",
+        window_ms: 5 * MINUTE,
+        points: 30,
+    };
+    /// Console sign-in attempts (passwords and codes), per operator name.
+    pub const CONSOLE_SIGN_IN_NAME: Bucket = Bucket {
+        name: "locus.console.signIn-name",
+        window_ms: 5 * MINUTE,
+        points: 10,
+    };
 
     /// `requestEmailConfirmation`, `requestEmailUpdate` and
     /// `requestAccountDelete` share this shape (each its own key prefix).

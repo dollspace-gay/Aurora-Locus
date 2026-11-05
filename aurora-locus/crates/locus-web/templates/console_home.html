@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+{% for a in attention %}<div class="banner{% if a.class == "bad" %} bad{% endif %}"><strong>{{ a.label }}</strong> {{ a.value }}</div>
+{% endfor %}
+<div class="grid">
+<div class="card">
+<h2>This server</h2>
+{% for f in facts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h2>Accounts and data</h2>
+{% for f in counts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+</div>
+<h2>Jobs</h2>
+<div class="scroll"><table>
+<thead><tr><th class="name">Job</th><th class="when">Last run</th><th class="state">State</th><th class="text">Last error</th></tr></thead>
+<tbody>
+{% for j in jobs %}<tr><td class="name">{{ j.name }}</td><td class="when">{{ j.last_run }}</td><td class="state"><span class="pill {{ j.class }}">{{ j.state }}</span></td><td class="text"><div class="cell-text">{{ j.error }}</div></td></tr>
+{% else %}<tr><td class="text" colspan="4"><div class="cell-text">No job has run yet.</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% endblock %}

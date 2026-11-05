@@ -65,6 +65,9 @@ pub struct Nav {
     pub csrf: String,
     pub theme: Theme,
     pub sections: Vec<Section>,
+    /// The signed-in person's own pages (Appearance, …), in the menu under
+    /// their name.
+    pub own: Vec<Item>,
     /// The current item's href, which is marked; empty for none.
     pub current: String,
     pub banners: Vec<Banner>,
@@ -72,18 +75,14 @@ pub struct Nav {
 
 impl Nav {
     #[must_use]
-    pub fn appearance_href(&self) -> String {
-        format!("{}/appearance", self.base)
-    }
-
-    #[must_use]
     pub fn sign_out_action(&self) -> String {
         format!("{}/sign-out", self.base)
     }
 
+    /// Whether the page is one of the person's own (the menu opens).
     #[must_use]
-    pub fn on_appearance(&self) -> bool {
-        self.current == self.appearance_href()
+    pub fn on_own(&self) -> bool {
+        self.own.iter().any(|i| self.is_current(i))
     }
 
     #[must_use]
@@ -95,8 +94,8 @@ impl Nav {
     /// in.
     #[must_use]
     pub fn eyebrow(&self) -> String {
-        if self.on_appearance() {
-            return format!("{} · Appearance", self.area);
+        if self.on_own() {
+            return format!("{} · Your account", self.area);
         }
         for s in &self.sections {
             if s.items.iter().any(|i| self.is_current(i)) {
@@ -206,6 +205,11 @@ mod tests {
                         tag: Some("3".into()),
                     },
                 ],
+            }],
+            own: vec![Item {
+                name: "Appearance",
+                href: "/admin/appearance".into(),
+                tag: None,
             }],
             current: "/admin/invites".into(),
             banners: vec![Banner {

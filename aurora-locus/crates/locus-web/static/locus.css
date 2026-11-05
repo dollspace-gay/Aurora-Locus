@@ -612,3 +612,12 @@ main.narrow { max-width: 30rem; }
 .steps li[aria-current="step"] { color: var(--accent); font-weight: 700; }
 .steps a { color: inherit; }
 .steps li.done { color: var(--fg); }
+
+/* Pills: a setting's or a check's state. */
+.pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; background: var(--pill); color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+.pill.on { background: var(--ok-bg); color: var(--ok); }
+.pill.off { background: var(--bad-bg); color: var(--bad); }
+.pill.red { background: var(--bad-bg); color: var(--bad); }
+.pill.amber { background: var(--warn-bg); color: var(--warn); }
+.pill.info { background: var(--accent-subtle); color: var(--accent); }
+.pill.fine { background: var(--ok-bg); color: var(--ok); }

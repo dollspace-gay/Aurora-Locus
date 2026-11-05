@@ -9029,3 +9029,506 @@ async fn the_wizard_is_gone_after_setup() {
         );
     }
 }
+
+impl Harness {
+    /// An operator with a real password, for the console.
+    async fn console_operator(&self, name: &str, role: &str, pw: &str) {
+        let hash = locus_auth::password::hash(pw).unwrap();
+        assert!(
+            self.state
+                .store
+                .create_operator(name, &hash, role)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Signs `b` in to the console (no code app).
+    async fn console_sign_in(&self, b: &Browser, name: &str, pw: &str) {
+        let (_, _, page) = b.get(self, "/admin/sign-in").await;
+        let csrf = hidden(&page, "csrf");
+        let (st, headers, body) = b
+            .post(
+                self,
+                "/admin/sign-in",
+                &[("csrf", &csrf), ("username", name), ("password", pw)],
+            )
+            .await;
+        assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(headers["location"], "/admin");
+    }
+}
+
+fn console_session(b: &Browser) -> String {
+    b.jar
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k == "locus-console")
+        .map(|(_, v)| v.clone())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_console_signs_in_with_a_password_then_a_code() {
+    let h = harness(false).await;
+    h.console_operator("alice", "owner", "correct horse battery")
+        .await;
+    let b = Browser::default();
+    let (st, headers, _) = b.get(&h, "/admin").await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/admin/sign-in")
+    );
+
+    // Wrong password, forged form, then right.
+    let (_, _, page) = b.get(&h, "/admin/sign-in").await;
+    let csrf = hidden(&page, "csrf");
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/sign-in",
+            &[
+                ("csrf", &csrf),
+                ("username", "alice"),
+                ("password", "wrong"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/sign-in",
+            &[
+                ("csrf", "forged"),
+                ("username", "alice"),
+                ("password", "correct horse battery"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/sign-in",
+            &[
+                ("csrf", &csrf),
+                ("username", "nobody"),
+                ("password", "correct horse battery"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "an unknown operator looks like a wrong password"
+    );
+    h.console_sign_in(&b, "alice", "correct horse battery")
+        .await;
+    let set = b.cookie_header();
+    assert!(set.contains("locus-console="));
+
+    let (st, _, page) = b.get(&h, "/admin").await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    assert!(
+        page.contains(r#"class="sidebar""#) && page.contains("Nodes running"),
+        "{page}"
+    );
+    assert!(
+        page.contains("no sign-in code app"),
+        "the code app banner shows: {page}"
+    );
+    assert!(
+        page.contains(r#"href="/admin/settings""#) && page.contains(r#"href="/admin/security""#)
+    );
+    let csrf = hidden(&page, "csrf");
+
+    // The session is a credential for the admin API too.
+    let id = console_session(&b);
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (st, _) = h
+        .admin_call(
+            "GET",
+            &ns("viewer.getSettings"),
+            &format!("Console {id}"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .admin_call("GET", &ns("viewer.getSettings"), "Console 00", None)
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // Appearance follows the operator.
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/appearance",
+            &[
+                ("csrf", &csrf),
+                ("mode", "dark"),
+                ("scheme", "teal"),
+                ("font", "plex"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let (_, _, page) = b.get(&h, "/admin").await;
+    assert!(
+        page.contains(r#"class="mode-dark scheme-teal font-plex""#),
+        "{page}"
+    );
+
+    // A code app: start, confirm with its code.
+    let (st, _, _) = b
+        .post(&h, "/admin/security/totp/start", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    let (_, _, page) = b.get(&h, "/admin/security").await;
+    assert!(page.contains("otpauth://totp/"), "{page}");
+    let secret = h
+        .state
+        .store
+        .get_secret("operator/alice/totp_pending", &h.state.master_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = locus_core::time::now_ms() / 1000;
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/security/totp/confirm",
+            &[("csrf", &csrf), ("code", "000000")],
+        )
+        .await;
+    assert!(
+        st == StatusCode::BAD_REQUEST || page.contains("is on"),
+        "a wrong code is refused (unless it happens to be right)"
+    );
+    let code = locus_auth::totp::code_at(&secret, now / 30);
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/security/totp/confirm",
+            &[("csrf", &csrf), ("code", &code)],
+        )
+        .await;
+    assert!(st == StatusCode::OK && page.contains("is on"), "{page}");
+    assert!(
+        h.state
+            .store
+            .get_secret("operator/alice/totp_pending", &h.state.master_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Sign out; signing in now needs the code, and a code works once.
+    let (st, _, _) = b.post(&h, "/admin/sign-out", &[("csrf", &csrf)]).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(b.get(&h, "/admin").await.0, StatusCode::SEE_OTHER);
+    let (_, _, page) = b.get(&h, "/admin/sign-in").await;
+    let pre = hidden(&page, "csrf");
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/admin/sign-in",
+            &[
+                ("csrf", &pre),
+                ("username", "alice"),
+                ("password", "correct horse battery"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/admin/sign-in/code")
+    );
+    assert_eq!(
+        b.get(&h, "/admin").await.0,
+        StatusCode::SEE_OTHER,
+        "half signed in isn't signed in"
+    );
+    let half = console_session(&b);
+    let (st, _) = h
+        .admin_call(
+            "GET",
+            &ns("viewer.getSettings"),
+            &format!("Console {half}"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "nor for the API");
+    let (_, _, page) = b.get(&h, "/admin/sign-in/code").await;
+    let ccsrf = hidden(&page, "csrf");
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/sign-in/code",
+            &[("csrf", &ccsrf), ("code", &code)],
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "the code that turned the app on was used"
+    );
+    let next = locus_auth::totp::code_at(&secret, now / 30 + 1);
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/admin/sign-in/code",
+            &[("csrf", &ccsrf), ("code", &next)],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/admin")
+    );
+    assert_ne!(console_session(&b), half, "a new session id once signed in");
+    let (st, _, page) = b.get(&h, "/admin").await;
+    assert!(
+        st == StatusCode::OK && !page.contains("no sign-in code app"),
+        "{page}"
+    );
+    let audit = h.state.store.audit_entries(None, 50).await.unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|e| e.action == "operator.totp_on" && e.actor == "operator:alice")
+    );
+    assert!(
+        audit
+            .iter()
+            .filter(|e| e.action == "console.sign_in")
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn console_settings_save_through_the_admin_api_by_role() {
+    let h = harness(true).await;
+    h.console_operator("alice", "admin", "correct horse battery")
+        .await;
+    h.console_operator("vic", "viewer", "another long password")
+        .await;
+    let b = Browser::default();
+    h.console_sign_in(&b, "alice", "correct horse battery")
+        .await;
+    let (st, _, page) = b.get(&h, "/admin/settings?q=invite").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        page.contains("accounts.invite_required") && !page.contains("log.level"),
+        "searched"
+    );
+    let csrf = hidden(&page, "csrf");
+
+    // A checkbox left unticked saves false.
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "accounts.invite_required"),
+                ("back", "/admin/settings?q=invite"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(
+        headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/admin/settings?q=invite&saved=")
+    );
+    assert!(!h.state.snapshot().bool("accounts.invite_required"));
+    let audit = h.state.store.audit_entries(None, 20).await.unwrap();
+    assert!(audit.iter().any(|e| e.action == "setting.change"
+        && e.actor == "operator:alice"
+        && e.target.as_deref() == Some("accounts.invite_required")));
+
+    // Lists and numbers; a bad value is refused with why.
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "sync.crawlers"),
+                ("value", "https://a.example\nhttps://b.example"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        h.state.snapshot().list("sync.crawlers"),
+        ["https://a.example", "https://b.example"]
+    );
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "admin.session_idle_minutes"),
+                ("value", "1"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{page}");
+    // An unsafe back goes to the settings page instead.
+    let (_, headers, _) = b
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "accounts.invite_required"),
+                ("value", "true"),
+                ("back", "https://evil.example"),
+            ],
+        )
+        .await;
+    assert!(
+        headers["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/admin/settings?saved=")
+    );
+
+    // The portal switch.
+    let (_, _, page) = b.get(&h, "/admin/portal").await;
+    assert!(page.contains("Turn the portal off"), "{page}");
+    let (st, _, _) = b
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "portal.enabled"),
+                ("back", "/admin/portal"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert!(!h.state.snapshot().bool("portal.enabled"));
+    let (_, _, page) = b.get(&h, "/admin/portal?saved=1").await;
+    assert!(
+        page.contains("Turn the portal on") && page.contains("is off"),
+        "{page}"
+    );
+
+    // A viewer reads but can't change.
+    let v = Browser::default();
+    h.console_sign_in(&v, "vic", "another long password").await;
+    let (_, _, page) = v.get(&h, "/admin/settings").await;
+    assert!(
+        !page.contains(">Save</button>") && page.contains("disabled"),
+        "read-only for a viewer"
+    );
+    let (_, _, page) = v.get(&h, "/admin/portal").await;
+    assert!(!page.contains("Turn the portal"), "{page}");
+    let vcsrf = hidden(&page, "csrf");
+    let (st, _, page) = v
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &vcsrf),
+                ("key", "portal.enabled"),
+                ("value", "true"),
+            ],
+        )
+        .await;
+    assert!(
+        st == StatusCode::BAD_REQUEST && page.contains("admin role"),
+        "{page}"
+    );
+    assert!(!h.state.snapshot().bool("portal.enabled"));
+    // Another operator's session doesn't carry this one's CSRF token.
+    let (st, _, _) = v
+        .post(
+            &h,
+            "/admin/settings/save",
+            &[
+                ("csrf", &csrf),
+                ("key", "portal.enabled"),
+                ("value", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // A password change ends the operator's other sign-ins.
+    let other = Browser::default();
+    h.console_sign_in(&other, "alice", "correct horse battery")
+        .await;
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/security/password",
+            &[
+                ("csrf", &csrf),
+                ("current", "wrong"),
+                ("new", "a brand new password"),
+                ("new2", "a brand new password"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{page}");
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/security/password",
+            &[
+                ("csrf", &csrf),
+                ("current", "correct horse battery"),
+                ("new", "a brand new password"),
+                ("new2", "a brand new password"),
+            ],
+        )
+        .await;
+    assert!(
+        st == StatusCode::OK && page.contains("signed out everywhere else"),
+        "{page}"
+    );
+    assert_eq!(other.get(&h, "/admin").await.0, StatusCode::SEE_OTHER);
+    assert_eq!(b.get(&h, "/admin").await.0, StatusCode::OK);
+
+    // Re-confirming goes back where it was asked from.
+    let (st, _, page) = b
+        .get(&h, "/admin/confirm-identity?next=/admin/settings")
+        .await;
+    assert!(st == StatusCode::OK && page.contains("password"), "{page}");
+    let (st, headers, _) = b
+        .post(
+            &h,
+            "/admin/confirm-identity",
+            &[
+                ("csrf", &csrf),
+                ("next", "/admin/settings"),
+                ("password", "a brand new password"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        (st, headers["location"].to_str().unwrap()),
+        (StatusCode::SEE_OTHER, "/admin/settings")
+    );
+    let (_, headers, _) = b
+        .post(
+            &h,
+            "/admin/confirm-identity",
+            &[
+                ("csrf", &csrf),
+                ("next", "//evil.example"),
+                ("password", "a brand new password"),
+            ],
+        )
+        .await;
+    assert_eq!(headers["location"], "/admin");
+}

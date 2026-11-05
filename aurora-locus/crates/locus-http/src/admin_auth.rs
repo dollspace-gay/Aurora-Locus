@@ -4,7 +4,8 @@
 //! - the reference's `admin:<password>` Basic auth (while enabled): `admin`,
 //!   on the reference admin surface only;
 //! - a service JWT from the moderation service: the reference's mod-service
-//!   access (the methods the reference opens to it).
+//!   access (the methods the reference opens to it);
+//! - a console sign-in (`Console <session>`): the operator's role.
 //!
 //! Every method has a minimum role; a caller below it is refused.
 
@@ -55,6 +56,9 @@ pub enum Via {
     Token,
     Basic,
     ModService,
+    /// A console sign-in (`Console <session>`), as the console's forms call
+    /// this API.
+    Console,
 }
 
 /// An authenticated admin-API caller.
@@ -147,6 +151,21 @@ pub async fn require(
             actor: format!("operator:{}", op.username),
             role: Role::parse(&op.role).unwrap_or(Role::Viewer),
             via: Via::Token,
+        }
+    } else if let Some(id) = auth.strip_prefix("Console ") {
+        let idle = s.snapshot().int("admin.session_idle_minutes") * 60_000;
+        let (session, op) = s
+            .store
+            .operator_session(&crate::console::session_hash(id.trim()), idle)
+            .await?
+            .ok_or_else(unauthorized)?;
+        if session.stage != "full" {
+            return Err(unauthorized());
+        }
+        Caller {
+            actor: format!("operator:{}", op.username),
+            role: Role::parse(&op.role).unwrap_or(Role::Viewer),
+            via: Via::Console,
         }
     } else if auth.starts_with("Bearer ") {
         let Surface::Reference { mod_service: true } = surface else {

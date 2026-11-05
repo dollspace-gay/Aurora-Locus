@@ -1883,6 +1883,7 @@ version = "0.1.0-dev"
 dependencies = [
  "argon2",
  "base64 0.22.1",
+ "data-encoding",
  "hex",
  "hmac",
  "k256",
@@ -1897,8 +1898,10 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

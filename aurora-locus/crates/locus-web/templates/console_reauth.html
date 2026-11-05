@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+{% if let Some(e) = error %}<div class="banner bad" role="alert">{{ e }}</div>{% endif %}
+<div class="card">
+<p>This changes something that matters, so the console asks for your password{% if totp %} and a code{% endif %} again first.</p>
+<form class="stack" method="post" action="/admin/confirm-identity">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="next" value="{{ next }}">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
+{% if totp %}
+<label for="code">Code from your sign-in code app</label>
+<input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+{% endif %}
+<div class="row"><a class="button secondary" href="{{ next }}">Cancel</a><button type="submit">Continue</button></div>
+</form>
+</div>
+{% endblock %}

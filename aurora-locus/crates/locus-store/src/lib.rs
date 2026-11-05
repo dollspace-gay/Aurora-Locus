@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod admin;
 pub mod blob;
 pub mod bulk;
+pub mod console;
 pub mod email;
 pub mod env;
 pub mod identity;

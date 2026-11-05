@@ -1743,3 +1743,150 @@ async fn setup_state_on_both_backends() {
         assert_eq!(s.operator("alice").await.unwrap().unwrap().role, "owner");
     }
 }
+
+#[tokio::test]
+async fn console_sessions_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.create_operator("alice", "h", "owner").await.unwrap());
+        s.create_operator_session(
+            "live",
+            "alice",
+            "full",
+            60_000,
+            Some("10.0.0.1"),
+            Some("ua"),
+        )
+        .await
+        .unwrap();
+        s.create_operator_session("code", "alice", "code", 60_000, None, None)
+            .await
+            .unwrap();
+        s.create_operator_session("expired", "alice", "full", -1, None, None)
+            .await
+            .unwrap();
+        let (row, op) = s.operator_session("live", 60_000).await.unwrap().unwrap();
+        assert_eq!(
+            (row.stage.as_str(), op.username.as_str(), row.ip.as_deref()),
+            ("full", "alice", Some("10.0.0.1")),
+            "{}",
+            b.name
+        );
+        assert!(
+            s.operator_session("expired", 60_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "{}",
+            b.name
+        );
+        // Idle: used longer ago than the idle limit.
+        assert!(
+            s.operator_session("live", -1).await.unwrap().is_none(),
+            "{}: idle",
+            b.name
+        );
+        assert!(s.upgrade_operator_session("code").await.unwrap());
+        assert!(
+            !s.upgrade_operator_session("code").await.unwrap(),
+            "{}: once",
+            b.name
+        );
+        assert_eq!(
+            s.operator_session("code", 60_000)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .stage,
+            "full"
+        );
+        s.confirm_operator_session("live").await.unwrap();
+        assert_eq!(s.operator_sessions("alice").await.unwrap().len(), 2);
+        assert_eq!(
+            s.delete_operator_sessions("alice", Some("live"))
+                .await
+                .unwrap(),
+            2,
+            "{}",
+            b.name
+        );
+        assert!(s.operator_session("code", 60_000).await.unwrap().is_none());
+        assert!(s.operator_session("live", 60_000).await.unwrap().is_some());
+        // A disabled operator's sessions stop working.
+        s.update_operator("alice", None, None, Some(true))
+            .await
+            .unwrap();
+        assert!(
+            s.operator_session("live", 60_000).await.unwrap().is_none(),
+            "{}",
+            b.name
+        );
+        s.update_operator("alice", None, None, Some(false))
+            .await
+            .unwrap();
+        s.delete_operator_session("live").await.unwrap();
+        assert!(s.operator_session("live", 60_000).await.unwrap().is_none());
+        assert_eq!(
+            s.prune_operator_sessions().await.unwrap(),
+            0,
+            "the expired one went with delete_operator_sessions"
+        );
+
+        let t = s.operator_theme("alice").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                t.theme_mode.as_str(),
+                t.theme_scheme.as_str(),
+                t.theme_font.as_str()
+            ),
+            ("system", "sky", "hyperlegible")
+        );
+        s.set_operator_theme("alice", "dark", "teal", "plex")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.operator_theme("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .theme_scheme,
+            "teal"
+        );
+
+        s.set_operator_totp("alice", true).await.unwrap();
+        assert!(
+            s.operator("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .totp_secret
+                .is_some()
+        );
+        assert!(s.use_totp_step("alice", 100).await.unwrap());
+        assert!(
+            !s.use_totp_step("alice", 100).await.unwrap(),
+            "{}: a step works once",
+            b.name
+        );
+        assert!(
+            !s.use_totp_step("alice", 99).await.unwrap(),
+            "{}: never an older one",
+            b.name
+        );
+        assert!(s.use_totp_step("alice", 101).await.unwrap());
+        s.set_operator_totp("alice", false).await.unwrap();
+        assert!(
+            s.operator("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .totp_secret
+                .is_none()
+        );
+
+        let c = s.console_counts().await.unwrap();
+        assert_eq!((c.blobs, c.records, c.outbox), (0, 0, 0), "{}", b.name);
+        assert!(!s.delete_secret("nothing").await.unwrap());
+    }
+}

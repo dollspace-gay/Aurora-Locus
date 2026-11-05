@@ -7,6 +7,7 @@ pub mod password;
 pub mod scopes;
 pub mod service_jwt;
 pub mod session;
+pub mod totp;
 
 #[cfg(test)]
 mod tests;

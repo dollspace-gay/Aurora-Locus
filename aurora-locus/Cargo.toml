@@ -79,6 +79,8 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2", "stream"] }
 tempfile = "3"
 rpassword = "7"
+sha1 = "0.10"
+data-encoding = "2"
 url = "2"
 futures = "0.3"
 hickory-resolver = "0.26"
