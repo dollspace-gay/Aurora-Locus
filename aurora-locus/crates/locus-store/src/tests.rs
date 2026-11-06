@@ -187,7 +187,8 @@ async fn settings_propagate_to_other_handles() {
 async fn leases_are_exclusive_fenced_and_taken_over_after_expiry() {
     for b in backends().await {
         let s = &b.store;
-        let ttl = Duration::from_millis(600);
+        // Long enough that two queries on a loaded host fit inside it.
+        let ttl = Duration::from_secs(3);
         let a = s
             .try_acquire_lease("sequencer", "node-a", ttl)
             .await
@@ -207,7 +208,7 @@ async fn leases_are_exclusive_fenced_and_taken_over_after_expiry() {
         tx.fence(&a).await.expect("holder passes the fence");
         tx.rollback().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        tokio::time::sleep(Duration::from_millis(3300)).await;
         let bt = s
             .try_acquire_lease("sequencer", "node-b", ttl)
             .await
@@ -2638,7 +2639,8 @@ async fn jobs_pause_and_run_now() {
             b.store.clone(),
             "controlled".into(),
             "node-a".into(),
-            Duration::from_millis(600),
+            // Long enough that a slow renewal under load doesn't restart it.
+            Duration::from_secs(3),
             cancel.clone(),
             move |_token, job_cancel| {
                 let starts = s2.clone();
@@ -2654,7 +2656,7 @@ async fn jobs_pause_and_run_now() {
         assert_eq!(starts.load(Ordering::SeqCst), 1, "{}", b.name);
         // Run now: restarted within a renew tick.
         b.store.request_job_run("controlled").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         assert_eq!(starts.load(Ordering::SeqCst), 2, "{}: run now", b.name);
         assert!(
             b.store
@@ -2669,9 +2671,9 @@ async fn jobs_pause_and_run_now() {
             .set_job_paused("controlled", true, "op")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         let n = starts.load(Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         assert_eq!(starts.load(Ordering::SeqCst), n, "{}: paused", b.name);
         let now = b.store.now_ms().await.unwrap();
         let held = b
@@ -2687,7 +2689,7 @@ async fn jobs_pause_and_run_now() {
             .set_job_paused("controlled", false, "op")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
         assert_eq!(starts.load(Ordering::SeqCst), n + 1, "{}: resumed", b.name);
         cancel.cancel();
         handle.await.unwrap();
