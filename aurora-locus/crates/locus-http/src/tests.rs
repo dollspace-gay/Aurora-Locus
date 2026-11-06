@@ -3,8 +3,8 @@
 mod audiences;
 mod blobs;
 mod bulk;
-mod identity;
 mod conformance;
+mod identity;
 mod keys;
 mod keys_shard;
 mod security;

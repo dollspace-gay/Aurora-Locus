@@ -541,5 +541,8 @@ pub fn admin() -> Vec<Step> {
         Step::get("admin.deleted.getAccountInfo", "com.atproto.admin.getAccountInfo").auth(a).q("did", "{{frank.did}}"),
         Step::post("admin.deleted.createSession", "com.atproto.server.createSession",
             json!({"identifier": "frank2.test", "password": "frank-new-password"})),
+        // A second delete announces the deletion again.
+        Step::post("admin.deleteAccount.again", "com.atproto.admin.deleteAccount", json!({"did": "{{frank.did}}"})).auth(a),
+        Step::wait("admin.wait.afterDeleteAgain", 1500),
     ]
 }

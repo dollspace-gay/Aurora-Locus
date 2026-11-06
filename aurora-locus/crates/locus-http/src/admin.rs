@@ -520,6 +520,17 @@ pub async fn delete_account(
         let job = crate::account::start_deletion(&s, &input.did).await?;
         crate::account::spawn_deletion(&s, job);
         s.store.oauth_delete_account_tokens(&input.did).await?;
+    } else {
+        // Already deleted (or never here): announce the deletion again,
+        // as the reference does, so a relay that missed it hears it.
+        if proto_blue_syntax::Did::new(&input.did).is_err() {
+            return Err(XrpcError::invalid_request("Invalid DID"));
+        }
+        let body = locus_repo::event::account_body(&input.did, false, Some("deleted"))
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        let mut tx = s.store.begin().await?;
+        tx.insert_outbox(&input.did, "account", &body).await?;
+        tx.commit().await?;
     }
     admin_auth::audit(&s, &who, "admin.deleteAccount", Some(&input.did), None).await;
     Ok(())

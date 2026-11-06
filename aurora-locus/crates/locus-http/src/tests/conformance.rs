@@ -289,3 +289,52 @@ async fn oauth_errors_keep_the_reference_names() {
         "{v}"
     );
 }
+
+/// Deleting an already-deleted account announces the deletion again, as
+/// the reference does; a malformed DID is refused.
+#[tokio::test]
+async fn a_second_admin_delete_announces_the_deletion_again() {
+    let h = harness(false).await;
+    let (did, _) = h.user("gone.pds.example.com").await;
+    let admin = h.basic_admin();
+    let deleted_events = || async {
+        h.state
+            .store
+            .outbox_for(&did)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, body)| {
+                kind == "account"
+                    && proto_blue_lex_cbor::decode(body)
+                        .unwrap()
+                        .as_map()
+                        .unwrap()
+                        .get("status")
+                        .and_then(proto_blue_lex_data::LexValue::as_str)
+                        == Some("deleted")
+            })
+            .count()
+    };
+    let del = |d: String| {
+        let (h, admin) = (&h, admin.clone());
+        async move {
+            h.admin_call(
+                "POST",
+                "/xrpc/com.atproto.admin.deleteAccount",
+                &admin,
+                Some(json!({"did": d})),
+            )
+            .await
+        }
+    };
+    assert_eq!(del(did.clone()).await.0, StatusCode::OK);
+    assert_eq!(deleted_events().await, 1);
+    assert_eq!(del(did.clone()).await.0, StatusCode::OK);
+    assert_eq!(deleted_events().await, 2, "announced again");
+    let (st, v) = del("not-a-did".into()).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest"))
+    );
+}

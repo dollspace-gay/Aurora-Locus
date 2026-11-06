@@ -737,6 +737,9 @@ kryphocron built in.
   implementations wouldn't reproduce). Found by new property tests that
   also verify every `#commit` event from its own blocks and `getRepo`
   since every earlier rev.
+- `com.atproto.admin.deleteAccount` of an account that's already deleted
+  announces the deletion again (`#account` deleted), as the reference
+  does, so a relay that missed it hears it.
 - `backup post-restore` reports a blob migration it ended whether it was
   copying or paused (it reported only a paused one).
 - Single-label handle domains (`.test`) are accepted in setup.
