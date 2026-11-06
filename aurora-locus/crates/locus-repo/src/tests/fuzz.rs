@@ -107,16 +107,20 @@ fn node_value() -> impl Strategy<Value = LexValue> {
         "[a-z.]{1,8}/[a-z0-9]{1,6}".prop_map(String::into_bytes),
         prop::collection::vec(any::<u8>(), 0..12),
     ];
-    let entry = (any::<i64>(), key, link.clone(), prop::option::of(link.clone())).prop_map(
-        |(p, k, v, t)| {
+    let entry = (
+        any::<i64>(),
+        key,
+        link.clone(),
+        prop::option::of(link.clone()),
+    )
+        .prop_map(|(p, k, v, t)| {
             let mut m = BTreeMap::new();
             m.insert("p".to_owned(), LexValue::Integer(p % 20));
             m.insert("k".to_owned(), LexValue::Bytes(k));
             m.insert("v".to_owned(), v);
             m.insert("t".to_owned(), t.unwrap_or(LexValue::Null));
             LexValue::Map(m)
-        },
-    );
+        });
     (
         prop::option::of(link),
         prop::collection::vec(entry, 0..6),

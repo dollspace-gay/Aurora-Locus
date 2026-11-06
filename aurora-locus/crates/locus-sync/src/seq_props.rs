@@ -168,15 +168,21 @@ async fn check(store: &Store, model: &Model, step: usize) -> usize {
 }
 
 async fn pass(store: &Store, model: &Model, node: usize, batch: i64) -> CoreResult<usize> {
-    let token = model.tokens[node]
-        .clone()
-        .expect("node has acquired once");
+    let token = model.tokens[node].clone().expect("node has acquired once");
     sequence_once(store, &token, batch, KEEP).await
 }
 
 /// A pass's outcome: a holder's pass moves min(batch, queued) rows; a
 /// stale token's pass is refused and moves nothing.
-fn expect_pass(r: CoreResult<usize>, holder: bool, batch: i64, queued: usize, before: usize, after: usize, step: usize) {
+fn expect_pass(
+    r: CoreResult<usize>,
+    holder: bool,
+    batch: i64,
+    queued: usize,
+    before: usize,
+    after: usize,
+    step: usize,
+) {
     if holder {
         let n = r.unwrap_or_else(|e| panic!("step {step}: holder's pass failed: {e}"));
         assert_eq!(n, queued.min(batch as usize), "step {step}: rows moved");
@@ -270,13 +276,20 @@ async fn run(ops: Vec<Op>, pg: Option<String>) {
                     s.try_acquire_lease(LEASE, NODES[other], TTL).await
                 });
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                assert!(!takeover.is_finished(), "step {step}: takeover waited for the fenced pass");
+                assert!(
+                    !takeover.is_finished(),
+                    "step {step}: takeover waited for the fenced pass"
+                );
                 p.resume.notify_one();
                 let r = paused.await.unwrap();
                 let after = check(&store, &model, step).await;
                 // Only a holder gets past the fence; it finishes its pass.
                 expect_pass(r, was_holder, batch, queued, before, after, step);
-                let t = takeover.await.unwrap().unwrap().expect("the lease was expired");
+                let t = takeover
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect("the lease was expired");
                 model.tokens[other] = Some(t);
                 model.holder = other;
             }
@@ -289,13 +302,20 @@ async fn run(ops: Vec<Op>, pg: Option<String>) {
                 let first = tokio::spawn(async move { sequence_once(&s, &t, batch, KEEP).await });
                 p.reached.notified().await;
                 let s = store.clone();
-                let second = tokio::spawn(async move { sequence_once(&s, &token, batch, KEEP).await });
+                let second =
+                    tokio::spawn(async move { sequence_once(&s, &token, batch, KEEP).await });
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 p.resume.notify_one();
                 // Both succeed, one after the other, between them moving
                 // what two passes would.
-                let a = first.await.unwrap().unwrap_or_else(|e| panic!("step {step}: first: {e}"));
-                let b = second.await.unwrap().unwrap_or_else(|e| panic!("step {step}: second: {e}"));
+                let a = first
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("step {step}: first: {e}"));
+                let b = second
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("step {step}: second: {e}"));
                 let after = check(&store, &model, step).await;
                 assert_eq!(a, queued.min(batch as usize), "step {step}");
                 assert_eq!(b, (queued - a).min(batch as usize), "step {step}");

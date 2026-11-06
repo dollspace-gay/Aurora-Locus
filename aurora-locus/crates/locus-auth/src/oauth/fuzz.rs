@@ -19,7 +19,8 @@ fn json_value() -> impl Strategy<Value = Value> {
         Just(Value::Null),
         any::<bool>().prop_map(Value::from),
         any::<i64>().prop_map(Value::from),
-        any::<f64>().prop_map(|f| serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)),
+        any::<f64>()
+            .prop_map(|f| serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)),
         ".{0,12}".prop_map(Value::from),
         Just(json!("code")),
         Just(json!("S256")),

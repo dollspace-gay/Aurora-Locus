@@ -104,10 +104,38 @@ const OAUTH: &[&str] = &[
 
 /// Parameter names the routes read, so garbage reaches their parsing.
 const PARAMS: &[&str] = &[
-    "repo", "collection", "rkey", "cid", "cids", "did", "limit", "cursor", "since", "handle",
-    "uri", "uris", "actor", "dids", "subject", "reverse", "includeTakedowns", "email",
-    "request_uri", "client_id", "response_type", "redirect_uri", "code", "grant_type",
-    "code_verifier", "refresh_token", "scope", "state", "code_challenge", "lxm", "aud", "exp",
+    "repo",
+    "collection",
+    "rkey",
+    "cid",
+    "cids",
+    "did",
+    "limit",
+    "cursor",
+    "since",
+    "handle",
+    "uri",
+    "uris",
+    "actor",
+    "dids",
+    "subject",
+    "reverse",
+    "includeTakedowns",
+    "email",
+    "request_uri",
+    "client_id",
+    "response_type",
+    "redirect_uri",
+    "code",
+    "grant_type",
+    "code_verifier",
+    "refresh_token",
+    "scope",
+    "state",
+    "code_challenge",
+    "lxm",
+    "aud",
+    "exp",
 ];
 
 fn value() -> impl Strategy<Value = String> {
@@ -210,7 +238,13 @@ fn body() -> impl Strategy<Value = Payload> {
 }
 
 impl Harness {
-    async fn garbage(&self, method: &str, path: &str, auth: Option<&str>, body: &Payload) -> StatusCode {
+    async fn garbage(
+        &self,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: &Payload,
+    ) -> StatusCode {
         let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(a) = auth {
             headers.push(("authorization", a));
@@ -259,9 +293,17 @@ async fn xrpc_and_oauth_routes_answer_garbage_with_4xx() {
         .prop_map(|(route, wrong, q, b, signed)| {
             let nsid = route.rsplit('/').next().unwrap_or_default();
             let name = nsid.rsplit('.').next().unwrap_or_default();
-            let query = ["get", "list", "describe", "resolve", "check", "search", "subscribe"]
-                .iter()
-                .any(|p| name.starts_with(p))
+            let query = [
+                "get",
+                "list",
+                "describe",
+                "resolve",
+                "check",
+                "search",
+                "subscribe",
+            ]
+            .iter()
+            .any(|p| name.starts_with(p))
                 || route == "/oauth/authorize";
             let method = if query != wrong { "GET" } else { "POST" };
             (route, method, q, b, signed)
@@ -278,12 +320,19 @@ async fn xrpc_and_oauth_routes_answer_garbage_with_4xx() {
                     (true, true) => Some(admin.as_str()),
                     (true, false) => Some(bearer.as_str()),
                 };
-                let path = if q.is_empty() { route.clone() } else { format!("{route}?{q}") };
+                let path = if q.is_empty() {
+                    route.clone()
+                } else {
+                    format!("{route}?{q}")
+                };
                 let st = handle.block_on(h.garbage(method, &path, auth, &b));
                 *seen.lock().unwrap().entry(st.as_u16()).or_insert(0) += 1;
                 // Collected rather than shrunk, so one run lists them all.
                 if st.is_server_error() {
-                    failures.lock().unwrap().push(format!("{st} {method} {path} {b:?}"));
+                    failures
+                        .lock()
+                        .unwrap()
+                        .push(format!("{st} {method} {path} {b:?}"));
                 }
                 Ok(())
             })
@@ -323,7 +372,12 @@ async fn hostile_datetimes_in_requests_are_refused_not_panicked_on() {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let (st, v) = h
-        .call("GET", "/xrpc/app.bsky.actor.getPreferences", Some(&access), None)
+        .call(
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(&access),
+            None,
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let age = v["preferences"]
@@ -346,7 +400,11 @@ async fn check_oracle(h: &Harness, did: &str, model: &BTreeMap<String, String>, 
         let page = h
             .state
             .store
-            .record_index_page(did, after.as_ref().map(|(c, r)| (c.as_str(), r.as_str())), 100)
+            .record_index_page(
+                did,
+                after.as_ref().map(|(c, r)| (c.as_str(), r.as_str())),
+                100,
+            )
             .await
             .unwrap();
         let Some((c, r, _)) = page.last().cloned() else {
@@ -361,7 +419,10 @@ async fn check_oracle(h: &Harness, did: &str, model: &BTreeMap<String, String>, 
     let mut eager = proto_blue_repo::mst::MstNode::empty();
     for (path, cid) in &index {
         eager = eager
-            .add(path, proto_blue_lex_data::Cid::from_str_multibase(cid).unwrap())
+            .add(
+                path,
+                proto_blue_lex_data::Cid::from_str_multibase(cid).unwrap(),
+            )
             .unwrap();
     }
     let root = h.state.store.repo_root_of(did).await.unwrap().unwrap();
@@ -380,7 +441,13 @@ async fn http_writes_match_the_eager_mst_built_from_the_index() {
     let (did, access) = h.user("oracle.pds.example.com").await;
     let mut model: BTreeMap<String, String> = BTreeMap::new();
     // The profile record the account starts with, if any.
-    for (c, r, cid) in h.state.store.record_index_page(&did, None, 100).await.unwrap() {
+    for (c, r, cid) in h
+        .state
+        .store
+        .record_index_page(&did, None, 100)
+        .await
+        .unwrap()
+    {
         model.insert(format!("{c}/{r}"), cid);
     }
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -440,7 +507,11 @@ async fn http_writes_match_the_eager_mst_built_from_the_index() {
             }
             _ => {
                 // A batch: create-or-update of one path, then maybe its delete.
-                let op = if model.contains_key(&path) { "update" } else { "create" };
+                let op = if model.contains_key(&path) {
+                    "update"
+                } else {
+                    "create"
+                };
                 let mut writes = vec![json!({
                     "$type": format!("com.atproto.repo.applyWrites#{op}"),
                     "collection": c, "rkey": rkey, "value": value(c, rnd(5)),

@@ -8,10 +8,10 @@ use base64::Engine as _;
 use serde_json::Value;
 
 use super::props::verify_event_opts;
-use proto_blue_repo::car::{ReadCarOpts, read_car_opts};
 use super::*;
 use crate::import::{CarReader, TreeWalk};
 use crate::records::{check_key_type, check_rkey, parse_json, prepare_record};
+use proto_blue_repo::car::{ReadCarOpts, read_car_opts};
 
 fn fixture(path: &str) -> String {
     let path = format!(
@@ -73,8 +73,8 @@ fn data_model_fixtures_encode_to_their_cbor_and_cid() {
             f["cid"].as_str().unwrap()
         );
         // And the record path: its prepared bytes decode to the same value.
-        let p = prepare_record("com.example.blah", "x", value.clone(), Some(false), 1 << 20)
-            .unwrap();
+        let p =
+            prepare_record("com.example.blah", "x", value.clone(), Some(false), 1 << 20).unwrap();
         let mut with_type = value.as_map().unwrap().clone();
         with_type.insert("$type".into(), LexValue::String("com.example.blah".into()));
         assert_eq!(
@@ -92,7 +92,10 @@ fn data_model_valid_and_invalid_records() {
     for f in json("data-model/data-model-valid.json").as_array().unwrap() {
         assert_eq!(prep(&f["json"]), Ok(()), "{}", f["note"]);
     }
-    for f in json("data-model/data-model-invalid.json").as_array().unwrap() {
+    for f in json("data-model/data-model-invalid.json")
+        .as_array()
+        .unwrap()
+    {
         assert!(prep(&f["json"]).is_err(), "{} accepted", f["note"]);
     }
 }

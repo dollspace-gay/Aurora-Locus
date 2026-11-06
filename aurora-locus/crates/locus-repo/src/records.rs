@@ -120,7 +120,9 @@ fn check_strict_shapes(json: &Value) -> Result<(), InvalidRecord> {
     match json {
         Value::Object(m) => {
             if (m.contains_key("$link") || m.contains_key("$bytes")) && m.len() != 1 {
-                return Err(bad("Invalid record: extra fields in a $link or $bytes object"));
+                return Err(bad(
+                    "Invalid record: extra fields in a $link or $bytes object",
+                ));
             }
             match m.get("$type") {
                 None => {}
@@ -147,7 +149,7 @@ fn is_blob_ref(m: &serde_json::Map<String, Value>) -> bool {
             .is_some_and(|t| t.contains('/'))
         && m.get("size")
             .and_then(Value::as_u64)
-            .is_some_and(|n| n <= (1 << 53) - 1)
+            .is_some_and(|n| n < (1 << 53))
         && m.get("ref")
             .and_then(Value::as_object)
             .is_some_and(|r| r.get("$link").is_some_and(Value::is_string))
@@ -238,7 +240,11 @@ fn validate_record(
 }
 
 /// The record schema's key type: `tid`, `nsid`, `literal:<value>` or `any`.
-pub(crate) fn check_key_type(collection: &str, key: Option<&str>, rkey: &str) -> Result<(), InvalidRecord> {
+pub(crate) fn check_key_type(
+    collection: &str,
+    key: Option<&str>,
+    rkey: &str,
+) -> Result<(), InvalidRecord> {
     let ok = match key.unwrap_or("any") {
         "tid" => proto_blue_syntax::Tid::new(rkey).is_ok(),
         "nsid" => proto_blue_syntax::Nsid::new(rkey).is_ok(),
