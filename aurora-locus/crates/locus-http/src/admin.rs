@@ -70,8 +70,19 @@ async fn account_view(s: &AppState, a: &Account) -> XrpcResult<Value> {
         "handle": a.handle,
         "indexedAt": iso8601(a.created_at),
         "invitesDisabled": a.invites_disabled,
-        "invites": s.store.invite_codes_for(&a.did).await?.iter().map(code_detail).collect::<Vec<_>>(),
     });
+    // A shard doesn't manage invites (the entryway does), as the reference.
+    let invites = s.entryway.is_none();
+    if invites {
+        v["invites"] = json!(
+            s.store
+                .invite_codes_for(&a.did)
+                .await?
+                .iter()
+                .map(code_detail)
+                .collect::<Vec<_>>()
+        );
+    }
     if let Some(e) = &a.email {
         v["email"] = json!(e);
     }
@@ -81,7 +92,8 @@ async fn account_view(s: &AppState, a: &Account) -> XrpcResult<Value> {
     if let Some(t) = a.deactivated_at {
         v["deactivatedAt"] = json!(iso8601(t));
     }
-    if let Some(code) = s.store.invited_by(&a.did).await?
+    if invites
+        && let Some(code) = s.store.invited_by(&a.did).await?
         && let Some(c) = s.store.invite_code(&code).await?
     {
         v["invitedBy"] = code_detail(&c);

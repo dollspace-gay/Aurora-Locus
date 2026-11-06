@@ -1589,7 +1589,7 @@ async fn form_for(
             f.appview_set = !p.services.appview_url.is_empty();
         }
         Step::Keys => {
-            f.rotation_key = s.secrets.plc_keys.current().did();
+            f.rotation_key = s.accepted_plc_keys().into_iter().next().unwrap_or_default();
             f.master_key_source = match s.master_key.source().as_str() {
                 "file" => "A key file".into(),
                 "env" => "From the environment".into(),

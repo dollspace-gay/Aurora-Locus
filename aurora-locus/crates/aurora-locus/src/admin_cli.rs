@@ -554,6 +554,35 @@ pub enum KeysSetCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Shard role: the entryway's token verify key (K256, hex or
+    /// did:key). The previous one stays accepted 2 hours unless
+    /// --revoke-previous.
+    EntrywayVerifyKey {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        revoke_previous: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Shard role: the entryway's PLC rotation key (genesis operations
+    /// may be signed by it). Earlier ones stay accepted until a later
+    /// --revoke-previous.
+    EntrywayPlcRotationKey {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        revoke_previous: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Shard role: the admin token this shard uses toward the entryway.
+    EntrywayAdminToken {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
     /// A new PLC rotation key for the PDS. It's stored pending and becomes
     /// current once a key backup holds it (or with
     /// --acknowledge-no-backup); the previous key keeps signing for the
@@ -854,6 +883,36 @@ async fn set_secret(
     Ok(())
 }
 
+async fn set_entryway(
+    c: &Client,
+    name: &str,
+    file: &std::path::Path,
+    revoke_previous: bool,
+    yes: bool,
+    what: &str,
+) -> Result<(), String> {
+    let value = read_key(file)?;
+    let body = merge(
+        json!({"name": name, "value": *value, "revokePrevious": revoke_previous}),
+        reauth(c, what, yes)?,
+    );
+    let v = c
+        .call(&format!("{NS}.owner.keys.setSecret"), &[], Some(body))
+        .await?;
+    println!(
+        "{name} set (fingerprint {}). Every node picks it up within seconds.",
+        v["fingerprint"].as_str().unwrap_or("")
+    );
+    if let Some(list) = v["accepted"].as_array() {
+        for k in list {
+            println!("  accepted: {}", k.as_str().unwrap_or(""));
+        }
+    } else if let Some(k) = v["accepted"].as_str() {
+        println!("  accepted: {k}");
+    }
+    Ok(())
+}
+
 async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match k {
@@ -997,6 +1056,47 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 &file,
                 yes,
                 "Replace the DPoP nonce secret",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::EntrywayVerifyKey {
+            file,
+            revoke_previous,
+            yes,
+        }) => {
+            set_entryway(
+                c,
+                "entryway-verify-key",
+                &file,
+                revoke_previous,
+                yes,
+                "Set the entryway's token verify key",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::EntrywayPlcRotationKey {
+            file,
+            revoke_previous,
+            yes,
+        }) => {
+            set_entryway(
+                c,
+                "entryway-plc-rotation-key",
+                &file,
+                revoke_previous,
+                yes,
+                "Set the entryway's PLC rotation key",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::EntrywayAdminToken { file, yes }) => {
+            set_entryway(
+                c,
+                "entryway-admin-token",
+                &file,
+                false,
+                yes,
+                "Replace the admin token used toward the entryway",
             )
             .await
         }

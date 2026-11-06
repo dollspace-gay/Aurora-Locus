@@ -39,6 +39,7 @@ pub mod routing;
 pub mod scanner;
 pub mod server;
 pub mod setup;
+pub mod shard;
 pub mod socket;
 pub mod state;
 pub mod sync;
@@ -73,6 +74,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/xrpc/com.atproto.server.createSession",
             post(server::create_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            post(shard::reserve_signing_key),
         )
         .route(
             "/xrpc/com.atproto.server.getSession",
@@ -334,6 +339,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(identity::well_known_atproto_did),
         )
         .route("/.well-known/did.json", get(identity::well_known_did_json))
+        .route("/.well-known/change-password", get(shard::change_password))
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth::authorization_server_metadata),
@@ -415,6 +421,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(branding::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
+        // In the shard role, account management goes to the entryway.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            shard::intercept,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routing::limit_body,

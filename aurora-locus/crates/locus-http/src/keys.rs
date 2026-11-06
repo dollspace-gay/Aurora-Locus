@@ -540,9 +540,16 @@ fn fingerprint(value: &[u8]) -> String {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSecretInput {
-    /// `jwt-secret`, `dpop-secret` or `backup-passphrase`.
+    /// `jwt-secret`, `dpop-secret`, `backup-passphrase`, or in the shard
+    /// role `entryway-verify-key`, `entryway-plc-rotation-key` and
+    /// `entryway-admin-token`.
     name: String,
     value: String,
+    /// The entryway keys: stop accepting the previous ones now (otherwise
+    /// a previous verify key stays accepted 2 h, and previous PLC rotation
+    /// keys until a later `--revoke-previous`).
+    #[serde(default)]
+    revoke_previous: bool,
     #[serde(flatten)]
     reauth: Reauth,
 }
@@ -558,6 +565,9 @@ pub async fn set_secret(
     let who = owner(&s, &headers, locus_nsid!("owner.keys.setSecret")).await?;
     admin_auth::reauth(&s, &who, &input.reauth).await?;
     let value = Zeroizing::new(input.value.trim().to_owned());
+    if input.name.starts_with("entryway-") {
+        return set_entryway_value(&s, &who, &input, &value).await;
+    }
     let (slot, bytes): (&str, Zeroizing<Vec<u8>>) = match input.name.as_str() {
         "jwt-secret" => {
             if value.len() < 32 {
@@ -608,6 +618,74 @@ pub async fn set_secret(
     reload_soon(&s);
     Ok(Json(
         json!({"name": input.name, "fingerprint": fingerprint(&bytes)}),
+    ))
+}
+
+/// The shard role's entryway values (`keys set entryway-*`). The keys are
+/// public: the verify key goes to `shard_verify_key`, the PLC rotation key
+/// to its setting; the admin token is a secret.
+async fn set_entryway_value(
+    s: &AppState,
+    who: &admin_auth::Caller,
+    input: &SetSecretInput,
+    value: &str,
+) -> XrpcResult<Json<Value>> {
+    let Some(ew) = &s.entryway else {
+        return Err(XrpcError::invalid_request(
+            "The entryway values are set only in the shard role",
+        ));
+    };
+    let bad = |e: String| XrpcError::invalid_request(e);
+    let mut tx = s.store.begin().await?;
+    let (fingerprint_of, shown): (Vec<u8>, Value) = match input.name.as_str() {
+        "entryway-verify-key" => {
+            let k = crate::shard::parse_k256_key(value).map_err(bad)?;
+            let keep = (!input.revoke_previous).then_some(crate::shard::VERIFY_KEY_OVERLAP_MS);
+            tx.set_shard_verify_key(&k, keep).await?;
+            (k.as_bytes().to_vec(), json!(k))
+        }
+        "entryway-plc-rotation-key" => {
+            let k = crate::shard::parse_k256_key(value).map_err(bad)?;
+            let mut keys = vec![k.clone()];
+            if !input.revoke_previous {
+                keys.extend(ew.plc_rotation_keys.iter().filter(|x| **x != k).cloned());
+            }
+            tx.set_setting("entryway.plc_rotation_keys", json!(keys), &who.actor)
+                .await?;
+            (k.as_bytes().to_vec(), json!(keys))
+        }
+        "entryway-admin-token" => {
+            if value.is_empty() {
+                return Err(XrpcError::invalid_request("The admin token can't be empty"));
+            }
+            tx.put_secret(
+                crate::shard::ADMIN_TOKEN_SECRET,
+                value.as_bytes(),
+                &s.master_key,
+            )
+            .await?;
+            (value.as_bytes().to_vec(), Value::Null)
+        }
+        other => {
+            return Err(XrpcError::invalid_request(format!(
+                "{other} isn't an entryway value (entryway-verify-key, entryway-plc-rotation-key, entryway-admin-token)"
+            )));
+        }
+    };
+    tx.bump_key_generation().await?;
+    tx.commit().await?;
+    let fp = fingerprint(&fingerprint_of);
+    admin_auth::audit(
+        s,
+        who,
+        "keys.setSecret",
+        Some(&input.name),
+        Some(json!({"fingerprint": fp, "revokePrevious": input.revoke_previous})),
+    )
+    .await;
+    reload_soon(s);
+    Ok(Json(
+        json!({"name": input.name, "fingerprint": fp, "accepted": shown}),
     ))
 }
 

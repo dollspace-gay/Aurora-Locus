@@ -342,6 +342,27 @@ pub static REGISTRY: &[Def] = &[
         description: "Largest single record (DAG-CBOR), in bytes.",
     },
     Def {
+        key: "entryway.url",
+        kind: Kind::Url,
+        default: r#""""#,
+        env: Some("PDS_ENTRYWAY_URL"),
+        description: "Shard role: the entryway's URL (account management, logins and OAuth go there). Applies on restart.",
+    },
+    Def {
+        key: "entryway.did",
+        kind: Kind::Text { max_len: 2048 },
+        default: r#""""#,
+        env: Some("PDS_ENTRYWAY_DID"),
+        description: "Shard role: the entryway's DID. Applies on restart.",
+    },
+    Def {
+        key: "entryway.plc_rotation_keys",
+        kind: Kind::TextList { max_len: 256 },
+        default: "[]",
+        env: None,
+        description: "Shard role: the entryway PLC rotation keys a genesis operation may be signed by, current first (`keys set entryway-plc-rotation-key`).",
+    },
+    Def {
         key: "appview.url",
         kind: Kind::Url,
         default: r#""""#,

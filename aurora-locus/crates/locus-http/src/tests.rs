@@ -157,12 +157,24 @@ async fn harness_with(invite_required: bool, email: bool) -> Harness {
 
 /// A PDS at `hostname`.
 async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harness {
-    harness_build(hostname, invite_required, email, false).await
+    harness_build(hostname, invite_required, email, false, None).await
 }
 
 /// A PDS in setup mode, its bootstrap hostname `hostname`.
 async fn setup_harness(hostname: &str, email: bool) -> Harness {
-    harness_build(hostname, false, email, true).await
+    harness_build(hostname, false, email, true, None).await
+}
+
+/// A shard at pds.example.com behind `entryway`.
+async fn shard_harness(entryway: crate::shard::Entryway) -> Harness {
+    harness_build(
+        "pds.example.com",
+        false,
+        true,
+        false,
+        Some(Arc::new(entryway)),
+    )
+    .await
 }
 
 async fn harness_build(
@@ -170,6 +182,7 @@ async fn harness_build(
     invite_required: bool,
     email: bool,
     setup_mode: bool,
+    entryway: Option<Arc<crate::shard::Entryway>>,
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
@@ -250,8 +263,13 @@ async fn harness_build(
         socket_secret: crate::socket::new_secret(),
         reload: tokio_util::sync::CancellationToken::new(),
         hosts: arc_swap::ArcSwap::from_pointee(crate::hostnames::Hosts::default()),
-        role: locus_core::bootstrap::Role::Pds,
+        role: if entryway.is_some() {
+            locus_core::bootstrap::Role::Shard
+        } else {
+            locus_core::bootstrap::Role::Pds
+        },
         dev_mode: false,
+        entryway,
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -341,7 +359,7 @@ async fn account_creation_registers_a_verifiable_did_and_writes_everything() {
     let op = h.plc.lock().unwrap().last(&did).expect("op submitted");
     let signed = SignedOp::from_json(&op).unwrap();
     assert_eq!(signed.genesis_did().unwrap(), did);
-    let rotation = h.state.secrets.plc_keys.current().did();
+    let rotation = h.state.secrets.plc_keys.current_did().unwrap();
     assert!(signed.verify(&rotation));
     assert_eq!(
         h.state.store.plc_key_listing(&did).await.unwrap(),
@@ -712,7 +730,7 @@ async fn plc_handle_changes_submit_an_op_then_update_the_account() {
     assert_eq!(op["prev"], genesis_cid.to_string_base32());
     assert_eq!(op["alsoKnownAs"], json!(["at://hana2.pds.example.com"]));
     let signed = SignedOp::from_json(&op).unwrap();
-    assert!(signed.verify(&h.state.secrets.plc_keys.current().did()));
+    assert!(signed.verify(&h.state.secrets.plc_keys.current_did().unwrap()));
 
     // The account, events and lookups follow; nothing is left to repair.
     let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
@@ -815,7 +833,7 @@ async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
     let h = harness(false).await;
     // A DID registered for a sign-up that never finished.
     let op = Operation {
-        rotation_keys: vec![h.state.secrets.plc_keys.current().did()],
+        rotation_keys: vec![h.state.secrets.plc_keys.current_did().unwrap()],
         verification_methods: BTreeMap::from([(
             "atproto".to_owned(),
             proto_blue_crypto::K256Keypair::generate().did(),
@@ -835,6 +853,7 @@ async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
         .secrets
         .plc_keys
         .current()
+        .unwrap()
         .sign_op(&op)
         .await
         .unwrap();
@@ -869,7 +888,7 @@ async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
     assert!(
         SignedOp::from_json(&tomb)
             .unwrap()
-            .verify(&h.state.secrets.plc_keys.current().did())
+            .verify(&h.state.secrets.plc_keys.current_did().unwrap())
     );
     let live_last = h.plc.lock().unwrap().last(&live).unwrap();
     assert_eq!(
@@ -1320,7 +1339,7 @@ async fn plc_operations_are_recommended_signed_with_a_code_and_submitted() {
         .await;
     let did = acct["did"].as_str().unwrap().to_owned();
     let access = acct["accessJwt"].as_str().unwrap().to_owned();
-    let current = h.state.secrets.plc_keys.current().did();
+    let current = h.state.secrets.plc_keys.current_did().unwrap();
     let genesis = h.plc.lock().unwrap().last(&did).unwrap();
 
     let (st, rec) = h
@@ -1528,6 +1547,7 @@ async fn deactivation_and_activation_check_the_did_document() {
         .secrets
         .plc_keys
         .current()
+        .unwrap()
         .sign_op(op)
         .await
         .unwrap();
@@ -8993,7 +9013,7 @@ async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
     );
     let (_, _, page) = b.get(&h, "/setup/keys").await;
     assert!(
-        page.contains(&h.state.secrets.plc_keys.current().did()),
+        page.contains(&h.state.secrets.plc_keys.current_did().unwrap()),
         "the rotation key is shown"
     );
     // The key backup downloads from this step.
@@ -11484,7 +11504,7 @@ async fn key_backups_hold_every_key_and_make_a_pending_plc_key_current() {
     let (did, _) = h.user("kim.pds.example.com").await;
     let owner = h.owner_with_password("olga", "olga-password-123").await;
     let admin = format!("Bearer {}", h.operator("adam", "admin").await);
-    let first = h.state.secrets.plc_keys.current().did();
+    let first = h.state.secrets.plc_keys.current_did().unwrap();
 
     // Owners only.
     assert_eq!(
@@ -11725,7 +11745,7 @@ fn merge(mut a: Value, b: &Value) -> Value {
 #[tokio::test]
 async fn a_changed_env_plc_key_becomes_pending_once() {
     let h = harness(false).await;
-    let first = h.state.secrets.plc_keys.current().did();
+    let first = h.state.secrets.plc_keys.current_did().unwrap();
     let env_key = proto_blue_crypto::K256Keypair::generate();
     let rows = |h: &Harness| {
         let s = h.state.store.clone();
@@ -12141,7 +12161,7 @@ async fn a_kms_plc_rotation_key_signs_in_kms() {
     let keys = crate::state::PlcKeys::load_or_create(&h.state.store, &h.state.master_key)
         .await
         .unwrap();
-    let current = keys.current();
+    let current = keys.current().unwrap();
     assert_eq!(current.did(), did_key);
     assert!(matches!(current, crate::state::PlcSigner::Kms { .. }));
     let op = locus_identity::plc::Operation {
@@ -12755,4 +12775,524 @@ async fn after_a_hostname_migration_the_old_host_keeps_serving_then_redirects() 
         )
         .await;
     assert_eq!(v["formerHosts"], json!([old]), "{v}");
+}
+
+// ---------------------------------------------------------------- shard role
+
+/// What a mock entryway received: (method, path, authorization, body).
+type EntrywaySeen = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
+/// An entryway that records each request and answers `getSession` and
+/// `createSession` with an account view, everything else with `{}`.
+async fn mock_entryway() -> (String, EntrywaySeen) {
+    let seen: EntrywaySeen = Arc::default();
+    let app = Router::new()
+        .route(
+            "/xrpc/{nsid}",
+            axum::routing::any(
+                |State(seen): State<EntrywaySeen>,
+                 Path(nsid): Path<String>,
+                 method: axum::http::Method,
+                 headers: axum::http::HeaderMap,
+                 body: axum::body::Bytes| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    seen.lock().unwrap().push((
+                        method.to_string(),
+                        nsid.clone(),
+                        auth,
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ));
+                    match nsid.as_str() {
+                        "com.atproto.server.getSession" | "com.atproto.server.createSession" => {
+                            axum::Json(json!({
+                                "did": "did:plc:from-entryway",
+                                "handle": "alice.test",
+                                "email": "alice@example.com",
+                                "emailConfirmed": true,
+                            }))
+                            .into_response()
+                        }
+                        "com.atproto.server.revokeAppPassword" => (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": "InvalidRequest", "message": "no such app password"})),
+                        )
+                            .into_response(),
+                        _ => axum::Json(json!({})).into_response(),
+                    }
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// A JWT signed ES256K with `key`.
+fn es256k_jwt(key: &proto_blue_crypto::K256Keypair, typ: &str, claims: &Value) -> String {
+    use base64::Engine;
+    use proto_blue_crypto::Signer;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let input = format!(
+        "{}.{}",
+        b64(json!({"typ": typ, "alg": "ES256K"}).to_string().as_bytes()),
+        b64(claims.to_string().as_bytes())
+    );
+    let sig = key.sign(input.as_bytes()).unwrap();
+    format!("{input}.{}", b64(&sig))
+}
+
+#[tokio::test]
+async fn a_shard_takes_entryway_tokens_and_creates_accounts_from_its_ops() {
+    use proto_blue_crypto::K256Keypair;
+    let token_key = K256Keypair::generate();
+    let plc_key = K256Keypair::generate();
+    let (url, seen) = mock_entryway().await;
+    let ew_did = "did:web:entryway.test";
+    let h = shard_harness(crate::shard::Entryway::for_test(
+        &url,
+        ew_did,
+        &[token_key.did()],
+        &[plc_key.did()],
+    ))
+    .await;
+
+    // reserveSigningKey (unauthenticated), then createAccount with a
+    // genesis op the entryway's PLC key signed.
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            None,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let reserved = v["signingKey"].as_str().unwrap().to_owned();
+    let op_for = |handle: &str, rotation: Vec<String>| locus_identity::plc::Operation {
+        rotation_keys: rotation,
+        verification_methods: [("atproto".to_owned(), reserved.clone())].into(),
+        also_known_as: vec![format!("at://{handle}")],
+        services: [(
+            "atproto_pds".to_owned(),
+            locus_identity::plc::Service {
+                kind: "AtprotoPersonalDataServer".into(),
+                endpoint: "https://pds.example.com".into(),
+            },
+        )]
+        .into(),
+        prev: None,
+    };
+    let create = |did: String, op: SignedOp| json!({"handle": "alice.test", "did": did, "plcOp": op.to_json()});
+    // Signed by another key, or not naming the entryway's: refused.
+    let other = K256Keypair::generate();
+    let forged = op_for("alice.test", vec![other.did(), plc_key.did()])
+        .sign(&other)
+        .unwrap();
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(create(forged.genesis_did().unwrap(), forged)),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("IncompatibleDidDoc"))
+    );
+    let unnamed = op_for("alice.test", vec![other.did()])
+        .sign(&other)
+        .unwrap();
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(create(unnamed.genesis_did().unwrap(), unnamed)),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("IncompatibleDidDoc"))
+    );
+    let op = op_for("alice.test", vec![plc_key.did()])
+        .sign(&plc_key)
+        .unwrap();
+    let did = op.genesis_did().unwrap();
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(create(did.clone(), op)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["did"], did);
+    let account = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!((account.email, account.password_hash), (None, None));
+    assert!(
+        h.plc.lock().unwrap().last(&did).is_some(),
+        "the shard submitted the op"
+    );
+    assert_eq!(
+        h.outbox_kinds(&did).await,
+        ["identity", "account", "commit", "sync"]
+    );
+    assert_eq!(
+        h.state.signing_key(&did).await.unwrap().did(),
+        reserved,
+        "the reserved key signs the repo"
+    );
+    assert!(
+        h.state
+            .store
+            .reserved_key(&reserved, &h.state.master_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "the reservation is used up"
+    );
+
+    // Entryway access tokens work; others don't.
+    let now = locus_core::time::now_ms() / 1000;
+    let access = |key: &K256Keypair, aud: &str| {
+        es256k_jwt(
+            key,
+            "at+jwt",
+            &json!({"scope": "com.atproto.access", "aud": aud, "sub": did, "iat": now, "exp": now + 600}),
+        )
+    };
+    let good = access(&token_key, "did:web:pds.example.com");
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&good),
+            Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": {
+                "$type": "app.bsky.feed.post", "text": "on a shard", "createdAt": "2026-11-06T00:00:00Z"}})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    for bad in [
+        access(&other, "did:web:pds.example.com"),
+        access(&token_key, ew_did),
+    ] {
+        let (st, v) = h
+            .call(
+                "GET",
+                "/xrpc/com.atproto.server.getSession",
+                Some(&bad),
+                None,
+            )
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], "InvalidToken");
+    }
+
+    // getSession goes to the entryway re-signed as the account.
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&good),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["handle"], "alice.test");
+    let (method, nsid, auth, _) = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (method.as_str(), nsid.as_str()),
+        ("GET", "com.atproto.server.getSession")
+    );
+    let jwt = auth.strip_prefix("Bearer ").unwrap();
+    let parsed =
+        locus_auth::service_jwt::parse(jwt, Some("com.atproto.server.getSession"), now).unwrap();
+    assert_eq!(
+        (parsed.iss.as_str(), parsed.aud.as_str()),
+        (did.as_str(), ew_did)
+    );
+    assert!(parsed.verifies_with(&reserved));
+
+    // An entryway error comes back as it was.
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.revokeAppPassword",
+            Some(&good),
+            Some(json!({"name": "x"})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["message"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("no such app password"))
+    );
+
+    // createSession passes through with its body; refreshSession with the
+    // client's token, after checking it's the entryway's.
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(json!({"identifier": "alice.test", "password": "pw"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        seen.lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .3
+            .contains("alice.test")
+    );
+    let refresh = es256k_jwt(
+        &token_key,
+        "refresh+jwt",
+        &json!({"scope": "com.atproto.refresh", "aud": ew_did, "sub": did, "jti": "r1", "iat": now, "exp": now + 600}),
+    );
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.refreshSession",
+            Some(&refresh),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().2,
+        format!("Bearer {refresh}")
+    );
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.refreshSession",
+            Some(&good),
+            None,
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "an access token isn't a refresh token"
+    );
+
+    // Invites are the entryway's; its OAuth server too.
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.server.createInviteCode",
+            &h.basic_admin(),
+            Some(json!({"useCount": 1})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        v["message"],
+        "Account invites are managed by the entryway service"
+    );
+    let (st, _) = h.call("POST", "/oauth/par", None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, meta) = h
+        .call("GET", "/.well-known/oauth-protected-resource", None, None)
+        .await;
+    assert_eq!(meta["authorization_servers"], json!([url]));
+    let (st, headers, _) = h
+        .raw("GET", "/.well-known/change-password", None, vec![], &[])
+        .await;
+    assert!(st.is_redirection());
+    assert_eq!(
+        headers["location"],
+        format!("{url}/.well-known/change-password").as_str()
+    );
+
+    // PLC credentials name the entryway's key.
+    let (_, v) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
+            Some(&good),
+            None,
+        )
+        .await;
+    assert_eq!(v["rotationKeys"], json!([plc_key.did()]));
+
+    // The entryway's handle callback: recorded once the document names it.
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountHandle",
+            &h.basic_admin(),
+            Some(json!({"did": did, "handle": "alice2.test"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(v["message"], "Handle does not match DID doc");
+    {
+        let mut plc = h.plc.lock().unwrap();
+        let last = plc.log.get_mut(&did).unwrap().last_mut().unwrap();
+        last["alsoKnownAs"] = json!(["at://alice2.test"]);
+    }
+    let before = h.outbox_kinds(&did).await.len();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountHandle",
+            &h.basic_admin(),
+            Some(json!({"did": did, "handle": "alice2.test"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "alice2.test"
+    );
+    assert_eq!(h.outbox_kinds(&did).await[before..], ["identity"]);
+    assert_eq!(
+        h.plc.lock().unwrap().log[&did].len(),
+        1,
+        "the shard didn't touch the PLC document"
+    );
+}
+
+#[tokio::test]
+async fn a_shard_changes_its_entryway_keys_with_keys_set() {
+    use proto_blue_crypto::K256Keypair;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (old_v, old_p) = (K256Keypair::generate(), K256Keypair::generate());
+    let (url, _) = mock_entryway().await;
+    let h = shard_harness(crate::shard::Entryway::for_test(
+        &url,
+        "did:web:entryway.test",
+        &[old_v.did()],
+        &[old_p.did()],
+    ))
+    .await;
+    h.state
+        .store
+        .set_setting("entryway.plc_rotation_keys", json!([old_p.did()]), "test")
+        .await
+        .unwrap();
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.replace_shard_verify_keys(&[old_v.did()]).await.unwrap();
+    tx.commit().await.unwrap();
+    let owner = h.owner_with_password("sara", "sara-password-123").await;
+    let reauth = json!({"password": "sara-password-123"});
+    let set = ns("owner.keys.setSecret");
+    let call = |body: Value| h.admin_call("POST", &set, &owner, Some(merge(body, &reauth)));
+
+    // A new verify key, as hex: the old one stays accepted for a while.
+    let new_v = K256Keypair::generate();
+    let parsed = proto_blue_crypto::parse_did_key(&new_v.did()).unwrap();
+    let (st, v) =
+        call(json!({"name": "entryway-verify-key", "value": hex::encode(&parsed.key_bytes)})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["accepted"], json!(new_v.did()));
+    let keys = h.state.store.shard_verify_keys().await.unwrap();
+    assert_eq!(keys.len(), 2);
+    let old = keys.iter().find(|k| k.did_key == old_v.did()).unwrap();
+    let left = old.expires_at.unwrap() - locus_core::time::now_ms();
+    assert!(
+        left > 0 && left <= crate::shard::VERIFY_KEY_OVERLAP_MS,
+        "{left}"
+    );
+    assert_eq!(
+        keys.iter()
+            .find(|k| k.did_key == new_v.did())
+            .unwrap()
+            .expires_at,
+        None
+    );
+    // --revoke-previous: only the new one.
+    let newer = K256Keypair::generate();
+    let (st, _) =
+        call(json!({"name": "entryway-verify-key", "value": newer.did(), "revokePrevious": true}))
+            .await;
+    assert_eq!(st, StatusCode::OK);
+    let keys = h.state.store.shard_verify_keys().await.unwrap();
+    assert_eq!(
+        keys.iter().map(|k| k.did_key.clone()).collect::<Vec<_>>(),
+        [newer.did()]
+    );
+
+    // PLC rotation keys: earlier ones kept until --revoke-previous.
+    let new_p = K256Keypair::generate();
+    let (st, v) = call(json!({"name": "entryway-plc-rotation-key", "value": new_p.did()})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["accepted"], json!([new_p.did(), old_p.did()]));
+    let (st, v) = call(
+        json!({"name": "entryway-plc-rotation-key", "value": new_p.did(), "revokePrevious": true}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["accepted"], json!([new_p.did()]));
+    // Not a key: refused.
+    let (st, _) = call(json!({"name": "entryway-verify-key", "value": "zz"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // The admin token is a secret.
+    let (st, _) = call(json!({"name": "entryway-admin-token", "value": "tok-123"})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.state
+            .store
+            .get_secret(crate::shard::ADMIN_TOKEN_SECRET, &h.state.master_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"tok-123"
+    );
+}
+
+#[tokio::test]
+async fn entryway_values_are_refused_outside_the_shard_role() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("pia", "pia-password-1234").await;
+    let body = merge(
+        json!({"name": "entryway-admin-token", "value": "x"}),
+        &json!({"password": "pia-password-1234"}),
+    );
+    let (st, v) = h
+        .admin_call("POST", &ns("owner.keys.setSecret"), &owner, Some(body))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    // And a standalone PDS reserves signing keys too, as the reference.
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            None,
+            Some(json!({"did": "did:plc:abc"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, again) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            None,
+            Some(json!({"did": "did:plc:abc"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        v["signingKey"], again["signingKey"],
+        "one reservation per DID"
+    );
 }

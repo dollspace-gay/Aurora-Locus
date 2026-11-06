@@ -580,6 +580,25 @@ kryphocron built in.
   until first used, then get a lookup hash and an Argon2id hash. Access
   tokens a reference PDS issued before the import (legacy, and OAuth ones
   signed with its JWT secret) are accepted until they expire.
+- The shard role (`LOCUS_ROLE=shard`), to the reference PDS's entryway
+  contract: the entryway's URL and DID are settings
+  (`PDS_ENTRYWAY_URL`, `PDS_ENTRYWAY_DID`); its token verify key, PLC
+  rotation key and admin token come from env on the first boot and change
+  after that with `keys set entryway-verify-key` (the previous key stays
+  accepted 2 hours unless `--revoke-previous`),
+  `keys set entryway-plc-rotation-key` (earlier keys stay accepted until
+  `--revoke-previous`) and `keys set entryway-admin-token`. A shard
+  accepts the entryway's ES256K access tokens (legacy and OAuth, the
+  OAuth ones checked statelessly, `ref:` scopes dereferenced through the
+  entryway), passes account-management calls to the entryway with the
+  client's credentials or re-signed as the account, serves no OAuth
+  server, invites or `/.well-known/atproto-did`, redirects
+  `/.well-known/change-password`, names the entryway as its
+  authorization server, and creates accounts from a genesis operation the
+  entryway's PLC rotation key signed (submitting it to PLC itself). It
+  holds no PLC rotation key of its own and runs no PLC key scan.
+- `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
+  IP; unused keys expire after a day).
 
 ### Changed
 

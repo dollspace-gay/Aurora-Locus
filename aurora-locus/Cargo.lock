@@ -2556,6 +2556,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "instant-acme",
+ "k256",
  "locus-auth",
  "locus-blob",
  "locus-core",

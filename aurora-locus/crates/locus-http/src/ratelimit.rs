@@ -54,6 +54,12 @@ pub mod buckets {
         window_ms: 5 * MINUTE,
         points: 100,
     };
+    /// Per IP **[deviation]** (the reference doesn't limit it).
+    pub const RESERVE_SIGNING_KEY: Bucket = Bucket {
+        name: "com.atproto.server.reserveSigningKey-0",
+        window_ms: 5 * MINUTE,
+        points: 100,
+    };
     pub const DELETE_ACCOUNT: Bucket = Bucket {
         name: "com.atproto.server.deleteAccount-0",
         window_ms: 5 * MINUTE,

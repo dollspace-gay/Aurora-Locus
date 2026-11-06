@@ -27,6 +27,7 @@ proto-blue-lex-json.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 proto-blue-crypto.workspace = true
+k256 = { version = "0.13", features = ["ecdsa"] }
 proto-blue-common.workspace = true
 proto-blue-syntax.workspace = true
 proto-blue-lex-data.workspace = true

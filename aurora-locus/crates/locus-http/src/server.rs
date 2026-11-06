@@ -377,7 +377,12 @@ async fn register_plc_did(
     if !operator_recovery.is_empty() {
         rotation_keys.push(operator_recovery.to_owned());
     }
-    rotation_keys.push(s.secrets.plc_keys.current().did());
+    let current = s
+        .secrets
+        .plc_keys
+        .current()
+        .ok_or_else(|| XrpcError::internal("no PLC rotation key to sign with"))?;
+    rotation_keys.push(current.did());
     let op = Operation {
         rotation_keys: rotation_keys.clone(),
         verification_methods: BTreeMap::from([("atproto".to_owned(), signing.did())]),
@@ -393,13 +398,7 @@ async fn register_plc_did(
     };
     op.validate()
         .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
-    let genesis = s
-        .secrets
-        .plc_keys
-        .current()
-        .sign_op(&op)
-        .await
-        .map_err(XrpcError::internal)?;
+    let genesis = current.sign_op(&op).await.map_err(XrpcError::internal)?;
     let did = genesis
         .genesis_did()
         .map_err(|e| XrpcError::internal(e.to_string()))?;

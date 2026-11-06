@@ -349,6 +349,21 @@ impl Node {
         let key_generation = self.store.key_state().await?.generation;
         let secrets = ServerSecrets::load_or_create(&self.store, &self.master_key).await?;
         let hosts = locus_http::hostnames::Hosts::load(&self.store, &hostname).await?;
+        let entryway = if self.bootstrap.role == locus_core::bootstrap::Role::Shard {
+            let env: HashMap<String, String> = std::env::vars().collect();
+            Some(Arc::new(
+                locus_http::shard::Entryway::load(
+                    &self.store,
+                    &self.master_key,
+                    &env,
+                    &self.settings.current(),
+                    &secrets.admin_password,
+                )
+                .await?,
+            ))
+        } else {
+            None
+        };
         let sessions =
             LegacySessions::new(self.store.clone(), secrets.jwt.clone(), service_did.clone())
                 .accepting(
@@ -426,6 +441,7 @@ impl Node {
             hosts: arc_swap::ArcSwap::from_pointee(hosts),
             role: self.bootstrap.role,
             dev_mode: self.bootstrap.dev_mode_honored(),
+            entryway,
         });
         self.setup_done = state.setup.completed.clone();
         self.spawn_key_watch(key_generation);
@@ -440,8 +456,12 @@ impl Node {
             self.spawn_oracle_refresh(Arc::clone(&state));
             self.spawn_kryphocron_jobs(Arc::clone(&state));
             self.spawn_audience_jobs(Arc::clone(&state));
-            self.spawn_identity_repair(Arc::clone(&state));
-            self.spawn_plc_key_scan(Arc::clone(&state));
+            // A shard holds no PLC rotation key: the entryway signs its
+            // accounts' operations and runs the key scan.
+            if self.bootstrap.role != locus_core::bootstrap::Role::Shard {
+                self.spawn_identity_repair(Arc::clone(&state));
+                self.spawn_plc_key_scan(Arc::clone(&state));
+            }
             self.spawn_backup_schedule(Arc::clone(&state));
             self.spawn_hostname_migration(Arc::clone(&state));
             self.spawn_blob_migration(Arc::clone(&state));

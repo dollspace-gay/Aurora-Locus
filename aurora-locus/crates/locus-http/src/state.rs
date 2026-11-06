@@ -109,8 +109,9 @@ impl PlcSigner {
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
 /// secondary ones it can still sign with.
 pub struct PlcKeys {
-    /// Index of the current key in `held`.
-    current: usize,
+    /// Index of the current key in `held` (None in the shard role, which
+    /// holds no PLC rotation key of its own).
+    current: Option<usize>,
     held: Vec<(String, PlcKeyRole, PlcSigner)>,
 }
 
@@ -152,7 +153,10 @@ impl PlcKeys {
         key: &MasterKey,
         env: &HashMap<String, String>,
     ) -> CoreResult<Self> {
-        let env_key = env_plc_key(env)?;
+        // A shard holds no PLC rotation key: the entryway's signs its
+        // accounts' operations.
+        let shard = env.get("LOCUS_ROLE").is_some_and(|r| r == "shard");
+        let env_key = if shard { None } else { env_plc_key(env)? };
         let env_did = match &env_key {
             Some(EnvPlcKey::Hex(h)) => Some(keypair_from(h)?.did()),
             Some(EnvPlcKey::Kms(id)) => Some(
@@ -163,7 +167,7 @@ impl PlcKeys {
             ),
             None => None,
         };
-        if store.plc_rotation_keys().await?.is_empty() {
+        if !shard && store.plc_rotation_keys().await?.is_empty() {
             let generated;
             let (did_key, source) = match (&env_key, &env_did) {
                 (Some(EnvPlcKey::Hex(h)), Some(did)) => (did.clone(), PlcKeySource::Private(h)),
@@ -251,14 +255,24 @@ impl PlcKeys {
         }
         let current = held
             .iter()
-            .position(|(_, role, _)| *role == PlcKeyRole::Current)
-            .ok_or_else(|| CoreError::Config("no current PLC rotation key".into()))?;
+            .position(|(_, role, _)| *role == PlcKeyRole::Current);
+        if current.is_none() && !shard {
+            return Err(CoreError::Config("no current PLC rotation key".into()));
+        }
         Ok(Self { current, held })
     }
 
-    /// The key new genesis operations and recommendations name.
-    pub fn current(&self) -> &PlcSigner {
-        &self.held[self.current].2
+    /// The key new genesis operations and recommendations name (None in
+    /// the shard role).
+    #[must_use]
+    pub fn current(&self) -> Option<&PlcSigner> {
+        self.current.map(|i| &self.held[i].2)
+    }
+
+    /// The current key's did:key, if there is one.
+    #[must_use]
+    pub fn current_did(&self) -> Option<String> {
+        self.current().map(PlcSigner::did)
     }
 
     /// The held key to sign an account's next op with: the first one its
@@ -568,6 +582,8 @@ pub struct AppState {
     pub role: locus_core::bootstrap::Role,
     /// Dev mode, honored (a local hostname).
     pub dev_mode: bool,
+    /// The entryway, in the shard role.
+    pub entryway: Option<Arc<crate::shard::Entryway>>,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.
@@ -635,6 +651,17 @@ impl AppState {
             vec![format!(".{}", self.hostname)]
         } else {
             set
+        }
+    }
+
+    /// The PLC rotation keys of which an account's document must name one:
+    /// this PDS's current key, or in the shard role the entryway's
+    /// accepted keys (its current one first).
+    #[must_use]
+    pub fn accepted_plc_keys(&self) -> Vec<String> {
+        match &self.entryway {
+            Some(ew) => ew.plc_rotation_keys.clone(),
+            None => self.secrets.plc_keys.current_did().into_iter().collect(),
         }
     }
 

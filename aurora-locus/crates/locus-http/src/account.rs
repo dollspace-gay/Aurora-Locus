@@ -158,8 +158,8 @@ pub async fn assert_valid_did_doc(s: &AppState, did: &str) -> XrpcResult<()> {
         )
     };
     if let Some(rotation) = &rotation {
-        let current = s.secrets.plc_keys.current().did();
-        if !rotation.contains(&current) {
+        let accepted = s.accepted_plc_keys();
+        if !accepted.iter().any(|k| rotation.contains(k)) {
             let listed = s.secrets.plc_keys.listed(rotation);
             let message = if listed.is_empty() {
                 "Server rotation key not included in PLC DID data".to_owned()

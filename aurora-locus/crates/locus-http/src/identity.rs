@@ -110,14 +110,17 @@ pub async fn resolve_handle(
 ) -> XrpcResult<Json<Value>> {
     let h = handle::normalize_and_validate(&p.handle)
         .map_err(|e| XrpcError::named("InvalidHandle", e.to_string()))?;
-    if let Some(account) = s.store.account_by_handle(&h).await?
+    // A shard doesn't own handles (the entryway does): no local lookup.
+    let shard = s.entryway.is_some();
+    if !shard
+        && let Some(account) = s.store.account_by_handle(&h).await?
         && account.status == Status::Active
     {
         return Ok(Json(json!({ "did": account.did })));
     }
     // A name on our own handle domains with no local account doesn't exist;
     // anything else is looked up on the network (cache, then DNS and HTTPS).
-    if handle::service_domain(&h, &s.handle_domains()).is_none()
+    if (shard || handle::service_domain(&h, &s.handle_domains()).is_none())
         && let Some(did) = s.resolvers()?.resolve_handle(&h).await
     {
         return Ok(Json(json!({ "did": did })));
@@ -166,7 +169,14 @@ pub(crate) async fn change_handle(
     raw: &str,
 ) -> XrpcResult<()> {
     let did = account.did.as_str();
-    let handle = validate_handle(s, raw, Some(did)).await?;
+    // On a shard the entryway has updated the document already (this is
+    // its callback): any valid handle the document names is recorded.
+    let shard = s.entryway.is_some();
+    let handle = if shard {
+        handle::normalize_and_validate(raw).map_err(handle_error)?
+    } else {
+        validate_handle(s, raw, Some(did)).await?
+    };
     if let Some(other) = s.store.account_by_handle(&handle).await?
         && other.did != did
     {
@@ -175,7 +185,7 @@ pub(crate) async fn change_handle(
             format!("Handle already taken: {handle}"),
         ));
     }
-    if did.starts_with("did:plc:") {
+    if did.starts_with("did:plc:") && !shard {
         // PLC first, then the database. The repair entry makes the change
         // converge if anything after the PLC step fails.
         s.store
@@ -195,7 +205,8 @@ pub(crate) async fn change_handle(
         s.store
             .finish_identity_repair(did, RepairKind::Handle, &handle)
             .await?;
-    } else if let Some(hosted) = s.store.hosted_did_web(did).await?
+    } else if !shard
+        && let Some(hosted) = s.store.hosted_did_web(did).await?
         && let Some(doc) = hosted.doc
     {
         // A document locus serves: edit it in the same transaction.
@@ -212,9 +223,11 @@ pub(crate) async fn change_handle(
             .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
         let named = doc.as_ref().and_then(|d| proto_blue_common::get_handle(d));
         if named != Some(handle.as_str()) {
-            return Err(XrpcError::invalid_request(
-                "DID is not properly configured for handle",
-            ));
+            return Err(XrpcError::invalid_request(if shard {
+                "Handle does not match DID doc"
+            } else {
+                "DID is not properly configured for handle"
+            }));
         }
         apply_handle(s, did, &handle, None).await?;
     }
@@ -583,7 +596,7 @@ pub async fn get_recommended_did_credentials(
     if !recovery.is_empty() {
         rotation_keys.push(recovery);
     }
-    rotation_keys.push(s.secrets.plc_keys.current().did());
+    rotation_keys.extend(s.accepted_plc_keys().into_iter().take(1));
     let mut out = json!({
         "rotationKeys": rotation_keys,
         "verificationMethods": { "atproto": signing.did() },
@@ -747,9 +760,10 @@ pub async fn submit_plc_operation(
     let plc::SignedOp::Operation { op: fields, .. } = &op else {
         return Err(invalid());
     };
-    if !fields
-        .rotation_keys
-        .contains(&s.secrets.plc_keys.current().did())
+    if !s
+        .accepted_plc_keys()
+        .iter()
+        .any(|k| fields.rotation_keys.contains(k))
     {
         return Err(XrpcError::invalid_request(
             "Rotation keys do not include server's rotation key",

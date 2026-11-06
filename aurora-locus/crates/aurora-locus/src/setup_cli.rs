@@ -82,7 +82,15 @@ async fn run_inner(
             }
             p
         }
-        None => interactive(seed, &mailer, &secrets.plc_keys.current().did(), dev).await?,
+        None => {
+            interactive(
+                seed,
+                &mailer,
+                &secrets.plc_keys.current_did().unwrap_or_default(),
+                dev,
+            )
+            .await?
+        }
     };
 
     // An SMTP URL is stored and checked first, so the checks see it.

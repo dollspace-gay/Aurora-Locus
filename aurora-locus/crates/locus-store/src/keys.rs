@@ -457,6 +457,9 @@ impl Tx {
             }
             after = last;
         }
+        // Reserved signing keys are short-lived: dropped rather than
+        // re-sealed (an account creation waiting on one reserves again).
+        tx_exec!(self, "DELETE FROM reserved_key",)?;
         Ok((secrets, signing))
     }
 

@@ -16,8 +16,13 @@ type St = State<Arc<AppState>>;
 
 /// The issuer: this PDS's public origin.
 #[must_use]
+/// The OAuth issuer: this PDS, or in the shard role its entryway (the
+/// authorization server its protected-resource metadata names).
 pub fn issuer(s: &AppState) -> String {
-    s.public_url.trim_end_matches('/').to_owned()
+    match &s.entryway {
+        Some(ew) => ew.url.clone(),
+        None => s.public_url.trim_end_matches('/').to_owned(),
+    }
 }
 
 /// An OAuth error response, with its challenge and a fresh DPoP nonce.

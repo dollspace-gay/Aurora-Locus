@@ -298,7 +298,7 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
     }
     lines.push(format!(
         "PLC rotation key: {} (current). Keep a copy of the master key off this server.",
-        secrets.plc_keys.current().did()
+        secrets.plc_keys.current_did().unwrap_or_default()
     ));
     Ok(lines)
 }

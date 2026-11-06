@@ -47,7 +47,10 @@ pub async fn access_with(
     extra: &[&str],
 ) -> XrpcResult<Authed> {
     let token = bearer(headers)?;
-    let authed = state.sessions.verify_access(token).await?;
+    let authed = match &state.entryway {
+        Some(ew) => crate::shard::verify_access(state, ew, token).await?,
+        None => state.sessions.verify_access(token).await?,
+    };
     let scope = authed.scope.as_str();
     if scopes.contains(&scope) || extra.contains(&scope) {
         Ok(authed)
@@ -82,7 +85,7 @@ pub async fn user_service_auth(
         let key = proto_blue_common::did_doc::get_verification_material(&doc, key_id)
             .map(|k| format!("did:key:{}", k.public_key_multibase));
         if key.is_some_and(|k| jwt.verifies_with(&k)) {
-            if !state.accepts_aud(&jwt.aud) {
+            if !state.accepts_aud(&jwt.aud) && !crate::shard::accepts_service_aud(state, &jwt.aud) {
                 return Err(unauthorized(service_jwt::ServiceJwtError::BadJwtAudience));
             }
             return Ok(did.to_owned());
@@ -188,6 +191,9 @@ pub async fn authorization(
 pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<Authed> {
     use locus_auth::session::{OAuthGrant, SCOPE_OAUTH};
     use serde_json::Value;
+    if let Some(ew) = &state.entryway {
+        return crate::shard::oauth_access(state, ew, headers).await;
+    }
     let invalid = |m: &str| XrpcError::from(OAuthError::invalid_token("DPoP", m));
     let token = headers
         .get(header::AUTHORIZATION)
