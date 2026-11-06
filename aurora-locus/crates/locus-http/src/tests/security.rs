@@ -82,7 +82,7 @@ fn post_with_image(blob: &Value) -> Value {
 }
 
 impl Harness {
-    async fn create_post(&self, did: &str, access: &str, record: Value) -> (StatusCode, Value) {
+    async fn try_post(&self, did: &str, access: &str, record: Value) -> (StatusCode, Value) {
         self.post(
             "com.atproto.repo.createRecord",
             Some(access),
@@ -126,7 +126,7 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
         .admin_call("POST", update, &moderator, Some(takedown(&fresh_cid, true)))
         .await;
     assert_eq!(st, StatusCode::OK);
-    refused(h.create_post(&did, &access, post_with_image(&fresh)).await);
+    refused(h.try_post(&did, &access, post_with_image(&fresh)).await);
     // Nor through applyWrites.
     let (st, v) = h
         .post(
@@ -162,7 +162,7 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
         Some(takedown(&fresh_cid, false)),
     )
     .await;
-    let (st, v) = h.create_post(&did, &access, post_with_image(&fresh)).await;
+    let (st, v) = h.try_post(&did, &access, post_with_image(&fresh)).await;
     assert_eq!(st, StatusCode::OK, "{v}");
 
     // A blob already referenced (permanent), then taken down: a second
@@ -180,7 +180,7 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
         .await;
     assert_eq!(st, StatusCode::OK);
     let before = h.post_count(&did).await;
-    refused(h.create_post(&did, &access, post_with_image(&fresh)).await);
+    refused(h.try_post(&did, &access, post_with_image(&fresh)).await);
     let rkey = first["uri"].as_str().unwrap().rsplit('/').next().unwrap();
     refused(
         h.post(
@@ -226,10 +226,7 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
     assert_eq!((row.state.as_str(), row.review_hold), ("quarantined", true));
     let bad_ref = json!({"$type": "blob", "ref": {"$link": bad_cid}, "mimeType": "image/png", "size": bad.len()});
     let before = h.post_count(&did).await;
-    refused(
-        h.create_post(&did, &access, post_with_image(&bad_ref))
-            .await,
-    );
+    refused(h.try_post(&did, &access, post_with_image(&bad_ref)).await);
     assert_eq!(h.post_count(&did).await, before);
     let row = h.state.store.blob(&did, &bad_cid).await.unwrap().unwrap();
     assert_eq!(row.state, "quarantined", "still quarantined");

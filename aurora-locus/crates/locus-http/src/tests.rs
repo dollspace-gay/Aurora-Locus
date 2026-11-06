@@ -1,7 +1,7 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
-mod bulk;
 mod blobs;
+mod bulk;
 mod security;
 
 use std::collections::HashMap;

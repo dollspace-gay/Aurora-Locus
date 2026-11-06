@@ -12,7 +12,8 @@ if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx lo
   docker exec locus-test-pg psql -U locus -d locus -tAc \
     "SELECT datname FROM pg_database WHERE datname LIKE 'locus_test_%'" |
     while read -r db; do
-      [ -n "$db" ] && docker exec locus-test-pg dropdb -U locus --if-exists "$db"
+      # One another run is still using stays (runs may overlap).
+      if [ -n "$db" ]; then docker exec locus-test-pg dropdb -U locus --if-exists "$db" >/dev/null 2>&1 || true; fi
     done
 fi
 
