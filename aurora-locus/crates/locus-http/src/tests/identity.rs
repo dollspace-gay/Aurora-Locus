@@ -1209,3 +1209,154 @@ async fn hostname_migrations_are_refused_in_the_entryway_and_shard_roles() {
         assert_eq!(crate::oauth::issuer(&h.state), issuer);
     }
 }
+
+/// Plain HTTP to an operator-configured endpoint: refused when typed in
+/// unless allowed for that endpoint; the flag follows the value; an env
+/// value allows itself; the console warns about each allowed one.
+#[tokio::test]
+async fn plain_http_endpoints_need_to_be_allowed_and_are_warned_about() {
+    let h = harness(true).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let admin = format!("Bearer {}", h.operator("ad", "admin").await);
+    let set = |v: Value| {
+        let (h, admin, path) = (&h, admin.clone(), ns("admin.setSetting"));
+        async move { h.admin_call("POST", &path, &admin, Some(v)).await }
+    };
+    let allowed = || {
+        h.state
+            .snapshot()
+            .list("http.allow_insecure_http")
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let lan = "http://192.168.1.20:3000";
+    let (st, v) = set(json!({"key": "appview.url", "value": lan})).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().contains("allowInsecureHttp"),
+        "{v}"
+    );
+    assert_ne!(
+        h.state.snapshot().text("appview.url"),
+        lan,
+        "nothing changed"
+    );
+    // A list endpoint too.
+    let (st, _) =
+        set(json!({"key": "sync.crawlers", "value": ["https://bsky.network", "http://relay.lan"]}))
+            .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // HTTPS needs nothing.
+    let (st, v) = set(json!({"key": "appview.url", "value": "https://appview.example"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // Allowed: stored, flagged, warned about.
+    let (st, v) = set(json!({"key": "appview.url", "value": lan, "allowInsecureHttp": true})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(h.state.snapshot().text("appview.url"), lan);
+    assert_eq!(allowed(), ["appview.url"]);
+    // Changing it again within plain HTTP needs no new flag.
+    let (st, _) = set(json!({"key": "appview.url", "value": "http://192.168.1.21:3000"})).await;
+    assert_eq!(st, StatusCode::OK);
+    h.console_operator("own", "owner", "correct horse battery")
+        .await;
+    let b = Browser::default();
+    h.console_sign_in(&b, "own", "correct horse battery").await;
+    let (_, _, page) = b.get(&h, "/admin").await;
+    assert!(
+        page.contains("appview.url uses plain http://"),
+        "the console warns"
+    );
+    // Back to HTTPS: the flag goes, and so does the warning.
+    let (st, _) = set(json!({"key": "appview.url", "value": "https://appview.example"})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(allowed().is_empty());
+    let (_, _, page) = b.get(&h, "/admin").await;
+    assert!(!page.contains("uses plain http://"));
+    // Settings that aren't endpoints are never flagged.
+    let (st, _) =
+        set(json!({"key": "server.privacy_policy_url", "value": "http://example.com/privacy"}))
+            .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(allowed().is_empty());
+
+    // From env: the value allows itself.
+    let env: std::collections::HashMap<String, String> =
+        [("PDS_BSKY_APP_VIEW_URL".to_owned(), lan.to_owned())].into();
+    let (values, _) = locus_store::env::collect_env(&env);
+    // As a node does at boot: holding a clock slot, it reports and applies.
+    h.state
+        .store
+        .claim_slot(
+            locus_store::env::CLOCK_SLOT_FAMILY,
+            8,
+            "env-node",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    h.state
+        .store
+        .report_and_apply_env("env-node", &values)
+        .await
+        .unwrap();
+    h.state.settings.refresh().await.unwrap();
+    assert_eq!(h.state.snapshot().text("appview.url"), lan);
+    assert_eq!(allowed(), ["appview.url"]);
+}
+
+/// Setup refuses a plain http:// service URL typed into the wizard, and
+/// takes one env already allowed.
+#[tokio::test]
+async fn setup_takes_plain_http_services_only_from_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
+        .await
+        .unwrap();
+    let key = MasterKey::generate(SourceKind::Env);
+    let mut plan = crate::setup::seed_plan(
+        &store.load_snapshot().await.unwrap(),
+        Some("pds.example.com"),
+    );
+    plan.handle_domains = vec![".pds.example.com".into()];
+    plan.operator = locus_core::setup::OperatorPlan {
+        username: "op".into(),
+        password: Some("op-password-123".into()),
+        ..Default::default()
+    };
+    plan.keys_backup_acknowledged = true;
+    plan.email.skipped = true;
+    plan.services.appview_url = "http://192.168.1.20:3000".into();
+    plan.services.appview_did = "did:web:appview.lan".into();
+    let err = crate::setup::apply(&store, &key, &plan, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--allow-insecure-http"), "{err}");
+    assert!(
+        store
+            .setup_state()
+            .await
+            .unwrap()
+            .is_none_or(|r| r.completed_at.is_none())
+    );
+    // The same URL from env.
+    let mut tx = store.begin().await.unwrap();
+    assert!(
+        tx.set_env_setting(
+            "appview.url",
+            json!("http://192.168.1.20:3000"),
+            "environment"
+        )
+        .await
+        .unwrap()
+    );
+    tx.commit().await.unwrap();
+    crate::setup::apply(&store, &key, &plan, false)
+        .await
+        .unwrap();
+}

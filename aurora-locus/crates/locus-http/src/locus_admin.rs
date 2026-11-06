@@ -472,6 +472,9 @@ pub async fn resolve_review(
 pub struct SettingInput {
     key: String,
     value: Value,
+    /// Allows a plain `http://` URL for this endpoint.
+    #[serde(default, rename = "allowInsecureHttp")]
+    allow_insecure_http: bool,
 }
 
 /// Changes a setting (validated; audited with before and after).
@@ -505,11 +508,41 @@ pub async fn set_setting(
     if input.key == "http.internal_hosts" {
         check_internal_hosts(&s, &value).await?;
     }
-    let before = s.snapshot().get(&input.key).clone();
+    // Plain HTTP to an operator-configured endpoint only when asked for
+    // (the reference takes any http:// URL; an env value allows itself).
+    let snap = s.snapshot();
+    let mut allowed: Vec<String> = snap
+        .list("http.allow_insecure_http")
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let endpoint = locus_core::settings::ENDPOINT_URL_SETTINGS.contains(&input.key.as_str());
+    let insecure = endpoint && locus_core::settings::plain_http(&value);
+    if insecure && !input.allow_insecure_http && !allowed.contains(&input.key) {
+        return Err(XrpcError::invalid_request(format!(
+            "{} is a plain http:// URL: use https://, or allow plain HTTP for this endpoint (allowInsecureHttp; --allow-insecure-http in the CLI)",
+            input.key
+        )));
+    }
+    let before = snap.get(&input.key).clone();
+    drop(snap);
     let version = s
         .settings
         .set(&input.key, value.clone(), &who.actor)
         .await?;
+    // The flag follows the value: added when allowed, dropped once it's
+    // https again.
+    let had = allowed.contains(&input.key);
+    if insecure && !had {
+        allowed.push(input.key.clone());
+    } else if endpoint && !insecure && had {
+        allowed.retain(|k| k != &input.key);
+    }
+    if had != allowed.contains(&input.key) {
+        s.settings
+            .set("http.allow_insecure_http", json!(allowed), &who.actor)
+            .await?;
+    }
     admin_auth::audit(
         &s,
         &who,

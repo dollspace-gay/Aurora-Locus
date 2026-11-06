@@ -259,6 +259,18 @@ async fn node_banners(s: &AppState) -> Vec<Banner> {
             link: None,
         });
     }
+    let snap = s.snapshot();
+    for key in snap.list("http.allow_insecure_http") {
+        if locus_core::settings::plain_http(snap.get(key)) {
+            out.push(Banner {
+                bad: false,
+                text: format!(
+                    "{key} uses plain http://: requests to it travel unencrypted. Use https:// unless it's on a private network."
+                ),
+                link: None,
+            });
+        }
+    }
     for (name, rows) in &reports {
         if rows.iter().any(|(_, h)| *h != rows[0].1) {
             let nodes: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();

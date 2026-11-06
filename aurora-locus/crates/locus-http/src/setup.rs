@@ -291,6 +291,20 @@ pub async fn apply(
         (None, None) => unreachable!("problems() requires one"),
     };
     let s = &plan.services;
+    let allowed = store.load_snapshot().await?;
+    let allowed: Vec<&str> = allowed.list("http.allow_insecure_http");
+    for (key, value) in [
+        ("appview.url", json!(s.appview_url)),
+        ("sync.crawlers", json!(s.crawlers)),
+        ("moderation.service_url", json!(s.moderation_url)),
+        ("moderation.report_service_url", json!(s.report_url)),
+    ] {
+        if locus_core::settings::plain_http(&value) && !allowed.contains(&key) {
+            return Err(ApplyError::Invalid(vec![format!(
+                "{key} is a plain http:// URL: use https://, or set it after setup with `aurora-locus settings set {key} <url> --allow-insecure-http`"
+            )]));
+        }
+    }
     let mut settings: Vec<(&str, Value)> = vec![
         ("identity.handle_domains", json!(plan.handle_domains)),
         ("identity.reserved_handles", json!(plan.reserved_handles())),

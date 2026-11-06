@@ -20,7 +20,9 @@ pub struct Normalizer {
 }
 
 /// Keys whose integer values are counters that differ between servers.
-const VOLATILE_INTS: &[&str] = &["seq", "cursor", "size", "time", "expires_in"];
+/// `repoBlocks` too: each server mints its own record keys, and how they
+/// hash decides how many tree nodes the same records need.
+const VOLATILE_INTS: &[&str] = &["seq", "cursor", "size", "time", "expires_in", "repoBlocks"];
 
 fn is_tid(s: &str) -> bool {
     s.len() == 13

@@ -278,6 +278,10 @@ pub enum SettingsCmd {
     Set {
         key: String,
         value: String,
+        /// Allow a plain http:// URL for this endpoint (a LAN AppView, a
+        /// local PLC).
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
     List,
     /// Every setting as one JSON object.
@@ -1855,11 +1859,19 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
                 print(&Value::Object(settings(c).await?.into_iter().collect()));
                 Ok(())
             }
-            SettingsCmd::Set { key, value } => {
+            SettingsCmd::Set {
+                key,
+                value,
+                allow_insecure_http,
+            } => {
                 c.call(
                     &lx("admin.setSetting"),
                     &[],
-                    Some(json!({"key": key, "value": setting_value(&value)})),
+                    Some(json!({
+                        "key": key,
+                        "value": setting_value(&value),
+                        "allowInsecureHttp": allow_insecure_http,
+                    })),
                 )
                 .await?;
                 println!("Set {key}. It applies now.");

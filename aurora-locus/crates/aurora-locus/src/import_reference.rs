@@ -202,10 +202,16 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
     {
         let mut tx = store.begin().await.map_err(e)?;
         for v in &values {
-            if tx.cas_env_applied(v.key, None, &v.hash).await.map_err(e)? {
-                tx.set_setting(v.key, v.value.clone(), ACTOR)
+            if tx.cas_env_applied(v.key, None, &v.hash).await.map_err(e)?
+                && tx
+                    .set_env_setting(v.key, v.value.clone(), ACTOR)
                     .await
-                    .map_err(e)?;
+                    .map_err(e)?
+            {
+                tracing::warn!(
+                    key = v.key,
+                    "a plain http:// endpoint from pds.env: allowed for this endpoint (see http.allow_insecure_http)"
+                );
             }
         }
         tx.commit().await.map_err(e)?;

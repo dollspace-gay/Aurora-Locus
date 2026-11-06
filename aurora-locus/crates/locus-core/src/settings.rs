@@ -132,6 +132,31 @@ impl Def {
     }
 }
 
+/// Settings naming an operator-configured endpoint. A plain `http://` URL
+/// in one needs that key in `http.allow_insecure_http`: an operator asks
+/// for it when typing the URL, and a value from env or a config file sets
+/// it itself.
+pub const ENDPOINT_URL_SETTINGS: &[&str] = &[
+    "identity.plc_url",
+    "entryway.url",
+    "appview.url",
+    "moderation.service_url",
+    "moderation.report_service_url",
+    "blobs.scanner_url",
+    "blobs.s3_endpoint",
+    "sync.crawlers",
+];
+
+/// Whether an endpoint value (a URL, or a list of them) uses plain HTTP.
+#[must_use]
+pub fn plain_http(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.trim().to_ascii_lowercase().starts_with("http://"),
+        Value::Array(items) => items.iter().any(plain_http),
+        _ => false,
+    }
+}
+
 fn is_http_url(s: &str) -> bool {
     let rest = s
         .strip_prefix("https://")
@@ -492,6 +517,13 @@ pub static REGISTRY: &[Def] = &[
         default: r#"["127.0.0.0/8", "::1/128"]"#,
         env: Some("LOCUS_TRUSTED_PROXIES"),
         description: "Proxies (CIDRs) whose X-Forwarded-For / Forwarded headers are trusted for the client IP.",
+    },
+    Def {
+        key: "http.allow_insecure_http",
+        kind: Kind::TextList { max_len: 64 },
+        default: "[]",
+        env: None,
+        description: "Endpoint settings allowed a plain http:// URL (a LAN AppView, a local PLC). Set by an http:// value from env, or when an operator allows it with the URL; the console warns about each.",
     },
     Def {
         key: "rate_limits.enabled",

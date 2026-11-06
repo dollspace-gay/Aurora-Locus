@@ -95,6 +95,49 @@ impl Store {
 }
 
 impl Tx {
+    /// Stores a setting from env or a config file. An endpoint URL there that
+    /// uses plain HTTP is allowed for that endpoint (`http.allow_insecure_http`),
+    /// as a reference `pds.env` with a LAN AppView or a local PLC expects;
+    /// the console warns about it. Returns whether that happened.
+    pub async fn set_env_setting(
+        &mut self,
+        key: &str,
+        value: Value,
+        actor: &str,
+    ) -> CoreResult<bool> {
+        let insecure =
+            settings::ENDPOINT_URL_SETTINGS.contains(&key) && settings::plain_http(&value);
+        self.set_setting(key, value, actor).await?;
+        if !insecure {
+            return Ok(false);
+        }
+        let list_key = "http.allow_insecure_http";
+        let current: Option<String> = match self {
+            Tx::Sqlite(t) => {
+                sqlx::query_scalar("SELECT value_json FROM setting WHERE key = ?1")
+                    .bind(list_key)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+            Tx::Postgres(t) => {
+                sqlx::query_scalar("SELECT value_json FROM setting WHERE key = $1")
+                    .bind(list_key)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+        }
+        .map_err(db_err)?;
+        let mut list: Vec<String> = current
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        if !list.iter().any(|k| k == key) {
+            list.push(key.to_owned());
+            self.set_setting(list_key, serde_json::json!(list), actor)
+                .await?;
+        }
+        Ok(true)
+    }
+
     /// Validates and stores one setting inside this transaction. Returns the
     /// new settings version.
     pub async fn set_setting(&mut self, key: &str, value: Value, actor: &str) -> CoreResult<i64> {

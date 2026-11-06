@@ -746,6 +746,14 @@ kryphocron built in.
   implementations wouldn't reproduce). Found by new property tests that
   also verify every `#commit` event from its own blocks and `getRepo`
   since every earlier rev.
+- Plain `http://` URLs for operator-configured endpoints (PLC directory,
+  AppView, moderation and report services, scanner, S3, entryway,
+  crawlers) need to be allowed per endpoint (`http.allow_insecure_http`):
+  typed into the console, the CLI (`settings set ... --allow-insecure-http`)
+  or the setup wizard, an `http://` URL is refused without it. A value from
+  env or a reference `pds.env` allows itself, with a log line, so existing
+  installs boot unchanged. The console warns about every endpoint on plain
+  HTTP; switching back to `https://` drops the flag.
 - On Postgres, input text with a NUL byte (a query parameter, a body
   field) is refused with 400 `InvalidRequest`; it answered 500, since
   Postgres can't store it.

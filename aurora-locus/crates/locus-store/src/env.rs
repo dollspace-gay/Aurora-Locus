@@ -116,7 +116,15 @@ impl Store {
                 tx.rollback().await?;
                 continue;
             }
-            tx.set_setting(v.key, v.value.clone(), ENV_ACTOR).await?;
+            if tx
+                .set_env_setting(v.key, v.value.clone(), ENV_ACTOR)
+                .await?
+            {
+                tracing::warn!(
+                    key = v.key,
+                    "a plain http:// endpoint from env: allowed for this endpoint (see http.allow_insecure_http)"
+                );
+            }
             tx.commit().await?;
             done.push(v.key.to_owned());
         }
