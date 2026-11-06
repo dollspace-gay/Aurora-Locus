@@ -226,6 +226,7 @@ pub async fn sync_account(s: &Arc<AppState>, owner: &str, listing: &Refreshed) -
                     s.store.delete_attempt(&id).await?;
                     continue;
                 };
+                crate::faults::at(s, "audience.created").await?;
                 let theirs = aud.row(
                     owner,
                     prism_rkey,
@@ -430,6 +431,7 @@ pub async fn repoint_pass(
                 .signing_key(&did)
                 .await
                 .map_err(|e| locus_core::CoreError::Storage(e.message))?;
+            crate::faults::at(s, "repoint.commit").await?;
             match s
                 .repo
                 .commit(locus_repo::CommitRequest {

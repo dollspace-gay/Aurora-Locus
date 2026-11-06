@@ -1,5 +1,6 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
+mod audiences;
 mod blobs;
 mod bulk;
 mod keys;
