@@ -533,6 +533,19 @@ kryphocron built in.
   bucket's earlier versions (or, with `--backend`, from the restored
   backend), stops when most are missing, ends a running blob migration,
   and finishes as `backup restore` does.
+- `aurora-locus migrate blobs --to disk|s3` moves every blob to another
+  backend while the node keeps serving: copy passes, a verify, then a
+  short pause (bounded by `blobs.cutover_max_pause_ms`) for a final pass
+  and the flip; every node then reloads onto the new backend. Uploads in
+  the pause get a retryable 503. `--status` follows it, `--cancel` ends it
+  without cutting over, and objects missing from the source hold the
+  cutover until `--accept-missing`. The old backend's objects are left
+  for the operator.
+- `aurora-locus migrate storage --to postgres --url <url>` (offline)
+  copies a SQLite install into an empty Postgres database in one
+  transaction, with every sequence continuing above what was copied; it
+  refuses a node-generated master key file (declare it shared, or rewrap
+  first) and a running blob migration.
 
 ### Changed
 

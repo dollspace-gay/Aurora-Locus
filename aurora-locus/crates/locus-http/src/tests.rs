@@ -129,7 +129,7 @@ struct Harness {
 fn test_blob_store(dir: &std::path::Path) -> locus_blob::BlobStore {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let Some(endpoint) = var("LOCUS_TEST_S3_ENDPOINT") else {
-        return locus_blob::BlobStore::Disk(locus_blob::DiskStore::new(dir.join("blobs")));
+        return locus_blob::BlobStore::disk(locus_blob::DiskStore::new(dir.join("blobs")));
     };
     let config = locus_blob::S3Config {
         bucket: var("LOCUS_TEST_S3_BUCKET").unwrap_or_else(|| "locus-test".into()),
@@ -143,7 +143,7 @@ fn test_blob_store(dir: &std::path::Path) -> locus_blob::BlobStore {
         upload_timeout: std::time::Duration::from_secs(30),
         request_timeout: None,
     };
-    locus_blob::BlobStore::S3(locus_blob::S3Store::new(&config).unwrap())
+    locus_blob::BlobStore::s3(locus_blob::S3Store::new(&config).unwrap())
 }
 
 async fn harness(invite_required: bool) -> Harness {
@@ -209,6 +209,7 @@ async fn harness_build(
         tokio_util::sync::CancellationToken::new(),
     ));
     let gate_settings = Arc::clone(&settings);
+    let blob_epoch = store.blob_backend().await.unwrap().epoch;
     let state = Arc::new(AppState {
         repo: RepoEngine::new(store.clone(), Arc::new(TidClock::new(0)))
             .with_media_gate(move || crate::media_gate::gate_on_in(&gate_settings.current())),
@@ -218,7 +219,7 @@ async fn harness_build(
         secrets,
         sessions,
         mailer,
-        blobs: test_blob_store(dir.path()),
+        blobs: test_blob_store(dir.path()).with_epoch(blob_epoch),
         scratch: locus_blob::DiskStore::new(dir.path()),
         firehose,
         public_url: format!("https://{hostname}"),
@@ -12253,4 +12254,241 @@ async fn backups_hold_the_database_every_object_it_names_and_the_keys() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(!dir2.join("keys.backup").exists());
+}
+
+#[tokio::test]
+async fn blob_migrations_copy_verify_pause_and_flip() {
+    use crate::blob_migration::{Step, step};
+    use locus_store::migrate_blobs::MIGRATE_LEASE;
+    let h = harness(false).await;
+    if !matches!(h.state.blobs.name(), "disk") {
+        return;
+    }
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, access) = h.user("mia.pds.example.com").await;
+    let mut cids = Vec::new();
+    for n in 0..3u8 {
+        let b = h
+            .upload(&access, format!("moving bytes {n}").as_bytes(), "image/png")
+            .await;
+        cids.push(b["ref"]["$link"].as_str().unwrap().to_owned());
+    }
+    let admin = format!("Bearer {}", h.operator("amy", "admin").await);
+    let target = tempfile::tempdir().unwrap();
+    let root = target.path().display().to_string();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.migrateBlobs.start"),
+            &admin,
+            Some(json!({"to": "disk", "diskRoot": root})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.migrateBlobs.start"),
+            &admin,
+            Some(json!({"to": "disk", "diskRoot": root})),
+        )
+        .await;
+    assert!(st.is_client_error(), "one at a time: {st}");
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease(
+            MIGRATE_LEASE,
+            "test-node",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // While paused, an upload is refused (retryable) and leaves no row.
+    let m = h
+        .state
+        .store
+        .active_blob_migration()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        h.state
+            .store
+            .pause_for_cutover(&lease, &m.id)
+            .await
+            .unwrap()
+    );
+    let (st, _, _) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            b"during the pause".to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    let paused_cid = proto_blue_lex_data::Cid::for_raw(b"during the pause").to_string_base32();
+    assert!(
+        h.state
+            .store
+            .blob(&did, &paused_cid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    h.state.store.clear_pause(&lease).await.unwrap();
+
+    // One step copies everything, verifies, pauses and flips.
+    let flipped = step(&h.state, &lease).await.unwrap();
+    assert!(matches!(flipped, Step::Flipped(_)), "{flipped:?}");
+    for cid in &cids {
+        let row = h.state.store.blob(&did, cid).await.unwrap().unwrap();
+        assert!(
+            target.path().join(&row.storage_key).exists(),
+            "{} copied",
+            row.storage_key
+        );
+    }
+    let backend = h.state.store.blob_backend().await.unwrap();
+    assert_eq!(
+        (
+            backend.active.as_str(),
+            backend.disk_root.as_deref(),
+            backend.paused
+        ),
+        ("disk", Some(root.as_str()), false)
+    );
+    assert_eq!(backend.epoch, h.state.blobs.epoch() + 1);
+    assert_eq!(step(&h.state, &lease).await.unwrap(), Step::Done);
+    let (_, v) = h
+        .admin_call("GET", &ns("viewer.migrateBlobs.status"), &admin, None)
+        .await;
+    assert_eq!(v["migration"]["phase"], "done", "{v}");
+    // This node's store is the old backend now: writes are refused and it
+    // reloads.
+    let (st, _, _) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            b"after the flip".to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        h.state.reload.is_cancelled(),
+        "the node reloads onto the new backend"
+    );
+}
+
+#[tokio::test]
+async fn blob_migrations_wait_on_missing_sources_and_cancel() {
+    use crate::blob_migration::{Step, step};
+    use locus_store::migrate_blobs::MIGRATE_LEASE;
+    let h = harness(false).await;
+    if !matches!(h.state.blobs.name(), "disk") {
+        return;
+    }
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, access) = h.user("noa.pds.example.com").await;
+    let b = h.upload(&access, b"soon missing", "image/png").await;
+    let cid = b["ref"]["$link"].as_str().unwrap().to_owned();
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    h.state.blobs.delete(&row.storage_key).await.unwrap();
+    let admin = format!("Bearer {}", h.operator("ava", "admin").await);
+    let target = tempfile::tempdir().unwrap();
+    let start = json!({"to": "disk", "diskRoot": target.path().display().to_string()});
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.migrateBlobs.start"),
+            &admin,
+            Some(start.clone()),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease(
+            MIGRATE_LEASE,
+            "test-node",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let waiting = step(&h.state, &lease).await.unwrap();
+    assert!(matches!(waiting, Step::Waiting(_)), "{waiting:?}");
+    let (_, v) = h
+        .admin_call("GET", &ns("viewer.migrateBlobs.status"), &admin, None)
+        .await;
+    assert_eq!(v["missingSources"][0]["key"], json!(row.storage_key), "{v}");
+    assert_eq!(h.state.store.blob_backend().await.unwrap().active, "disk");
+    assert!(
+        !h.state.store.blob_backend().await.unwrap().paused,
+        "no pause while waiting"
+    );
+    // Cancel: no flip, the lease goes, nothing paused.
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.migrateBlobs.cancel"),
+            &admin,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        step(&h.state, &lease).await.is_err()
+            || h.state
+                .store
+                .active_blob_migration()
+                .await
+                .unwrap()
+                .is_none(),
+        "the cancelled job can't go on"
+    );
+    assert!(!h.state.store.blob_backend().await.unwrap().paused);
+    // Again, then acknowledge the missing object: the cutover goes ahead.
+    let (st, _) = h
+        .admin_call("POST", &ns("admin.migrateBlobs.start"), &admin, Some(start))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease(
+            MIGRATE_LEASE,
+            "test-node",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        step(&h.state, &lease).await.unwrap(),
+        Step::Waiting(_)
+    ));
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.migrateBlobs.acceptMissing"),
+            &admin,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        (st, v["acknowledged"].as_i64()),
+        (StatusCode::OK, Some(1)),
+        "{v}"
+    );
+    let flipped = step(&h.state, &lease).await.unwrap();
+    assert!(matches!(flipped, Step::Flipped(_)), "{flipped:?}");
 }

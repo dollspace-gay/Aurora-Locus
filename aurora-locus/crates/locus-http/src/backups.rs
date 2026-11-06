@@ -198,7 +198,7 @@ async fn run(
         .map_err(|e| err(&e))?;
     check_lease()?;
     // 2. Exactly the objects the snapshot names.
-    let out = locus_blob::BlobStore::Disk(locus_blob::DiskStore::new(dir.join("objects")));
+    let out = locus_blob::BlobStore::disk(locus_blob::DiskStore::new(dir.join("objects")));
     let mut copied = 0u64;
     let mut missing = Vec::new();
     for pending in [false, true] {

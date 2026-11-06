@@ -238,6 +238,13 @@ impl Tx {
             self,
             "UPDATE backup_run SET status = 'ended' WHERE status = 'running'",
         )?;
+        // A blob migration the snapshot held ends; its copy records may
+        // name objects its target no longer has.
+        tx_exec!(
+            self,
+            "UPDATE blob_migration SET phase = 'cancelled' WHERE phase IN ('copying', 'post_flip')",
+        )?;
+        tx_exec!(self, "DELETE FROM blob_copy",)?;
         // Every lease the restored rows hold belongs to a node of the old
         // install (clock ids, jobs, the backup's own); none runs now.
         tx_exec!(self, "DELETE FROM job_lease",)?;
@@ -252,16 +259,7 @@ impl Tx {
         let q = "SELECT did, cid, pending_move FROM blob WHERE pending_move IS NOT NULL";
         let rows: Vec<(String, String, String)> = tx_run!(self, q, fetch_all,)?;
         for (did, cid, old) in &rows {
-            let place = if old.starts_with("gated/") {
-                Place::Gated
-            } else if old.starts_with("quarantine/") {
-                Place::Quarantine
-            } else if old.starts_with("tmp/") {
-                Place::Temp
-            } else {
-                Place::Normal
-            };
-            let fresh = place.new_key(did, cid);
+            let fresh = Place::of_key(old).new_key(did, cid);
             let q = sql(
                 "UPDATE blob SET pending_move = {3}, move_epoch = {4} WHERE did = {1} AND cid = {2}",
                 pg,

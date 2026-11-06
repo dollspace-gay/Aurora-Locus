@@ -892,9 +892,14 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     let result: XrpcResult<Vec<locus_store::blob::PendingMove>> = async {
         let (_lock, mut tx) = s.repo.locked_tx(&account.did).await.map_err(commit_error)?;
         let backend = tx.blob_backend().await?;
-        if backend.paused {
-            tx.queue_blob_delete(&temp, backend.epoch).await?;
+        if backend.paused || backend.epoch != s.blobs.epoch() {
+            // Paused for a cutover, or the bytes went to a backend that's
+            // no longer active (this node reloads).
+            tx.queue_blob_delete(&temp, s.blobs.epoch()).await?;
             tx.commit().await?;
+            if backend.epoch != s.blobs.epoch() {
+                crate::keys::reload_soon(&s);
+            }
             return Err(XrpcError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "TemporarilyUnavailable",
@@ -1084,12 +1089,27 @@ async fn serve_blob(
         None => (0, size.saturating_sub(1)),
     };
     let partial = start != 0 || end + 1 != size;
-    let reader = s
+    let reader = match s
         .blobs
         .read(&row.storage_key, partial.then_some((start, end)))
         .await
         .map_err(|e| XrpcError::internal(e.to_string()))?
-        .ok_or_else(not_found)?;
+    {
+        Some(r) => r,
+        None => {
+            // A node whose store predates a backend flip: it reloads, and
+            // the client retries against the new backend.
+            if s.store.blob_backend().await?.epoch != s.blobs.epoch() {
+                crate::keys::reload_soon(s);
+                return Err(XrpcError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TemporarilyUnavailable",
+                    "Blob storage moved; try again shortly",
+                ));
+            }
+            return Err(not_found());
+        }
+    };
     let len = if size == 0 { 0 } else { end - start + 1 };
     if reader.len != len {
         return Err(XrpcError::internal(format!(

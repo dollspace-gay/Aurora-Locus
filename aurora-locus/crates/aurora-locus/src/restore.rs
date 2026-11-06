@@ -313,7 +313,7 @@ async fn backend_store(
     snap: &Snapshot,
 ) -> Result<BlobStore, String> {
     match kind {
-        BackendKind::Disk => Ok(BlobStore::Disk(DiskStore::new(
+        BackendKind::Disk => Ok(BlobStore::disk(DiskStore::new(
             disk_root.map_or_else(|| data_dir.to_path_buf(), Path::to_path_buf),
         ))),
         BackendKind::S3 => {
@@ -323,7 +323,7 @@ async fn backend_store(
                 .map_err(e)?;
             let config = locus_blob::s3_env_overrides(config, &env)
                 .ok_or("--backend s3 needs S3 settings: none were restored, and none are in env")?;
-            Ok(BlobStore::S3(locus_blob::S3Store::new(&config).map_err(e)?))
+            Ok(BlobStore::s3(locus_blob::S3Store::new(&config).map_err(e)?))
         }
     }
 }
@@ -473,7 +473,7 @@ async fn restore_into(
     // The objects, to the named backend.
     let objects_dir = opts.dir.join("objects");
     let held = backup_objects(&objects_dir)?;
-    let source = BlobStore::Disk(DiskStore::new(&objects_dir));
+    let source = BlobStore::disk(DiskStore::new(&objects_dir));
     for k in &held {
         let r = source
             .read(k, None)

@@ -420,6 +420,35 @@ pub enum RewrapTo {
 }
 
 #[derive(Subcommand)]
+pub enum MigrateCmd {
+    /// Moves every blob to another backend while the node keeps serving,
+    /// then cuts over with a short pause.
+    Blobs {
+        #[arg(long, value_enum)]
+        to: Option<crate::restore::BackendKind>,
+        /// The disk store's root (`--to disk`; default the data dir).
+        #[arg(long)]
+        disk_root: Option<String>,
+        /// Ends the running migration without cutting over.
+        #[arg(long)]
+        cancel: bool,
+        /// Where the migration is.
+        #[arg(long)]
+        status: bool,
+        /// Goes ahead without the objects missing from the source.
+        #[arg(long)]
+        accept_missing: bool,
+    },
+    /// Copies this SQLite install into an empty Postgres database (offline).
+    Storage {
+        #[arg(long, value_parser = ["postgres"])]
+        to: String,
+        #[arg(long)]
+        url: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum BackupCmd {
     /// A backup of a SQLite install, made by the running node: the
     /// database, every object it names, and a key backup.
@@ -568,6 +597,8 @@ pub enum AdminCmd {
     Identity(IdentityCmd),
     #[command(subcommand)]
     Backup(BackupCmd),
+    #[command(subcommand)]
+    Migrate(MigrateCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -1102,6 +1133,95 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
                 }
             }
             Ok(())
+        }
+        AdminCmd::Migrate(MigrateCmd::Blobs {
+            to,
+            disk_root,
+            cancel,
+            status,
+            accept_missing,
+        }) => {
+            if cancel {
+                let v = c
+                    .call(&lx("admin.migrateBlobs.cancel"), &[], Some(json!({})))
+                    .await?;
+                println!(
+                    "Migration {} cancelled; objects it copied to the target are left there.",
+                    v["id"].as_str().unwrap_or("")
+                );
+            } else if accept_missing {
+                let v = c
+                    .call(
+                        &lx("admin.migrateBlobs.acceptMissing"),
+                        &[],
+                        Some(json!({})),
+                    )
+                    .await?;
+                println!("{} missing objects acknowledged.", v["acknowledged"]);
+            } else if let Some(to) = to {
+                let to = match to {
+                    crate::restore::BackendKind::Disk => "disk",
+                    crate::restore::BackendKind::S3 => "s3",
+                };
+                let v = c
+                    .call(
+                        &lx("admin.migrateBlobs.start"),
+                        &[],
+                        Some(json!({"to": to, "diskRoot": disk_root})),
+                    )
+                    .await?;
+                println!(
+                    "Migration {} to {to} started; `aurora-locus migrate blobs --status` follows it.",
+                    v["id"].as_str().unwrap_or("")
+                );
+            } else if status {
+                let v = c.call(&lx("viewer.migrateBlobs.status"), &[], None).await?;
+                let b = &v["backend"];
+                println!(
+                    "active backend {} (epoch {}{})",
+                    b["active"].as_str().unwrap_or(""),
+                    b["epoch"],
+                    if b["paused"] == json!(true) {
+                        ", paused"
+                    } else {
+                        ""
+                    }
+                );
+                let m = &v["migration"];
+                if m.is_null() {
+                    println!("no migration");
+                } else {
+                    println!(
+                        "migration {} to {}: {} after {} passes (copied through {}, verified through {})",
+                        m["id"].as_str().unwrap_or(""),
+                        m["to"].as_str().unwrap_or(""),
+                        m["phase"].as_str().unwrap_or(""),
+                        m["passes"],
+                        m["copiedThrough"],
+                        m["verifiedThrough"]
+                    );
+                    if let Some(n) = m["note"].as_str() {
+                        println!("  {n}");
+                    }
+                }
+                for k in v["missingSources"].as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "  missing from the source: {}{}",
+                        k["key"].as_str().unwrap_or(""),
+                        if k["acknowledged"] == json!(true) {
+                            " (acknowledged)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            } else {
+                return Err("give --to, --status, --cancel or --accept-missing".into());
+            }
+            Ok(())
+        }
+        AdminCmd::Migrate(MigrateCmd::Storage { .. }) => {
+            Err("migrate storage runs offline, from main".into())
         }
         AdminCmd::Backup(BackupCmd::List) => {
             let l = c.call(&lx("viewer.backup.list"), &[], None).await?;

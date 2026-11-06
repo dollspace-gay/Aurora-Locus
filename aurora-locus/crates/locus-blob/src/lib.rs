@@ -113,6 +113,12 @@ impl DiskStore {
         Ok(self.root.join(key))
     }
 
+    /// The directory keys are under.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Where `key` lives on disk.
     pub fn local_path(&self, key: &str) -> Result<PathBuf, BlobError> {
         self.path(key)
@@ -222,20 +228,57 @@ fn part_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// The active blob store.
 #[derive(Debug, Clone)]
-pub enum BlobStore {
+enum Inner {
     Disk(DiskStore),
     S3(S3Store),
 }
 
+/// A blob store (the active one, or a migration's source or target), and
+/// the backend epoch it was opened at.
+#[derive(Debug, Clone)]
+pub struct BlobStore {
+    inner: Inner,
+    epoch: i64,
+}
+
 impl BlobStore {
+    #[must_use]
+    pub fn disk(d: DiskStore) -> Self {
+        Self {
+            inner: Inner::Disk(d),
+            epoch: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn s3(s: S3Store) -> Self {
+        Self {
+            inner: Inner::S3(s),
+            epoch: 0,
+        }
+    }
+
+    /// This store as the backend of `epoch`.
+    #[must_use]
+    pub fn with_epoch(mut self, epoch: i64) -> Self {
+        self.epoch = epoch;
+        self
+    }
+
+    /// The backend epoch this store was opened at: a write noted under
+    /// another epoch can't name a key (its bytes are on another backend).
+    #[must_use]
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+
     /// The backend's name, as `blob_backend.active` records it.
     #[must_use]
     pub fn name(&self) -> &'static str {
-        match self {
-            Self::Disk(_) => "disk",
-            Self::S3(_) => "s3",
+        match &self.inner {
+            Inner::Disk(_) => "disk",
+            Inner::S3(_) => "s3",
         }
     }
 
@@ -252,9 +295,9 @@ impl BlobStore {
         B: AsRef<[u8]>,
         E: std::fmt::Display,
     {
-        match self {
-            Self::Disk(d) => d.write_stream(key, body, limit).await,
-            Self::S3(s) => s.write_stream(key, body, limit).await,
+        match &self.inner {
+            Inner::Disk(d) => d.write_stream(key, body, limit).await,
+            Inner::S3(s) => s.write_stream(key, body, limit).await,
         }
     }
 
@@ -265,25 +308,25 @@ impl BlobStore {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<Option<Reader>, BlobError> {
-        match self {
-            Self::Disk(d) => d.read(key, range).await,
-            Self::S3(s) => s.read(key, range).await,
+        match &self.inner {
+            Inner::Disk(d) => d.read(key, range).await,
+            Inner::S3(s) => s.read(key, range).await,
         }
     }
 
     /// A stored copy's size, if it exists.
     pub async fn size(&self, key: &str) -> Result<Option<u64>, BlobError> {
-        match self {
-            Self::Disk(d) => d.size(key).await,
-            Self::S3(s) => s.size(key).await,
+        match &self.inner {
+            Inner::Disk(d) => d.size(key).await,
+            Inner::S3(s) => s.size(key).await,
         }
     }
 
     /// Deletes a copy; a missing one is success.
     pub async fn delete(&self, key: &str) -> Result<(), BlobError> {
-        match self {
-            Self::Disk(d) => d.delete(key).await,
-            Self::S3(s) => s.delete(key).await,
+        match &self.inner {
+            Inner::Disk(d) => d.delete(key).await,
+            Inner::S3(s) => s.delete(key).await,
         }
     }
 
@@ -296,17 +339,17 @@ impl BlobStore {
     /// Brings back a deleted copy from the bucket's versions, where the
     /// store keeps them (S3 with versioning). Returns whether it did.
     pub async fn restore_newest_version(&self, key: &str) -> Result<bool, BlobError> {
-        match self {
-            Self::Disk(_) => Ok(false),
-            Self::S3(s) => s.restore_newest_version(key).await,
+        match &self.inner {
+            Inner::Disk(_) => Ok(false),
+            Inner::S3(s) => s.restore_newest_version(key).await,
         }
     }
 
     /// Whether the store answers (for S3, every bucket).
     pub async fn check(&self) -> Result<(), BlobError> {
-        match self {
-            Self::Disk(_) => Ok(()),
-            Self::S3(s) => s.check().await,
+        match &self.inner {
+            Inner::Disk(_) => Ok(()),
+            Inner::S3(s) => s.check().await,
         }
     }
 }
@@ -459,7 +502,7 @@ pub async fn open_blob_store(
         backend = store.blob_backend().await?;
     }
     match (backend.active.as_str(), s3) {
-        ("s3", Some(config)) => Ok(BlobStore::S3(S3Store::new(&config)?)),
+        ("s3", Some(config)) => Ok(BlobStore::s3(S3Store::new(&config)?).with_epoch(backend.epoch)),
         ("s3", None) => Err(CoreError::Config(
             "blobs are stored in S3, but no bucket is configured (PDS_BLOBSTORE_S3_BUCKET)".into(),
         )),
@@ -473,7 +516,7 @@ pub async fn open_blob_store(
             let root = backend
                 .disk_root
                 .map_or_else(|| data_dir.to_path_buf(), PathBuf::from);
-            Ok(BlobStore::Disk(DiskStore::new(root)))
+            Ok(BlobStore::disk(DiskStore::new(root)).with_epoch(backend.epoch))
         }
         (other, _) => Err(CoreError::Config(format!("unknown blob backend {other:?}"))),
     }
@@ -524,6 +567,13 @@ pub async fn finish_move(store: &Store, blobs: &BlobStore, m: &PendingMove) -> C
     if backend.paused {
         // A backend cutover is pausing key changes; try again later.
         tx.rollback().await?;
+        return Ok(false);
+    }
+    if backend.epoch != blobs.epoch() {
+        // The backend changed since this node opened its store: the copy
+        // is on the old one. The move restarts on the new backend.
+        tx.queue_blob_delete(&m.to, blobs.epoch()).await?;
+        tx.commit().await?;
         return Ok(false);
     }
     let done = tx
@@ -598,8 +648,15 @@ pub async fn run_deletes(
         Some(Some(mark)) => Some(mark),
     };
     let mut n = 0;
-    for (id, key, _epoch) in store.due_blob_deletes(grace_ms, limit, max_id).await? {
-        if !store.blob_key_in_use(&key).await? {
+    for (id, key, epoch) in store.due_blob_deletes(grace_ms, limit, max_id).await? {
+        if epoch > blobs.epoch() {
+            // Queued for a newer backend than this node's store: a node
+            // that has reloaded takes it.
+            continue;
+        }
+        // An older epoch's key is on the old backend, left to the
+        // operator; a migration's flip re-queued it for this one.
+        if epoch == blobs.epoch() && !store.blob_key_in_use(&key).await? {
             if let Err(e) = blobs.delete(&key).await {
                 tracing::warn!(key, "blob delete failed, will retry: {e}");
                 store.bump_blob_delete(id).await?;
@@ -661,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn writes_are_atomic_hashed_and_capped() {
         let dir = tempfile::tempdir().unwrap();
-        let disk = BlobStore::Disk(DiskStore::new(dir.path()));
+        let disk = BlobStore::disk(DiskStore::new(dir.path()));
         let w = disk
             .write_stream("tmp/a", chunks(&[b"hello ", b"world"]), 100)
             .await
@@ -737,7 +794,7 @@ mod tests {
             upload_timeout: Duration::from_secs(30),
             request_timeout: None,
         };
-        Some(BlobStore::S3(S3Store::new(&config).unwrap()))
+        Some(BlobStore::s3(S3Store::new(&config).unwrap()))
     }
 
     #[tokio::test]
@@ -835,7 +892,7 @@ mod tests {
             eprintln!("LOCUS_TEST_S3_VERSIONED_BUCKET isn't set; skipping");
             return;
         };
-        let s3 = BlobStore::S3(
+        let s3 = BlobStore::s3(
             S3Store::new(&S3Config {
                 bucket,
                 endpoint: Some(endpoint),
@@ -863,7 +920,7 @@ mod tests {
         assert!(!s3.restore_newest_version(&never).await.unwrap());
         // Disk keeps no versions.
         let dir = tempfile::tempdir().unwrap();
-        let disk = BlobStore::Disk(DiskStore::new(dir.path()));
+        let disk = BlobStore::disk(DiskStore::new(dir.path()));
         assert!(!disk.restore_newest_version("blobs/x").await.unwrap());
     }
 

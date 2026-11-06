@@ -5,6 +5,7 @@
 mod admin_cli;
 mod deploy;
 mod logging;
+mod migrate_storage;
 mod node;
 mod restore;
 mod rewrap;
@@ -203,6 +204,24 @@ async fn main() {
                 Ok(report) => {
                     for line in report.0 {
                         println!("{line}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Nothing was changed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Admin(admin_cli::AdminCmd::Migrate(admin_cli::MigrateCmd::Storage {
+            url,
+            ..
+        })) => {
+            let bootstrap = bootstrap_or_exit();
+            let _log = logging::init(LogFormat::Pretty);
+            match migrate_storage::run(&bootstrap, &url).await {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
                     }
                 }
                 Err(e) => {

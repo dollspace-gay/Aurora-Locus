@@ -880,6 +880,16 @@ pub static REGISTRY: &[Def] = &[
         description: "Milliseconds every other S3 request may take (0: no limit beyond the client's). Takes effect on restart.",
     },
     Def {
+        key: "blobs.cutover_max_pause_ms",
+        kind: Kind::Int {
+            min: 5_000,
+            max: 600_000,
+        },
+        default: "60000",
+        env: None,
+        description: "The longest a blob migration's cutover may pause uploads and move completions; a final pass that would take longer is retried later.",
+    },
+    Def {
         key: "backups.dir",
         kind: Kind::Text { max_len: 1024 },
         default: r#""""#,

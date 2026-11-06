@@ -1,7 +1,7 @@
 //! Branding storage: theme versions (one draft, published ones kept), the
 //! version in use, and uploads with the versions using them.
 
-use locus_core::CoreResult;
+use locus_core::{CoreError, CoreResult};
 
 use crate::blob::sql;
 use crate::{Store, Tx, db_err};
@@ -188,9 +188,21 @@ impl Store {
 
     /// Records an upload whose bytes are at `a.storage_key`, drawing its
     /// key sequence value after the backend read, as blob rows do.
-    pub async fn put_branding_asset(&self, a: &AssetRow) -> CoreResult<()> {
+    ///
+    /// `epoch` is the backend epoch the bytes were written under: while a
+    /// cutover pauses key changes, or after the backend changed, the row
+    /// isn't written and the bytes are queued for deletion (an error asks
+    /// the caller to try again).
+    pub async fn put_branding_asset(&self, a: &AssetRow, epoch: i64) -> CoreResult<()> {
         let mut tx = self.begin().await?;
-        tx.blob_backend().await?;
+        let backend = tx.blob_backend().await?;
+        if backend.paused || backend.epoch != epoch {
+            tx.queue_blob_delete(&a.storage_key, epoch).await?;
+            tx.commit().await?;
+            return Err(CoreError::Conflict(
+                "blob storage is being moved; try again shortly".into(),
+            ));
+        }
         let seq = tx.next_key_seq().await?;
         let q = sql(
             &format!(

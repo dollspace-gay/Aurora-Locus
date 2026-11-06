@@ -1078,7 +1078,7 @@ pub async fn upload(State(s): St, headers: HeaderMap, mut mp: Multipart) -> Resp
         created_at: 0,
         unused_since: None,
     };
-    if let Err(e) = s.store.put_branding_asset(&row).await {
+    if let Err(e) = s.store.put_branding_asset(&row, s.blobs.epoch()).await {
         return editor_render(
             &s,
             &op,

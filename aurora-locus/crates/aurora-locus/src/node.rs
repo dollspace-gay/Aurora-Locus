@@ -431,6 +431,7 @@ impl Node {
             self.spawn_identity_repair(Arc::clone(&state));
             self.spawn_plc_key_scan(Arc::clone(&state));
             self.spawn_backup_schedule(Arc::clone(&state));
+            self.spawn_blob_migration(Arc::clone(&state));
             self.spawn_account_jobs(Arc::clone(&state));
             self.spawn_blob_jobs(Arc::clone(&state));
             self.spawn_sync_jobs(Arc::clone(&state));
@@ -991,6 +992,54 @@ impl Node {
                 }
             }
         }));
+    }
+
+    /// `migrate blobs`: one node at a time runs the copy passes and the
+    /// cutover, fenced on the job's lease (a cancel drops the lease).
+    fn spawn_blob_migration(&mut self, state: Arc<AppState>) {
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                locus_store::migrate_blobs::MIGRATE_LEASE.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |lease, cancel| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        loop {
+                            let result = locus_http::blob_migration::step(&state, &lease).await;
+                            let busy = match &result {
+                                Ok(locus_http::blob_migration::Step::Copied(n)) => {
+                                    tracing::info!(copied = n, "blob migration pass");
+                                    true
+                                }
+                                Ok(locus_http::blob_migration::Step::Flipped(_)) => true,
+                                Ok(
+                                    locus_http::blob_migration::Step::Waiting(why)
+                                    | locus_http::blob_migration::Step::CutoverRetried(why),
+                                ) => {
+                                    tracing::warn!("blob migration: {why}");
+                                    false
+                                }
+                                Ok(_) => false,
+                                Err(locus_core::CoreError::LeaseLost(m)) => {
+                                    return Err(locus_core::CoreError::LeaseLost(m.clone()));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("blob migration step failed: {e}");
+                                    false
+                                }
+                            };
+                            let wait = if busy { 1 } else { 10 };
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// Scheduled backups (`backups.every_hours`), checked every ten

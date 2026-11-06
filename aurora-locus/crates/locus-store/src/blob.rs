@@ -114,6 +114,20 @@ impl Place {
         }
     }
 
+    /// The store a key is in.
+    #[must_use]
+    pub fn of_key(key: &str) -> Self {
+        if key.starts_with("gated/") {
+            Self::Gated
+        } else if key.starts_with("quarantine/") {
+            Self::Quarantine
+        } else if key.starts_with("tmp/") {
+            Self::Temp
+        } else {
+            Self::Normal
+        }
+    }
+
     /// Whether `key` is in this store.
     #[must_use]
     pub fn holds(self, key: &str) -> bool {

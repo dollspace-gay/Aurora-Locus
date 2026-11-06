@@ -1664,16 +1664,19 @@ async fn blob_placement_on_both_backends() {
 
         // Branding uploads draw a key sequence value, and their keys count
         // as in use.
-        s.put_branding_asset(&crate::branding::AssetRow {
-            id: "a1".into(),
-            kind: "logo".into(),
-            name: "logo.png".into(),
-            mime: "image/png".into(),
-            size: 3,
-            storage_key: "branding/a1.0".into(),
-            created_at: 0,
-            unused_since: None,
-        })
+        s.put_branding_asset(
+            &crate::branding::AssetRow {
+                id: "a1".into(),
+                kind: "logo".into(),
+                name: "logo.png".into(),
+                mime: "image/png".into(),
+                size: 3,
+                storage_key: "branding/a1.0".into(),
+                created_at: 0,
+                unused_since: None,
+            },
+            1,
+        )
         .await
         .unwrap();
         assert!(s.blob_key_in_use("branding/a1.0").await.unwrap(), "{n}");
@@ -2028,16 +2031,19 @@ async fn branding_on_both_backends() {
             b.name
         );
         for id in ["logo1", "bg1"] {
-            s.put_branding_asset(&AssetRow {
-                id: id.into(),
-                kind: if id == "logo1" { "logo" } else { "background" }.into(),
-                name: "x.png".into(),
-                mime: "image/png".into(),
-                size: 10,
-                storage_key: format!("branding/{id}"),
-                created_at: 0,
-                unused_since: None,
-            })
+            s.put_branding_asset(
+                &AssetRow {
+                    id: id.into(),
+                    kind: if id == "logo1" { "logo" } else { "background" }.into(),
+                    name: "x.png".into(),
+                    mime: "image/png".into(),
+                    size: 10,
+                    storage_key: format!("branding/{id}"),
+                    created_at: 0,
+                    unused_since: None,
+                },
+                1,
+            )
             .await
             .unwrap();
         }
@@ -2088,16 +2094,19 @@ async fn branding_on_both_backends() {
             "{}",
             b.name
         );
-        s.put_branding_asset(&AssetRow {
-            id: "orphan".into(),
-            kind: "font".into(),
-            name: "f.woff2".into(),
-            mime: "font/woff2".into(),
-            size: 1,
-            storage_key: "branding/orphan".into(),
-            created_at: 0,
-            unused_since: None,
-        })
+        s.put_branding_asset(
+            &AssetRow {
+                id: "orphan".into(),
+                kind: "font".into(),
+                name: "f.woff2".into(),
+                mime: "font/woff2".into(),
+                size: 1,
+                storage_key: "branding/orphan".into(),
+                created_at: 0,
+                unused_since: None,
+            },
+            1,
+        )
         .await
         .unwrap();
         assert_eq!(
@@ -2366,4 +2375,96 @@ async fn backups_hold_the_delete_job_and_restores_settle_blobs_on_both_backends(
             }
         }
     }
+}
+
+#[tokio::test]
+async fn sqlite_installs_copy_into_postgres() {
+    use locus_core::keys::{MasterKey, SourceKind};
+    let all = backends().await;
+    let Some(pg) = all.iter().find(|b| b.name == "postgres") else {
+        eprintln!("no Postgres to copy into; skipping");
+        return;
+    };
+    let src = &all.iter().find(|b| b.name == "sqlite").unwrap().store;
+    let key = MasterKey::generate(SourceKind::Env);
+    let mut tx = src.begin().await.unwrap();
+    tx.put_secret("jwt_secret", b"the secret", &key)
+        .await
+        .unwrap();
+    tx.put_signing_key("did:plc:a", "k256", b"sk", &key)
+        .await
+        .unwrap();
+    tx.insert_temp_blob("did:plc:a", "bafy1", "image/png", 3, "tmp/x1")
+        .await
+        .unwrap();
+    for k in ["tmp/d1", "tmp/d2", "tmp/d3"] {
+        tx.queue_blob_delete(k, 1).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    // The highest queued delete goes before the copy: its id must not come back.
+    let due = src.due_blob_deletes(-1_000_000, 10, None).await.unwrap();
+    let top = due.iter().map(|d| d.0).max().unwrap();
+    let mut tx = src.begin().await.unwrap();
+    tx.remove_blob_delete(top).await.unwrap();
+    tx.commit().await.unwrap();
+    // Booleans, bytes and nulls survive.
+    assert!(
+        src.set_blob_takedown("did:plc:a", "bafy1", Some("t1"))
+            .await
+            .unwrap()
+    );
+
+    let report = crate::copy::sqlite_to_postgres(src, &pg.store)
+        .await
+        .unwrap();
+    let count = |t: &str| report.tables.iter().find(|(n, _)| n == t).map(|(_, c)| *c);
+    assert_eq!(count("blob"), Some(1));
+    assert_eq!(count("blob_delete"), Some(2));
+    assert_eq!(count("secret"), Some(1));
+    let d = &pg.store;
+    assert_eq!(
+        d.get_secret("jwt_secret", &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"the secret"
+    );
+    assert_eq!(
+        d.check_master_key(&key).await.unwrap(),
+        crate::secrets::KeyCheck::Matches
+    );
+    let row = d.blob("did:plc:a", "bafy1").await.unwrap().unwrap();
+    assert_eq!(
+        (
+            row.storage_key.as_str(),
+            row.takedown_ref.as_deref(),
+            row.review_hold
+        ),
+        ("tmp/x1", Some("t1"), false)
+    );
+    // Sequences continue above what was copied, and above the deleted id.
+    let mut tx = d.begin().await.unwrap();
+    tx.queue_blob_delete("tmp/after", 1).await.unwrap();
+    let next = tx.next_key_seq().await.unwrap();
+    tx.commit().await.unwrap();
+    let after = d
+        .due_blob_deletes(-1_000_000, 10, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.1 == "tmp/after")
+        .unwrap()
+        .0;
+    assert!(
+        after > top,
+        "a new id ({after}) above every SQLite id ({top})"
+    );
+    assert!(
+        next > report.key_seq - 1 && next >= 2,
+        "{next} vs {}",
+        report.key_seq
+    );
+    // A second copy into the now-full database is refused.
+    assert!(crate::copy::sqlite_to_postgres(src, d).await.is_err());
 }

@@ -9,6 +9,7 @@ pub mod audience;
 pub mod audience_sync;
 pub mod auth;
 pub mod backups;
+pub mod blob_migration;
 pub mod branding;
 pub mod bsky;
 pub mod cloudflare;
