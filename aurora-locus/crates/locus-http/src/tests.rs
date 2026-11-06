@@ -1,6 +1,7 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
 mod bulk;
+mod blobs;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12541,16 +12542,24 @@ async fn blob_migrations_wait_on_missing_sources_and_cancel() {
         )
         .await;
     assert_eq!(st, StatusCode::OK);
+    // The cancelled job can't go on: its fenced transactions fail, and a
+    // step finds no migration.
     assert!(
-        step(&h.state, &lease).await.is_err()
-            || h.state
-                .store
-                .active_blob_migration()
-                .await
-                .unwrap()
-                .is_none(),
-        "the cancelled job can't go on"
+        h.state
+            .store
+            .record_copy(&lease, &row.storage_key, "copied")
+            .await
+            .is_err()
     );
+    assert!(
+        h.state
+            .store
+            .active_blob_migration()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(step(&h.state, &lease).await.unwrap(), Step::Idle);
     assert!(!h.state.store.blob_backend().await.unwrap().paused);
     // Again, then acknowledge the missing object: the cutover goes ahead.
     let (st, _) = h

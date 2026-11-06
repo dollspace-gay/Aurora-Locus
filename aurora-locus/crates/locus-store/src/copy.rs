@@ -55,6 +55,14 @@ pub async fn sqlite_to_postgres(src: &Store, dst: &Store) -> CoreResult<CopyRepo
             "the Postgres database already holds an install; give an empty one".into(),
         ));
     }
+    // No job's marks may sit above the new key sequence.
+    if let Some(m) = src.active_blob_migration().await? {
+        return Err(CoreError::Conflict(format!(
+            "the blob migration {} (to {}) is still running: let it finish, or \
+             `aurora-locus migrate blobs --cancel`",
+            m.id, m.target
+        )));
+    }
     let mut tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
          AND name NOT LIKE '_sqlx%' ORDER BY name",
@@ -183,12 +191,20 @@ pub async fn sqlite_to_postgres(src: &Store, dst: &Store) -> CoreResult<CopyRepo
         }
         report.tables.push((table.clone(), copied));
     }
-    // The key sequence: above the SQLite counter and every copied key_seq.
+    // The key sequence: above the SQLite counter, every copied key_seq and
+    // every mark a blob migration recorded (the rows that drew the highest
+    // values may since have been deleted).
     let counter: i64 = sqlx::query_scalar("SELECT value FROM key_seq_counter WHERE id = 1")
         .fetch_optional(sp)
         .await
         .map_err(db_err)?
         .unwrap_or(0);
+    let marks: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(MAX(copied_through, verified_through)) FROM blob_migration")
+            .fetch_one(sp)
+            .await
+            .map_err(db_err)?;
+    let counter = counter.max(marks.unwrap_or(0));
     let copied_max: Option<i64> = sqlx::query_scalar(
         "SELECT MAX(k) FROM (SELECT MAX(key_seq) AS k FROM blob UNION ALL SELECT MAX(key_seq) FROM branding_asset) t",
     )

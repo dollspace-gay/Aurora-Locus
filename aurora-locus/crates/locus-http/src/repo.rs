@@ -1072,27 +1072,11 @@ async fn serve_blob(
         None => (0, size.saturating_sub(1)),
     };
     let partial = start != 0 || end + 1 != size;
-    let reader = match s
-        .blobs
-        .read(&row.storage_key, partial.then_some((start, end)))
+    let range = partial.then_some((start, end));
+    let reader = crate::blob_migration::read_tracked(s, &row.storage_key, range)
         .await
         .map_err(|e| XrpcError::internal(e.to_string()))?
-    {
-        Some(r) => r,
-        None => {
-            // A node whose store predates a backend flip: it reloads, and
-            // the client retries against the new backend.
-            if s.store.blob_backend().await?.epoch != s.blobs.epoch() {
-                crate::keys::reload_soon(s);
-                return Err(XrpcError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "TemporarilyUnavailable",
-                    "Blob storage moved; try again shortly",
-                ));
-            }
-            return Err(not_found());
-        }
-    };
+        .ok_or_else(not_found)?;
     let len = if size == 0 { 0 } else { end - start + 1 };
     if reader.len != len {
         return Err(XrpcError::internal(format!(

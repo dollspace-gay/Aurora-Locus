@@ -727,6 +727,21 @@ kryphocron built in.
   (both waited for the import's last phase, so such blobs were public
   meanwhile). A rollback gates them again from the old tree.
 - `RepoWriteBlocked` answers carry `Retry-After: 5`.
+- `migrate blobs` runs its full verify (every row up to the copy mark)
+  once before the first cutover, so a gap below the copied mark is caught
+  (each pass verified only its own range); a verify that finds a gap runs
+  another copy pass before the cutover is tried.
+- A node whose blob store predates a backend flip serves a blob or
+  branding upload missing from the old backend by reading the new one
+  once (it answered 503).
+- `backup create` checks it still holds its lease before writing the
+  manifest, so a backup whose lease lapsed mid-copy is marked failed even
+  before the renewer notices.
+- A second `backup create` on the node running one is refused; it used to
+  take the running backup's lease over (same holder) and run alongside it.
+- `migrate storage --to postgres` sets the key sequence above every mark
+  a blob migration recorded too, and names the blob migration it refuses
+  to run alongside.
 
-- proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
-  which adds the lazily loaded MST.
+- proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
+  (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

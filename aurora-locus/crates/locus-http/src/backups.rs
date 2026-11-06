@@ -85,9 +85,12 @@ pub async fn start(
             "A key backup passphrase is at least 12 characters",
         ));
     }
+    // A holder of its own: a second create on this node mustn't reclaim
+    // the running backup's lease.
+    let holder = format!("{}/{}", s.node_id, hex::encode(rand::random::<[u8; 4]>()));
     let lease = s
         .store
-        .try_acquire_lease(BACKUP_LEASE, &s.node_id, LEASE_TTL)
+        .try_acquire_lease(BACKUP_LEASE, &holder, LEASE_TTL)
         .await?
         .ok_or_else(|| XrpcError::invalid_request("A backup is already running"))?;
     let started = s.store.db_now_ms().await?;
@@ -114,7 +117,7 @@ pub async fn start(
                 }
             })
         };
-        let result = run(&s, &run_id, &dir, started, passphrase, &lost).await;
+        let result = run(&s, &run_id, &dir, started, passphrase, &lost, &lease).await;
         renewer.abort();
         let (status, error, objects, missing, keys) = match &result {
             Ok(m) => ("done", None, m.objects, m.missing.len(), m.keys_backup),
@@ -176,11 +179,13 @@ async fn run(
     started: i64,
     passphrase: Option<Zeroizing<String>>,
     lost: &AtomicBool,
+    lease: &locus_core::lease::LeaseToken,
 ) -> Result<Manifest, String> {
     let err = |e: &dyn std::fmt::Display| e.to_string();
+    const LOST: &str = "the backup lost its lease, so objects it names may have been deleted";
     let check_lease = || {
         if lost.load(Ordering::SeqCst) {
-            Err("the backup lost its lease, so objects it names may have been deleted".to_owned())
+            Err(LOST.to_owned())
         } else {
             Ok(())
         }
@@ -215,6 +220,9 @@ async fn run(
             };
             for key in &keys {
                 check_lease()?;
+                crate::faults::at(s, "backup.copy")
+                    .await
+                    .map_err(|e| err(&e))?;
                 match s.blobs.read(key, None).await.map_err(|e| err(&e))? {
                     Some(r) => {
                         out.write_stream(key, r.body, u64::MAX)
@@ -251,7 +259,12 @@ async fn run(
         }
         None => false,
     };
+    // Still held now (the renewer only looks every so often): otherwise the
+    // delete job may have run while the objects were copied.
     check_lease()?;
+    if !s.store.renew_lease(lease).await.map_err(|e| err(&e))? {
+        return Err(LOST.to_owned());
+    }
     // 4. The manifest, last: a backup without one isn't whole.
     let m = Manifest {
         format: FORMAT.into(),

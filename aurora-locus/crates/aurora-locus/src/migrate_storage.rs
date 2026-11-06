@@ -39,13 +39,17 @@ pub async fn run(bootstrap: &Bootstrap, url: &str) -> Result<Vec<String>, String
             live.len()
         ));
     }
-    if src.active_blob_migration().await.map_err(e)?.is_some()
-        || src.blob_backend().await.map_err(e)?.paused
-    {
-        return Err(
-            "a blob migration is running: let it finish, or `aurora-locus migrate blobs --cancel`"
-                .into(),
-        );
+    if let Some(m) = src.active_blob_migration().await.map_err(e)? {
+        return Err(format!(
+            "the blob migration {} (to {}) is still running: let it finish, or \
+             `aurora-locus migrate blobs --cancel`",
+            m.id, m.target
+        ));
+    }
+    if src.blob_backend().await.map_err(e)?.paused {
+        return Err("blob storage is paused for a cutover: let it finish, or \
+             `aurora-locus migrate blobs --cancel`"
+            .into());
     }
     let dst = Store::connect(&DatabaseUrl::Postgres(url.to_owned()))
         .await

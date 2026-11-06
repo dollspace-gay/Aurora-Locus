@@ -16,6 +16,8 @@ use crate::env::{CLOCK_SLOT_FAMILY, collect_env};
 use crate::runtime::{Settings, run_leased};
 use crate::{Store, Tx};
 
+mod blobs;
+
 struct Backend {
     name: &'static str,
     store: Store,
@@ -2461,10 +2463,10 @@ async fn sqlite_installs_copy_into_postgres() {
         after > top,
         "a new id ({after}) above every SQLite id ({top})"
     );
-    assert!(
-        next > report.key_seq - 1 && next >= 2,
-        "{next} vs {}",
-        report.key_seq
+    assert_eq!(
+        (report.key_seq, next),
+        (1, 2),
+        "the sequence continues after the one value drawn"
     );
     // A second copy into the now-full database is refused.
     assert!(crate::copy::sqlite_to_postgres(src, d).await.is_err());

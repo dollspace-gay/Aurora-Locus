@@ -116,6 +116,25 @@ enum Blobs {
     },
 }
 
+/// The blobs of a reference blob dir at `location`: in place under its
+/// parent, or copied when its name is one of locus's prefixes (its keys
+/// would collide with locus's own, and the sweep would take them).
+fn disk_blobs(location: PathBuf, dir: &Path) -> Blobs {
+    let root = location
+        .parent()
+        .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
+    let name = location
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = (!name.is_empty() && !LOCUS_PREFIXES.contains(&name.as_str())).then_some(name);
+    Blobs::Disk {
+        location,
+        root,
+        prefix,
+    }
+}
+
 /// Runs the import; the report's lines.
 pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, String> {
     let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
@@ -151,20 +170,10 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
     {
         Blobs::S3
     } else {
-        let location = layout.path(&env, "PDS_BLOBSTORE_DISK_LOCATION", "blocks");
-        let root = location
-            .parent()
-            .map_or_else(|| opts.dir.clone(), Path::to_path_buf);
-        let name = location
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let prefix = (!name.is_empty() && !LOCUS_PREFIXES.contains(&name.as_str())).then_some(name);
-        Blobs::Disk {
-            location,
-            root,
-            prefix,
-        }
+        disk_blobs(
+            layout.path(&env, "PDS_BLOBSTORE_DISK_LOCATION", "blocks"),
+            &opts.dir,
+        )
     };
 
     // The reference must be stopped: its databases are checked first.
@@ -552,6 +561,26 @@ mod tests {
         assert_eq!(env["PDS_JWT_SECRET"], "abc");
         assert_eq!(env["PDS_X"], "y z");
         assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn a_blob_dir_named_like_a_locus_prefix_is_copied_not_used_in_place() {
+        let prefix_of = |p: &str| match disk_blobs(PathBuf::from(p), Path::new("/srv/pds")) {
+            Blobs::Disk { root, prefix, .. } => (root, prefix),
+            Blobs::S3 => unreachable!(),
+        };
+        assert_eq!(
+            prefix_of("/srv/pds/blocks"),
+            (PathBuf::from("/srv/pds"), Some("blocks".to_owned())),
+            "in place"
+        );
+        for name in ["blobs", "gated", "quarantine", "branding", "tmp"] {
+            assert_eq!(prefix_of(&format!("/srv/pds/{name}")).1, None, "{name}");
+        }
+        // Every prefix the sweep lists is one an import won't reuse.
+        for p in locus_blob::SWEPT_PREFIXES {
+            assert!(LOCUS_PREFIXES.contains(&p.trim_end_matches('/')), "{p}");
+        }
     }
 
     #[test]
