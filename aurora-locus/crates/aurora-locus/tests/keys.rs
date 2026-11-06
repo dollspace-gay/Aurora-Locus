@@ -202,10 +202,15 @@ async fn refused(plc: &str, dir: &Path, extra: &[(&str, &str)]) -> String {
             assert!(!st.success());
             return std::fs::read_to_string(&log).unwrap();
         }
-        assert!(!up(&url).await, "the node started");
+        if up(&url).await {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the node started");
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let _ = child.kill();
+    let _ = child.wait();
     panic!("the node neither started nor exited");
 }
 
@@ -282,12 +287,9 @@ impl Sealed {
 }
 
 async fn sqlite(dir: &Path) -> sqlx::SqlitePool {
-    sqlx::SqlitePool::connect(&format!(
-        "sqlite://{}",
-        dir.join("locus.sqlite").display()
-    ))
-    .await
-    .unwrap()
+    sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("locus.sqlite").display()))
+        .await
+        .unwrap()
 }
 
 async fn sealed_sqlite(dir: &Path) -> Sealed {
@@ -410,10 +412,16 @@ async fn a_rewrap_changes_nothing_until_it_commits_and_then_retires_the_old_key(
     // rewrap fails and nothing changed.
     let limit = "ulimit -f 128";
     let full = root.path().join("full.key");
-    let out = command(&plc, &a, free_port(), &[], &format!("trap '' XFSZ; {limit}"))
-        .args(args(&rewrap(&full)))
-        .output()
-        .unwrap();
+    let out = command(
+        &plc,
+        &a,
+        free_port(),
+        &[],
+        &format!("trap '' XFSZ; {limit}"),
+    )
+    .args(args(&rewrap(&full)))
+    .output()
+    .unwrap();
     assert!(!out.status.success());
     assert!(out.status.code().is_some(), "it failed, not killed");
     assert!(text(&out).contains("disk"), "{}", text(&out));
@@ -427,7 +435,12 @@ async fn a_rewrap_changes_nothing_until_it_commits_and_then_retires_the_old_key(
         .unwrap();
     {
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(out.status.signal(), Some(25), "killed by SIGXFSZ: {}", text(&out));
+        assert_eq!(
+            out.status.signal(),
+            Some(25),
+            "killed by SIGXFSZ: {}",
+            text(&out)
+        );
     }
     unchanged("killed", &sealed_sqlite(&a).await);
 
@@ -465,9 +478,18 @@ async fn a_rewrap_changes_nothing_until_it_commits_and_then_retires_the_old_key(
     // pending migration is still pending afterwards (on a copy).
     let c = root.path().join("copy");
     std::fs::create_dir_all(&c).unwrap();
-    for f in ["locus.sqlite", "master.key"] {
-        std::fs::copy(a.join(f), c.join(f)).unwrap();
+    for f in ["locus.sqlite", "locus.sqlite-wal", "master.key"] {
+        if a.join(f).exists() {
+            std::fs::copy(a.join(f), c.join(f)).unwrap();
+        }
     }
+    let p = sqlite(&c).await;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM master_key_check")
+        .fetch_one(&p)
+        .await
+        .unwrap();
+    p.close().await;
+    assert_eq!(rows, 1, "the copy has the key check");
     let p = sqlite(&c).await;
     let last: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
         .fetch_one(&p)
@@ -614,18 +636,19 @@ async fn postgres_nodes_share_one_master_key() {
                 ("LOCUS_MASTER_KEY_SOURCE", "env"),
                 ("LOCUS_MASTER_KEY", k.as_str()),
             ];
-            let (child, u) = spawn(&plc, &d, &env, &d.with_extension("log"));
-            nodes.push((child, u, d));
+            let (child, url) = spawn(&plc, &d, &env, &d.with_extension("log"));
+            // Stopped when dropped, also when an assertion fails.
+            nodes.push((Node { child, url }, d));
         }
         let (mut serving, mut exited) = (Vec::new(), Vec::new());
         for _ in 0..240 {
             serving.clear();
             exited.clear();
-            for (i, (child, u, _)) in nodes.iter_mut().enumerate() {
-                if let Ok(Some(st)) = child.try_wait() {
+            for (i, (n, _)) in nodes.iter_mut().enumerate() {
+                if let Ok(Some(st)) = n.child.try_wait() {
                     assert!(!st.success());
                     exited.push(i);
-                } else if up(u).await {
+                } else if up(&n.url).await {
                     serving.push(i);
                 }
             }
@@ -638,7 +661,7 @@ async fn postgres_nodes_share_one_master_key() {
         let (w, l) = (serving[0], exited[0]);
         let winner = MasterKey::from_hex(&keys[w], SourceKind::Env).unwrap();
         let loser = MasterKey::from_hex(&keys[l], SourceKind::Env).unwrap();
-        let log = std::fs::read_to_string(nodes[l].2.with_extension("log")).unwrap();
+        let log = std::fs::read_to_string(nodes[l].1.with_extension("log")).unwrap();
         assert!(log.contains("master key"), "{log}");
         let p = sqlx::PgPool::connect(&url).await.unwrap();
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM master_key_check")
@@ -659,7 +682,7 @@ async fn postgres_nodes_share_one_master_key() {
 
         if round == 0 {
             // A third node with the losing key: refused, writing nothing.
-            let (u, wd) = (nodes[w].1.clone(), nodes[w].2.clone());
+            let (u, wd) = (nodes[w].0.url.clone(), nodes[w].1.clone());
             let (did, token) = account(&u, "pat.test").await;
             let before = sealed_pg(&url).await;
             let d = dir("late");
@@ -683,18 +706,19 @@ async fn postgres_nodes_share_one_master_key() {
                 &plc,
                 &wd,
                 &env,
-                &["keys", "rewrap", "--to", "env", "--out", "/nonexistent-dir/k"],
+                &[
+                    "keys",
+                    "rewrap",
+                    "--to",
+                    "env",
+                    "--out",
+                    "/nonexistent-dir/k",
+                ],
             );
             assert!(!out.status.success());
             assert!(text(&out).contains("a node is running"), "{}", text(&out));
             assert_eq!(before, sealed_pg(&url).await);
         }
-        for (child, _, _) in &mut nodes {
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(child.id().to_string())
-                .status();
-            let _ = child.wait();
-        }
+        drop(nodes);
     }
 }
