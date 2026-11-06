@@ -1,6 +1,7 @@
 //! Test-only pauses in a sequencer pass, at a named point, for one lease
-//! holder: `begin` (before the transaction opens) and `fenced` (after the
-//! fence check, holding the transaction). One pause at a time per thread
+//! holder: `begin` (before the transaction opens), `fenced` (after the
+//! fence check, holding the transaction) and `locked` (after reading the
+//! sequencer state, before the outbox). One pause at a time per thread
 //! (tokio tests run on one thread, spawned tasks included).
 
 use std::cell::RefCell;

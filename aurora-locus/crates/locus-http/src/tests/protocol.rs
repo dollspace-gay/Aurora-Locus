@@ -1,7 +1,10 @@
 //! Robustness of the XRPC and OAuth endpoints: every route, signed in as a
 //! user (and as the admin for admin routes), given garbage query strings
 //! and bodies, answers with a 4xx (or a 2xx when the garbage happens to be
-//! acceptable), never a 5xx or a panic.
+//! acceptable), never a 5xx or a panic. And the MST oracle on writes made
+//! over HTTP.
+
+use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
@@ -331,4 +334,156 @@ async fn hostile_datetimes_in_requests_are_refused_not_panicked_on() {
         .cloned()
         .unwrap();
     assert_eq!(age["isOverAge13"], json!(false), "unparseable: false");
+}
+
+/// The repo's data root after `did`'s writes equals proto-blue's eager MST
+/// built from scratch over the record index, and the index holds exactly
+/// the paths the writes left.
+async fn check_oracle(h: &Harness, did: &str, model: &BTreeMap<String, String>, step: usize) {
+    let mut index = BTreeMap::new();
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page = h
+            .state
+            .store
+            .record_index_page(did, after.as_ref().map(|(c, r)| (c.as_str(), r.as_str())), 100)
+            .await
+            .unwrap();
+        let Some((c, r, _)) = page.last().cloned() else {
+            break;
+        };
+        for (c, r, cid) in page {
+            index.insert(format!("{c}/{r}"), cid);
+        }
+        after = Some((c, r));
+    }
+    assert_eq!(&index, model, "step {step}: the record index");
+    let mut eager = proto_blue_repo::mst::MstNode::empty();
+    for (path, cid) in &index {
+        eager = eager
+            .add(path, proto_blue_lex_data::Cid::from_str_multibase(cid).unwrap())
+            .unwrap();
+    }
+    let root = h.state.store.repo_root_of(did).await.unwrap().unwrap();
+    assert_eq!(
+        root.data_cid,
+        eager.get_all_blocks().unwrap().0.to_string_base32(),
+        "step {step}: data root"
+    );
+}
+
+/// Random HTTP writes (create, put, delete, applyWrites batches naming a
+/// path twice) over a small key space, with the oracle after each.
+#[tokio::test]
+async fn http_writes_match_the_eager_mst_built_from_the_index() {
+    let h = harness(false).await;
+    let (did, access) = h.user("oracle.pds.example.com").await;
+    let mut model: BTreeMap<String, String> = BTreeMap::new();
+    // The profile record the account starts with, if any.
+    for (c, r, cid) in h.state.store.record_index_page(&did, None, 100).await.unwrap() {
+        model.insert(format!("{c}/{r}"), cid);
+    }
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let colls = ["app.bsky.feed.post", "com.example.thing"];
+    let key = |n: u64| locus_repo::tid::encode((1_700_000_000_000_000 + n * 1_000_003) << 10);
+    let value = |c: &str, n: u64| match c {
+        "app.bsky.feed.post" => post_record(&format!("post {n}")),
+        _ => json!({"$type": c, "n": n}),
+    };
+    for step in 0..80 {
+        let c = colls[rnd(2) as usize];
+        let rkey = key(rnd(24));
+        let path = format!("{c}/{rkey}");
+        match rnd(4) {
+            0 => {
+                let (st, v) = h
+                    .post(
+                        "com.atproto.repo.createRecord",
+                        Some(&access),
+                        json!({"repo": did, "collection": c, "rkey": rkey, "record": value(c, rnd(5))}),
+                    )
+                    .await;
+                if model.contains_key(&path) {
+                    assert_eq!(st, StatusCode::BAD_REQUEST, "step {step}: {v}");
+                } else {
+                    assert_eq!(st, StatusCode::OK, "step {step}: {v}");
+                    model.insert(path.clone(), v["cid"].as_str().unwrap().to_owned());
+                }
+            }
+            1 => {
+                let (st, v) = h
+                    .post(
+                        "com.atproto.repo.putRecord",
+                        Some(&access),
+                        json!({"repo": did, "collection": c, "rkey": rkey, "record": value(c, rnd(5))}),
+                    )
+                    .await;
+                assert_eq!(st, StatusCode::OK, "step {step}: {v}");
+                model.insert(path.clone(), v["cid"].as_str().unwrap().to_owned());
+            }
+            2 => {
+                let (st, v) = h
+                    .post(
+                        "com.atproto.repo.deleteRecord",
+                        Some(&access),
+                        json!({"repo": did, "collection": c, "rkey": rkey}),
+                    )
+                    .await;
+                assert_eq!(st, StatusCode::OK, "step {step}: {v}");
+                model.remove(&path);
+            }
+            _ => {
+                // A batch: create-or-update of one path, then maybe its delete.
+                let op = if model.contains_key(&path) { "update" } else { "create" };
+                let mut writes = vec![json!({
+                    "$type": format!("com.atproto.repo.applyWrites#{op}"),
+                    "collection": c, "rkey": rkey, "value": value(c, rnd(5)),
+                })];
+                if rnd(2) == 0 {
+                    writes.push(json!({
+                        "$type": "com.atproto.repo.applyWrites#delete",
+                        "collection": c, "rkey": rkey,
+                    }));
+                }
+                let oc = colls[1 - colls.iter().position(|x| *x == c).unwrap()];
+                let or = key(rnd(24));
+                let other = format!("{oc}/{or}");
+                if !model.contains_key(&other) {
+                    writes.push(json!({
+                        "$type": "com.atproto.repo.applyWrites#create",
+                        "collection": oc, "rkey": or, "value": value(oc, rnd(5)),
+                    }));
+                }
+                let (st, v) = h
+                    .post(
+                        "com.atproto.repo.applyWrites",
+                        Some(&access),
+                        json!({"repo": did, "writes": writes}),
+                    )
+                    .await;
+                assert_eq!(st, StatusCode::OK, "step {step}: {v}");
+                // Apply the batch in order, with the CIDs it answered.
+                for (w, r) in writes.iter().zip(v["results"].as_array().unwrap()) {
+                    let p = format!(
+                        "{}/{}",
+                        w["collection"].as_str().unwrap(),
+                        w["rkey"].as_str().unwrap()
+                    );
+                    if w["$type"] == "com.atproto.repo.applyWrites#delete" {
+                        model.remove(&p);
+                    } else {
+                        model.insert(p, r["cid"].as_str().unwrap().to_owned());
+                    }
+                }
+            }
+        }
+        check_oracle(&h, &did, &model, step).await;
+    }
+    assert!(model.len() > 5, "the writes left records");
 }

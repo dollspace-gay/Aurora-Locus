@@ -44,6 +44,8 @@ pub async fn sequence_once(
     #[cfg(test)]
     fault::hit("fenced", &lease.holder).await;
     let state = tx.lock_seq_state().await?;
+    #[cfg(test)]
+    fault::hit("locked", &lease.holder).await;
     let rows = tx.outbox_batch(batch).await?;
     #[allow(clippy::cast_precision_loss)]
     let lag = rows.first().map_or(0.0, |r| {

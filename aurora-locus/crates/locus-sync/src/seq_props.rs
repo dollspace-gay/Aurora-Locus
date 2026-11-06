@@ -42,6 +42,10 @@ enum Op {
     /// `node` starts a pass and pauses after its fence check; the other
     /// node tries to take over meanwhile; the paused pass resumes.
     PausedAfterFence { node: usize, batch: i64 },
+    /// Two passes by the holder overlap (say, a restart while one is in
+    /// flight): the first pauses after reading the sequencer state; the
+    /// second starts; the first resumes.
+    Overlapping { batch: i64 },
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -51,6 +55,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0..2usize).prop_map(|node| Op::Takeover { node }),
         1 => (0..2usize, 1..5i64).prop_map(|(node, batch)| Op::PausedBeforeBegin { node, batch }),
         1 => (0..2usize, 1..5i64).prop_map(|(node, batch)| Op::PausedAfterFence { node, batch }),
+        1 => (1..5i64).prop_map(|batch| Op::Overlapping { batch }),
     ]
 }
 
@@ -274,6 +279,27 @@ async fn run(ops: Vec<Op>, pg: Option<String>) {
                 let t = takeover.await.unwrap().unwrap().expect("the lease was expired");
                 model.tokens[other] = Some(t);
                 model.holder = other;
+            }
+            Op::Overlapping { batch } => {
+                let node = model.holder;
+                let token = model.tokens[node].clone().unwrap();
+                let p = fault::pause("locked", NODES[node]);
+                let s = store.clone();
+                let t = token.clone();
+                let first = tokio::spawn(async move { sequence_once(&s, &t, batch, KEEP).await });
+                p.reached.notified().await;
+                let s = store.clone();
+                let second = tokio::spawn(async move { sequence_once(&s, &token, batch, KEEP).await });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                p.resume.notify_one();
+                // Both succeed, one after the other, between them moving
+                // what two passes would.
+                let a = first.await.unwrap().unwrap_or_else(|e| panic!("step {step}: first: {e}"));
+                let b = second.await.unwrap().unwrap_or_else(|e| panic!("step {step}: second: {e}"));
+                let after = check(&store, &model, step).await;
+                assert_eq!(a, queued.min(batch as usize), "step {step}");
+                assert_eq!(b, (queued - a).min(batch as usize), "step {step}");
+                assert_eq!(after, before + a + b, "step {step}");
             }
         }
         check(&store, &model, step).await;
