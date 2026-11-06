@@ -2468,3 +2468,162 @@ async fn sqlite_installs_copy_into_postgres() {
     // A second copy into the now-full database is refused.
     assert!(crate::copy::sqlite_to_postgres(src, d).await.is_err());
 }
+
+/// A reference `account.sqlite` with the tables the account import reads.
+async fn reference_account_db(path: &std::path::Path) -> sqlx::SqlitePool {
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    for q in [
+        "CREATE TABLE actor (did varchar PRIMARY KEY, handle varchar, createdAt varchar NOT NULL, \
+         takedownRef varchar, deactivatedAt varchar, deleteAfter varchar)",
+        "CREATE TABLE account (did varchar PRIMARY KEY, email varchar NOT NULL, passwordScrypt varchar NOT NULL, \
+         emailConfirmedAt varchar, invitesDisabled int2 NOT NULL DEFAULT 0)",
+        "CREATE TABLE app_password (did varchar NOT NULL, name varchar NOT NULL, passwordScrypt varchar NOT NULL, \
+         createdAt varchar NOT NULL, privileged integer NOT NULL DEFAULT 0, PRIMARY KEY (did, name))",
+        "CREATE TABLE refresh_token (id varchar PRIMARY KEY, did varchar NOT NULL, expiresAt varchar NOT NULL, \
+         nextId varchar, appPasswordName varchar)",
+        "CREATE TABLE email_token (purpose varchar NOT NULL, did varchar NOT NULL, token varchar NOT NULL, \
+         requestedAt varchar NOT NULL, PRIMARY KEY (purpose, did))",
+        "CREATE TABLE invite_code (code varchar PRIMARY KEY, availableUses integer NOT NULL, disabled int2 DEFAULT 0, \
+         forAccount varchar NOT NULL, createdBy varchar NOT NULL, createdAt varchar NOT NULL)",
+        "CREATE TABLE invite_code_use (code varchar NOT NULL, usedBy varchar NOT NULL, usedAt varchar NOT NULL, \
+         PRIMARY KEY (code, usedBy))",
+        "INSERT INTO actor VALUES ('did:plc:aaa', 'Ada.Example.com', '2025-01-01T00:00:00.000Z', NULL, NULL, NULL)",
+        "INSERT INTO actor VALUES ('did:plc:bbb', 'bob.example.com', '2025-01-02T00:00:00.000Z', 'td-1', NULL, NULL)",
+        "INSERT INTO actor VALUES ('did:plc:ccc', NULL, '2025-01-03T00:00:00.000Z', NULL, NULL, NULL)",
+        "INSERT INTO account VALUES ('did:plc:aaa', 'Ada@Example.com', 'salt:key', '2025-01-01T00:00:00.000Z', 0)",
+        "INSERT INTO account VALUES ('did:plc:bbb', 'bob@example.com', 'salt2:key2', NULL, 1)",
+        "INSERT INTO app_password VALUES ('did:plc:aaa', 'phone', 'apsalt:apkey', '2025-01-01T00:00:00.000Z', 1)",
+        "INSERT INTO refresh_token VALUES ('r1', 'did:plc:aaa', '2999-01-01T00:00:00.000Z', 'r2', 'phone')",
+        "INSERT INTO refresh_token VALUES ('r2', 'did:plc:aaa', '2999-01-01T00:00:00.000Z', NULL, 'phone')",
+        "INSERT INTO refresh_token VALUES ('r3', 'did:plc:aaa', '2000-01-01T00:00:00.000Z', NULL, NULL)",
+        "INSERT INTO email_token VALUES ('reset_password', 'did:plc:aaa', 'ABCDE-FGHIJ', '2025-01-01T00:00:00.000Z')",
+        "INSERT INTO invite_code VALUES ('inv-1', 2, 0, 'did:plc:aaa', 'admin', '2025-01-01T00:00:00.000Z')",
+        "INSERT INTO invite_code_use VALUES ('inv-1', 'did:plc:bbb', '2025-01-02T00:00:00.000Z')",
+    ] {
+        sqlx::query(q).execute(&pool).await.unwrap();
+    }
+    pool
+}
+
+#[tokio::test]
+async fn reference_account_import_on_both_backends() {
+    use crate::reference::{AccountImport, Source};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let holder = reference_account_db(&path).await;
+    // Refused while another process (here, another connection) has it open.
+    match Source::open(&path).await {
+        Err(CoreError::Conflict(m)) => assert!(m.contains("in use"), "{m}"),
+        Err(e) => panic!("wrong refusal: {e}"),
+        Ok(_) => panic!("opened a database in use"),
+    }
+    holder.close().await;
+    for b in backends().await {
+        let src = Source::open(&path).await.unwrap();
+        let hash = |t: &str| format!("h:{t}");
+        let mut tx = b.store.begin().await.unwrap();
+        let report = tx
+            .import_reference_accounts(
+                &src,
+                &AccountImport {
+                    now_ms: 1_800_000_000_000,
+                    token_hash: &hash,
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        src.close().await;
+        let n = |k: &str| report.counts.get(k).copied().unwrap_or(0);
+        assert_eq!(
+            (
+                n("accounts"),
+                n("app passwords"),
+                n("sessions"),
+                n("refresh tokens")
+            ),
+            (2, 1, 1, 2),
+            "{}",
+            b.name
+        );
+        assert_eq!(report.skipped.len(), 1, "the handle-less actor");
+        let ada = b
+            .store
+            .account_by_did("did:plc:aaa")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ada.handle, "ada.example.com");
+        assert_eq!(ada.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(ada.password_hash.as_deref(), Some("scrypt:salt:key"));
+        assert_eq!(ada.created_at, 1_735_689_600_000);
+        let bob = b
+            .store
+            .account_by_did("did:plc:bbb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bob.status, crate::accounts::Status::Takendown);
+        assert_eq!(bob.status_ref.as_deref(), Some("td-1"));
+        assert!(bob.invites_disabled);
+        // The rotated pair is one session, with the app password's scope.
+        let mut tx = b.store.begin().await.unwrap();
+        let r1 = tx.refresh_token_for_update("r1").await.unwrap().unwrap();
+        let r2 = tx.refresh_token_for_update("r2").await.unwrap().unwrap();
+        assert!(tx.refresh_token_for_update("r3").await.unwrap().is_none());
+        tx.rollback().await.unwrap();
+        assert_eq!(r1.session_id, r2.session_id);
+        assert_eq!(r1.next_id.as_deref(), Some("r2"));
+        let s = b.store.session(&r1.session_id).await.unwrap().unwrap();
+        assert_eq!(s.scope, "com.atproto.appPassPrivileged");
+        assert_eq!(s.app_password_name.as_deref(), Some("phone"));
+        // Imported app passwords: found by hash until upgraded.
+        assert!(
+            b.store
+                .has_imported_app_passwords("did:plc:aaa")
+                .await
+                .unwrap()
+        );
+        let ap = b
+            .store
+            .imported_app_password("did:plc:aaa", "scrypt:apsalt:apkey")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ap.privileged);
+        assert!(
+            b.store
+                .upgrade_app_password("did:plc:aaa", "phone", &ap.hash, "lookup", "$argon2id$x")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !b.store
+                .has_imported_app_passwords("did:plc:aaa")
+                .await
+                .unwrap()
+        );
+        assert!(
+            b.store
+                .upgrade_password_hash("did:plc:aaa", "scrypt:salt:key", "$argon2id$y")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !b.store
+                .upgrade_password_hash("did:plc:aaa", "scrypt:salt:key", "$argon2id$z")
+                .await
+                .unwrap()
+        );
+        assert!(b.store.has_accounts().await.unwrap());
+        assert!(b.store.reference_import().await.unwrap().is_none());
+    }
+}

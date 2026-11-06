@@ -358,6 +358,73 @@ fn parse_record(collection: &str, rkey: &str, bytes: &[u8]) -> Result<LexValue, 
     Ok(v)
 }
 
+/// A bounded walk of a whole stored tree, one node at a time, with the
+/// import's checks (key order and bounds, layers, no node reached twice,
+/// at most [`MAX_BLOCKS`] nodes). The caller fetches each node's bytes.
+pub struct TreeWalk {
+    queue: VecDeque<Visit>,
+    visited: HashSet<Cid>,
+    current: Option<Visit>,
+}
+
+impl TreeWalk {
+    /// A walk of the tree whose root node is `data`.
+    #[must_use]
+    pub fn new(data: Cid) -> Self {
+        let mut queue = VecDeque::new();
+        queue.push_back((data, None, None, None, true));
+        Self {
+            queue,
+            visited: HashSet::new(),
+            current: None,
+        }
+    }
+
+    /// The next node to fetch, or None when the walk is done.
+    pub fn next_node(&mut self) -> Result<Option<Cid>, ImportError> {
+        let Some(v) = self.queue.pop_front() else {
+            return Ok(None);
+        };
+        if !self.visited.insert(v.0.clone()) {
+            return Err(invalid(format!(
+                "invalid MST: node referenced more than once: {}",
+                v.0
+            )));
+        }
+        if self.visited.len() as u64 > MAX_BLOCKS {
+            return Err(invalid("invalid MST: too many nodes"));
+        }
+        let cid = v.0.clone();
+        self.current = Some(v);
+        Ok(Some(cid))
+    }
+
+    /// Checks the node [`TreeWalk::next_node`] named and queues its
+    /// children. Returns its leaves as (`collection/rkey`, record CID).
+    pub fn visit(&mut self, bytes: &[u8]) -> Result<Vec<(String, Cid)>, ImportError> {
+        let (cid, lo, hi, layer, is_root) = self
+            .current
+            .take()
+            .ok_or_else(|| CoreError::Storage("tree walk: no node to visit".into()))?;
+        let node = check_node(&cid, bytes, lo.as_deref(), hi.as_deref(), layer, is_root)?;
+        let child_layer = node.layer.and_then(|l| l.checked_sub(1));
+        for (c, clo, chi) in node.children {
+            self.queue.push_back((c, clo, chi, child_layer, false));
+        }
+        Ok(node.leaves)
+    }
+}
+
+/// Splits a tree key into (collection, rkey).
+pub fn split_tree_key(key: &str) -> Result<(String, String), ImportError> {
+    split_key(key)
+}
+
+/// Decodes a record block (a DAG-CBOR map).
+pub fn decode_record(collection: &str, rkey: &str, bytes: &[u8]) -> Result<LexValue, ImportError> {
+    parse_record(collection, rkey, bytes)
+}
+
 // ---------------------------------------------------------------- staging
 
 /// A node to visit: (cid, lower bound, upper bound, expected layer, is root).

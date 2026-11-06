@@ -26,6 +26,7 @@ pub mod oauth;
 pub mod operators;
 pub mod portal;
 pub mod prefs;
+pub mod reference;
 pub mod repo;
 pub mod runtime;
 pub mod scan;

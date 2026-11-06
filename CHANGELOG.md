@@ -559,6 +559,27 @@ kryphocron built in.
   `identity.hostname_transition_days`) and `--status`. Refused outside
   the standalone role. OAuth: each served host has its own
   protected-resource metadata, and the issuer lists every served origin.
+- `aurora-locus import reference-pds <data dir> --env <pds.env>`: turns a
+  stopped reference PDS (0.5.x) into a locus install with the same
+  hostname, DIDs, handles, repos, blobs, sessions and firehose position.
+  Offline, into an empty SQLite install (`migrate storage` moves it to
+  Postgres after), refused while the reference has its databases open.
+  It brings over settings through the env mapping, the JWT and DPoP
+  secrets, the PLC rotation key (as current) and the admin password;
+  accounts, app passwords, refresh tokens, emailed tokens, invites, OAuth
+  state and preferences; each repo's signing key and the blocks its
+  current tree reaches (reference counts rebuilt by walking the tree;
+  unreachable blocks dropped), the record index with takedowns, and blob
+  metadata; and the event log within retention, with seqs continuing from
+  the reference's last. Disk blobs stay in place under the blob dir's
+  parent (copied when its name is one of locus's prefixes); quarantined
+  ones are copied into `quarantine/`. Trusted proxies are set to the
+  reference's ranges, and setup is marked complete.
+- Imported scrypt passwords log in and become Argon2id on the first
+  successful login; imported app passwords are found the reference's way
+  until first used, then get a lookup hash and an Argon2id hash. Access
+  tokens a reference PDS issued before the import (legacy, and OAuth ones
+  signed with its JWT secret) are accepted until they expire.
 
 ### Changed
 

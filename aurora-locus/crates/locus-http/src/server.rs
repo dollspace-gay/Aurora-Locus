@@ -490,6 +490,16 @@ pub(crate) async fn check_password(
     if let Some(hash) = &account.password_hash
         && password::verify(pw, hash)
     {
+        // A hash imported from a reference PDS becomes Argon2id now.
+        if password::is_imported(hash)
+            && let Ok(new) = password::hash(pw)
+            && let Err(e) = s
+                .store
+                .upgrade_password_hash(&account.did, hash, &new)
+                .await
+        {
+            tracing::warn!(did = %account.did, "couldn't rehash an imported password: {e}");
+        }
         return Ok(Some(Credential::Account));
     }
     if password::looks_like_app_password(pw) {
@@ -501,6 +511,26 @@ pub(crate) async fn check_password(
             .await?
             && password::verify(pw, &ap.hash)
         {
+            return Ok(Some(Credential::AppPassword {
+                name: ap.name,
+                privileged: ap.privileged,
+            }));
+        }
+        // App passwords imported from a reference PDS have no lookup hash
+        // until first used: one scrypt with the account's salt, then
+        // equality, as the reference finds them.
+        if s.store.has_imported_app_passwords(&account.did).await?
+            && let Some(theirs) = password::reference_app_password_hash(&account.did, pw)
+            && let Some(ap) = s.store.imported_app_password(&account.did, &theirs).await?
+        {
+            if let Ok(new) = password::hash(pw)
+                && let Err(e) = s
+                    .store
+                    .upgrade_app_password(&account.did, &ap.name, &ap.hash, &lookup, &new)
+                    .await
+            {
+                tracing::warn!(did = %account.did, "couldn't rehash an imported app password: {e}");
+            }
             return Ok(Some(Credential::AppPassword {
                 name: ap.name,
                 privileged: ap.privileged,

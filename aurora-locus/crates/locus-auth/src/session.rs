@@ -114,6 +114,9 @@ pub struct LegacySessions {
     service_did: String,
     /// Other audiences accepted (old hostnames' service DIDs).
     also_accepted: Vec<String>,
+    /// When the install was imported from a reference PDS (seconds): its
+    /// access tokens, which name no session, are accepted if issued before.
+    imported_at_s: Option<i64>,
     pub access_ttl_s: i64,
     pub refresh_ttl_s: i64,
 }
@@ -136,6 +139,7 @@ impl LegacySessions {
             secret,
             service_did,
             also_accepted: Vec::new(),
+            imported_at_s: None,
             access_ttl_s: 120 * 60,
             refresh_ttl_s: 90 * 24 * 60 * 60,
         }
@@ -251,6 +255,26 @@ impl LegacySessions {
         self
     }
 
+    /// Also accepts the access tokens a reference PDS issued before the
+    /// install was imported from it (`imported_at_ms`), until they expire.
+    #[must_use]
+    pub fn accepting_imported(mut self, imported_at_ms: Option<i64>) -> Self {
+        self.imported_at_s = imported_at_ms.map(|t| t / 1000);
+        self
+    }
+
+    /// When the install was imported from a reference PDS (ms), if it was.
+    #[must_use]
+    pub fn imported_at_ms(&self) -> Option<i64> {
+        self.imported_at_s.map(|t| t * 1000)
+    }
+
+    /// The legacy JWT secret (the reference's, after an import).
+    #[must_use]
+    pub fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
     fn aud_ok(&self, aud: &str) -> bool {
         aud == self.service_did || self.also_accepted.iter().any(|a| a == aud)
     }
@@ -264,7 +288,9 @@ impl LegacySessions {
         if !ACCESS_SCOPES.contains(&claims.scope.as_str()) || !claims.sub.starts_with("did:") {
             return Err(AuthError::InvalidToken);
         }
-        let session_id = claims.jti.ok_or(AuthError::InvalidToken)?;
+        let Some(session_id) = claims.jti.clone() else {
+            return self.verify_imported(claims).await;
+        };
         let session = self
             .store
             .session(&session_id)
@@ -293,6 +319,35 @@ impl LegacySessions {
             scope: claims.scope,
             session_id,
             app_password_name: session.app_password_name,
+            status: account.status,
+            oauth: None,
+        })
+    }
+
+    /// An access token a reference PDS issued before the import (it names
+    /// no session): the account's status is checked, but there's no
+    /// session to revoke until it expires (at most the access lifetime).
+    async fn verify_imported(&self, claims: Claims) -> Result<Authed, AuthError> {
+        if self.imported_at_s.is_none_or(|t| claims.iat > t) {
+            return Err(AuthError::InvalidToken);
+        }
+        let account = self
+            .store
+            .account_by_did(&claims.sub)
+            .await?
+            .ok_or(AuthError::AccountNotFound)?;
+        match account.status {
+            Status::Deleted => return Err(AuthError::AccountNotFound),
+            Status::Takendown | Status::Suspended if claims.scope != SCOPE_TAKENDOWN => {
+                return Err(AuthError::AccountTakedown);
+            }
+            _ => {}
+        }
+        Ok(Authed {
+            did: claims.sub,
+            scope: claims.scope,
+            session_id: String::new(),
+            app_password_name: None,
             status: account.status,
             oauth: None,
         })

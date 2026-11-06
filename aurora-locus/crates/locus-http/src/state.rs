@@ -120,9 +120,12 @@ enum EnvPlcKey {
     Kms(String),
 }
 
+fn kms_from(env: &HashMap<String, String>) -> CoreResult<locus_identity::kms::Kms> {
+    locus_identity::kms::Kms::from_env(env).map_err(|e| CoreError::Config(e.to_string()))
+}
+
 fn kms_from_env() -> CoreResult<locus_identity::kms::Kms> {
-    let env: HashMap<String, String> = std::env::vars().collect();
-    locus_identity::kms::Kms::from_env(&env).map_err(|e| CoreError::Config(e.to_string()))
+    kms_from(&std::env::vars().collect())
 }
 
 /// The did:key of a KMS-held PLC rotation key.
@@ -140,10 +143,24 @@ impl PlcKeys {
     /// a changed env value is stored as the pending key (it becomes current
     /// after a key backup), as `keys set plc-rotation-key` does.
     pub async fn load_or_create(store: &Store, key: &MasterKey) -> CoreResult<Self> {
-        let env_key = env_plc_key()?;
+        Self::load_or_create_from(store, key, &std::env::vars().collect()).await
+    }
+
+    /// As [`PlcKeys::load_or_create`], with the env values given.
+    pub async fn load_or_create_from(
+        store: &Store,
+        key: &MasterKey,
+        env: &HashMap<String, String>,
+    ) -> CoreResult<Self> {
+        let env_key = env_plc_key(env)?;
         let env_did = match &env_key {
             Some(EnvPlcKey::Hex(h)) => Some(keypair_from(h)?.did()),
-            Some(EnvPlcKey::Kms(id)) => Some(kms_did_key(id).await?),
+            Some(EnvPlcKey::Kms(id)) => Some(
+                kms_from(env)?
+                    .k256_did_key(id)
+                    .await
+                    .map_err(|e| CoreError::Config(e.to_string()))?,
+            ),
             None => None,
         };
         if store.plc_rotation_keys().await?.is_empty() {
@@ -186,7 +203,7 @@ impl PlcKeys {
             let signer = match &row.kms_key_id {
                 Some(id) => {
                     if kms.is_none() {
-                        kms = Some(kms_from_env()?);
+                        kms = Some(kms_from(env)?);
                     }
                     let client = kms.clone().unwrap_or_else(|| unreachable!());
                     let did = client
@@ -277,10 +294,9 @@ impl PlcKeys {
 /// under (its hash is of the public did:key).
 pub const PLC_ENV_APPLIED: &str = "env:PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX";
 
-fn env_plc_key() -> CoreResult<Option<EnvPlcKey>> {
+fn env_plc_key(env: &HashMap<String, String>) -> CoreResult<Option<EnvPlcKey>> {
     let get = |k: &str| {
-        std::env::var(k)
-            .ok()
+        env.get(k)
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
     };
@@ -374,9 +390,19 @@ impl ServerSecrets {
     /// boot, `PDS_JWT_SECRET` and `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`
     /// are imported if set, so an existing `pds.env` keeps its keys.
     pub async fn load_or_create(store: &Store, key: &MasterKey) -> CoreResult<Self> {
+        Self::load_or_create_from(store, key, &std::env::vars().collect()).await
+    }
+
+    /// As [`ServerSecrets::load_or_create`], with the env values given
+    /// (`import reference-pds` passes the reference's `pds.env`).
+    pub async fn load_or_create_from(
+        store: &Store,
+        key: &MasterKey,
+        env: &HashMap<String, String>,
+    ) -> CoreResult<Self> {
+        let var = |k: &str| env.get(k).cloned();
         let jwt = load_or(store, key, secret_names::JWT, || {
-            std::env::var("PDS_JWT_SECRET")
-                .ok()
+            var("PDS_JWT_SECRET")
                 .filter(|s| !s.is_empty())
                 .map(String::into_bytes)
                 .unwrap_or_else(|| rand::random::<[u8; 32]>().to_vec())
@@ -390,7 +416,7 @@ impl ServerSecrets {
             rand::random::<[u8; 32]>().to_vec()
         })
         .await?;
-        let plc_keys = PlcKeys::load_or_create(store, key).await?;
+        let plc_keys = PlcKeys::load_or_create_from(store, key, env).await?;
         let service = load_or(store, key, secret_names::SERVICE_KEY, || {
             K256Keypair::generate().export_private_key()
         })
@@ -402,8 +428,7 @@ impl ServerSecrets {
         let oauth_key = locus_auth::oauth::jose::Es256Key::from_bytes(&oauth)
             .map_err(|e| CoreError::Config(format!("stored OAuth signing key: {e}")))?;
         let dpop = load_or(store, key, secret_names::DPOP_SECRET, || {
-            std::env::var("PDS_DPOP_SECRET")
-                .ok()
+            var("PDS_DPOP_SECRET")
                 .and_then(|h| hex::decode(h.trim()).ok())
                 .filter(|b| b.len() == 32)
                 .unwrap_or_else(|| rand::random::<[u8; 32]>().to_vec())
@@ -421,16 +446,21 @@ impl ServerSecrets {
         })
         .await?;
         let stored_admin = load_or(store, key, secret_names::ADMIN_PASSWORD, || {
-            hex::encode(rand::random::<[u8; 16]>()).into_bytes()
+            var("PDS_ADMIN_PASSWORD")
+                .filter(|p| !p.is_empty())
+                .map_or_else(
+                    || hex::encode(rand::random::<[u8; 16]>()).into_bytes(),
+                    String::into_bytes,
+                )
         })
         .await?;
-        let admin_password = match std::env::var("PDS_ADMIN_PASSWORD") {
-            Ok(p) if !p.is_empty() => Zeroizing::new(p.into_bytes()),
+        let admin_password = match var("PDS_ADMIN_PASSWORD") {
+            Some(p) if !p.is_empty() => Zeroizing::new(p.into_bytes()),
             _ => stored_admin,
         };
         // Secrets are imported from env only on the first boot; a later
         // change is refused (its change path is `keys set`).
-        if let Ok(v) = std::env::var("PDS_JWT_SECRET")
+        if let Some(v) = var("PDS_JWT_SECRET")
             && !v.is_empty()
             && v.as_bytes() != jwt.as_slice()
         {
@@ -439,7 +469,7 @@ impl ServerSecrets {
                  change it with `aurora-locus keys set jwt-secret`"
             );
         }
-        if let Ok(v) = std::env::var("PDS_DPOP_SECRET")
+        if let Some(v) = var("PDS_DPOP_SECRET")
             && let Ok(b) = hex::decode(v.trim())
             && b.len() == 32
             && b != dpop.as_slice()

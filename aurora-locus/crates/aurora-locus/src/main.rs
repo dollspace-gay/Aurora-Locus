@@ -4,6 +4,7 @@
 #[cfg(unix)]
 mod admin_cli;
 mod deploy;
+mod import_reference;
 mod logging;
 mod migrate_storage;
 mod node;
@@ -52,6 +53,9 @@ enum Command {
     /// Deployment files.
     #[command(subcommand)]
     Deploy(DeployCmd),
+    /// Imports an existing installation (offline).
+    #[command(subcommand)]
+    Import(ImportCmd),
     /// GET /xrpc/_health; exits 0 on 200 (the compose health check).
     Healthcheck {
         #[arg(long, default_value = "http://127.0.0.1:3000")]
@@ -62,6 +66,20 @@ enum Command {
     #[cfg(unix)]
     #[command(flatten)]
     Admin(admin_cli::AdminCmd),
+}
+
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// A stopped reference PDS (0.5.x), in place: same hostname, DIDs,
+    /// handles, repos, blobs, sessions and firehose position. Into an empty
+    /// SQLite install.
+    ReferencePds {
+        /// The reference's data directory (`PDS_DATA_DIRECTORY`).
+        dir: PathBuf,
+        /// Its pds.env.
+        #[arg(long)]
+        env: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,6 +162,25 @@ async fn main() {
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(2);
+                }
+            }
+        }
+        Command::Import(ImportCmd::ReferencePds { dir, env }) => {
+            let bootstrap = bootstrap_or_exit();
+            let _log = logging::init(LogFormat::Pretty);
+            match import_reference::run(&bootstrap, import_reference::Opts { dir, env_file: env })
+                .await
+            {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "The import stopped: {e}\nIf it got as far as writing, remove the locus database before running it again."
+                    );
+                    std::process::exit(1);
                 }
             }
         }

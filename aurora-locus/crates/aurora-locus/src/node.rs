@@ -357,7 +357,8 @@ impl Node {
                         .iter()
                         .map(|h| format!("did:web:{h}"))
                         .collect(),
-                );
+                )
+                .accepting_imported(self.store.reference_import().await?.map(|m| m.imported_at));
         let clock_id = u16::try_from(self.clock_id)
             .map_err(|_| CoreError::Config(format!("clock id {} out of range", self.clock_id)))?;
         let mailer = locus_mail::Mailer::new(self.store.clone(), Arc::clone(&self.master_key));

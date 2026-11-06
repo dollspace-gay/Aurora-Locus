@@ -35,8 +35,13 @@ pub fn new_token() -> String {
 }
 
 fn token_hash(s: &AppState, token: &str) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(&s.secrets.email_token_pepper).expect("any key length");
+    token_hash_with(&s.secrets.email_token_pepper, token)
+}
+
+/// The stored form of an emailed token, under the server's token pepper.
+#[must_use]
+pub fn token_hash_with(pepper: &[u8], token: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).expect("any key length");
     mac.update(token.trim().to_ascii_uppercase().as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

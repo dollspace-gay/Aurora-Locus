@@ -197,11 +197,21 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
         .ok_or_else(|| invalid("Malformed token"))?;
     let jws =
         locus_auth::oauth::jose::Jws::decode(&token).map_err(|_| invalid("Malformed token"))?;
-    state
-        .secrets
-        .oauth_key
-        .verify(&jws)
-        .map_err(|_| invalid("Invalid token"))?;
+    // Tokens a reference PDS issued before the install was imported from
+    // it are HS256 under its JWT secret; they're accepted until they expire.
+    let imported = jws.alg() == "HS256"
+        && state.sessions.imported_at_ms().is_some_and(|t| {
+            jws.payload
+                .get("iat")
+                .and_then(Value::as_i64)
+                .is_some_and(|iat| iat * 1000 <= t)
+        });
+    if imported {
+        locus_auth::oauth::jose::verify_hs256(state.sessions.secret(), &jws)
+    } else {
+        state.secrets.oauth_key.verify(&jws)
+    }
+    .map_err(|_| invalid("Invalid token"))?;
     let p = &jws.payload;
     // Tokens minted before a hostname switch carry the old issuer until
     // they expire.

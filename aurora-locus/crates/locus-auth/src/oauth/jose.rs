@@ -396,9 +396,42 @@ impl Es256Key {
     }
 }
 
+/// Verifies an HS256 JWS under `secret` (OAuth access tokens a reference
+/// PDS issued before an import: it signs them with its JWT secret).
+pub fn verify_hs256(secret: &[u8], jws: &Jws) -> Result<(), JoseError> {
+    use hmac::{Hmac, Mac};
+    if jws.alg() != "HS256" {
+        return Err(err("unexpected \"alg\""));
+    }
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret).map_err(|_| err("invalid HMAC key"))?;
+    mac.update(&jws.signing_input);
+    mac.verify_slice(&jws.signature)
+        .map_err(|_| err("signature verification failed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hs256_verifies_only_under_its_secret() {
+        use hmac::{Hmac, Mac};
+        let input = format!(
+            "{}.{}",
+            b64(br#"{"alg":"HS256","typ":"at+jwt"}"#),
+            b64(br#"{"sub":"did:plc:a"}"#)
+        );
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(b"secret").unwrap();
+        mac.update(input.as_bytes());
+        let jwt = format!("{input}.{}", b64(&mac.finalize().into_bytes()));
+        let jws = Jws::decode(&jwt).unwrap();
+        verify_hs256(b"secret", &jws).unwrap();
+        assert!(verify_hs256(b"other", &jws).is_err());
+        let k = Es256Key::generate();
+        let es = Jws::decode(&k.sign(Map::new(), &json!({"a": 1}))).unwrap();
+        assert!(verify_hs256(b"secret", &es).is_err());
+    }
 
     #[test]
     fn es256_signs_verifies_and_thumbprints() {

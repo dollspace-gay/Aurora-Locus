@@ -25,11 +25,48 @@ pub fn hash(password: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Whether `password` matches a stored Argon2id hash. Malformed hashes never match.
+/// The marker of a hash imported from a reference PDS: `scrypt:salt:hexkey`.
+pub const SCRYPT_MARKER: &str = "scrypt:";
+
+/// The reference's scrypt (Node `crypto.scrypt` defaults: N = 16384, r = 8,
+/// p = 1, a 64-byte key; the salt is the hex string's bytes), as hex.
+fn reference_scrypt(password: &str, salt: &str) -> Option<String> {
+    let params = scrypt::Params::new(14, 8, 1, 64).ok()?;
+    let mut out = [0u8; 64];
+    scrypt::scrypt(password.as_bytes(), salt.as_bytes(), &params, &mut out).ok()?;
+    Some(hex::encode(out))
+}
+
+/// Whether a stored hash is an imported scrypt one (rehash it on the next
+/// successful login).
+#[must_use]
+pub fn is_imported(stored: &str) -> bool {
+    stored.starts_with(SCRYPT_MARKER)
+}
+
+/// The reference's app-password hash for an account, `salt:hexkey` (salt =
+/// hex of the first 16 bytes of sha256(did)), with the marker: imported app
+/// passwords are found by equality with it.
+#[must_use]
+pub fn reference_app_password_hash(did: &str, password: &str) -> Option<String> {
+    use sha2::Digest;
+    let salt = hex::encode(&Sha256::digest(did.as_bytes())[..16]);
+    reference_scrypt(password, &salt).map(|k| format!("{SCRYPT_MARKER}{salt}:{k}"))
+}
+
+/// Whether `password` matches a stored hash: Argon2id, or an imported
+/// scrypt hash. Malformed hashes never match.
 #[must_use]
 pub fn verify(password: &str, stored: &str) -> bool {
     if password.len() > MAX_LOGIN_PASSWORD {
         return false;
+    }
+    if let Some(rest) = stored.strip_prefix(SCRYPT_MARKER) {
+        let Some((salt, key)) = rest.split_once(':') else {
+            return false;
+        };
+        return reference_scrypt(password, salt)
+            .is_some_and(|k| subtle::ConstantTimeEq::ct_eq(k.as_bytes(), key.as_bytes()).into());
     }
     let Ok(parsed) = PasswordHash::new(stored) else {
         return false;
@@ -90,6 +127,27 @@ mod tests {
         assert!(!verify("correct horse", "not a hash"));
         assert!(!verify(&"x".repeat(MAX_LOGIN_PASSWORD + 1), &h));
     }
+
+    #[test]
+    fn imported_scrypt_hashes() {
+        // scrypt("hunter2-hunter2", "0123456789abcdef", N=16384, r=8, p=1,
+        // 64 bytes), as the reference's hashWithSalt makes it.
+        let stored = format!("{SCRYPT_MARKER}0123456789abcdef:{REFERENCE_KEY}");
+        assert!(is_imported(&stored));
+        assert!(verify("hunter2-hunter2", &stored));
+        assert!(!verify("hunter2-hunter3", &stored));
+        assert!(!verify("hunter2-hunter2", "scrypt:no-separator"));
+        assert!(!is_imported(&hash("x").unwrap()));
+        let ap = reference_app_password_hash("did:plc:a", "abcd-efgh-ijkl-mnop").unwrap();
+        assert!(verify("abcd-efgh-ijkl-mnop", &ap));
+        assert_ne!(
+            ap,
+            reference_app_password_hash("did:plc:b", "abcd-efgh-ijkl-mnop").unwrap()
+        );
+    }
+
+    const REFERENCE_KEY: &str = "49521831b3670ff7fb057bb83f23c981bf62cbfff86340ac3a9d234504b3c764\
+                                 913ff5309bbbb143125958ff649a9a38091228128ed2bbd21f67b247f23e5a01";
 
     #[test]
     fn app_passwords() {
