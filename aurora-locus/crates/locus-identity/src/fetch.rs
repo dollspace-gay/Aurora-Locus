@@ -487,19 +487,36 @@ mod tests {
             lookup: Some(Arc::clone(&lookup)),
         };
         // The first answer is public: the check passes.
-        assert!(resolver.resolve("rebind.pds.social".parse().unwrap()).await.is_ok());
+        assert!(
+            resolver
+                .resolve("rebind.pds.social".parse().unwrap())
+                .await
+                .is_ok()
+        );
         // The client resolves again when it connects, and refuses the
         // private answer without connecting; so it does for every other
         // non-public answer.
-        let f = SafeFetcher::build(ON_LOOSE, UnicastResolver { lookup: Some(lookup) }).unwrap();
+        let f = SafeFetcher::build(
+            ON_LOOSE,
+            UnicastResolver {
+                lookup: Some(lookup),
+            },
+        )
+        .unwrap();
         for case in ["loopback", "mapped", "cgnat", "ula", "mixed"] {
             let err = f
-                .fetch(HttpRequest::get(format!("https://rebind.pds.social:{port}/")))
+                .fetch(HttpRequest::get(format!(
+                    "https://rebind.pds.social:{port}/"
+                )))
                 .await
                 .unwrap_err();
             assert!(matches!(err, FetchError::Network(_)), "{case}: {err}");
         }
-        assert_eq!(lookups.load(Ordering::SeqCst), 6, "every connection resolved anew");
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            6,
+            "every connection resolved anew"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing connected");
     }
 

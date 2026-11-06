@@ -695,6 +695,16 @@ kryphocron built in.
 
 ### Changed
 
+- `http.internal_hosts` entries are reserved: they can't be taken as a
+  handle or did:web host, and saving an entry that already is a handle,
+  did:web or PDS hostname is refused.
+- `include:` permission sets are fetched from the authority's PDS under
+  the stricter URL rule (no IP-literal hosts, in every mode), as the
+  reference.
+- Nodes also report dev mode, SSRF protection and the master key source
+  at boot; the console warns on every page while a live node runs with
+  SSRF protection off or ignores `PDS_DEV_MODE`, and when live nodes
+  disagree on a reported value.
 - Answers now match the reference PDS where the conformance run found
   them apart: a missing or malformed query parameter or JSON body is a 400
   `InvalidRequest` (not a plain-text error); handle syntax errors on

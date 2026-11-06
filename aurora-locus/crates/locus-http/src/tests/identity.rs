@@ -153,7 +153,12 @@ async fn outbound_rules(protection: bool) {
     // A did:web:localhost service: its document over plain HTTP from
     // loopback, then the call proxied there. Only with protection off.
     let (st, v) = h
-        .via_proxy(&access, &format!("did:web:localhost%3A{port}#svc"), ping, None)
+        .via_proxy(
+            &access,
+            &format!("did:web:localhost%3A{port}#svc"),
+            ping,
+            None,
+        )
         .await;
     assert_eq!(st.is_success(), off, "did:web:localhost: {st} {v}");
     assert_eq!(hit(&hits, "/.well-known/did.json"), off);
@@ -346,7 +351,11 @@ async fn the_console_names_nodes_without_ssrf_protection_and_nodes_that_disagree
             .unwrap();
         leases.push(lease);
     }
-    let on = [("role", "Pds"), ("dev_mode", "off"), ("ssrf_protection", "on")];
+    let on = [
+        ("role", "Pds"),
+        ("dev_mode", "off"),
+        ("ssrf_protection", "on"),
+    ];
     h.state.store.report_bootstrap("node-a", &on).await.unwrap();
     h.state.store.report_bootstrap("node-b", &on).await.unwrap();
     let p = page().await;
@@ -359,7 +368,12 @@ async fn the_console_names_nodes_without_ssrf_protection_and_nodes_that_disagree
         ("dev_mode", "ignored"),
         ("ssrf_protection", "off"),
     ];
-    let differ = h.state.store.report_bootstrap("node-b", &off).await.unwrap();
+    let differ = h
+        .state
+        .store
+        .report_bootstrap("node-b", &off)
+        .await
+        .unwrap();
     assert_eq!(differ, ["dev_mode", "ssrf_protection"]);
     let p = page().await;
     assert!(p.contains(ssrf_off), "{p}");
@@ -370,7 +384,10 @@ async fn the_console_names_nodes_without_ssrf_protection_and_nodes_that_disagree
     assert!(other.contains(ssrf_off));
     h.state.store.release_lease(&leases[1]).await.unwrap();
     let p = page().await;
-    assert!(!p.contains(ssrf_off) && !p.contains(disagree), "node-b stopped");
+    assert!(
+        !p.contains(ssrf_off) && !p.contains(disagree),
+        "node-b stopped"
+    );
 }
 
 // ---------------------------------------------------------------- host routing
@@ -467,7 +484,12 @@ async fn handle_hosts_get_only_their_documents_and_internal_hosts_only_the_pds_i
         assert_eq!(st, StatusCode::OK);
     }
     let (st, v) = h
-        .at_host("yan.pds.example.com", "GET", "/.well-known/atproto-did", &[])
+        .at_host(
+            "yan.pds.example.com",
+            "GET",
+            "/.well-known/atproto-did",
+            &[],
+        )
         .await;
     assert_eq!((st, v.as_str()), (StatusCode::OK, Some(did.as_str())));
     let (st, doc) = h
@@ -479,7 +501,13 @@ async fn handle_hosts_get_only_their_documents_and_internal_hosts_only_the_pds_i
     // privileged checks answer exactly as on the PDS hostname.
     let status = ns("viewer.hostname.status");
     let owner_only = ns("owner.listOperators");
-    for host in ["pds.example.com", "localhost", "127.0.0.1", "[::1]", "locus"] {
+    for host in [
+        "pds.example.com",
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "locus",
+    ] {
         let (_, v) = h
             .at_host(host, "GET", "/xrpc/com.atproto.server.describeServer", &[])
             .await;
@@ -674,19 +702,23 @@ async fn internal_hosts_and_user_hosts_are_reserved_against_each_other() {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while h.state.store.account_by_did(gone_did).await.unwrap().is_some() {
-        assert!(tokio::time::Instant::now() < deadline, "deletion never finished");
+    while h
+        .state
+        .store
+        .account_by_did(gone_did)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "deletion never finished"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let prepare_path = ns("owner.hostname.prepare");
-    let prepare = |host: &str| {
-        h.admin_call(
-            "POST",
-            &prepare_path,
-            &owner,
-            Some(json!({"host": host})),
-        )
-    };
+    let prepare =
+        |host: &str| h.admin_call("POST", &prepare_path, &owner, Some(json!({"host": host})));
     for host in [
         "yan.pds.example.com",
         "eve.example.org",
@@ -695,7 +727,14 @@ async fn internal_hosts_and_user_hosts_are_reserved_against_each_other() {
     ] {
         let (st, v) = prepare(host).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{host}: {v}");
-        assert!(h.state.store.open_hostname_migration().await.unwrap().is_none());
+        assert!(
+            h.state
+                .store
+                .open_hostname_migration()
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // An old PDS hostname is accepted (migrating back).
@@ -788,14 +827,8 @@ async fn the_window_outlasts_the_job_and_stragglers_do_not_block_the_next_migrat
     let close_path = ns("owner.hostname.close");
     let close = || h.admin_call("POST", &close_path, &owner, Some(json!({})));
     let prepare_path = ns("owner.hostname.prepare");
-    let prepare = |host: &str| {
-        h.admin_call(
-            "POST",
-            &prepare_path,
-            &owner,
-            Some(json!({"host": host})),
-        )
-    };
+    let prepare =
+        |host: &str| h.admin_call("POST", &prepare_path, &owner, Some(json!({"host": host})));
 
     // While the job runs, the migration can't close and no other starts.
     let (st, v) = close().await;
@@ -806,10 +839,16 @@ async fn the_window_outlasts_the_job_and_stragglers_do_not_block_the_next_migrat
     assert!(crate::hostnames::step(&h.state).await.unwrap());
     assert!(!crate::hostnames::step(&h.state).await.unwrap());
     let m = &h.state.store.hostname_migrations().await.unwrap()[0];
-    assert_eq!((m.state.as_str(), m.job_done_at.is_some()), ("running", true));
+    assert_eq!(
+        (m.state.as_str(), m.job_done_at.is_some()),
+        ("running", true)
+    );
     let stragglers = h.state.store.hostname_stragglers("m1", 10).await.unwrap();
     assert_eq!(
-        stragglers.iter().map(|x| x.did.as_str()).collect::<Vec<_>>(),
+        stragglers
+            .iter()
+            .map(|x| x.did.as_str())
+            .collect::<Vec<_>>(),
         [bo.as_str()]
     );
     assert_eq!(stragglers[0].state, "cannot");
@@ -858,7 +897,10 @@ async fn the_window_outlasts_the_job_and_stragglers_do_not_block_the_next_migrat
     // bo updates its own document; the next daily recheck sees it, and the
     // old host becomes former: did.json only, no audience, no resource.
     h.plc_edit(&bo, &h.state.public_url, false);
-    assert!(!crate::hostnames::step(&h.state).await.unwrap(), "not rechecked yet");
+    assert!(
+        !crate::hostnames::step(&h.state).await.unwrap(),
+        "not rechecked yet"
+    );
     sqlx::query("UPDATE hostname_migration SET rechecked_at = NULL")
         .execute(match &h.state.store {
             Store::Sqlite(p) => p,
@@ -921,24 +963,23 @@ async fn migrating_back_to_a_former_hostname() {
         .unwrap();
     h.reload_hosts().await;
     let describe = "/xrpc/com.atproto.server.describeServer";
-    assert_eq!(served_doc(&h, back).await, Some(json!(format!("did:web:{back}"))));
+    assert_eq!(
+        served_doc(&h, back).await,
+        Some(json!(format!("did:web:{back}")))
+    );
 
     // Prepared again: a candidate, which keeps its former did.json and
     // gets health and /tls-check but nothing else (no redirect either).
     let prepare_path = ns("owner.hostname.prepare");
-    let prepare = || {
-        h.admin_call(
-            "POST",
-            &prepare_path,
-            &owner,
-            Some(json!({"host": back})),
-        )
-    };
+    let prepare = || h.admin_call("POST", &prepare_path, &owner, Some(json!({"host": back})));
     let (st, v) = prepare().await;
     assert_eq!(st, StatusCode::OK, "{v}");
     h.reload_hosts().await;
     assert_eq!(h.state.hosts().candidate.as_deref(), Some(back));
-    assert_eq!(served_doc(&h, back).await, Some(json!(format!("did:web:{back}"))));
+    assert_eq!(
+        served_doc(&h, back).await,
+        Some(json!(format!("did:web:{back}")))
+    );
     let (st, _) = h.at_host(back, "GET", describe, &[]).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert!(crate::health::approved(&h.state, back).await);
@@ -967,8 +1008,21 @@ async fn migrating_back_to_a_former_hostname() {
     // host in full service.
     let (st, v) = prepare().await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    let id = h.state.store.open_hostname_migration().await.unwrap().unwrap().id;
-    assert!(h.state.store.confirm_hostname_migration(&id, 0).await.unwrap());
+    let id = h
+        .state
+        .store
+        .open_hostname_migration()
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert!(
+        h.state
+            .store
+            .confirm_hostname_migration(&id, 0)
+            .await
+            .unwrap()
+    );
     let there = crate::hostnames::Hosts::load(&h.state.store, back)
         .await
         .unwrap();
@@ -980,7 +1034,13 @@ async fn migrating_back_to_a_former_hostname() {
             former: vec![],
         }
     );
-    assert!(h.state.store.pds_host_reserved("social.example.com").await.unwrap());
+    assert!(
+        h.state
+            .store
+            .pds_host_reserved("social.example.com")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -1016,7 +1076,10 @@ async fn oauth_and_assertions_across_a_hostname_migration() {
             .at_host(host, "GET", "/.well-known/oauth-protected-resource", &[])
             .await;
         assert_eq!(pr["resource"], json!(format!("https://{host}")));
-        assert_eq!(pr["authorization_servers"], json!([format!("https://{new}")]));
+        assert_eq!(
+            pr["authorization_servers"],
+            json!([format!("https://{new}")])
+        );
     }
     let (_, asm) = h
         .at_host(new, "GET", "/.well-known/oauth-authorization-server", &[])
@@ -1082,7 +1145,9 @@ async fn oauth_and_assertions_across_a_hostname_migration() {
         .await
         .unwrap();
     h.reload_hosts().await;
-    let (st, v) = h.oauth_get_at(&client, &pre_switch, new, new, session).await;
+    let (st, v) = h
+        .oauth_get_at(&client, &pre_switch, new, new, session)
+        .await;
     assert!(st.is_client_error(), "the old issuer: {st} {v}");
     let (st, _) = h.oauth_get_at(&client, &at, new, new, session).await;
     assert_eq!(st, StatusCode::OK);
@@ -1093,7 +1158,10 @@ async fn oauth_and_assertions_across_a_hostname_migration() {
     let (_, asm) = h
         .at_host(new, "GET", "/.well-known/oauth-authorization-server", &[])
         .await;
-    assert_eq!(asm["protected_resources"], json!([format!("https://{new}")]));
+    assert_eq!(
+        asm["protected_resources"],
+        json!([format!("https://{new}")])
+    );
 }
 
 #[tokio::test]
@@ -1127,7 +1195,14 @@ async fn hostname_migrations_are_refused_in_the_entryway_and_shard_roles() {
             v["message"].as_str().unwrap().contains("standalone role"),
             "{v}"
         );
-        assert!(h.state.store.open_hostname_migration().await.unwrap().is_none());
+        assert!(
+            h.state
+                .store
+                .open_hostname_migration()
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!crate::health::approved(&h.state, "next.example.org").await);
         assert_eq!(crate::oauth::issuer(&h.state), issuer);
     }
