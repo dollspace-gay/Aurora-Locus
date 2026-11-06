@@ -2546,6 +2546,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "locus-conformance"
+version = "0.1.0-dev"
+dependencies = [
+ "axum",
+ "futures",
+ "proto-blue-lex-data",
+ "proto-blue-ws",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+]
+
+[[package]]
 name = "locus-core"
 version = "0.1.0-dev"
 dependencies = [

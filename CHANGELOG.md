@@ -684,11 +684,30 @@ kryphocron built in.
   gated media fetches. Readable from `metrics.allowed_ips` (loopback by
   default) or with `metrics.token` (`LOCUS_METRICS_TOKEN`); off with
   `metrics.enabled`.
+- A differential conformance harness (`scripts/conformance.sh`,
+  `crates/locus-conformance`): the same XRPC scenarios and firehose
+  against a fresh node and the reference PDS (`@atproto/pds` 0.5.51 in
+  Docker) on a shared mock PLC, with values that legitimately differ
+  normalized and deliberate differences listed with their reasons in
+  `conformance/allowlist.json`.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 
 ### Changed
 
+- Answers now match the reference PDS where the conformance run found
+  them apart: a missing or malformed query parameter or JSON body is a 400
+  `InvalidRequest` (not a plain-text error); handle syntax errors on
+  handle inputs are `InvalidRequest` (disallowed TLDs and service-domain
+  rules stay `InvalidHandle`); `createAccount` with a taken handle is
+  `InvalidRequest` and always returns `didDoc`; `refreshSession` includes
+  the email fields; `describeServer` has `blobUploadLimit` and `contact`
+  and no `phoneVerificationRequired`; `listRepos` gives a cursor on every
+  page with rows; `getBlocks` serves only blocks a tree references; a
+  duplicate app-password name is `InvalidRequest`.
+- Single-label handle domains (`.test`) are accepted in setup.
+- Setup no longer adds the default relay when `PDS_CRAWLERS` is set
+  (even empty) or the hostname is local.
 - A leased job stops when a renewal hasn't answered before its lease could
   run out, so a slow database can't leave two nodes running it at once.
 - Blobs uploaded after an import whose records already use them, and blobs

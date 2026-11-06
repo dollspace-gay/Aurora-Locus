@@ -12,7 +12,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HandleError {
-    /// Bad syntax or a disallowed TLD (atproto `InvalidHandle`).
+    /// Not handle syntax at all (what a lexicon `handle` format refuses).
+    #[error("{0}")]
+    Syntax(String),
+    /// A disallowed TLD or a service-domain rule (atproto `InvalidHandle`).
     #[error("{0}")]
     Invalid(String),
     /// Reserved or otherwise not available (atproto `HandleNotAvailable`).
@@ -24,7 +27,7 @@ pub enum HandleError {
 pub fn normalize_and_validate(handle: &str) -> Result<String, HandleError> {
     let handle = handle.trim().to_ascii_lowercase();
     if proto_blue_syntax::Handle::new(&handle).is_err() {
-        return Err(HandleError::Invalid("Invalid handle".into()));
+        return Err(HandleError::Syntax("Invalid handle".into()));
     }
     let tld = handle.rsplit('.').next().unwrap_or_default();
     if DISALLOWED_TLDS.contains(&tld) {

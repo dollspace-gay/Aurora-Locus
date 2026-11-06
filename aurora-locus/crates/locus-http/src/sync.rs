@@ -337,7 +337,11 @@ pub async fn get_blocks(
     for c in &p.cids {
         let cid = Cid::from_str_multibase(c)
             .map_err(|_| XrpcError::invalid_request(format!("Invalid CID: {c}")))?;
-        match s.store.block(&p.did, &cid.to_string_base32()).await? {
+        match s
+            .store
+            .referenced_block(&p.did, &cid.to_string_base32())
+            .await?
+        {
             Some(bytes) => car.extend(locus_repo::car::block(&cid, &bytes)),
             None => missing.push(c.clone()),
         }
@@ -456,9 +460,7 @@ pub async fn list_repos(State(s): St, Query(p): Query<ListReposParams>) -> XrpcR
         })
         .collect();
     let mut out = json!({ "repos": repos });
-    if rows.len() as i64 == limit
-        && let Some((did, at, ..)) = rows.last()
-    {
+    if let Some((did, at, ..)) = rows.last() {
         out["cursor"] = json!(format!("{at}::{did}"));
     }
     Ok(Json(out))

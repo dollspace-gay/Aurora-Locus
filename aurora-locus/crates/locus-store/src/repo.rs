@@ -658,6 +658,30 @@ impl Store {
     }
 
     /// A stored block's bytes.
+    /// A block some tree still references (an unreferenced one waits for
+    /// GC and isn't served).
+    pub async fn referenced_block(&self, did: &str, cid: &str) -> CoreResult<Option<Vec<u8>>> {
+        let q = "SELECT content FROM repo_block WHERE did = {1} AND cid = {2} AND ref_count > 0";
+        let q = crate::blob::sql(q, self.is_postgres());
+        match self {
+            Self::Sqlite(p) => {
+                sqlx::query_scalar(&q)
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+            Self::Postgres(p) => {
+                sqlx::query_scalar(&q)
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
     pub async fn block(&self, did: &str, cid: &str) -> CoreResult<Option<Vec<u8>>> {
         match self {
             Self::Sqlite(p) => {

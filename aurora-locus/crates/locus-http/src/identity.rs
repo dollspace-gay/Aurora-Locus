@@ -40,6 +40,8 @@ pub fn request_host(headers: &HeaderMap) -> Option<String> {
 
 fn handle_error(e: HandleError) -> XrpcError {
     match e {
+        // As the reference's lexicon check, before any handler rule.
+        HandleError::Syntax(m) => XrpcError::invalid_request(m),
         HandleError::Invalid(m) => XrpcError::named("InvalidHandle", m),
         HandleError::NotAvailable(m) => XrpcError::named("HandleNotAvailable", m),
     }
@@ -108,8 +110,7 @@ pub async fn resolve_handle(
     State(s): St,
     Query(p): Query<ResolveHandleParams>,
 ) -> XrpcResult<Json<Value>> {
-    let h = handle::normalize_and_validate(&p.handle)
-        .map_err(|e| XrpcError::named("InvalidHandle", e.to_string()))?;
+    let h = handle::normalize_and_validate(&p.handle).map_err(handle_error)?;
     // A shard doesn't own handles (the entryway does): no local lookup.
     let shard = s.entryway.is_some();
     if !shard

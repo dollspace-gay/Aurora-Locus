@@ -209,7 +209,11 @@ pub fn seed_plan(snap: &Snapshot, bootstrap_hostname: Option<&str>) -> SetupPlan
         .into_iter()
         .map(str::to_owned)
         .collect();
-    if !crawlers.is_empty() {
+    // The installer's default relay only when nothing chose otherwise: a
+    // `PDS_CRAWLERS` set empty means none, and no relay can crawl a local
+    // hostname.
+    let local = bootstrap_hostname.is_some_and(locus_core::bootstrap::is_local_hostname);
+    if !crawlers.is_empty() || std::env::var_os("PDS_CRAWLERS").is_some() || local {
         services.crawlers = crawlers;
     }
     services.moderation_url = text("moderation.service_url");

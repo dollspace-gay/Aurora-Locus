@@ -1,0 +1,24 @@
+[package]
+name = "locus-conformance"
+description = "Differential conformance harness: the same XRPC scenarios against locus and the reference PDS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "locus-conformance"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+axum = "0.8"
+tokio-tungstenite = "0.26"
+proto-blue-ws.workspace = true
+proto-blue-lex-data.workspace = true
+
+[lints]
+workspace = true

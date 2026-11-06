@@ -361,7 +361,11 @@ impl SetupPlan {
         }
         for d in &self.handle_domains {
             let bare = d.trim_start_matches('.');
-            if !d.starts_with('.') || !valid_hostname(bare) {
+            // One label is enough (`.test`, as the reference allows): a
+            // handle adds its own.
+            if !d.starts_with('.')
+                || !(valid_hostname(bare) || valid_hostname(&format!("x.{bare}")))
+            {
                 out.push(problem(
                     "handle_domains",
                     format!("{d} isn't a valid domain."),
@@ -620,6 +624,14 @@ mod tests {
         p.handle_domains = vec![".localhost".into()];
         assert_eq!(fields(&p, false), ["hostname"]);
         assert!(fields(&p, true).is_empty());
+        // One label is a handle domain (`alice.test`); bad labels aren't.
+        let mut p = complete();
+        p.handle_domains = vec![".test".into()];
+        assert!(fields(&p, false).is_empty());
+        for bad in [".123", ".-x", "..", "test"] {
+            p.handle_domains = vec![bad.into()];
+            assert_eq!(fields(&p, false), ["handle_domains"], "{bad}");
+        }
 
         let mut p = complete();
         p.operator.password = Some("short".into());

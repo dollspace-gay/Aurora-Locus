@@ -295,6 +295,43 @@ pub async fn headers_and_deadline(
     res
 }
 
+/// Requests the extractors refused (a missing or malformed query
+/// parameter, a JSON body that doesn't parse or fit) answer as XRPC
+/// errors: 400 `InvalidRequest` with the reason, as the reference's input
+/// validation does, never axum's plain-text rejection.
+pub async fn xrpc_rejections(req: Request<Body>, next: Next) -> Response {
+    if !req.uri().path().starts_with("/xrpc/") {
+        return next.run(req).await;
+    }
+    let res = next.run(req).await;
+    let status = res.status();
+    let plain = res
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/plain"));
+    if !plain
+        || !matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNPROCESSABLE_ENTITY
+                | StatusCode::UNSUPPORTED_MEDIA_TYPE
+        )
+    {
+        return res;
+    }
+    let bytes = axum::body::to_bytes(res.into_body(), 4096)
+        .await
+        .unwrap_or_default();
+    let message = String::from_utf8_lossy(&bytes).trim().to_owned();
+    crate::error::XrpcError::invalid_request(if message.is_empty() {
+        "Invalid request".to_owned()
+    } else {
+        message
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_internal_name;

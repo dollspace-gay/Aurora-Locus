@@ -447,6 +447,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             ratelimit::middleware,
         ))
+        .layer(axum::middleware::from_fn(routing::xrpc_rejections))
         .layer(axum::middleware::from_fn(metrics::record))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

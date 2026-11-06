@@ -647,9 +647,11 @@ async fn account_creation_refusals() {
     h.create_account("erin.pds.example.com", "erin@example.com", "pw")
         .await;
     for (body, error) in [
+        // A taken handle is InvalidRequest here, as the reference
+        // (HandleNotAvailable on updateHandle).
         (
             base("erin.pds.example.com", "other@example.com"),
-            "HandleNotAvailable",
+            "InvalidRequest",
         ),
         (
             base("frank.pds.example.com", "ERIN@example.com"),
@@ -14871,4 +14873,96 @@ async fn metrics_are_served_to_allowed_addresses_or_the_token() {
         .await
         .unwrap();
     assert_eq!(get("127.0.0.1", None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn answers_match_the_reference_where_the_conformance_run_found_them_apart() {
+    let h = harness(false).await;
+    // describeServer: the reference's fields.
+    let (_, v) = h
+        .call("GET", "/xrpc/com.atproto.server.describeServer", None, None)
+        .await;
+    assert_eq!(v["contact"], json!({}));
+    assert!(v["blobUploadLimit"].is_i64());
+    assert!(v.get("phoneVerificationRequired").is_none());
+    // A query the extractor refuses is an XRPC error.
+    let (st, v) = h
+        .call("GET", "/xrpc/com.atproto.server.getServiceAuth", None, None)
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, v2) = h
+        .call("GET", "/xrpc/com.atproto.sync.getRepoStatus", None, None)
+        .await;
+    assert_eq!(
+        (st, v2["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "{v2}"
+    );
+    let _ = v;
+    // Handle syntax on a handle-format input: InvalidRequest.
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.identity.resolveHandle?handle=not%20a%20handle",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest"))
+    );
+    let (did, access) = h.user("conf.pds.example.com").await;
+    let (_, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "conf.pds.example.com", "email": "other@example.com", "password": "pw-123456789"})),
+        )
+        .await;
+    assert_eq!(v["error"], "InvalidRequest", "a taken handle: {v}");
+    // A duplicate app-password name.
+    for expect in [None, Some("InvalidRequest")] {
+        let (_, v) = h
+            .call(
+                "POST",
+                "/xrpc/com.atproto.server.createAppPassword",
+                Some(&access),
+                Some(json!({"name": "one"})),
+            )
+            .await;
+        assert_eq!(v["error"].as_str(), expect, "{v}");
+    }
+    // getBlocks serves only blocks a tree references: the empty genesis
+    // node is gone from the tree after the first record.
+    h.call(
+        "POST",
+        "/xrpc/com.atproto.repo.createRecord",
+        Some(&access),
+        Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x")})),
+    )
+    .await;
+    let empty = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
+    let (st, v) = h
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getBlocks?did={did}&cids={empty}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+        "{v}"
+    );
+    // listRepos: a cursor on every page with rows.
+    let (_, v) = h
+        .call("GET", "/xrpc/com.atproto.sync.listRepos", None, None)
+        .await;
+    assert!(v["cursor"].is_string(), "{v}");
+    // No default relay for a local hostname.
+    let plan = crate::setup::seed_plan(&h.state.snapshot(), Some("localhost"));
+    assert!(plan.services.crawlers.is_empty());
 }

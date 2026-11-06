@@ -1,0 +1,26 @@
+[
+  {
+    "step": "repo.applyWrites.deleteMissing",
+    "path": "status",
+    "section": "§1.3, §6",
+    "why": "The reference answers 500 for a delete of a missing record (an MST conflict); locus answers 400 with the reason."
+  },
+  {
+    "step": "repo.applyWrites.deleteMissing",
+    "path": "/error",
+    "section": "§1.3, §6",
+    "why": "As above: InvalidRequest instead of InternalServerError."
+  },
+  {
+    "step": "server.createAppPassword.again",
+    "path": "status",
+    "section": "§1.3",
+    "why": "The reference answers 500 when an app-password name is already used (a database constraint); locus answers 400 InvalidRequest."
+  },
+  {
+    "step": "server.createAppPassword.again",
+    "path": "/error",
+    "section": "§1.3",
+    "why": "As above: InvalidRequest instead of InternalServerError."
+  }
+]

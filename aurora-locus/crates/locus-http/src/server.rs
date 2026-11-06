@@ -43,18 +43,19 @@ pub async fn describe_server(State(s): St) -> Json<Value> {
             links.insert(field.into(), v.into());
         }
     }
-    let mut out = json!({
+    let mut contact = serde_json::Map::new();
+    let email = snap.text("server.contact_email");
+    if !email.is_empty() {
+        contact.insert("email".into(), email.into());
+    }
+    Json(json!({
         "did": s.service_did,
         "availableUserDomains": s.handle_domains(),
         "inviteCodeRequired": snap.bool("accounts.invite_required"),
-        "phoneVerificationRequired": false,
+        "blobUploadLimit": snap.int("blobs.upload_limit"),
         "links": links,
-    });
-    let contact = snap.text("server.contact_email");
-    if !contact.is_empty() {
-        out["contact"] = json!({ "email": contact });
-    }
-    Json(out)
+        "contact": contact,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -118,6 +119,30 @@ async fn did_doc_for(s: &AppState, account: &Account) -> XrpcResult<Option<Value
     if !s.snapshot().bool("accounts.did_doc_with_session") {
         return Ok(None);
     }
+    account_did_doc(s, account).await
+}
+
+/// A resolved DID document as JSON (the fields atproto uses).
+fn resolved_doc_json(d: &proto_blue_common::DidDocument) -> Value {
+    json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/multikey/v1",
+            "https://w3id.org/security/suites/secp256k1-2019/v1",
+        ],
+        "id": d.id,
+        "alsoKnownAs": d.also_known_as,
+        "verificationMethod": d.verification_method.iter().map(|m| json!({
+            "id": m.id, "type": m.method_type, "controller": m.controller,
+            "publicKeyMultibase": m.public_key_multibase,
+        })).collect::<Vec<_>>(),
+        "service": d.service.iter().map(|x| json!({
+            "id": x.id, "type": x.service_type, "serviceEndpoint": x.service_endpoint,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn account_did_doc(s: &AppState, account: &Account) -> XrpcResult<Option<Value>> {
     let Some((_, sk)) = s.store.get_signing_key(&account.did, &s.master_key).await? else {
         return Ok(None);
     };
@@ -206,10 +231,9 @@ pub async fn create_account(
     }
     // Fail fast on taken names; the unique indexes are the real guard.
     if s.store.account_by_handle(&handle).await?.is_some() {
-        return Err(XrpcError::named(
-            "HandleNotAvailable",
-            "Handle already taken",
-        ));
+        return Err(XrpcError::invalid_request(format!(
+            "Handle already taken: {handle}"
+        )));
     }
     if s.store.account_by_email(&email).await?.is_some() {
         return Err(XrpcError::invalid_request("Email already taken"));
@@ -350,7 +374,17 @@ pub async fn create_account(
             .set_plc_key_listing(&did, &s.secrets.plc_keys.listed(&rotation_keys))
             .await;
     }
-    let did_doc = did_doc_for(&s, &account).await?;
+    let did_doc = match &migrating {
+        // Migrating in: the document as it stands (it names the old PDS).
+        Some(did) => s
+            .resolvers()?
+            .resolve_did(did, true)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| resolved_doc_json(&d)),
+        None => account_did_doc(&s, &account).await?,
+    };
     let mut out = json!({
         "handle": account.handle,
         "did": account.did,
@@ -675,13 +709,7 @@ pub async fn refresh_session(State(s): St, headers: HeaderMap) -> XrpcResult<Jso
         )
     })?;
     let did_doc = did_doc_for(&s, &account).await?;
-    let mut out = session_json(&account, &tokens, did_doc);
-    if let Some(m) = out.as_object_mut() {
-        m.remove("email");
-        m.remove("emailConfirmed");
-        m.remove("emailAuthFactor");
-    }
-    Ok(Json(out))
+    Ok(Json(session_json(&account, &tokens, did_doc)))
 }
 
 pub async fn delete_session(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
@@ -733,7 +761,7 @@ pub async fn create_app_password(
     };
     let mut tx = s.store.begin().await?;
     tx.insert_app_password(&row).await.map_err(|e| match e {
-        CoreError::Conflict(m) => XrpcError::named("DuplicateName", m),
+        CoreError::Conflict(m) => XrpcError::invalid_request(m),
         other => other.into(),
     })?;
     tx.commit().await?;

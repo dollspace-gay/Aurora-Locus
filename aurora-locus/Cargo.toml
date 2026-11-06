@@ -13,6 +13,7 @@ members = [
     "crates/locus-http",
     "crates/locus-web",
     "crates/locus-mail",
+    "crates/locus-conformance",
 ]
 
 [workspace.package]
