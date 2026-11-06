@@ -85,9 +85,12 @@ pub async fn start(
             "A key backup passphrase is at least 12 characters",
         ));
     }
+    // A holder of its own: a second create on this node mustn't reclaim
+    // the running backup's lease.
+    let holder = format!("{}/{}", s.node_id, hex::encode(rand::random::<[u8; 4]>()));
     let lease = s
         .store
-        .try_acquire_lease(BACKUP_LEASE, &s.node_id, LEASE_TTL)
+        .try_acquire_lease(BACKUP_LEASE, &holder, LEASE_TTL)
         .await?
         .ok_or_else(|| XrpcError::invalid_request("A backup is already running"))?;
     let started = s.store.db_now_ms().await?;

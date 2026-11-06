@@ -98,6 +98,40 @@ async fn migrate_storage_waits_for_blob_migrations_and_seeds_above_the_counters(
 }
 
 #[tokio::test]
+async fn a_pass_mark_waits_for_a_key_drawn_before_it_and_committed_after() {
+    for b in backends().await {
+        if b.name != "postgres" {
+            continue; // SQLite writers are serialized
+        }
+        let s = &b.store;
+        let lease = s
+            .try_acquire_lease(MIGRATE_LEASE, "n1", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        // A key-setting transaction draws its key_seq and stalls.
+        let mut tx = s.begin().await.unwrap();
+        tx.blob_backend().await.unwrap();
+        tx.insert_temp_blob("did:plc:a", "bafyslow", "image/png", 1, "tmp/slow")
+            .await
+            .unwrap();
+        let drawn = tx.next_key_seq().await.unwrap();
+        let mark = tokio::spawn({
+            let (s, lease) = (s.clone(), lease.clone());
+            async move { s.key_seq_mark(&lease).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!mark.is_finished(), "the mark waits for it");
+        tx.commit().await.unwrap();
+        let mark = mark.await.unwrap();
+        assert!(mark >= drawn, "{mark} covers {drawn}");
+        // So the pass up to that mark sees the row.
+        let rows = s.tracked_between(0, mark, 10).await.unwrap();
+        assert!(rows.iter().any(|r| r.storage_key == "tmp/slow"));
+    }
+}
+
+#[tokio::test]
 async fn migrate_storage_seeds_key_seq_above_recorded_marks() {
     let all = backends().await;
     let Some((src, dst)) = pair(&all) else {

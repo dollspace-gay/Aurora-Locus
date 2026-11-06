@@ -939,6 +939,13 @@ async fn backups_under_moves_gc_and_the_delete_job_hold_every_key_the_snapshot_n
     let id = crate::backups::start(h.state.clone(), None, "test")
         .await
         .unwrap();
+    // One at a time, even from the same node (it may not take the
+    // running backup's lease over).
+    assert!(
+        crate::backups::start(h.state.clone(), None, "test")
+            .await
+            .is_err()
+    );
     let run = backup_ended(&h, &id).await;
     assert_eq!(run.status, "done", "{:?}", run.error);
     assert_eq!(run.delete_mark, Some(0));
