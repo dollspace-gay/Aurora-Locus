@@ -14511,3 +14511,208 @@ async fn repair_tools_fix_the_index_the_tree_and_the_identity() {
         .await;
     assert_eq!(v["plcUpdated"], false);
 }
+
+#[tokio::test]
+async fn sequencer_recovery_replays_the_event_log_onto_repos() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("seq", "seq-password-123").await;
+    let lease = h
+        .state
+        .store
+        .try_acquire_lease("sequencer", "test", std::time::Duration::from_secs(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let (did, access) = h.user("rec.pds.example.com").await;
+    let post = |text: &'static str| {
+        let (h, did, access) = (&h, did.clone(), access.clone());
+        async move {
+            let (st, v) = h
+                .call(
+                    "POST",
+                    "/xrpc/com.atproto.repo.createRecord",
+                    Some(&access),
+                    Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record(text)})),
+                )
+                .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+        }
+    };
+    post("one").await;
+    let early = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    post("two").await;
+    post("three").await;
+    locus_sync::sequence_once(&h.state.store, &lease, 500, 0)
+        .await
+        .unwrap();
+    let latest = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    let locus_store::Store::Sqlite(pool) = &h.state.store else {
+        unreachable!()
+    };
+
+    // Data loss: the repo back at its first post, later blocks and index
+    // rows gone (the event log kept).
+    let roll_back = || async {
+        sqlx::query("DELETE FROM repo_block WHERE did = ?1 AND rev_introduced > ?2")
+            .bind(&did)
+            .bind(&early.rev)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM record WHERE did = ?1 AND rev > ?2")
+            .bind(&did)
+            .bind(&early.rev)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repo_root SET commit_cid = ?2, rev = ?3, data_cid = ?4 WHERE did = ?1")
+            .bind(&did)
+            .bind(&early.commit_cid)
+            .bind(&early.rev)
+            .bind(&early.data_cid)
+            .execute(pool)
+            .await
+            .unwrap();
+    };
+    roll_back().await;
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM record WHERE did = ?1")
+            .bind(&did)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(count().await, 1);
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.recoverFromSequencer"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["recovered"], json!([did]), "{v}");
+    let now = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    assert_eq!(
+        now.commit_cid, latest.commit_cid,
+        "the newest commit adopted"
+    );
+    assert_eq!(count().await, 3, "the index follows");
+    // Run again: up to date.
+    let (_, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.recoverFromSequencer"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(v["upToDate"], 1);
+
+    // When the log's commits and tree nodes are gone too (its record blocks
+    // kept), recovery can't adopt anything: the account is listed, and
+    // repair repos --from-sequencer replays the log's record changes into
+    // the index and rebuilds the repository from it.
+    roll_back().await;
+    let rows: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT seq, payload FROM seq_event WHERE did = ?1 AND kind = 'commit'")
+            .bind(&did)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    for (seq, payload) in rows {
+        let mut v: proto_blue_lex_data::LexValue = proto_blue_lex_cbor::decode(&payload).unwrap();
+        if let proto_blue_lex_data::LexValue::Map(m) = &mut v
+            && m.get("rev")
+                .and_then(proto_blue_lex_data::LexValue::as_str)
+                .is_some_and(|r| r > early.rev.as_str())
+        {
+            let ops: Vec<String> = m
+                .get("ops")
+                .and_then(proto_blue_lex_data::LexValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| {
+                    o.as_map()?
+                        .get("cid")?
+                        .as_cid()
+                        .map(|c| c.to_string_base32())
+                })
+                .collect();
+            let Some(proto_blue_lex_data::LexValue::Bytes(car)) = m.get("blocks") else {
+                unreachable!()
+            };
+            let (_, blocks) = proto_blue_repo::car::read_car(car).unwrap();
+            let mut kept = locus_repo::car::header(None);
+            for (cid, bytes) in blocks.iter() {
+                if ops.contains(&cid.to_string_base32()) {
+                    kept.extend(locus_repo::car::block(cid, bytes));
+                }
+            }
+            m.insert("blocks".into(), proto_blue_lex_data::LexValue::Bytes(kept));
+        }
+        sqlx::query("UPDATE seq_event SET payload = ?2 WHERE seq = ?1")
+            .bind(seq)
+            .bind(proto_blue_lex_cbor::encode(&v).unwrap())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    let (_, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.recoverFromSequencer"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(v["failed"][0]["did"], did, "{v}");
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.repairFromSequencer"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["fixed"], json!([did]));
+    let rebuilt = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    assert_ne!(rebuilt.commit_cid, early.commit_cid, "rebuilt");
+    assert_eq!(
+        count().await,
+        3,
+        "the log's changes replayed into the index"
+    );
+    let (st, v) = h
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getRepo?did={did}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        h.state
+            .store
+            .recoveries()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.fixed)
+    );
+    // rotate-account --recovery takes the recovered accounts.
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.keys.rotateAccountKeys"),
+            &owner,
+            Some(json!({"recovery": true})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["results"][0]["did"], did);
+}

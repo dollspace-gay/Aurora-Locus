@@ -143,6 +143,28 @@ impl Tx {
         .map_err(db_err)
     }
 
+    /// A stored block whatever its reference count (recovery reads blocks
+    /// it stored unreferenced).
+    pub async fn any_repo_block(&mut self, did: &str, cid: &str) -> CoreResult<Option<Vec<u8>>> {
+        match self {
+            Tx::Sqlite(t) => {
+                sqlx::query_scalar("SELECT content FROM repo_block WHERE did = ?1 AND cid = ?2")
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+            Tx::Postgres(t) => {
+                sqlx::query_scalar("SELECT content FROM repo_block WHERE did = $1 AND cid = $2")
+                    .bind(did)
+                    .bind(cid)
+                    .fetch_optional(&mut **t)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+
     /// Applies reference-count changes. A block whose count goes from 0 (or
     /// absent) to ≥1 gets `rev_introduced = rev` and `zero_since` cleared; a
     /// block reaching 0 gets `zero_since` = now. A negative delta on a block
@@ -776,6 +798,95 @@ impl Tx {
                 .execute(&mut **t)
                 .await
                 .map(|r| r.rows_affected()),
+        }
+        .map_err(db_err)
+    }
+}
+
+impl Tx {
+    /// Stores a block's bytes with no references if it isn't there (the
+    /// event log's blocks, during a recovery).
+    pub async fn put_unreferenced_block(
+        &mut self,
+        did: &str,
+        cid: &str,
+        rev: &str,
+        bytes: &[u8],
+    ) -> CoreResult<()> {
+        let q = crate::blob::sql(
+            "INSERT INTO repo_block (did, cid, rev_introduced, size, content, ref_count, zero_since) \
+             VALUES ({1}, {2}, {3}, {4}, {5}, 0, {now}) ON CONFLICT (did, cid) DO NOTHING",
+            matches!(self, Tx::Postgres(_)),
+        );
+        let size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+        match self {
+            Tx::Sqlite(t) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .bind(rev)
+                .bind(size)
+                .bind(bytes)
+                .execute(&mut **t)
+                .await
+                .map(|_| ()),
+            Tx::Postgres(t) => sqlx::query(&q)
+                .bind(did)
+                .bind(cid)
+                .bind(rev)
+                .bind(size)
+                .bind(bytes)
+                .execute(&mut **t)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(db_err)
+    }
+}
+
+/// One account's line in the last `sequencer recover`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct Recovery {
+    pub did: String,
+    pub recovered_at: i64,
+    pub error: Option<String>,
+    pub fixed: bool,
+}
+
+impl Store {
+    /// Records how an account's recovery went (`error` None: recovered).
+    pub async fn record_recovery(&self, did: &str, error: Option<&str>) -> CoreResult<()> {
+        let q = crate::blob::sql(
+            "INSERT INTO sequencer_recovery (did, recovered_at, error, fixed) VALUES ({1}, {now}, {2}, {3}) \
+             ON CONFLICT (did) DO UPDATE SET recovered_at = excluded.recovered_at, error = excluded.error, \
+             fixed = excluded.fixed",
+            self.is_postgres(),
+        );
+        let fixed = error.is_none();
+        match self {
+            Store::Sqlite(p) => sqlx::query(&q)
+                .bind(did)
+                .bind(error)
+                .bind(fixed)
+                .execute(p)
+                .await
+                .map(|_| ()),
+            Store::Postgres(p) => sqlx::query(&q)
+                .bind(did)
+                .bind(error)
+                .bind(fixed)
+                .execute(p)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(db_err)
+    }
+
+    /// Every account the last recoveries touched.
+    pub async fn recoveries(&self) -> CoreResult<Vec<Recovery>> {
+        let q = "SELECT did, recovered_at, error, fixed FROM sequencer_recovery ORDER BY did";
+        match self {
+            Store::Sqlite(p) => sqlx::query_as(q).fetch_all(p).await,
+            Store::Postgres(p) => sqlx::query_as(q).fetch_all(p).await,
         }
         .map_err(db_err)
     }

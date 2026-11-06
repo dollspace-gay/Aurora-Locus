@@ -814,7 +814,12 @@ pub async fn rotate_service_key(
 
 #[derive(Deserialize)]
 pub struct DidsInput {
+    #[serde(default)]
     dids: Vec<String>,
+    /// Every account `sequencer recover` recovered (the reference's
+    /// `rotate-keys-recovery`).
+    #[serde(default)]
+    recovery: bool,
 }
 
 /// `admin.keys.rotateAccountKeys`: the reference's `rotate-keys`. For
@@ -834,8 +839,12 @@ pub async fn rotate_account_keys(
         Role::Admin,
     )
     .await?;
+    let mut dids = input.dids.clone();
+    if input.recovery {
+        dids.extend(crate::repair::recovered_dids(&s).await?);
+    }
     let mut results = Vec::new();
-    for did in &input.dids {
+    for did in &dids {
         let outcome = rotate_one(&s, did).await;
         results.push(match &outcome {
             Ok(changed) => json!({"did": did, "ok": true, "plcUpdated": changed}),
@@ -847,7 +856,7 @@ pub async fn rotate_account_keys(
         &who,
         "keys.rotateAccountKeys",
         None,
-        Some(json!({"dids": input.dids.len()})),
+        Some(json!({"dids": dids.len(), "recovery": input.recovery})),
     )
     .await;
     Ok(Json(json!({"results": results})))

@@ -344,9 +344,29 @@ pub enum RepoCmd {
 }
 
 #[derive(Subcommand)]
+pub enum SequencerCmd {
+    /// Replays the retained event log onto repositories (the reference's
+    /// sequencer-recovery); accounts it can't recover are listed for
+    /// `repair repos --from-sequencer`.
+    Recover {
+        #[arg(long)]
+        did: Option<String>,
+        /// Start after this seq.
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum RepairCmd {
     /// The record index rebuilt from the repository's tree.
     Repo { did: String },
+    /// The accounts `sequencer recover` couldn't recover: the event log's
+    /// record changes into the index, then a rebuild.
+    Repos {
+        #[arg(long, required = true)]
+        from_sequencer: bool,
+    },
     /// The PLC document set back to the handle, this PDS and the held
     /// signing key, then `#identity`.
     Identity { did: String },
@@ -445,6 +465,9 @@ pub enum KeysCmd {
         /// A file of DIDs, one per line (did:plc ones are used).
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Every account `sequencer recover` recovered.
+        #[arg(long)]
+        recovery: bool,
     },
     /// Reads a key backup: adds the PLC rotation keys this PDS lacks, and
     /// restores account signing keys their live DID documents list.
@@ -748,6 +771,9 @@ pub enum AdminCmd {
     /// Repair tools.
     #[command(subcommand)]
     Repair(RepairCmd),
+    /// The event log.
+    #[command(subcommand)]
+    Sequencer(SequencerCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -1289,7 +1315,21 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             );
             Ok(())
         }
-        KeysCmd::RotateAccount { dids, file } => {
+        KeysCmd::RotateAccount {
+            dids,
+            file,
+            recovery: true,
+        } if dids.is_empty() && file.is_none() => {
+            let v = c
+                .call(
+                    &lx("admin.keys.rotateAccountKeys"),
+                    &[],
+                    Some(json!({"recovery": true})),
+                )
+                .await?;
+            report_results(&v)
+        }
+        KeysCmd::RotateAccount { dids, file, .. } => {
             let dids = dids_from(dids, file.as_deref(), true)?;
             for chunk in dids.chunks(50) {
                 let v = c
@@ -1386,6 +1426,24 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
         AdminCmd::Repair(RepairCmd::Repo { did }) => {
             print(
                 &c.call(&lx("admin.repo.repair"), &[], Some(json!({"did": did})))
+                    .await?,
+            );
+            Ok(())
+        }
+        AdminCmd::Sequencer(SequencerCmd::Recover { did, since }) => {
+            print(
+                &c.call(
+                    &lx("admin.repo.recoverFromSequencer"),
+                    &[],
+                    Some(json!({"did": did, "since": since})),
+                )
+                .await?,
+            );
+            Ok(())
+        }
+        AdminCmd::Repair(RepairCmd::Repos { .. }) => {
+            print(
+                &c.call(&lx("admin.repo.repairFromSequencer"), &[], Some(json!({})))
                     .await?,
             );
             Ok(())

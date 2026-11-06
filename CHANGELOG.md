@@ -662,6 +662,13 @@ kryphocron built in.
   backlinks) and `repair identity <did>` (a did:plc document set back to
   the account's handle, this PDS and its signing key in one operation,
   then `#identity`).
+- `sequencer recover [--did] [--since]` (the reference's
+  `sequencer-recovery`): replays the retained event log onto repositories,
+  adopting each account's newest logged commit whose tree is whole (blocks
+  re-counted, record index rebuilt, `#sync`). Accounts it can't recover
+  are recorded, and `repair repos --from-sequencer` replays their logged
+  record changes into the index and rebuilds them. `keys rotate-account
+  --recovery` rotates the accounts recovery touched.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 
