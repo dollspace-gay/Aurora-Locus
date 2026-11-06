@@ -58,6 +58,12 @@ pub fn value_hash(value: &Value) -> String {
     hex::encode(Sha256::digest(value.to_string().as_bytes()))
 }
 
+/// The hash `report_bootstrap` records for a value.
+#[must_use]
+pub fn bootstrap_hash(value: &str) -> String {
+    value_hash(&Value::String(value.to_owned()))
+}
+
 impl Store {
     /// Records this node's env values in `env_report` (and removes rows for
     /// keys it no longer has), prunes reports of nodes that aren't live, then
@@ -118,7 +124,8 @@ impl Store {
     }
 
     /// Records hashes of this node's bootstrap values that must agree
-    /// install-wide (role, Redis URL) and returns the names of those another
+    /// install-wide (role, Redis URL, dev mode, SSRF protection, master key
+    /// source) and returns the names of those another
     /// live node reports differently. Bootstrap values can't be changed
     /// live, so a disagreement is only warned about.
     pub async fn report_bootstrap(
@@ -128,7 +135,7 @@ impl Store {
     ) -> CoreResult<Vec<String>> {
         let mut tx = self.begin().await?;
         for (name, value) in values {
-            let hash = value_hash(&Value::String((*value).to_owned()));
+            let hash = bootstrap_hash(value);
             tx.upsert_env_report(node_id, &format!("@{name}"), &hash)
                 .await?;
         }
@@ -149,6 +156,23 @@ impl Store {
             }
         }
         Ok(differ)
+    }
+
+    /// What live nodes reported with `report_bootstrap`, by name: each
+    /// node and its value's hash (compare with [`bootstrap_hash`]).
+    pub async fn live_bootstrap_reports(
+        &self,
+    ) -> CoreResult<BTreeMap<String, Vec<(String, String)>>> {
+        let live = self.live_slot_holders(CLOCK_SLOT_FAMILY).await?;
+        let mut out: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for ((node, key), hash) in self.env_reports().await? {
+            if let Some(name) = key.strip_prefix('@')
+                && live.contains(&node)
+            {
+                out.entry(name.to_owned()).or_default().push((node, hash));
+            }
+        }
+        Ok(out)
     }
 
     async fn prune_env_reports(&self, live: &[String]) -> CoreResult<()> {

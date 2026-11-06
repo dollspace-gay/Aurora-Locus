@@ -216,6 +216,62 @@ async fn banners(s: &AppState, op: &Op) -> Vec<Banner> {
             link: None,
         });
     }
+    out.extend(node_banners(s).await);
+    out
+}
+
+/// Warnings from the bootstrap values live nodes report: SSRF protection
+/// off, dev mode ignored, and values nodes disagree on.
+async fn node_banners(s: &AppState) -> Vec<Banner> {
+    let Ok(reports) = s.store.live_bootstrap_reports().await else {
+        return Vec::new();
+    };
+    let nodes_with = |name: &str, value: &str| -> Vec<String> {
+        let hash = locus_store::env::bootstrap_hash(value);
+        reports
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|(_, h)| *h == hash)
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+    let mut out = Vec::new();
+    let off = nodes_with("ssrf_protection", "off");
+    if !off.is_empty() {
+        out.push(Banner {
+            bad: true,
+            text: format!(
+                "SSRF protection is off on {} (PDS_DISABLE_SSRF_PROTECTION or dev mode): requests users can influence may reach loopback and private addresses.",
+                off.join(", ")
+            ),
+            link: None,
+        });
+    }
+    let ignored = nodes_with("dev_mode", "ignored");
+    if !ignored.is_empty() {
+        out.push(Banner {
+            bad: false,
+            text: format!(
+                "PDS_DEV_MODE is ignored on {}: the hostname isn't local.",
+                ignored.join(", ")
+            ),
+            link: None,
+        });
+    }
+    for (name, rows) in &reports {
+        if rows.iter().any(|(_, h)| *h != rows[0].1) {
+            let nodes: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+            out.push(Banner {
+                bad: true,
+                text: format!(
+                    "The nodes {} disagree on {name}: every node must use the same value.",
+                    nodes.join(", ")
+                ),
+                link: None,
+            });
+        }
+    }
     out
 }
 

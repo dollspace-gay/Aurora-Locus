@@ -68,6 +68,14 @@ pub async fn validate_handle(s: &AppState, raw: &str, did: Option<&str>) -> Xrpc
     if h == s.hostname || s.store.pds_host_reserved(&h).await? {
         return Err(taken());
     }
+    // So are the internal names that get every route.
+    if s.snapshot()
+        .list("http.internal_hosts")
+        .iter()
+        .any(|i| i.eq_ignore_ascii_case(&h))
+    {
+        return Err(taken());
+    }
     if let Some(web) = s.store.hosted_did_web_by_host(&h).await?
         && Some(web.did.as_str()) != did
     {

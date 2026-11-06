@@ -258,8 +258,27 @@ impl Node {
         }
         let role = format!("{:?}", bootstrap.role);
         let redis = bootstrap.redis_url.clone().unwrap_or_default();
+        let dev_mode = match (bootstrap.dev_mode, bootstrap.dev_mode_honored()) {
+            (false, _) => "off",
+            (true, true) => "on",
+            (true, false) => "ignored",
+        };
+        let ssrf = if bootstrap.ssrf_protection_disabled() {
+            "off"
+        } else {
+            "on"
+        };
         for name in store
-            .report_bootstrap(&node_id, &[("role", &role), ("redis_url", &redis)])
+            .report_bootstrap(
+                &node_id,
+                &[
+                    ("role", &role),
+                    ("redis_url", &redis),
+                    ("dev_mode", dev_mode),
+                    ("ssrf_protection", ssrf),
+                    ("master_key_source", master_key.source().as_str()),
+                ],
+            )
             .await?
         {
             tracing::warn!(

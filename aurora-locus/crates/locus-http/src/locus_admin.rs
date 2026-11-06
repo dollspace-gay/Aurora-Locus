@@ -502,6 +502,9 @@ pub async fn set_setting(
             "Turn the media gate off before removing the scanner",
         ));
     }
+    if input.key == "http.internal_hosts" {
+        check_internal_hosts(&s, &value).await?;
+    }
     let before = s.snapshot().get(&input.key).clone();
     let version = s
         .settings
@@ -516,6 +519,24 @@ pub async fn set_setting(
     )
     .await;
     Ok(Json(json!({"version": version})))
+}
+
+/// Internal names get every route, so none may be a name a user holds or a
+/// PDS hostname (current, prepared or old).
+async fn check_internal_hosts(s: &AppState, value: &Value) -> XrpcResult<()> {
+    for host in value.as_array().into_iter().flatten() {
+        let host = host.as_str().unwrap_or("").trim().to_ascii_lowercase();
+        let taken = host == s.hostname
+            || s.store.pds_host_reserved(&host).await?
+            || s.store.account_by_handle(&host).await?.is_some()
+            || s.store.hosted_did_web_by_host(&host).await?.is_some();
+        if taken {
+            return Err(XrpcError::invalid_request(format!(
+                "{host} is a handle, did:web or PDS hostname, not an internal name"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Asks every configured relay to crawl this PDS now.

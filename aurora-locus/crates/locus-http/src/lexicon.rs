@@ -53,9 +53,10 @@ async fn fetch_record(s: &AppState, did: &str, rkey: &str) -> Result<Value, Stri
         url::form_urlencoded::byte_serialize(did.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(rkey.as_bytes()).collect::<String>()
     );
+    // The stricter rule, as every `include:` fetch (no IP-literal hosts).
     let fetcher = locus_identity::fetch::SafeFetcher::new(locus_identity::fetch::FetchPolicy {
         ssrf_protection: s.ssrf_protection,
-        strict: false,
+        strict: true,
     })
     .map_err(|e| e.to_string())?;
     let res = fetcher
