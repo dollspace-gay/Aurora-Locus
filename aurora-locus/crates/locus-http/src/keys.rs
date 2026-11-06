@@ -69,7 +69,31 @@ pub async fn show(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
         .unwrap_or_default();
     let counts = s.store.plc_listing_counts(&current).await?;
     let backed_up = |created: i64| state.last_backup_at.is_some_and(|b| b > created);
+    // Entryway role: the token key shards verify with (as did:key and
+    // compressed hex, for a reference shard's env).
+    let token_key = if s.role == locus_core::bootstrap::Role::Entryway {
+        let k = crate::entryway::token_key(&s).await?;
+        let did = k.did();
+        let hex = proto_blue_crypto::parse_did_key(&did)
+            .ok()
+            .and_then(|p| k256::PublicKey::from_sec1_bytes(&p.key_bytes).ok())
+            .map(|p| {
+                hex::encode(
+                    k256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&p, true)
+                        .as_bytes(),
+                )
+            });
+        Some(json!({"didKey": did, "hex": hex}))
+    } else {
+        None
+    };
+    // Shard role: the entryway keys accepted.
+    let entryway = s.entryway.as_ref().map(|ew| {
+        json!({"url": ew.url, "did": ew.did, "verifyKeys": ew.verify_key_ids(), "plcRotationKeys": ew.plc_rotation_keys})
+    });
     Ok(Json(json!({
+        "entrywayTokenKey": token_key,
+        "entryway": entryway,
         "masterKey": {"id": s.master_key.key_id(), "source": s.master_key.source().as_str()},
         "serviceKey": s.secrets.service_key.did(),
         "plcRotationKeys": rows.iter().map(|r| json!({

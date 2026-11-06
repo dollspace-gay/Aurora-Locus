@@ -63,7 +63,7 @@ pub async fn deactivate_account(
     let body = account_body(did, false, Some(status.as_str())).map_err(internal)?;
     tx.insert_outbox(did, "account", &body).await?;
     tx.commit().await?;
-    Ok(())
+    crate::entryway::push_status(&s, did).await
 }
 
 pub async fn activate_account(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
@@ -72,6 +72,9 @@ pub async fn activate_account(State(s): St, headers: HeaderMap) -> XrpcResult<()
     ))
     .await?;
     let did = authed.did.as_str();
+    if s.role == locus_core::bootstrap::Role::Entryway {
+        return crate::entryway::activate(&s, did).await;
+    }
     assert_valid_did_doc(&s, did).await?;
     let account = s
         .store
@@ -310,6 +313,10 @@ pub async fn start_deletion(s: &AppState, did: &str) -> XrpcResult<BulkJob> {
     )
     .await?;
     tx.commit().await?;
+    // On an entryway, the account's shard deletes its repo.
+    if let Err(e) = crate::entryway::push_delete(s, did).await {
+        tracing::warn!(did, "the shard didn't delete the account: {e:?}");
+    }
     Ok(job)
 }
 

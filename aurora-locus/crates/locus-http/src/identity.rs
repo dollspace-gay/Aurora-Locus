@@ -235,7 +235,8 @@ pub(crate) async fn change_handle(
         let _ = s.store.clear_handle_cache(h).await;
     }
     let _ = s.store.clear_did_doc(did).await;
-    Ok(())
+    // On an entryway, the account's shard records it (and sequences it).
+    crate::entryway::push_handle(s, did, &handle).await
 }
 
 /// Puts `handle` first among a document's `at://` names.

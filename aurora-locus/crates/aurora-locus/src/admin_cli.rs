@@ -337,6 +337,39 @@ pub enum ModerationCmd {
 }
 
 #[derive(Subcommand)]
+pub enum ShardCmd {
+    /// Adds (or re-adds) a shard: probes it, checks its admin password,
+    /// and on a locus shard installs a fresh callback token.
+    Add {
+        /// The shard's URL.
+        #[arg(value_name = "URL")]
+        shard_url: String,
+        /// The shard's admin password, from a file (or `-` for stdin).
+        #[arg(long)]
+        admin_password_file: PathBuf,
+        /// Its name here (default: its hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Its placement weight (default 1).
+        #[arg(long)]
+        weight: Option<i64>,
+        /// Record a listed locus shard that now answers as non-locus.
+        #[arg(long)]
+        confirm_non_locus: bool,
+    },
+    /// The shards, their accounts, weights and kind.
+    List,
+    /// A shard's placement weight (0: no new accounts).
+    Weight { name: String, weight: i64 },
+    /// Stops placing new accounts on a shard (`--undo` resumes).
+    Drain {
+        name: String,
+        #[arg(long)]
+        undo: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum CrawlCmd {
     /// Asks every relay to crawl now.
     Request,
@@ -663,6 +696,9 @@ pub enum AdminCmd {
     Backup(BackupCmd),
     #[command(subcommand)]
     Migrate(MigrateCmd),
+    /// Entryway role: the shards behind it.
+    #[command(subcommand)]
+    Shard(ShardCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -794,6 +830,27 @@ fn read_key(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String
         std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
     };
     Ok(zeroize::Zeroizing::new(text.trim().to_owned()))
+}
+
+fn print_shard(v: &Value) {
+    println!(
+        "{}  {}  {}  {}  weight {}  {} accounts{}",
+        v["name"].as_str().unwrap_or(""),
+        v["url"].as_str().unwrap_or(""),
+        v["did"].as_str().unwrap_or(""),
+        if v["locus"].as_bool() == Some(true) {
+            "locus"
+        } else {
+            "non-locus"
+        },
+        v["weight"],
+        v["accounts"],
+        if v["draining"].as_bool() == Some(true) {
+            "  draining"
+        } else {
+            ""
+        },
+    );
 }
 
 /// Writes a new file only the owner can read; an existing one is refused.
@@ -940,6 +997,26 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 v["masterKey"]["source"].as_str().unwrap_or("")
             );
             println!("service key  {}", v["serviceKey"].as_str().unwrap_or(""));
+            if let Some(k) = v["entrywayTokenKey"].as_object() {
+                println!(
+                    "token key    {} (hex {})",
+                    k["didKey"].as_str().unwrap_or(""),
+                    k["hex"].as_str().unwrap_or("")
+                );
+            }
+            if let Some(e) = v["entryway"].as_object() {
+                println!(
+                    "entryway     {} ({})",
+                    e["url"].as_str().unwrap_or(""),
+                    e["did"].as_str().unwrap_or("")
+                );
+                for k in e["verifyKeys"].as_array().into_iter().flatten() {
+                    println!("  verify key        {}", k.as_str().unwrap_or(""));
+                }
+                for k in e["plcRotationKeys"].as_array().into_iter().flatten() {
+                    println!("  PLC rotation key  {}", k.as_str().unwrap_or(""));
+                }
+            }
             for r in v["plcRotationKeys"].as_array().cloned().unwrap_or_default() {
                 let note = if r["inLastBackup"] == json!(false) {
                     "  (not in a key backup yet)"
@@ -1214,6 +1291,54 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match cmd {
         AdminCmd::Keys(k) => keys(c, k).await,
+        AdminCmd::Shard(ShardCmd::Add {
+            shard_url,
+            admin_password_file,
+            name,
+            weight,
+            confirm_non_locus,
+        }) => {
+            let pw = read_key(&admin_password_file)?;
+            let v = c
+                .call(
+                    &lx("owner.shard.add"),
+                    &[],
+                    Some(json!({"url": shard_url, "adminPassword": *pw, "name": name,
+                                "weight": weight, "confirmNonLocus": confirm_non_locus})),
+                )
+                .await?;
+            print_shard(&v);
+            Ok(())
+        }
+        AdminCmd::Shard(ShardCmd::List) => {
+            let v = c.call(&lx("owner.shard.list"), &[], None).await?;
+            for sh in v["shards"].as_array().into_iter().flatten() {
+                print_shard(sh);
+            }
+            Ok(())
+        }
+        AdminCmd::Shard(ShardCmd::Weight { name, weight }) => {
+            let v = c
+                .call(
+                    &lx("owner.shard.update"),
+                    &[],
+                    Some(json!({"name": name, "weight": weight})),
+                )
+                .await?;
+            print_shard(&v);
+            Ok(())
+        }
+        AdminCmd::Shard(ShardCmd::Drain { name, undo }) => {
+            let v = c
+                .call(
+                    &lx("owner.shard.update"),
+                    &[],
+                    Some(json!({"name": name, "draining": !undo})),
+                )
+                .await?;
+            print_shard(&v);
+            Ok(())
+        }
         AdminCmd::Backup(BackupCmd::Create {
             passphrase_file,
             no_keys,

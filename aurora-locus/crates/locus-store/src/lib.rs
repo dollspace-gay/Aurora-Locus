@@ -12,6 +12,7 @@ pub mod bulk;
 pub mod console;
 pub mod copy;
 pub mod email;
+pub mod entryway;
 pub mod env;
 pub mod hostnames;
 pub mod identity;

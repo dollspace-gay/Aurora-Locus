@@ -297,7 +297,8 @@ pub(crate) async fn set_account_takedown(
     if takedown_ref.is_some() {
         s.store.oauth_delete_account_tokens(did).await?;
     }
-    Ok(())
+    // On an entryway, the account's shard applies it too.
+    crate::entryway::push_status(s, did).await
 }
 
 #[derive(Deserialize)]

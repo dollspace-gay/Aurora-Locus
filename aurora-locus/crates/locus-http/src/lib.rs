@@ -17,6 +17,7 @@ pub mod console;
 pub mod console_people;
 pub mod console_sections;
 pub mod email;
+pub mod entryway;
 pub mod error;
 pub mod health;
 pub mod hostnames;
@@ -419,12 +420,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(console_sections::routes())
         .merge(portal::routes())
         .merge(branding::routes())
+        .merge(entryway::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
-        // In the shard role, account management goes to the entryway.
+        // In the shard role, account management goes to the entryway; in
+        // the entryway role, everything else goes to the account's shard.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             shard::intercept,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            entryway::intercept,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

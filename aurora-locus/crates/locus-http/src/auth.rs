@@ -47,6 +47,12 @@ pub async fn access_with(
     extra: &[&str],
 ) -> XrpcResult<Authed> {
     let token = bearer(headers)?;
+    // An entryway takes a shard's re-signed calls (the account's checks
+    // were made there).
+    if state.role == locus_core::bootstrap::Role::Entryway && crate::entryway::is_service_jwt(token)
+    {
+        return crate::entryway::verify_service(state, headers).await;
+    }
     let authed = match &state.entryway {
         Some(ew) => crate::shard::verify_access(state, ew, token).await?,
         None => state.sessions.verify_access(token).await?,

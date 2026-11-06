@@ -108,8 +108,18 @@ pub struct Tokens {
     pub session_id: String,
 }
 
+/// The entryway role's token keys: tokens are ES256K, access tokens
+/// addressed to the account's shard.
+pub struct EntrywayKeys {
+    pub signing: proto_blue_crypto::K256Keypair,
+    /// Keys whose tokens are accepted (the signing key, and during a
+    /// rotation the other one).
+    pub accepted: Vec<crate::oauth::jose::PublicJwk>,
+}
+
 pub struct LegacySessions {
     store: Store,
+    entryway: Option<EntrywayKeys>,
     secret: Zeroizing<Vec<u8>>,
     service_did: String,
     /// Other audiences accepted (old hostnames' service DIDs).
@@ -136,6 +146,7 @@ impl LegacySessions {
     pub fn new(store: Store, secret: Zeroizing<Vec<u8>>, service_did: String) -> Self {
         Self {
             store,
+            entryway: None,
             secret,
             service_did,
             also_accepted: Vec::new(),
@@ -145,26 +156,77 @@ impl LegacySessions {
         }
     }
 
-    fn access_jwt(&self, did: &str, scope: &str, session_id: &str, now: i64) -> String {
-        jwt::sign(
-            &self.secret,
+    /// In the entryway role: tokens are ES256K with these keys.
+    #[must_use]
+    pub fn with_entryway(mut self, keys: EntrywayKeys) -> Self {
+        self.entryway = Some(keys);
+        self
+    }
+
+    /// Whether this is the entryway role.
+    #[must_use]
+    pub fn is_entryway(&self) -> bool {
+        self.entryway.is_some()
+    }
+
+    fn sign(&self, typ: &str, claims: &Claims) -> String {
+        match &self.entryway {
+            Some(e) => jwt::sign_es256k(&e.signing, typ, claims),
+            None => jwt::sign(&self.secret, typ, claims),
+        }
+    }
+
+    fn verify(&self, typ: &str, token: &str, now: i64) -> Result<Claims, JwtError> {
+        match &self.entryway {
+            Some(e) => jwt::verify_es256k(&e.accepted, typ, token, now),
+            None => jwt::verify(&self.secret, typ, token, now),
+        }
+    }
+
+    /// Where an account's access tokens are addressed: this PDS, or in the
+    /// entryway role the account's shard.
+    async fn access_aud(&self, did: &str) -> String {
+        if self.entryway.is_some()
+            && let Ok(Some(aud)) = self.store.account_shard_did(did).await
+        {
+            return aud;
+        }
+        self.service_did.clone()
+    }
+
+    fn access_jwt(
+        &self,
+        did: &str,
+        scope: &str,
+        session_id: &str,
+        now: i64,
+        aud: String,
+    ) -> String {
+        // An entryway token names its session in `sid` (shards revoke by
+        // it) and gets its own `jti`.
+        let (jti, sid) = if self.entryway.is_some() {
+            (random_id(), Some(session_id.to_owned()))
+        } else {
+            (session_id.to_owned(), None)
+        };
+        self.sign(
             TYP_ACCESS,
             &Claims {
                 scope: scope.to_owned(),
-                aud: self.service_did.clone(),
+                aud,
                 sub: did.to_owned(),
                 iat: now,
                 exp: now + self.access_ttl_s,
-                jti: Some(session_id.to_owned()),
+                jti: Some(jti),
                 cnf: None,
                 lxm: None,
+                sid,
             },
         )
     }
 
     fn refresh_jwt(&self, did: &str, refresh_id: &str, now: i64, exp: i64) -> String {
-        jwt::sign(
-            &self.secret,
+        self.sign(
             TYP_REFRESH,
             &Claims {
                 scope: SCOPE_REFRESH.to_owned(),
@@ -175,6 +237,7 @@ impl LegacySessions {
                 jti: Some(refresh_id.to_owned()),
                 cnf: None,
                 lxm: None,
+                sid: None,
             },
         )
     }
@@ -183,7 +246,7 @@ impl LegacySessions {
     /// signs its own calls with one; it holds no refresh token).
     #[must_use]
     pub fn mint_access(&self, did: &str, scope: &str, session_id: &str) -> String {
-        self.access_jwt(did, scope, session_id, now_s())
+        self.access_jwt(did, scope, session_id, now_s(), self.service_did.clone())
     }
 
     /// Opens a session. `store_refresh` is false for a taken-down account's
@@ -240,8 +303,9 @@ impl LegacySessions {
         } else {
             None
         };
+        let aud = self.access_aud(did).await;
         Ok(Tokens {
-            access_jwt: self.access_jwt(did, scope, &session_id, now),
+            access_jwt: self.access_jwt(did, scope, &session_id, now, aud),
             refresh_jwt,
             session_id,
         })
@@ -281,14 +345,23 @@ impl LegacySessions {
 
     /// Verifies an access token against its session and the account.
     pub async fn verify_access(&self, token: &str) -> Result<Authed, AuthError> {
-        let claims = jwt::verify(&self.secret, TYP_ACCESS, token, now_s())?;
-        if claims.cnf.is_some() || claims.lxm.is_some() || !self.aud_ok(&claims.aud) {
+        let claims = self.verify(TYP_ACCESS, token, now_s())?;
+        // An entryway's tokens are addressed to the account's shard; it
+        // takes them too when a client calls it directly.
+        let aud_ok = self.aud_ok(&claims.aud)
+            || (self.entryway.is_some() && self.access_aud(&claims.sub).await == claims.aud);
+        if claims.cnf.is_some() || claims.lxm.is_some() || !aud_ok {
             return Err(AuthError::InvalidToken);
         }
         if !ACCESS_SCOPES.contains(&claims.scope.as_str()) || !claims.sub.starts_with("did:") {
             return Err(AuthError::InvalidToken);
         }
-        let Some(session_id) = claims.jti.clone() else {
+        let named = if self.entryway.is_some() {
+            claims.sid.clone()
+        } else {
+            claims.jti.clone()
+        };
+        let Some(session_id) = named else {
             return self.verify_imported(claims).await;
         };
         let session = self
@@ -357,7 +430,7 @@ impl LegacySessions {
     /// period returns the same next refresh token.
     pub async fn refresh(&self, refresh_jwt: &str) -> Result<(Tokens, String), AuthError> {
         let now = now_s();
-        let claims = jwt::verify(&self.secret, TYP_REFRESH, refresh_jwt, now)?;
+        let claims = self.verify(TYP_REFRESH, refresh_jwt, now)?;
         if !self.aud_ok(&claims.aud) || claims.scope != SCOPE_REFRESH {
             return Err(AuthError::InvalidToken);
         }
@@ -413,9 +486,10 @@ impl LegacySessions {
             }
         };
         tx.commit().await?;
+        let aud = self.access_aud(&session.did).await;
         Ok((
             Tokens {
-                access_jwt: self.access_jwt(&session.did, &session.scope, &session.id, now),
+                access_jwt: self.access_jwt(&session.did, &session.scope, &session.id, now, aud),
                 refresh_jwt: Some(self.refresh_jwt(&session.did, &next_id, now, next_exp)),
                 session_id: session.id,
             },
@@ -426,11 +500,9 @@ impl LegacySessions {
     /// Ends the session a refresh token belongs to (an expired token is
     /// accepted, as the reference).
     pub async fn delete(&self, refresh_jwt: &str) -> Result<(), AuthError> {
-        let claims = match jwt::verify(&self.secret, TYP_REFRESH, refresh_jwt, now_s()) {
+        let claims = match self.verify(TYP_REFRESH, refresh_jwt, now_s()) {
             Ok(c) => c,
-            Err(JwtError::Expired) => {
-                jwt::verify(&self.secret, TYP_REFRESH, refresh_jwt, i64::MIN)?
-            }
+            Err(JwtError::Expired) => self.verify(TYP_REFRESH, refresh_jwt, i64::MIN)?,
             Err(e) => return Err(e.into()),
         };
         let id = claims.jti.ok_or(AuthError::InvalidToken)?;

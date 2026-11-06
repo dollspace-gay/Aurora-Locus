@@ -608,6 +608,22 @@ kryphocron built in.
   require `--entryway-verify-key` and `--entryway-plc-rotation-key` (the
   entryway's current keys replace the restored ones) and refuse every
   hosted account's tokens issued before the restore.
+- The entryway role (`LOCUS_ROLE=entryway`): accounts, logins, handles and
+  the PLC rotation key for shards behind it. `shard add <url>
+  --admin-password-file <f>` probes a shard (`describeCapabilities`),
+  checks its admin password and, on a locus shard, installs a callback
+  token; `shard list`, `shard weight`, `shard drain`. New accounts go to
+  the shard with the most room for its weight: the entryway reserves a
+  signing key there, signs the genesis operation with its PLC rotation
+  key and has the shard create the account, keeping the email, password,
+  invite and sessions. Its tokens are ES256K with its token key (`keys
+  show` gives it, as did:key and hex), access tokens addressed to the
+  account's shard with a `sid`. It takes the calls shards re-sign as the
+  account, tells the shard of status, handle and deletion changes
+  (`admin.updateSubjectStatus`, `admin.updateAccountHandle`,
+  `admin.deleteAccount`), and forwards repo and other calls to the
+  account's shard. `com.atproto.temp.dereferenceScope` is served (a locus
+  entryway sends full scopes).
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

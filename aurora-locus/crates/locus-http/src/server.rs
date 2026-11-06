@@ -60,12 +60,12 @@ pub async fn describe_server(State(s): St) -> Json<Value> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAccountInput {
-    email: Option<String>,
-    handle: String,
-    did: Option<String>,
-    invite_code: Option<String>,
-    password: Option<String>,
-    recovery_key: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) handle: String,
+    pub(crate) did: Option<String>,
+    pub(crate) invite_code: Option<String>,
+    pub(crate) password: Option<String>,
+    pub(crate) recovery_key: Option<String>,
     /// Locus extension, ignored by stock clients: `plc` or `web`.
     locus_did_method: Option<String>,
 }
@@ -127,7 +127,7 @@ async fn did_doc_for(s: &AppState, account: &Account) -> XrpcResult<Option<Value
     ))
 }
 
-fn session_json(account: &Account, tokens: &Tokens, did_doc: Option<Value>) -> Value {
+pub(crate) fn session_json(account: &Account, tokens: &Tokens, did_doc: Option<Value>) -> Value {
     let (active, status) = status_fields(account.status);
     let mut out = json!({
         "accessJwt": tokens.access_jwt,
@@ -154,6 +154,9 @@ pub async fn create_account(
     Json(input): Json<CreateAccountInput>,
 ) -> XrpcResult<Json<Value>> {
     crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::CREATE_ACCOUNT]).await?;
+    if s.role == locus_core::bootstrap::Role::Entryway {
+        return crate::entryway::create_account(&s, input).await.map(Json);
+    }
     // Migrating in: the DID must authorize this with a service JWT, and the
     // account starts deactivated, emitting nothing until it's activated.
     let migrating = match input.did.as_deref() {

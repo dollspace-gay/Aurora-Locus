@@ -28,6 +28,10 @@ pub struct Claims {
     /// Present on service-auth tokens; a legacy token carrying it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lxm: Option<String>,
+    /// The session a token belongs to (entryway tokens: `jti` is per token,
+    /// `sid` stays the same across refreshes, so a shard can revoke it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +102,51 @@ pub fn verify(secret: &[u8], typ: &str, token: &str, now: i64) -> Result<Claims,
     Ok(claims)
 }
 
+/// Signs `claims` ES256K with `key` as a `typ` token (the entryway role).
+#[must_use]
+pub fn sign_es256k(key: &proto_blue_crypto::K256Keypair, typ: &str, claims: &Claims) -> String {
+    use proto_blue_crypto::Signer;
+    let header = Header {
+        typ: typ.to_owned(),
+        alg: "ES256K".to_owned(),
+    };
+    let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header serializes"));
+    let c = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims serialize"));
+    let signing_input = format!("{h}.{c}");
+    let sig = key
+        .sign(signing_input.as_bytes())
+        .expect("a k256 key signs");
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))
+}
+
+/// Verifies an ES256K `typ` token against any of `keys`.
+pub fn verify_es256k(
+    keys: &[crate::oauth::jose::PublicJwk],
+    typ: &str,
+    token: &str,
+    now: i64,
+) -> Result<Claims, JwtError> {
+    let jws = crate::oauth::jose::Jws::decode(token).map_err(|_| JwtError::Malformed)?;
+    if jws.alg() != "ES256K" {
+        return Err(JwtError::Malformed);
+    }
+    if !keys.iter().any(|k| {
+        k.verify("ES256K", &jws.signing_input, &jws.signature)
+            .is_ok()
+    }) {
+        return Err(JwtError::BadSignature);
+    }
+    if jws.header.get("typ").and_then(serde_json::Value::as_str) != Some(typ) {
+        return Err(JwtError::WrongType);
+    }
+    let claims: Claims = serde_json::from_value(serde_json::Value::Object(jws.payload))
+        .map_err(|_| JwtError::Malformed)?;
+    if claims.exp <= now {
+        return Err(JwtError::Expired);
+    }
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +161,7 @@ mod tests {
             jti: Some("sess-1".into()),
             cnf: None,
             lxm: None,
+            sid: None,
         }
     }
 

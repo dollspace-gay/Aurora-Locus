@@ -157,38 +157,86 @@ async fn harness_with(invite_required: bool, email: bool) -> Harness {
 
 /// A PDS at `hostname`.
 async fn harness_at(hostname: &str, invite_required: bool, email: bool) -> Harness {
-    harness_build(hostname, invite_required, email, false, None).await
+    harness_build(HarnessOpts {
+        hostname: hostname.into(),
+        invite_required,
+        email,
+        ..HarnessOpts::default()
+    })
+    .await
 }
 
 /// A PDS in setup mode, its bootstrap hostname `hostname`.
 async fn setup_harness(hostname: &str, email: bool) -> Harness {
-    harness_build(hostname, false, email, true, None).await
+    harness_build(HarnessOpts {
+        hostname: hostname.into(),
+        email,
+        setup_mode: true,
+        ..HarnessOpts::default()
+    })
+    .await
 }
 
 /// A shard at pds.example.com behind `entryway`.
 async fn shard_harness(entryway: crate::shard::Entryway) -> Harness {
-    harness_build(
-        "pds.example.com",
-        false,
-        true,
-        false,
-        Some(Arc::new(entryway)),
-    )
+    harness_build(HarnessOpts {
+        entryway: Some(Arc::new(entryway)),
+        ..HarnessOpts::default()
+    })
     .await
 }
 
-async fn harness_build(
-    hostname: &str,
+/// How a test node is built.
+struct HarnessOpts {
+    hostname: String,
     invite_required: bool,
     email: bool,
     setup_mode: bool,
+    /// The shard role, behind this entryway.
     entryway: Option<Arc<crate::shard::Entryway>>,
-) -> Harness {
+    /// The entryway role, with this token key.
+    entryway_key: Option<proto_blue_crypto::K256Keypair>,
+    /// A PLC directory shared with another node.
+    plc: Option<(String, Plc)>,
+    /// Instead of `https://<hostname>`.
+    public_url: Option<String>,
+}
+
+impl Default for HarnessOpts {
+    fn default() -> Self {
+        Self {
+            hostname: "pds.example.com".into(),
+            invite_required: false,
+            email: true,
+            setup_mode: false,
+            entryway: None,
+            entryway_key: None,
+            plc: None,
+            public_url: None,
+        }
+    }
+}
+
+async fn harness_build(o: HarnessOpts) -> Harness {
+    let HarnessOpts {
+        hostname,
+        invite_required,
+        email,
+        setup_mode,
+        entryway,
+        entryway_key,
+        plc,
+        public_url,
+    } = o;
+    let hostname = hostname.as_str();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
         .await
         .unwrap();
-    let (plc_url, plc) = mock_plc().await;
+    let (plc_url, plc) = match plc {
+        Some(p) => p,
+        None => mock_plc().await,
+    };
     store
         .set_setting("identity.plc_url", json!(plc_url), "test")
         .await
@@ -205,7 +253,21 @@ async fn harness_build(
     let hostname = hostname.to_owned();
     let hostname_for_gate = hostname.clone();
     let service_did = format!("did:web:{hostname}");
-    let sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
+    let mut sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
+    if let Some(k) = &entryway_key {
+        let private = proto_blue_crypto::ExportableKeypair::export_private_key(k);
+        sessions = sessions.with_entryway(
+            crate::entryway::session_keys(
+                proto_blue_crypto::K256Keypair::from_private_key(&private).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut tx = store.begin().await.unwrap();
+        tx.put_secret(crate::entryway::TOKEN_KEY_SECRET, &private, &master_key)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
     let (mailer, mail) = if email {
         locus_mail::Mailer::capturing(store.clone(), Arc::clone(&master_key))
     } else {
@@ -235,7 +297,7 @@ async fn harness_build(
         blobs: test_blob_store(dir.path()).with_epoch(blob_epoch),
         scratch: locus_blob::DiskStore::new(dir.path()),
         firehose,
-        public_url: format!("https://{hostname}"),
+        public_url: public_url.unwrap_or_else(|| format!("https://{hostname}")),
         hostname,
         service_did,
         node_id: "test-node".into(),
@@ -263,7 +325,9 @@ async fn harness_build(
         socket_secret: crate::socket::new_secret(),
         reload: tokio_util::sync::CancellationToken::new(),
         hosts: arc_swap::ArcSwap::from_pointee(crate::hostnames::Hosts::default()),
-        role: if entryway.is_some() {
+        role: if entryway_key.is_some() {
+            locus_core::bootstrap::Role::Entryway
+        } else if entryway.is_some() {
             locus_core::bootstrap::Role::Shard
         } else {
             locus_core::bootstrap::Role::Pds
@@ -13555,6 +13619,306 @@ async fn shard_callbacks_are_refused_outside_the_shard_role() {
             &ns("shard.revokeSessions"),
             Some("x"),
             Some(json!({"did": "did:plc:a", "sid": "s"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+}
+
+// ---------------------------------------------------------------- entryway role
+
+/// Serves a node's router on `listener`.
+fn serve_on(h: &Harness, listener: tokio::net::TcpListener) {
+    let app = h
+        .app
+        .clone()
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+}
+
+/// A locus entryway and one locus shard behind it, served over TCP and
+/// sharing a PLC directory: (entryway, shard, shard URL).
+async fn entryway_and_shard() -> (Harness, Harness, String) {
+    let (plc_url, plc) = mock_plc().await;
+    let el = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let e_url = format!("http://{}", el.local_addr().unwrap());
+    let s_url = format!("http://{}", sl.local_addr().unwrap());
+    let token_key = proto_blue_crypto::K256Keypair::generate();
+    let token_did = token_key.did();
+    let e = harness_build(HarnessOpts {
+        hostname: "entryway.example.com".into(),
+        entryway_key: Some(token_key),
+        plc: Some((plc_url.clone(), plc.clone())),
+        public_url: Some(e_url.clone()),
+        ..HarnessOpts::default()
+    })
+    .await;
+    let plc_key = e.state.secrets.plc_keys.current_did().unwrap();
+    let s = harness_build(HarnessOpts {
+        entryway: Some(Arc::new(crate::shard::Entryway::for_test(
+            &e_url,
+            "did:web:entryway.example.com",
+            &[token_did],
+            &[plc_key],
+        ))),
+        plc: Some((plc_url, plc)),
+        public_url: Some(s_url.clone()),
+        ..HarnessOpts::default()
+    })
+    .await;
+    serve_on(&e, el);
+    serve_on(&s, sl);
+    (e, s, s_url)
+}
+
+#[tokio::test]
+async fn an_entryway_runs_accounts_on_a_locus_shard() {
+    use locus_store::accounts::Status;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (e, s, s_url) = entryway_and_shard().await;
+    let owner = e.owner_with_password("ena", "ena-password-123").await;
+
+    // No shard yet: no account can be made.
+    let (st, _) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "ann.entryway.example.com", "email": "ann@example.com", "password": "ann-password"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // shard add: a wrong admin password is refused, writing nothing.
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.shard.add"),
+            &owner,
+            Some(json!({"url": s_url, "adminPassword": "wrong", "name": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(e.state.store.shards().await.unwrap().is_empty());
+    let shard_pw = String::from_utf8(s.state.secrets.admin_password.to_vec()).unwrap();
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.shard.add"),
+            &owner,
+            Some(json!({"url": s_url, "adminPassword": shard_pw, "name": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        (v["locus"].as_bool(), v["did"].as_str()),
+        (Some(true), Some("did:web:pds.example.com"))
+    );
+    assert!(
+        s.state.store.callback_token_hash().await.unwrap().is_some(),
+        "the shard got a callback token"
+    );
+
+    // An account: made on the shard, kept on the entryway.
+    let (st, acct) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "ann.entryway.example.com", "email": "ann@example.com", "password": "ann-password"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{acct}");
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let access = acct["accessJwt"].as_str().unwrap().to_owned();
+    let on_e = e.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!(on_e.email.as_deref(), Some("ann@example.com"));
+    assert_eq!(
+        e.state
+            .store
+            .account_shard_did(&did)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("did:web:pds.example.com")
+    );
+    let on_s = s.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!((on_s.email, on_s.password_hash), (None, None));
+    let doc_op = e.plc.lock().unwrap().last(&did).unwrap();
+    assert_eq!(doc_op["services"]["atproto_pds"]["endpoint"], s_url);
+
+    // The entryway's token works on the shard.
+    let (st, v) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": {
+                "$type": "app.bsky.feed.post", "text": "via the entryway", "createdAt": "2026-11-06T00:00:00Z"}})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // getSession on the shard: re-signed to the entryway, answered there.
+    let (st, v) = s
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        (v["did"].as_str(), v["email"].as_str()),
+        (Some(did.as_str()), Some("ann@example.com"))
+    );
+    // Log in and refresh through the shard.
+    let (st, sess) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(json!({"identifier": "ann.entryway.example.com", "password": "ann-password"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{sess}");
+    let refresh = sess["refreshJwt"].as_str().unwrap().to_owned();
+    let (st, v) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.refreshSession",
+            Some(&refresh),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // Repo calls reaching the entryway go to the shard.
+    let (st, v) = e
+        .call(
+            "GET",
+            &format!("/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["records"][0]["value"]["text"], "via the entryway");
+
+    // Deactivate and reactivate through the shard: the entryway decides,
+    // the shard is told.
+    let (st, v) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.deactivateAccount",
+            Some(&access),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let status = |h: &Harness| {
+        let (store, did) = (h.state.store.clone(), did.clone());
+        async move { store.account_by_did(&did).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status(&e).await, Status::Deactivated);
+    assert_eq!(status(&s).await, Status::Deactivated);
+    let (st, v) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.activateAccount",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        (status(&e).await, status(&s).await),
+        (Status::Active, Status::Active)
+    );
+
+    // A handle change: the entryway updates PLC, the shard records it.
+    let (st, v) = s
+        .call(
+            "POST",
+            "/xrpc/com.atproto.identity.updateHandle",
+            Some(&access),
+            Some(json!({"handle": "ann2.entryway.example.com"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        s.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "ann2.entryway.example.com"
+    );
+
+    // A takedown on the entryway reaches the shard.
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateSubjectStatus",
+            &e.basic_admin(),
+            Some(
+                json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did},
+                        "takedown": {"applied": true, "ref": "td-1"}}),
+            ),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(status(&s).await, Status::Takendown);
+
+    // Shards are listed with their accounts, weighted and drained.
+    let (_, v) = e
+        .admin_call("GET", &ns("owner.shard.list"), &owner, None)
+        .await;
+    assert_eq!(v["shards"][0]["accounts"], 1);
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.shard.update"),
+            &owner,
+            Some(json!({"name": "s1", "draining": true})),
+        )
+        .await;
+    assert_eq!((st, v["draining"].as_bool()), (StatusCode::OK, Some(true)));
+    let (st, _) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "bo2.entryway.example.com", "email": "bo@example.com", "password": "bo-password-1"})),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a draining shard takes no accounts"
+    );
+}
+
+#[tokio::test]
+async fn entryway_methods_are_refused_in_other_roles() {
+    let h = harness(false).await;
+    let owner = h.owner_with_password("eli", "eli-password-123").await;
+    let (st, _) = h
+        .admin_call(
+            "GET",
+            &format!("/xrpc/{}.owner.shard.list", locus_core::LOCUS_NS),
+            &owner,
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    let (st, _) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.temp.dereferenceScope?scope=ref:x",
+            None,
+            None,
         )
         .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED);

@@ -374,6 +374,13 @@ impl Node {
                         .collect(),
                 )
                 .accepting_imported(self.store.reference_import().await?.map(|m| m.imported_at));
+        let sessions = if self.bootstrap.role == locus_core::bootstrap::Role::Entryway {
+            let key = locus_http::entryway::load_or_create_token_key(&self.store, &self.master_key)
+                .await?;
+            sessions.with_entryway(locus_http::entryway::session_keys(key)?)
+        } else {
+            sessions
+        };
         let clock_id = u16::try_from(self.clock_id)
             .map_err(|_| CoreError::Config(format!("clock id {} out of range", self.clock_id)))?;
         let mailer = locus_mail::Mailer::new(self.store.clone(), Arc::clone(&self.master_key));
