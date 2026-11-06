@@ -42,7 +42,12 @@ async fn rolling_env_apply_follows_live_nodes_only() {
 
         // A stopped node's stale report (it holds no slot) neither blocks
         // nor counts: a reporter without a live slot changes nothing.
-        assert!(s.report_and_apply_env("ghost", &v1).await.unwrap().is_empty());
+        assert!(
+            s.report_and_apply_env("ghost", &v1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(name().await, "Zero", "{n}");
 
         // Rolling restart onto v1, each node coming back with a new id.

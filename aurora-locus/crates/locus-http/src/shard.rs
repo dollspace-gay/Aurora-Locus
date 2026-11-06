@@ -232,7 +232,13 @@ impl Entryway {
             did: did.to_owned(),
             verify_keys: verify
                 .iter()
-                .map(|k| (k.clone(), did_key_verifier(k).expect("a k256 did:key"), None))
+                .map(|k| {
+                    (
+                        k.clone(),
+                        did_key_verifier(k).expect("a k256 did:key"),
+                        None,
+                    )
+                })
                 .collect(),
             plc_rotation_keys: plc.to_vec(),
             admin_token: Zeroizing::new("entryway-admin".into()),

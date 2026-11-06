@@ -145,8 +145,10 @@ async fn set_key(
         "POST",
         &ns("owner.keys.setSecret"),
         auth,
-        Some(json!({"name": name, "value": key.did(), "revokePrevious": revoke,
-            "password": password})),
+        Some(
+            json!({"name": name, "value": key.did(), "revokePrevious": revoke,
+            "password": password}),
+        ),
     )
     .await
 }
@@ -368,8 +370,10 @@ async fn an_entryway_key_rotation_waits_for_an_offline_shard_and_keeps_the_old_k
             "POST",
             "/xrpc/com.atproto.server.createAccount",
             None,
-            Some(json!({"handle": "olga.entryway.example.com", "email": "olga@example.com",
-                "password": "olga-password"})),
+            Some(
+                json!({"handle": "olga.entryway.example.com", "email": "olga@example.com",
+                "password": "olga-password"}),
+            ),
         )
         .await;
     assert_eq!(st, StatusCode::OK, "{acct}");
