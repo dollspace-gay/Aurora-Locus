@@ -35,9 +35,13 @@ proto-blue-lex-data.workspace = true
 proto-blue-lex-cbor.workspace = true
 proto-blue-repo.workspace = true
 hex.workspace = true
+sqlx.workspace = true
 serde_json.workspace = true
 rpassword.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [lints]
 workspace = true

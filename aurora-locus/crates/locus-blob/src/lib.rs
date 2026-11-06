@@ -124,6 +124,55 @@ impl DiskStore {
         self.path(key)
     }
 
+    /// Up to `limit` keys under `prefix` (a directory, `blobs/`), after
+    /// `after`, in order, with their modification time (ms). A write in
+    /// progress (`.part`) is listed too: a crashed one is an orphan.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, BlobError> {
+        let base = self.path(prefix.trim_end_matches('/'))?;
+        let root = self.root.clone();
+        let after = after.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let mut stack = vec![base];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let path = e.path();
+                    let Ok(meta) = e.metadata() else { continue };
+                    if meta.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    let Ok(rel) = path.strip_prefix(&root) else {
+                        continue;
+                    };
+                    let key = rel.to_string_lossy().replace('\\', "/");
+                    if after.as_deref().is_some_and(|a| key.as_str() <= a) {
+                        continue;
+                    }
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    out.push((key, modified));
+                }
+            }
+            out.sort();
+            out.truncate(limit);
+            out
+        })
+        .await
+        .map_err(|e| BlobError::Backend(e.to_string()))
+    }
+
     /// Streams `body` to `key`, refusing more than `limit` bytes, and
     /// returns its size, raw CID and first bytes.
     pub async fn write_stream<S, B, E>(
@@ -327,6 +376,20 @@ impl BlobStore {
         match &self.inner {
             Inner::Disk(d) => d.delete(key).await,
             Inner::S3(s) => s.delete(key).await,
+        }
+    }
+
+    /// Up to `limit` keys under `prefix` after `after`, in order, with
+    /// their modification time (ms).
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, BlobError> {
+        match &self.inner {
+            Inner::Disk(d) => d.list_page(prefix, after, limit).await,
+            Inner::S3(s) => s.list_page(prefix, after, limit).await,
         }
     }
 
@@ -694,6 +757,68 @@ pub async fn run_gc(
             return Ok(total);
         }
     }
+}
+
+/// The key prefixes locus writes; the sweep lists only these and the
+/// in-place prefixes an import recorded, never the rest of a disk root.
+pub const SWEPT_PREFIXES: &[&str] = &["blobs/", "gated/", "quarantine/", "branding/", "tmp/"];
+
+/// The orphan sweep: lists the active store under locus's prefixes and
+/// queues for deletion (through the delete job) every key older than
+/// `min_age_ms` that nothing names. Returns how many were queued.
+pub async fn run_orphan_sweep(
+    store: &Store,
+    blobs: &BlobStore,
+    min_age_ms: i64,
+) -> CoreResult<usize> {
+    let backend = store.blob_backend().await?;
+    if backend.paused || backend.epoch != blobs.epoch() {
+        // A cutover is under way, or this node hasn't reloaded after one.
+        return Ok(0);
+    }
+    let cutoff = locus_core::time::now_ms() - min_age_ms;
+    let mut prefixes: Vec<String> = SWEPT_PREFIXES.iter().map(|p| (*p).to_owned()).collect();
+    for p in store.import_prefixes().await? {
+        prefixes.push(format!("{}/", p.trim_end_matches('/')));
+    }
+    let moving = store.pending_move_keys().await?;
+    let mut queued = 0;
+    for prefix in prefixes {
+        let mut after: Option<String> = None;
+        loop {
+            let page = blobs
+                .list_page(&prefix, after.as_deref(), 1000)
+                .await
+                .map_err(|e| CoreError::Storage(e.to_string()))?;
+            let (Some(first), Some(last)) = (page.first(), page.last()) else {
+                break;
+            };
+            let tracked = store.tracked_keys_in_range(&first.0, &last.0).await?;
+            let orphans: Vec<&String> = page
+                .iter()
+                .filter(|(k, at)| *at < cutoff && !tracked.contains(k) && !moving.contains(k))
+                .map(|(k, _)| k)
+                .collect();
+            if !orphans.is_empty() {
+                let mut tx = store.begin().await?;
+                let b = tx.blob_backend().await?;
+                if b.paused || b.epoch != backend.epoch {
+                    tx.rollback().await?;
+                    return Ok(queued);
+                }
+                for k in &orphans {
+                    tx.queue_blob_delete(k, b.epoch).await?;
+                }
+                tx.commit().await?;
+                queued += orphans.len();
+            }
+            after = Some(last.0.clone());
+            if page.len() < 1000 {
+                break;
+            }
+        }
+    }
+    Ok(queued)
 }
 
 #[cfg(test)]

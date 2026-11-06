@@ -155,6 +155,11 @@ pub async fn run_leased<F, Fut>(
     let interval = ttl / 3;
     let margin = ttl / 6;
     while !cancel.is_cancelled() {
+        // A paused job isn't taken up (`jobs pause`).
+        if store.job_control(&name).await.is_ok_and(|c| c.paused) {
+            wait(&cancel, interval).await;
+            continue;
+        }
         let asked = Instant::now();
         let token = match store.try_acquire_lease(&name, &holder, ttl).await {
             Ok(Some(t)) => t,
@@ -173,6 +178,7 @@ pub async fn run_leased<F, Fut>(
         let job_cancel = cancel.child_token();
         let mut handle = tokio::spawn(job(token.clone(), job_cancel.clone()));
         let mut finished = None;
+        let mut run_now = false;
         // The lease is surely ours until here: the store set its expiry
         // after this instant.
         let mut held_until = asked + ttl;
@@ -186,7 +192,25 @@ pub async fn run_leased<F, Fut>(
                     let sent = Instant::now();
                     let left = held_until.saturating_duration_since(sent).saturating_sub(margin);
                     match tokio::time::timeout(left, store.renew_lease(&token)).await {
-                        Ok(Ok(true)) => held_until = sent + ttl,
+                        Ok(Ok(true)) => {
+                            held_until = sent + ttl;
+                            // `jobs pause` stops it; `jobs run` restarts it
+                            // (a job does its work when it starts).
+                            match store.job_control(&name).await {
+                                Ok(c) if c.paused => {
+                                    tracing::info!(lease = %name, "job paused");
+                                    break;
+                                }
+                                Ok(c) if c.run_requested.is_some()
+                                    && store.take_job_run_request(&name).await.unwrap_or(false) =>
+                                {
+                                    tracing::info!(lease = %name, "job run now");
+                                    run_now = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
                         Ok(Ok(false)) => {
                             tracing::warn!(lease = %name, epoch = token.epoch, "lease lost; stopping job");
                             break;
@@ -216,6 +240,10 @@ pub async fn run_leased<F, Fut>(
         }
         if let Err(e) = store.release_lease(&token).await {
             tracing::warn!(lease = %name, "release failed: {e}");
+        }
+        if run_now {
+            // Taken up again at once (by this node, most likely).
+            continue;
         }
         if !cancel.is_cancelled() {
             wait(&cancel, interval).await;

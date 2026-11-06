@@ -25,6 +25,8 @@ const ENV_RECHECK: Duration = Duration::from_secs(60);
 
 /// A running node's shared state.
 pub struct Node {
+    /// Keeps offline commands (and, on SQLite, other nodes) off the data.
+    _lock: crate::node_lock::NodeLock,
     pub bootstrap: Bootstrap,
     pub node_id: String,
     pub store: Store,
@@ -223,6 +225,7 @@ impl Node {
             tracing::warn!("SSRF protection is OFF for user-influenced requests on this node");
         }
 
+        let lock = crate::node_lock::acquire(&bootstrap, crate::node_lock::Holder::Node).await?;
         let (store, master_key) = open_store(&bootstrap).await?;
 
         let (clock_id, clock_lease) = store
@@ -288,6 +291,7 @@ impl Node {
             setup_done: CancellationToken::new(),
             reload: CancellationToken::new(),
             logs: log.ring(),
+            _lock: lock,
             setup_mode,
             tasks: Vec::new(),
         };
@@ -775,6 +779,7 @@ impl Node {
             "blob-deletes",
             "blob-gc",
             "blob-rescan",
+            "blob-orphan-sweep",
         ] {
             let state = Arc::clone(&state);
             self.tasks
@@ -816,6 +821,14 @@ impl Node {
                                     // Uploads stored unscanned while the
                                     // scanner was down.
                                     "blob-rescan" => locus_http::scanner::rescan_pass(&state).await,
+                                    // Keys nothing names, older than a day.
+                                    "blob-orphan-sweep" => locus_blob::run_orphan_sweep(
+                                        &state.store,
+                                        &state.blobs,
+                                        24 * 3_600_000,
+                                    )
+                                    .await
+                                    .map(|n| n as u64),
                                     _ => {
                                         locus_blob::run_gc(
                                             &state.store,
@@ -837,9 +850,14 @@ impl Node {
                                 let err = result.as_ref().err().map(ToString::to_string);
                                 let _ =
                                     state.store.record_job_run(name, err.as_deref(), None).await;
+                                let every = if name == "blob-orphan-sweep" {
+                                    Duration::from_secs(24 * 3600)
+                                } else {
+                                    EVERY
+                                };
                                 tokio::select! {
                                     () = cancel.cancelled() => return Ok(()),
-                                    () = tokio::time::sleep(EVERY) => {}
+                                    () = tokio::time::sleep(every) => {}
                                 }
                             }
                         }

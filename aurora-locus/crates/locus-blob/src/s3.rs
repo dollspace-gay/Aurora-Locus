@@ -438,6 +438,36 @@ impl S3Store {
         Ok(true)
     }
 
+    /// Up to `limit` keys under `prefix` after `after`, in order, with
+    /// their modification time (ms).
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, BlobError> {
+        let bucket = self.bucket_for(prefix);
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .max_keys(i32::try_from(limit.min(1000)).unwrap_or(1000));
+        if let Some(a) = after {
+            req = req.start_after(a);
+        }
+        let out = req.send().await.map_err(backend)?;
+        Ok(out
+            .contents()
+            .iter()
+            .filter_map(|o| {
+                let key = o.key()?.to_owned();
+                let at = o.last_modified().map_or(0, |t| t.to_millis().unwrap_or(0));
+                Some((key, at))
+            })
+            .collect())
+    }
+
     /// Whether every bucket answers.
     pub async fn check(&self) -> Result<(), BlobError> {
         let mut buckets = vec![self.bucket.as_str()];

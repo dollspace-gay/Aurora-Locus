@@ -14206,3 +14206,115 @@ async fn an_entryway_pushes_revocations_blocks_and_key_changes_to_its_shards() {
     assert_eq!(v["role"], "current");
     assert_eq!(current().await, pending);
 }
+
+#[tokio::test]
+async fn the_orphan_sweep_queues_only_untracked_keys_under_locus_prefixes() {
+    let h = harness(false).await;
+    if h.state.blobs.name() != "disk" {
+        return; // the S3 test bucket is shared with other tests
+    }
+    let (_did, access) = h.user("swe.pds.example.com").await;
+    let uploaded = h.upload(&access, b"tracked bytes", "image/png").await;
+    let cid = uploaded["ref"]["$link"].as_str().unwrap().to_owned();
+    let write = |key: &'static str| {
+        let blobs = h.state.blobs.clone();
+        async move {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                axum::body::Bytes::from_static(b"x"),
+            )]);
+            blobs.write_stream(key, body, 10).await.unwrap();
+        }
+    };
+    write("blobs/did:plc:gone/bafkreiorphan.0001").await;
+    write("tmp/0002").await;
+    write("other/not-ours").await;
+    // Too young: nothing.
+    assert_eq!(
+        locus_blob::run_orphan_sweep(&h.state.store, &h.state.blobs, 3_600_000)
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let n = locus_blob::run_orphan_sweep(&h.state.store, &h.state.blobs, 0)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "the two orphans under locus prefixes");
+    let locus_store::Store::Sqlite(pool) = &h.state.store else {
+        unreachable!()
+    };
+    let queued: Vec<(String,)> =
+        sqlx::query_as("SELECT storage_key FROM blob_delete ORDER BY storage_key")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let keys: Vec<&str> = queued.iter().map(|(k,)| k.as_str()).collect();
+    assert_eq!(keys, ["blobs/did:plc:gone/bafkreiorphan.0001", "tmp/0002"]);
+    assert!(
+        !keys.iter().any(|k| k.contains(&cid)),
+        "the upload is tracked"
+    );
+    // Already queued: not again.
+    assert_eq!(
+        locus_blob::run_orphan_sweep(&h.state.store, &h.state.blobs, 0)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn jobs_are_paused_and_run_through_the_admin_api() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("jo", "jo-password-12345").await;
+    h.state
+        .store
+        .record_job_run("blob-gc", None, None)
+        .await
+        .unwrap();
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.jobs.setPaused"),
+            &owner,
+            Some(json!({"name": "blob-gc", "paused": true})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = h
+        .admin_call("GET", &ns("viewer.listJobs"), &owner, None)
+        .await;
+    assert_eq!(v["jobs"][0]["paused"], true);
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.jobs.runNow"),
+            &owner,
+            Some(json!({"name": "blob-gc"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "paused jobs don't run now");
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.jobs.setPaused"),
+            &owner,
+            Some(json!({"name": "blob-gc", "paused": false})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.jobs.runNow"),
+            &owner,
+            Some(json!({"name": "blob-gc"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, v) = h
+        .admin_call("GET", &ns("viewer.listJobs"), &owner, None)
+        .await;
+    assert_eq!(v["jobs"][0]["runRequested"], true);
+}

@@ -642,6 +642,18 @@ kryphocron built in.
   once one is, the pending key can't be replaced or discarded. The
   console's Shards page lists the shards, their queues and a rotation's
   progress.
+- Offline commands (`import reference-pds`, `keys rewrap`, `backup
+  restore`, `backup post-restore`, `migrate storage`) refuse to run while a
+  node is running: on SQLite every node holds an exclusive lock on
+  `<data>/node.lock` (so one node per data dir), on Postgres a shared
+  advisory lock that an offline command needs exclusively.
+- `jobs pause <name> [--resume]` and `jobs run <name>`: a paused job stops
+  within seconds and isn't taken up again; a run restarts it now.
+  `jobs list` shows both.
+- The orphan sweep (daily): lists the blob store under locus's prefixes
+  (and an import's in-place prefixes, never the rest of a disk root) and
+  queues for deletion every key older than a day that no blob, branding
+  asset, move or queued delete names.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

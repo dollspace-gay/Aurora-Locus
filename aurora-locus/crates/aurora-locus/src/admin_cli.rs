@@ -378,6 +378,16 @@ pub enum CrawlCmd {
 #[derive(Subcommand)]
 pub enum JobsCmd {
     List,
+    /// Runs a job now (its holder restarts it within seconds).
+    Run {
+        name: String,
+    },
+    /// Pauses a job (`--resume` resumes it).
+    Pause {
+        name: String,
+        #[arg(long)]
+        resume: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1866,6 +1876,22 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
         }
         AdminCmd::Jobs(JobsCmd::List) => {
             print(&c.call(&lx("viewer.listJobs"), &[], None).await?);
+            Ok(())
+        }
+        AdminCmd::Jobs(JobsCmd::Run { name }) => {
+            c.call(&lx("admin.jobs.runNow"), &[], Some(json!({"name": name})))
+                .await?;
+            println!("{name} runs within seconds.");
+            Ok(())
+        }
+        AdminCmd::Jobs(JobsCmd::Pause { name, resume }) => {
+            c.call(
+                &lx("admin.jobs.setPaused"),
+                &[],
+                Some(json!({"name": name, "paused": !resume})),
+            )
+            .await?;
+            println!("{name} {}.", if resume { "resumed" } else { "paused" });
             Ok(())
         }
         AdminCmd::Kryphocron(k) => {

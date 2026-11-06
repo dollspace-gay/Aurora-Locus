@@ -882,3 +882,53 @@ impl Store {
 pub fn blob_not_found(cid: &str) -> CoreError {
     CoreError::NotFound(format!("Could not find blob: {cid}"))
 }
+
+impl Store {
+    /// The keys in `[first, last]` something still names: a blob row's
+    /// `storage_key`, a branding asset's, or a queued delete.
+    pub async fn tracked_keys_in_range(
+        &self,
+        first: &str,
+        last: &str,
+    ) -> CoreResult<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        for q in [
+            "SELECT storage_key FROM blob WHERE storage_key >= {1} AND storage_key <= {2}",
+            "SELECT storage_key FROM branding_asset WHERE storage_key >= {1} AND storage_key <= {2}",
+            "SELECT storage_key FROM blob_delete WHERE storage_key >= {1} AND storage_key <= {2}",
+        ] {
+            let q = sql(q, self.is_postgres());
+            let rows: Vec<(String,)> = match self {
+                Store::Sqlite(p) => sqlx::query_as(&q).bind(first).bind(last).fetch_all(p).await,
+                Store::Postgres(p) => sqlx::query_as(&q).bind(first).bind(last).fetch_all(p).await,
+            }
+            .map_err(db_err)?;
+            out.extend(rows.into_iter().map(|(k,)| k));
+        }
+        Ok(out)
+    }
+
+    /// Every `pending_move` target (moves in flight write there).
+    pub async fn pending_move_keys(&self) -> CoreResult<std::collections::HashSet<String>> {
+        let q = "SELECT pending_move FROM blob WHERE pending_move IS NOT NULL";
+        let rows: Vec<(String,)> = match self {
+            Store::Sqlite(p) => sqlx::query_as(q).fetch_all(p).await,
+            Store::Postgres(p) => sqlx::query_as(q).fetch_all(p).await,
+        }
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
+    /// The in-place key prefixes an import recorded (`blocks`, …).
+    pub async fn import_prefixes(&self) -> CoreResult<Vec<String>> {
+        let q = "SELECT import_prefixes FROM blob_backend WHERE id = 1";
+        let row: Option<(String,)> = match self {
+            Store::Sqlite(p) => sqlx::query_as(q).fetch_optional(p).await,
+            Store::Postgres(p) => sqlx::query_as(q).fetch_optional(p).await,
+        }
+        .map_err(db_err)?;
+        Ok(row
+            .and_then(|(j,)| serde_json::from_str(&j).ok())
+            .unwrap_or_default())
+    }
+}

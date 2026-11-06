@@ -118,6 +118,9 @@ enum Blobs {
 
 /// Runs the import; the report's lines.
 pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, String> {
+    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+        .await
+        .map_err(|e| e.to_string())?;
     if matches!(bootstrap.database, DatabaseUrl::Postgres(_)) {
         return Err(
             "import into a SQLite install, then move it with `aurora-locus migrate storage --to postgres`"

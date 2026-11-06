@@ -78,6 +78,8 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("moderator.review.listQueue"), get(list_review_queue))
         .route(at!("moderator.review.resolve"), post(resolve_review))
         .route(at!("admin.setSetting"), post(set_setting))
+        .route(at!("admin.jobs.setPaused"), post(set_job_paused))
+        .route(at!("admin.jobs.runNow"), post(run_job_now))
         .route(at!("admin.kryphocron.rotateNow"), post(rotate_now))
         .route(at!("admin.requestCrawl"), post(request_crawl))
         .route(at!("owner.listOperators"), get(list_operators))
@@ -220,17 +222,73 @@ pub async fn get_audit_log(
 pub async fn list_jobs(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
     op(&s, &headers, locus_nsid!("viewer.listJobs")).await?;
     let iso = |t: Option<i64>| t.map(locus_core::time::iso8601);
+    let controls = s.store.job_controls().await?;
     let jobs: Vec<Value> = s
         .store
         .job_states()
         .await?
         .into_iter()
-        .map(|j| json!({
-            "name": j.name, "runs": j.runs, "lastRunAt": iso(j.last_run_at), "lastOkAt": iso(j.last_ok_at),
-            "nextRunAt": iso(j.next_run_at), "lastError": j.last_error,
-        }))
+        .map(|j| {
+            let c = controls
+                .iter()
+                .find(|(n, _)| *n == j.name)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default();
+            json!({
+                "name": j.name, "runs": j.runs, "lastRunAt": iso(j.last_run_at), "lastOkAt": iso(j.last_ok_at),
+                "nextRunAt": iso(j.next_run_at), "lastError": j.last_error,
+                "paused": c.paused, "pausedBy": c.paused_by, "runRequested": c.run_requested.is_some(),
+            })
+        })
         .collect();
     Ok(Json(json!({"jobs": jobs})))
+}
+
+#[derive(Deserialize)]
+pub struct JobInput {
+    name: String,
+    #[serde(default)]
+    paused: bool,
+}
+
+/// `admin.jobs.setPaused`: a paused job stops within seconds and isn't
+/// taken up again until resumed.
+pub async fn set_job_paused(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<JobInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = op(&s, &headers, locus_nsid!("admin.jobs.setPaused")).await?;
+    s.store
+        .set_job_paused(&input.name, input.paused, &who.actor)
+        .await?;
+    admin_auth::audit(
+        &s,
+        &who,
+        "jobs.setPaused",
+        Some(&input.name),
+        Some(json!({"paused": input.paused})),
+    )
+    .await;
+    Ok(Json(json!({"name": input.name, "paused": input.paused})))
+}
+
+/// `admin.jobs.runNow`: the job's holder restarts it now (a job does its
+/// work when it starts).
+pub async fn run_job_now(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<JobInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = op(&s, &headers, locus_nsid!("admin.jobs.runNow")).await?;
+    if s.store.job_control(&input.name).await?.paused {
+        return Err(XrpcError::invalid_request(
+            "That job is paused; resume it first",
+        ));
+    }
+    s.store.request_job_run(&input.name).await?;
+    admin_auth::audit(&s, &who, "jobs.runNow", Some(&input.name), None).await;
+    Ok(Json(json!({"name": input.name, "requested": true})))
 }
 
 #[derive(Deserialize)]

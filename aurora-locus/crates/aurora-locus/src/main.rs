@@ -8,6 +8,7 @@ mod import_reference;
 mod logging;
 mod migrate_storage;
 mod node;
+mod node_lock;
 mod restore;
 mod rewrap;
 mod setup_cli;

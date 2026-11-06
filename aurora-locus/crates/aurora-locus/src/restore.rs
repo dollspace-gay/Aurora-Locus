@@ -456,6 +456,9 @@ pub struct RestoreOpts {
 
 /// `backup restore`: into an empty SQLite install only.
 pub async fn restore(bootstrap: &Bootstrap, opts: RestoreOpts) -> Result<Report, String> {
+    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+        .await
+        .map_err(|e| e.to_string())?;
     let DatabaseUrl::Sqlite(target) = &bootstrap.database else {
         return Err(
             "restore into a SQLite install (then `aurora-locus migrate storage --to postgres`)"
@@ -649,6 +652,9 @@ pub struct PostRestoreOpts {
 /// `backup post-restore`: after a Postgres point-in-time recovery, before
 /// any node starts.
 pub async fn post_restore(bootstrap: &Bootstrap, opts: PostRestoreOpts) -> Result<Report, String> {
+    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+        .await
+        .map_err(|e| e.to_string())?;
     // 1. Checks, writing nothing. (open_store checks the master key.)
     let shard = shard_keys(bootstrap, &opts.finish)?;
     let (store, key) = crate::node::open_store(bootstrap).await.map_err(e)?;

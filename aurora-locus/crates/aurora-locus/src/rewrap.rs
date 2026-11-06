@@ -45,6 +45,9 @@ fn write_new(path: &Path, text: &str) -> Result<(), String> {
 
 /// Runs the rewrap; returns what to do next.
 pub async fn run(bootstrap: &Bootstrap, to: Target) -> Result<String, String> {
+    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+        .await
+        .map_err(|e| e.to_string())?;
     let (store, old) = crate::node::open_store(bootstrap)
         .await
         .map_err(|e| e.to_string())?;

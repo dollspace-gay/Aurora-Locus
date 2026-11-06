@@ -12,6 +12,9 @@ fn e(x: impl std::fmt::Display) -> String {
 }
 
 pub async fn run(bootstrap: &Bootstrap, url: &str) -> Result<Vec<String>, String> {
+    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+        .await
+        .map_err(|e| e.to_string())?;
     if !matches!(bootstrap.database, DatabaseUrl::Sqlite(_)) {
         return Err("this install is already on Postgres".into());
     }

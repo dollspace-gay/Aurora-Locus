@@ -2627,3 +2627,69 @@ async fn reference_account_import_on_both_backends() {
         assert!(b.store.reference_import().await.unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn jobs_pause_and_run_now() {
+    for b in backends().await {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let s2 = starts.clone();
+        let handle = tokio::spawn(run_leased(
+            b.store.clone(),
+            "controlled".into(),
+            "node-a".into(),
+            Duration::from_millis(600),
+            cancel.clone(),
+            move |_token, job_cancel| {
+                let starts = s2.clone();
+                async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    // A long-running job: it only restarts when asked.
+                    job_cancel.cancelled().await;
+                    Ok(())
+                }
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "{}", b.name);
+        // Run now: restarted within a renew tick.
+        b.store.request_job_run("controlled").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "{}: run now", b.name);
+        assert!(
+            b.store
+                .job_control("controlled")
+                .await
+                .unwrap()
+                .run_requested
+                .is_none()
+        );
+        // Paused: stopped, and not taken up again.
+        b.store
+            .set_job_paused("controlled", true, "op")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let n = starts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), n, "{}: paused", b.name);
+        let now = b.store.now_ms().await.unwrap();
+        let held = b
+            .store
+            .job_leases()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|(n, _, exp)| n == "controlled" && exp > now);
+        assert!(!held, "{}: released", b.name);
+        // Resumed.
+        b.store
+            .set_job_paused("controlled", false, "op")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), n + 1, "{}: resumed", b.name);
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+}
