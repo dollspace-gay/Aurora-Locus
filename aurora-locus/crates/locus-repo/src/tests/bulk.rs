@@ -40,10 +40,7 @@ fn rec(collection: &str, n: i64, blobs: &[&str]) -> (Cid, Vec<u8>) {
         .map(|c| {
             lex(vec![
                 ("$type", LexValue::String("blob".into())),
-                (
-                    "ref",
-                    LexValue::Cid(Cid::from_str_multibase(c).unwrap()),
-                ),
+                ("ref", LexValue::Cid(Cid::from_str_multibase(c).unwrap())),
                 ("mimeType", LexValue::String("image/png".into())),
                 ("size", LexValue::Integer(10)),
             ])
@@ -64,10 +61,7 @@ fn like_of(uri: &str) -> (Cid, Vec<u8>) {
             "subject",
             lex(vec![
                 ("uri", LexValue::String(uri.into())),
-                (
-                    "cid",
-                    LexValue::String(blob_cid("subject")),
-                ),
+                ("cid", LexValue::String(blob_cid("subject"))),
             ]),
         ),
     ]))
@@ -124,7 +118,10 @@ fn car_file(model: &Model, key: &K256Keypair) -> (tempfile::TempDir, std::path::
 async fn import_all(engine: &RepoEngine, model: &Model, key: &K256Keypair) {
     let (_dir, path) = car_file(model, key);
     let job = engine.start_import(DID, "node-a").await.unwrap();
-    engine.run_import(&job, &path, None, key, true).await.unwrap();
+    engine
+        .run_import(&job, &path, None, key, true)
+        .await
+        .unwrap();
     engine.finish_import(&job).await.unwrap();
 }
 
@@ -219,7 +216,11 @@ async fn check_index(store: &Store, model: &Model, what: &str) {
 async fn index(store: &Store) -> BTreeMap<String, String> {
     let mut got = BTreeMap::new();
     for c in COLLS {
-        for (rkey, cid) in store.list_records(DID, c, 10_000, None, false).await.unwrap() {
+        for (rkey, cid) in store
+            .list_records(DID, c, 10_000, None, false)
+            .await
+            .unwrap()
+        {
             got.insert(format!("{c}/{rkey}"), cid);
         }
     }
@@ -321,7 +322,11 @@ async fn uploads_during_each_import_phase_end_permanent_and_gated_per_the_new_tr
                     continue;
                 }
                 round += 1;
-                let what = format!("{} {point}{}", b.name, if rollback { " rolled back" } else { "" });
+                let what = format!(
+                    "{} {point}{}",
+                    b.name,
+                    if rollback { " rolled back" } else { "" }
+                );
                 let pubc = blob_cid(&format!("public {what}"));
                 let privc = blob_cid(&format!("private {what}"));
                 // The new tree: the base, a public post and a private one
@@ -329,9 +334,15 @@ async fn uploads_during_each_import_phase_end_permanent_and_gated_per_the_new_tr
                 // several batches.
                 let mut new = base();
                 new.insert(format!("{PUBLIC}/r{round}p"), rec(PUBLIC, round, &[&pubc]));
-                new.insert(format!("{PRIVATE}/r{round}q"), rec(PRIVATE, round, &[&privc]));
+                new.insert(
+                    format!("{PRIVATE}/r{round}q"),
+                    rec(PRIVATE, round, &[&privc]),
+                );
                 for i in 0..6 {
-                    new.insert(format!("{LIKE}/r{round}f{i}"), record(LIKE, (round * 10 + i) as u64));
+                    new.insert(
+                        format!("{LIKE}/r{round}f{i}"),
+                        record(LIKE, (round * 10 + i) as u64),
+                    );
                 }
                 let (_dir, path) = car_file(&new, &key);
                 let job = engine.start_import(DID, "node-a").await.unwrap();
@@ -410,17 +421,27 @@ async fn uploads_during_each_import_phase_end_permanent_and_gated_per_the_new_tr
                     .await
                     .unwrap();
                 if point == "reindex" {
-                    during(engine.import_reindex(&job, &staged.new_rev), "reindex", 1, up())
-                        .await
-                        .unwrap();
+                    during(
+                        engine.import_reindex(&job, &staged.new_rev),
+                        "reindex",
+                        1,
+                        up(),
+                    )
+                    .await
+                    .unwrap();
                 } else {
                     engine.import_reindex(&job, &staged.new_rev).await.unwrap();
                 }
                 if point == "decrements" || point == "decrements-blobs" {
                     let skip = usize::from(point == "decrements");
-                    during(engine.import_decrements(&job, &staged.new_rev), point, skip, up())
-                        .await
-                        .unwrap();
+                    during(
+                        engine.import_decrements(&job, &staged.new_rev),
+                        point,
+                        skip,
+                        up(),
+                    )
+                    .await
+                    .unwrap();
                 } else {
                     engine
                         .import_decrements(&job, &staged.new_rev)
@@ -455,7 +476,9 @@ async fn uploads_during_a_rollback_stay_temp_and_promoted_blobs_end_unreferenced
         // Six blobs uploaded before the import (promoted by increments), x
         // just before the rollback, and y, z, w during it: after it set
         // `rolling_back`, during its blob pass and after it.
-        let early: Vec<String> = (0..6).map(|i| blob_cid(&format!("early {n} {i}"))).collect();
+        let early: Vec<String> = (0..6)
+            .map(|i| blob_cid(&format!("early {n} {i}")))
+            .collect();
         let [x, y, z, w, v] = ["x", "y", "z", "w", "v"].map(|t| blob_cid(&format!("{t} {n}")));
         let mut new = old.clone();
         for (i, c) in early.iter().chain([&x, &y, &z, &w, &v]).enumerate() {
@@ -499,7 +522,10 @@ async fn uploads_during_a_rollback_stay_temp_and_promoted_blobs_end_unreferenced
         let p1 = fault::pause("rollback", 0, false);
         let (res, ()) = tokio::join!(engine.import_rollback(&job, "stopped"), async {
             reached(&p1).await;
-            assert_eq!(s.bulk_job(&job.id).await.unwrap().unwrap().phase, "rolling_back");
+            assert_eq!(
+                s.bulk_job(&job.id).await.unwrap().unwrap().phase,
+                "rolling_back"
+            );
             temp_and_collected(y.clone(), "after rolling_back").await;
             // Not unreferenced yet: the rollback's blob pass hasn't run.
             assert!(row(s, &x).await.is_some(), "{n}");
@@ -555,6 +581,27 @@ async fn uploads_during_a_rollback_stay_temp_and_promoted_blobs_end_unreferenced
         gc(s).await;
         assert!(row(s, &late).await.is_none(), "{n}: collected");
         check_against_model(&b, &old, 2, &key).await;
+
+        // A blob the old tree uses privately and the new one publicly,
+        // uploaded during the import: public per the new tree, then gated
+        // again by the rollback (from the committed rows).
+        let pb = blob_cid(&format!("pb {n}"));
+        let mut old2 = old.clone();
+        old2.insert(format!("{PRIVATE}/pb"), rec(PRIVATE, 5, &[&pb]));
+        import_all(&engine, &old2, &key).await;
+        let mut new = old2.clone();
+        new.insert(format!("{POST}/pb"), rec(POST, 6, &[&pb]));
+        let (_dir, path) = car_file(&new, &key);
+        let job = engine.start_import(DID, "node-a").await.unwrap();
+        let staged = engine.stage_import(&job, &path, None).await.unwrap();
+        engine
+            .import_increments(&job, &staged.new_rev)
+            .await
+            .unwrap();
+        upload(&engine, &pb).await;
+        assert_in_use(s, &pb, false, &format!("{n}: public in the new tree")).await;
+        engine.import_rollback(&job, "stopped").await.unwrap();
+        assert_in_use(s, &pb, true, &format!("{n}: rolled back")).await;
     }
 }
 
@@ -598,9 +645,16 @@ async fn crashes_between_batches_roll_back_before_the_swap_and_resume_after_it()
         upload(&engine, &ob).await;
         let ob_ref = &ob;
         let old_blob_intact = |what: String| async move {
-            assert!(has_records(s, ob_ref).await, "{what}: record_blob rows intact");
+            assert!(
+                has_records(s, ob_ref).await,
+                "{what}: record_blob rows intact"
+            );
             let r = row(s, ob_ref).await.unwrap();
-            assert_eq!((r.state.as_str(), r.unreferenced_since), ("permanent", None), "{what}");
+            assert_eq!(
+                (r.state.as_str(), r.unreferenced_since),
+                ("permanent", None),
+                "{what}"
+            );
         };
 
         // Before the swap: each crash rolls back (some crash again in the
@@ -690,7 +744,11 @@ async fn crashes_between_batches_roll_back_before_the_swap_and_resume_after_it()
                 // reindex removed the old record's rows; its blob still
                 // gets its decrement from the staged rows.
                 assert!(!has_records(s, &ob).await, "{what}");
-                assert_eq!(row(s, &ob).await.unwrap().unreferenced_since, None, "{what}");
+                assert_eq!(
+                    row(s, &ob).await.unwrap().unreferenced_since,
+                    None,
+                    "{what}"
+                );
             }
             let taken = s.bulk_job(&job.id).await.unwrap().unwrap();
             engine.resume_import(&taken).await.unwrap();
@@ -702,7 +760,10 @@ async fn crashes_between_batches_roll_back_before_the_swap_and_resume_after_it()
             assert_eq!(count(s, &e.0).await, 3, "{what}");
             assert_eq!(count(s, &d.0).await, 1, "{what}");
             assert_eq!(s.latest_import(DID).await.unwrap().unwrap().phase, "done");
-            assert!(row(s, &ob).await.unwrap().unreferenced_since.is_some(), "{what}");
+            assert!(
+                row(s, &ob).await.unwrap().unreferenced_since.is_some(),
+                "{what}"
+            );
             assert_in_use(s, &nb, false, &what).await;
             // Back to the old repo for the next round.
             import_all(&engine, &old, &key).await;
@@ -722,7 +783,10 @@ async fn the_index_serves_the_old_repo_then_lags_the_new_root_and_keeps_takedown
             "at://did:plc:someone0000000000000000/app.bsky.feed.post/3maaaaaaaaaaa",
             "at://did:plc:someone0000000000000000/app.bsky.feed.post/3mbbbbbbbbbbb",
         );
-        let (tb_old, tb_new) = (blob_cid(&format!("t old {n}")), blob_cid(&format!("t new {n}")));
+        let (tb_old, tb_new) = (
+            blob_cid(&format!("t old {n}")),
+            blob_cid(&format!("t new {n}")),
+        );
         let mut old = base();
         for i in 6..14 {
             old.insert(format!("{POST}/3m{i:011}"), record(POST, i));
@@ -768,20 +832,31 @@ async fn the_index_serves_the_old_repo_then_lags_the_new_root_and_keeps_takedown
         // During reindex it lags the new root: each key as in the new tree
         // or still as in the old one, some of each, nothing else.
         let (old_flat, new_flat) = (flat(&visible(&old)), flat(&visible(&new)));
-        during(engine.import_reindex(&job, &staged.new_rev), "reindex", 2, async {
-            assert_eq!(root_of(s).await.data_cid, staged.data_cid.to_string_base32());
-            let got = index(s).await;
-            let (mut moved, mut kept) = (0, 0);
-            let paths: BTreeSet<&String> =
-                old_flat.keys().chain(new_flat.keys()).chain(got.keys()).collect();
-            for p in paths {
-                let (g, o, w) = (got.get(p), old_flat.get(p), new_flat.get(p));
-                assert!(g == o || g == w, "{n}: {p} -> {g:?} is in neither tree");
-                moved += usize::from(g == w && g != o);
-                kept += usize::from(g == o && g != w);
-            }
-            assert!(moved > 0 && kept > 0, "{n}: mid-reindex ({moved}, {kept})");
-        })
+        during(
+            engine.import_reindex(&job, &staged.new_rev),
+            "reindex",
+            2,
+            async {
+                assert_eq!(
+                    root_of(s).await.data_cid,
+                    staged.data_cid.to_string_base32()
+                );
+                let got = index(s).await;
+                let (mut moved, mut kept) = (0, 0);
+                let paths: BTreeSet<&String> = old_flat
+                    .keys()
+                    .chain(new_flat.keys())
+                    .chain(got.keys())
+                    .collect();
+                for p in paths {
+                    let (g, o, w) = (got.get(p), old_flat.get(p), new_flat.get(p));
+                    assert!(g == o || g == w, "{n}: {p} -> {g:?} is in neither tree");
+                    moved += usize::from(g == w && g != o);
+                    kept += usize::from(g == o && g != w);
+                }
+                assert!(moved > 0 && kept > 0, "{n}: mid-reindex ({moved}, {kept})");
+            },
+        )
         .await
         .unwrap();
         engine
@@ -860,16 +935,21 @@ async fn reindex_gates_a_blob_when_its_last_public_record_goes_and_not_before_a_
             .await
             .unwrap();
         // The first batch (app.bsky.feed.post/gpub's delete first) has run.
-        during(engine.import_reindex(&job, &staged.new_rev), "reindex", 1, async {
-            let mut tx = s.begin().await.unwrap();
-            let gpub = tx
-                .record_blob_cids(DID, &[(POST.into(), "gpub".into())])
-                .await
-                .unwrap();
-            tx.rollback().await.unwrap();
-            assert!(gpub.is_empty(), "{n}: the public record left the index");
-            assert_in_use(s, &g, true, &format!("{n}: gated in that batch")).await;
-        })
+        during(
+            engine.import_reindex(&job, &staged.new_rev),
+            "reindex",
+            1,
+            async {
+                let mut tx = s.begin().await.unwrap();
+                let gpub = tx
+                    .record_blob_cids(DID, &[(POST.into(), "gpub".into())])
+                    .await
+                    .unwrap();
+                tx.rollback().await.unwrap();
+                assert!(gpub.is_empty(), "{n}: the public record left the index");
+                assert_in_use(s, &g, true, &format!("{n}: gated in that batch")).await;
+            },
+        )
         .await
         .unwrap();
         engine
@@ -957,15 +1037,16 @@ async fn import_and_deletion_exclude_each_other_and_deletion_resumes_after_crash
 
         // An import holds the account: no deletion, no writes.
         let job = engine.start_import(DID, "node-a").await.unwrap();
-        let mut tx = s.begin().await.unwrap();
         assert!(
-            matches!(
-                tx.start_bulk_job("del-1", DID, "delete", "deleting", "node-a")
-                    .await,
-                Err(CoreError::Conflict(_))
-            ),
-            "{n}"
+            write_blocked(s).await,
+            "{n}: {job:?} {:?}",
+            s.bulk_job(&job.id).await
         );
+        let mut tx = s.begin().await.unwrap();
+        let r = tx
+            .start_bulk_job("del-1", DID, "delete", "deleting", "node-a")
+            .await;
+        assert!(matches!(r, Err(CoreError::Conflict(_))), "{n}: {r:?}");
         tx.rollback().await.unwrap();
         let commit = |rkey: &'static str| {
             engine.commit(crate::engine::CommitRequest {
@@ -1011,7 +1092,9 @@ async fn import_and_deletion_exclude_each_other_and_deletion_resumes_after_crash
             if left == 0 {
                 tx.rollback().await.unwrap(); // the crash, before the final step
             } else {
-                tx.set_bulk_progress(&job.id, "deleting", None).await.unwrap();
+                tx.set_bulk_progress(&job.id, "deleting", None)
+                    .await
+                    .unwrap();
                 tx.commit().await.unwrap();
             }
             left
@@ -1023,7 +1106,10 @@ async fn import_and_deletion_exclude_each_other_and_deletion_resumes_after_crash
                 Store::Postgres(p) => sqlx::query(expire).execute(p).await.map(|_| ()),
             }
             .unwrap();
-            s.take_over_bulk_job(holder).await.unwrap().expect("taken over")
+            s.take_over_bulk_job(holder)
+                .await
+                .unwrap()
+                .expect("taken over")
         };
         for _ in 0..3 {
             assert!(batch(del.clone()).await > 0, "{n}");
@@ -1031,11 +1117,17 @@ async fn import_and_deletion_exclude_each_other_and_deletion_resumes_after_crash
         let second = take_over("node-b").await;
         assert_eq!(second.epoch, 2, "{n}");
         assert!(
-            matches!(s.run_delete_job(&del, 2).await, Err(CoreError::LeaseLost(_))),
+            matches!(
+                s.run_delete_job(&del, 2).await,
+                Err(CoreError::LeaseLost(_))
+            ),
             "{n}: the first holder is fenced out"
         );
         while batch(second.clone()).await > 0 {}
-        assert!(s.account_by_did(DID).await.unwrap().is_some(), "{n}: not yet");
+        assert!(
+            s.account_by_did(DID).await.unwrap().is_some(),
+            "{n}: not yet"
+        );
         let third = take_over("node-c").await;
         s.run_delete_job(&third, 2).await.unwrap();
         assert!(s.account_by_did(DID).await.unwrap().is_none(), "{n}");
@@ -1044,7 +1136,11 @@ async fn import_and_deletion_exclude_each_other_and_deletion_resumes_after_crash
         assert!(check_empty_index(s).await, "{n}");
         assert!(row(s, &blob).await.is_none(), "{n}: blob rows gone");
         assert!(!has_records(s, &blob).await, "{n}");
-        assert_eq!(s.bulk_job("del-1").await.unwrap().unwrap().phase, "done", "{n}");
+        assert_eq!(
+            s.bulk_job("del-1").await.unwrap().unwrap().phase,
+            "done",
+            "{n}"
+        );
     }
 }
 
