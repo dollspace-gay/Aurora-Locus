@@ -715,7 +715,6 @@ impl RepoEngine {
         let new_rev = self.tids().next_after(Some(&floor));
         let total = store.import_record_count(&job.id).await?;
         let mut tx = self.job_tx(job, "stage-end").await?;
-        tx.settle_import_private_only(&job.id, did).await?;
         tx.stage_old_blobs(&job.id, did).await?;
         tx.set_import_rev(&job.id, &new_rev).await?;
         tx.set_bulk_counts(&job.id, 0, total).await?;

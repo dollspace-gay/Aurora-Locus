@@ -381,6 +381,13 @@ async fn uploads_during_each_import_phase_end_permanent_and_gated_per_the_new_tr
                         .await
                         .unwrap();
                 }
+                if point == "before-staging" {
+                    // Promoted by increments, and gated at once if
+                    // private-only in the new tree.
+                    gc(s).await;
+                    assert_in_use(s, &pubc, false, &format!("{what}: promoted")).await;
+                    assert_in_use(s, &privc, true, &format!("{what}: promoted")).await;
+                }
                 if point == "after-increments" {
                     up().await;
                 }
@@ -603,6 +610,9 @@ async fn crashes_between_batches_roll_back_before_the_swap_and_resume_after_it()
             ("stage", 1, None),
             ("stage-end", 0, Some(("drop", 0))),
             ("increments", 1, Some(("rollback-blobs", 0))),
+            ("increments-blobs", 0, Some(("rollback", 1))),
+            // After the blob pass promoted nb.
+            ("increments-blobs", 1, None),
             ("increments-blobs", 0, Some(("rollback", 2))),
         ];
         for (round, (point, skip, again)) in before.into_iter().enumerate() {
@@ -755,21 +765,22 @@ async fn the_index_serves_the_old_repo_then_lags_the_new_root_and_keeps_takedown
             .import_swap(&job, &staged.data_cid, &staged.new_rev, &key, true)
             .await
             .unwrap();
-        // During reindex it lags the new root: some keys already new, the
-        // rest still old, none from anywhere else.
-        let (old_flat, new_flat) = (flat(&old), flat(&new));
+        // During reindex it lags the new root: each key as in the new tree
+        // or still as in the old one, some of each, nothing else.
+        let (old_flat, new_flat) = (flat(&visible(&old)), flat(&visible(&new)));
         during(engine.import_reindex(&job, &staged.new_rev), "reindex", 2, async {
             assert_eq!(root_of(s).await.data_cid, staged.data_cid.to_string_base32());
             let got = index(s).await;
-            let mut moved = 0;
-            for (p, c) in &got {
-                assert!(
-                    Some(c) == old_flat.get(p) || Some(c) == new_flat.get(p),
-                    "{n}: {p} -> {c} is in neither tree"
-                );
-                moved += usize::from(Some(c) != old_flat.get(p));
+            let (mut moved, mut kept) = (0, 0);
+            let paths: BTreeSet<&String> =
+                old_flat.keys().chain(new_flat.keys()).chain(got.keys()).collect();
+            for p in paths {
+                let (g, o, w) = (got.get(p), old_flat.get(p), new_flat.get(p));
+                assert!(g == o || g == w, "{n}: {p} -> {g:?} is in neither tree");
+                moved += usize::from(g == w && g != o);
+                kept += usize::from(g == o && g != w);
             }
-            assert!(moved > 0 && moved < got.len(), "{n}: mid-reindex ({moved})");
+            assert!(moved > 0 && kept > 0, "{n}: mid-reindex ({moved}, {kept})");
         })
         .await
         .unwrap();

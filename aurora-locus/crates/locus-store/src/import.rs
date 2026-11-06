@@ -232,29 +232,6 @@ impl Tx {
         Ok(())
     }
 
-    /// Clears `private_only` on new-tree CIDs a public record the import
-    /// leaves unchanged references (its subtree wasn't walked).
-    pub async fn settle_import_private_only(&mut self, job: &str, did: &str) -> CoreResult<()> {
-        let q = sql(
-            &format!(
-                "UPDATE import_blob SET private_only = FALSE WHERE job_id = {{1}} AND in_new_tree \
-                 AND private_only AND EXISTS (SELECT 1 FROM record_blob rb WHERE rb.did = {{2}} \
-                 AND rb.blob_cid = import_blob.cid AND rb.collection NOT IN ({}) \
-                 AND NOT EXISTS (SELECT 1 FROM import_record ir WHERE ir.job_id = {{1}} \
-                 AND ir.collection = rb.collection AND ir.rkey = rb.rkey))",
-                crate::scan::PRIVATE_COLLECTIONS
-            ),
-            self.pg(),
-        );
-        on_tx!(self, q, |ex| sqlx::query(&q)
-            .bind(job)
-            .bind(did)
-            .execute(ex)
-            .await
-            .map(|_| ())
-            .map_err(db_err))
-    }
-
     /// An upload's reference check, under the repo lock: a blob records
     /// reference, or an active import's new tree does, is made permanent at
     /// once, its gating decided (bytes to the gated store if private-only

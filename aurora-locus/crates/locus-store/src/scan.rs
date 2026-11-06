@@ -249,7 +249,7 @@ impl Store {
 }
 
 /// The private-tier collections: a blob only they reference is private-only.
-pub(crate) const PRIVATE_COLLECTIONS: &str = "'tools.kryphocron.feed.postPrivate', 'tools.kryphocron.graph.block', \
+const PRIVATE_COLLECTIONS: &str = "'tools.kryphocron.feed.postPrivate', 'tools.kryphocron.graph.block', \
      'tools.kryphocron.graph.mute'";
 
 /// Whether a collection is private-tier (as [`PRIVATE_COLLECTIONS`]).
