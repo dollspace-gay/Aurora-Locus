@@ -792,6 +792,11 @@ kryphocron built in.
 - The PLC key listing guard also re-fetches documents whose listing was
   checked in the same millisecond the key was stored or demoted, which may
   have been just before it.
+- An audience listing page that answers after the listing's deadline is
+  ignored; before, it was still applied, and as a last page it could
+  delete audiences.
+- A refresh that discards an audience copy from another AppView also drops
+  the account's permission rows from that AppView.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

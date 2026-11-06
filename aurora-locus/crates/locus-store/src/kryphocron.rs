@@ -130,6 +130,20 @@ impl Store {
         exec!(self, q, prism_did)
     }
 
+    /// Drops an account's permission rows copied from another AppView.
+    pub async fn delete_kr_permissions_of_not_from(
+        &self,
+        did: &str,
+        prism_did: &str,
+    ) -> CoreResult<()> {
+        let q = sql(
+            "DELETE FROM kr_permission WHERE did = {1} AND prism_did <> {2}",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, prism_did)?;
+        Ok(())
+    }
+
     /// The operator's local block on private-tier writes.
     pub async fn private_tier_blocked(&self, did: &str) -> CoreResult<bool> {
         let q = sql(

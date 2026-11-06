@@ -487,10 +487,14 @@ pub async fn refresh(
         );
     let deadline = deadline.min(listing_deadline);
 
-    // A copy that came from another AppView is discarded first.
+    // A copy that came from another AppView is discarded first, with the
+    // permission answers that AppView gave.
     let mut versions = s.store.audience_versions(owner).await?;
     if versions.iter().any(|v| v.prism_did != prism_did) {
         s.store.purge_audience_copy(owner).await?;
+        s.store
+            .delete_kr_permissions_of_not_from(owner, &prism_did)
+            .await?;
         versions.clear();
     }
     let started = s.store.db_now().await?;
@@ -529,6 +533,11 @@ pub async fn refresh(
         )
         .await;
         out.pages += 1;
+        // A page that answers past the deadline applies nothing.
+        if Instant::now() >= deadline {
+            out.error = Some("deadline".into());
+            break;
+        }
         let (status, body) = match &answer {
             Prism::Answer { status, body, .. } => (*status, body.clone()),
             Prism::Unreachable => {
