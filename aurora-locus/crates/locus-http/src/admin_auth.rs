@@ -228,6 +228,31 @@ pub async fn require(
     Ok(caller)
 }
 
+/// The role a locus method's group needs (`<ns>.viewer.*`, `.moderator.*`,
+/// `.admin.*`, `.owner.*`), or None outside the groups.
+#[must_use]
+pub fn group_min(lxm: &str) -> Option<Role> {
+    let rest = lxm.strip_prefix(locus_core::LOCUS_NS)?.strip_prefix('.')?;
+    Role::parse(rest.split('.').next()?)
+}
+
+/// Refuses a call to a grouped locus method below the group's role before
+/// the handler runs, so before its body is parsed. Handlers check again.
+pub async fn group_gate(
+    axum::extract::State(s): axum::extract::State<std::sync::Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(lxm) = req.uri().path().strip_prefix("/xrpc/")
+        && let Some(min) = group_min(lxm)
+        && let Err(e) = require(&s, req.headers(), lxm, Surface::Locus, min).await
+    {
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
 /// Appends an operator or moderation action to the audit log.
 pub async fn audit(
     s: &AppState,

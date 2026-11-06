@@ -742,6 +742,9 @@ kryphocron built in.
 - `migrate storage --to postgres` sets the key sequence above every mark
   a blob migration recorded too, and names the blob migration it refuses
   to run alongside.
+- Grouped operator methods (`.viewer.*`, `.moderator.*`, `.admin.*`,
+  `.owner.*`) are refused below the group's role before the handler runs
+  and parses the body; handlers still check their own role.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

@@ -2,6 +2,7 @@
 
 mod bulk;
 mod blobs;
+mod security;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -205,6 +206,8 @@ struct HarnessOpts {
     public_url: Option<String>,
     /// Rate limits and replay windows in this Redis.
     kv: crate::scratch::Scratch,
+    /// Off: user-influenced fetches may reach loopback (mock remote PDSes).
+    ssrf_protection: bool,
 }
 
 impl Default for HarnessOpts {
@@ -219,6 +222,7 @@ impl Default for HarnessOpts {
             plc: None,
             public_url: None,
             kv: crate::scratch::Scratch::default(),
+            ssrf_protection: true,
         }
     }
 }
@@ -234,6 +238,7 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         plc,
         public_url,
         kv,
+        ssrf_protection,
     } = o;
     let hostname = hostname.as_str();
     let dir = tempfile::tempdir().unwrap();
@@ -308,7 +313,7 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         hostname,
         service_did,
         node_id: "test-node".into(),
-        ssrf_protection: true,
+        ssrf_protection,
         resolvers: crate::state::ResolverCache::default(),
         limits: crate::ratelimit::Limiter::default(),
         kv,
