@@ -721,6 +721,12 @@ kryphocron built in.
 - Blobs uploaded after an import whose records already use them, and blobs
   an import brings in, are now checked for being private-only.
 - The blob delete job skips keys a branding upload still uses.
+- With the media gate on, an import now gates private-only blobs as it
+  goes: uploads of its blobs and the blobs it promotes follow the new tree,
+  and each `reindex` batch gates a blob whose last public record it removed
+  (both waited for the import's last phase, so such blobs were public
+  meanwhile). A rollback gates them again from the old tree.
+- `RepoWriteBlocked` answers carry `Retry-After: 5`.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.

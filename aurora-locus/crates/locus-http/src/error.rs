@@ -55,6 +55,13 @@ impl IntoResponse for XrpcError {
             Json(json!({"error": self.error, "message": self.message})),
         )
             .into_response();
+        if self.error == "RepoWriteBlocked" {
+            // A bulk job holds the account; retryable shortly.
+            res.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+        }
         if let Some(w) = &self.www_authenticate
             && let Ok(v) = axum::http::HeaderValue::from_str(w)
         {

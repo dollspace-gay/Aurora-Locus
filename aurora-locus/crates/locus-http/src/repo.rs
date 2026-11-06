@@ -947,34 +947,10 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         // active import's new tree): permanent at once.
         let mut moves = Vec::new();
         if fresh {
-            let import = tx.active_import_for_blob(&account.did, &cid).await?;
-            if import.is_some() || tx.blob_has_records(&account.did, &cid).await? {
-                let key = locus_store::blob::permanent_key(&account.did, &cid);
-                if tx
-                    .reference_blob(&account.did, &cid, &key, backend.epoch)
-                    .await?
-                    .is_some()
-                {
-                    // Whether it's private-only is decided now, and with the
-                    // gate on its bytes go straight to the gated store.
-                    tx.recompute_private_only(&account.did, &cid).await?;
-                    tx.place_blob(&account.did, &cid, gate_on, backend.epoch)
-                        .await?;
-                    if let Some(r) = tx.blob_for_update(&account.did, &cid).await?
-                        && let Some(to) = r.pending_move
-                    {
-                        moves.push(locus_store::blob::PendingMove {
-                            did: account.did.clone(),
-                            cid: cid.clone(),
-                            from: r.storage_key,
-                            to,
-                        });
-                    }
-                }
-                if let Some(job) = import {
-                    tx.mark_import_blob(&job, &cid, true).await?;
-                }
-            }
+            moves.extend(
+                tx.promote_upload(&account.did, &cid, gate_on, backend.epoch)
+                    .await?,
+            );
         }
         tx.commit().await?;
         Ok(moves)

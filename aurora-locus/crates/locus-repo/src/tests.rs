@@ -18,6 +18,8 @@ use proto_blue_repo::mst::MstNode;
 use crate::engine::{Action, CommitError, CommitRequest, PreparedWrite, RepoEngine};
 use crate::tid::TidClock;
 
+mod bulk;
+
 const DID: &str = "did:plc:testrepo0000000000000000";
 
 struct Backend {

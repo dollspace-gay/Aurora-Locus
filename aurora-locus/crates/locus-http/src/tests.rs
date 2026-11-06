@@ -1,5 +1,7 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
+mod bulk;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
