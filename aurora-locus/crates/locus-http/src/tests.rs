@@ -7,6 +7,7 @@ mod conformance;
 mod identity;
 mod keys;
 mod keys_shard;
+mod protocol;
 mod security;
 
 use std::collections::HashMap;

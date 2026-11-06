@@ -2552,6 +2552,7 @@ dependencies = [
  "p256",
  "p384",
  "p521",
+ "proptest",
  "proto-blue-crypto",
  "proto-blue-syntax",
  "rand 0.8.8",
@@ -2650,6 +2651,7 @@ dependencies = [
  "locus-store",
  "locus-sync",
  "locus-web",
+ "proptest",
  "proto-blue-common",
  "proto-blue-crypto",
  "proto-blue-lex-cbor",
@@ -2694,6 +2696,7 @@ dependencies = [
  "k256",
  "locus-core",
  "locus-store",
+ "proptest",
  "proto-blue-common",
  "proto-blue-crypto",
  "proto-blue-identity",
@@ -2753,6 +2756,7 @@ dependencies = [
 name = "locus-repo"
 version = "0.1.0-dev"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "kryphocron-lexicons",
  "locus-core",
@@ -2796,14 +2800,18 @@ dependencies = [
 name = "locus-sync"
 version = "0.1.0-dev"
 dependencies = [
+ "hex",
  "locus-core",
  "locus-store",
+ "proptest",
  "proto-blue-lex-cbor",
  "proto-blue-lex-data",
  "proto-blue-ws",
+ "rand 0.8.8",
  "reqwest",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

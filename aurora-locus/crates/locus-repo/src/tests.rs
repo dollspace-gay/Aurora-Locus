@@ -2,6 +2,8 @@
 //! is set. Every commit is checked against an in-memory model and against
 //! proto-blue's eager MST built from scratch (the oracle).
 
+mod fuzz;
+mod interop;
 mod props;
 
 use std::collections::{BTreeMap, BTreeSet};

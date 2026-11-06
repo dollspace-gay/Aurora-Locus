@@ -705,6 +705,15 @@ kryphocron built in.
   at boot; the console warns on every page while a live node runs with
   SSRF protection off or ignores `PDS_DEV_MODE`, and when live nodes
   disagree on a reported value.
+- Record JSON is parsed as strictly as the reference: a `$type` that is
+  null, not a string or empty, a `$type: "blob"` object that isn't a
+  complete blob ref, and a `$link` or `$bytes` object with other fields
+  are refused (found by the atproto interop fixtures).
+- Handles with surrounding whitespace are a syntax error, as in the
+  reference (they were trimmed and accepted).
+- Datetime inputs (`deactivateAccount`'s `deleteAfter`, birth dates) with
+  a non-digit in the fraction, an out-of-range field or a sign no longer
+  panic or wrap; they're refused.
 - Answers now match the reference PDS where the conformance run found
   them apart: a missing or malformed query parameter or JSON body is a 400
   `InvalidRequest` (not a plain-text error); handle syntax errors on

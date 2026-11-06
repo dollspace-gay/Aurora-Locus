@@ -7,6 +7,7 @@
 
 use proptest::prelude::*;
 use proto_blue_repo::BlockMap;
+use proto_blue_repo::car::{ReadCarOpts, read_car_opts};
 use proto_blue_repo::mst::Mst;
 
 use super::*;
@@ -71,11 +72,17 @@ fn plan(ops: &[Op], model: &Model) -> (Vec<PreparedWrite>, Model) {
 
 /// Verifies a `#commit` event from its blocks alone.
 fn verify_event(body: &LexValue, key: &K256Keypair) {
+    verify_event_opts(body, key, ReadCarOpts::default());
+}
+
+/// [`verify_event`], with the CAR read with `opts` (the interop fixtures'
+/// leaf CIDs have no bytes behind them).
+pub(super) fn verify_event_opts(body: &LexValue, key: &K256Keypair, opts: ReadCarOpts) {
     let m = body.as_map().unwrap();
     let LexValue::Bytes(car) = &m["blocks"] else {
         panic!("blocks")
     };
-    let (_, blocks): (_, BlockMap) = read_car(car).unwrap();
+    let (_, blocks): (_, BlockMap) = read_car_opts(car, opts).unwrap();
     let commit_cid = m["commit"].as_cid().unwrap();
     let commit = SignedCommit::from_lex_value(
         &proto_blue_lex_cbor::decode(blocks.get(commit_cid).expect("the commit block")).unwrap(),
