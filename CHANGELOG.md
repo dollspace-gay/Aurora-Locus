@@ -715,6 +715,14 @@ kryphocron built in.
 - Blobs uploaded after an import whose records already use them, and blobs
   an import brings in, are now checked for being private-only.
 - The blob delete job skips keys a branding upload still uses.
+- The PLC key listing guard counts every stored PLC rotation key as held,
+  so a node that hasn't reloaded since a pending key was stored can't
+  record a listing without it and then let that key be discarded or
+  replaced while a document names it.
+- In the entryway role the PLC key listing guard re-fetches every
+  account's document, since an entryway doesn't see the ops its shards
+  submit.
+- `keys drop-plc-key` of a KMS-backed key says to disable that key in KMS.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.

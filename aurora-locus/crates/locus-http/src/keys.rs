@@ -304,6 +304,13 @@ pub(crate) async fn listing_guard(
         .into_iter()
         .map(|r| r.did_key)
         .collect();
+    // An entryway doesn't see the ops its shards submit, so its listings
+    // can't be trusted: every account is re-fetched.
+    let since = if s.role == locus_core::bootstrap::Role::Entryway {
+        i64::MAX
+    } else {
+        since
+    };
     for did in s.store.plc_guard_candidates(did_key, since).await? {
         let keys = match crate::identity::plc_state(s, &did).await {
             Ok((Some(op), _)) => op.rotation_keys,
@@ -568,7 +575,14 @@ pub async fn drop_plc_key(
     )
     .await;
     reload_soon(&s);
-    Ok(Json(json!({"didKey": row.did_key, "role": "dropped"})))
+    Ok(Json(json!({
+        "didKey": row.did_key,
+        "role": "dropped",
+        "kmsKeyId": row.kms_key_id,
+        "next": row.kms_key_id.as_ref().map(|id| format!(
+            "This PDS no longer uses the KMS key {id}: disable it in KMS."
+        )),
+    })))
 }
 
 /// One step of the PLC key scan: starts a pass when one is due (a key

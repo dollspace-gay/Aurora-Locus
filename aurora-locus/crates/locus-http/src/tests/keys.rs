@@ -137,7 +137,10 @@ impl Harness {
     async fn plc_secret(&self, did_key: &str) -> Option<Vec<u8>> {
         self.state
             .store
-            .get_secret(&format!("plc_rotation_key/{did_key}"), &self.state.master_key)
+            .get_secret(
+                &format!("plc_rotation_key/{did_key}"),
+                &self.state.master_key,
+            )
             .await
             .unwrap()
             .map(|s| s.to_vec())
@@ -155,7 +158,11 @@ async fn the_drop_guard_refetches_what_it_can_t_trust_and_refuses_on_doubt() {
 
     // K2 becomes current; K1 secondary. Every node reloads its keys.
     let (st, v) = h
-        .owner_call(&owner, "owner.keys.setPlcRotationKey", json!({"generate": true}))
+        .owner_call(
+            &owner,
+            "owner.keys.setPlcRotationKey",
+            json!({"generate": true}),
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let k2 = v["didKey"].as_str().unwrap().to_owned();
@@ -251,7 +258,11 @@ async fn the_drop_guard_refetches_what_it_can_t_trust_and_refuses_on_doubt() {
 
     // Neither the current nor a pending key can be dropped.
     let (st, v) = h
-        .owner_call(&owner, "owner.keys.setPlcRotationKey", json!({"generate": true}))
+        .owner_call(
+            &owner,
+            "owner.keys.setPlcRotationKey",
+            json!({"generate": true}),
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let k3 = v["didKey"].as_str().unwrap().to_owned();
@@ -269,8 +280,15 @@ async fn the_drop_guard_refetches_what_it_can_t_trust_and_refuses_on_doubt() {
     assert!(h.plc_secret(&k1).await.is_some());
     let (st, v) = drop(&k1).await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(held(&h).await.iter().all(|(k, _)| *k != k1), "{:?}", held(&h).await);
-    assert!(h.plc_secret(&k1).await.is_none(), "its private half is gone");
+    assert!(
+        held(&h).await.iter().all(|(k, _)| *k != k1),
+        "{:?}",
+        held(&h).await
+    );
+    assert!(
+        h.plc_secret(&k1).await.is_none(),
+        "its private half is gone"
+    );
     assert!(
         h.state
             .store
@@ -287,7 +305,7 @@ async fn the_drop_guard_refetches_what_it_can_t_trust_and_refuses_on_doubt() {
 async fn a_key_import_is_owner_only_dates_new_keys_and_resigns_only_what_changed() {
     let h = harness(false).await;
     let (a, _) = h.user("amy.pds.example.com").await;
-    let (b, _) = h.user("bea.pds.example.com").await;
+    let (b, b_access) = h.user("bea.pds.example.com").await;
     let owner = h.owner_with_password("olive", "olive-password-12").await;
     let admin = format!("Bearer {}", h.operator("adam", "admin").await);
     // A held PLC key and A's rotated signing key are in the backup; the
@@ -378,7 +396,10 @@ async fn a_key_import_is_owner_only_dates_new_keys_and_resigns_only_what_changed
         .unwrap();
     assert_eq!(row.role, "secondary");
     let since = row.secondary_since.unwrap();
-    assert!((before..=after).contains(&since), "{before} {since} {after}");
+    assert!(
+        (before..=after).contains(&since),
+        "{before} {since} {after}"
+    );
 
     // B's document lists its stored key: untouched.
     assert_eq!(h.state.signing_key(&b).await.unwrap().did(), b_key);
@@ -410,14 +431,7 @@ async fn a_key_import_is_owner_only_dates_new_keys_and_resigns_only_what_changed
     .unwrap();
     assert!(proto_blue_repo::commit::verify_commit_sig(&commit, &k2.did()).unwrap());
     assert!(!proto_blue_repo::commit::verify_commit_sig(&commit, &k1.did()).unwrap());
-    let (kind, payload) = h
-        .state
-        .store
-        .outbox_for(&a)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let (kind, payload) = h.state.store.outbox_for(&a).await.unwrap().pop().unwrap();
     assert_eq!(kind, "sync");
     let body: proto_blue_lex_data::LexValue = proto_blue_lex_cbor::decode(&payload).unwrap();
     let m = body.as_map().unwrap();
@@ -432,6 +446,18 @@ async fn a_key_import_is_owner_only_dates_new_keys_and_resigns_only_what_changed
     )
     .unwrap();
     assert!(proto_blue_repo::commit::verify_commit_sig(&synced, &k2.did()).unwrap());
+
+    // Reloaded, the node signs with the imported key for a document that
+    // lists only it.
+    let h = reload(h).await;
+    set_rotation_keys(&h, &b, &[&extra.did()]).await;
+    let (st, v) = h.update_handle(&b_access, "bea2.pds.example.com").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let current = h.state.secrets.plc_keys.current_did().unwrap();
+    assert_eq!(
+        last_op_signer(&h, &b, &[&current, &extra.did()]),
+        Some(extra.did())
+    );
 }
 
 /// Requests and signs a PLC op for the account with `rotation_keys`.
@@ -465,7 +491,11 @@ async fn after_a_key_change_new_identities_name_it_and_old_documents_keep_their_
     let owner = h.owner_with_password("olive", "olive-password-12").await;
     let k1 = h.state.secrets.plc_keys.current_did().unwrap();
     let (st, v) = h
-        .owner_call(&owner, "owner.keys.setPlcRotationKey", json!({"generate": true}))
+        .owner_call(
+            &owner,
+            "owner.keys.setPlcRotationKey",
+            json!({"generate": true}),
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let k2 = v["didKey"].as_str().unwrap().to_owned();
@@ -603,11 +633,7 @@ async fn after_a_key_change_new_identities_name_it_and_old_documents_keep_their_
     .await
     .unwrap();
     let now = held(&h).await;
-    assert_eq!(
-        now.iter().filter(|(k, _)| *k == k1).count(),
-        1,
-        "{now:?}"
-    );
+    assert_eq!(now.iter().filter(|(k, _)| *k == k1).count(), 1, "{now:?}");
     assert!(now.contains(&(k1.clone(), "pending".into())), "{now:?}");
     assert!(now.contains(&(k2.clone(), "current".into())), "{now:?}");
     let (st, _) = h.backup_bytes(&owner, "backup passphrase 1").await;
@@ -700,13 +726,119 @@ async fn a_first_boot_env_plc_key_is_current_at_once_and_stays_so() {
         vec![(plc.did(), "current".to_owned())],
         "no pending step"
     );
-    // The next boot, same value: nothing changes.
+    // The key moves on; the next boot, same value, changes nothing: the
+    // first boot recorded the value as applied, so the old key isn't
+    // brought back as pending.
+    let next = K256Keypair::generate();
+    let mut tx = store.begin().await.unwrap();
+    tx.store_pending_plc_key(
+        &next.did(),
+        locus_store::keys::PlcKeySource::Private(&next.export_private_key()),
+        &key,
+    )
+    .await
+    .unwrap();
+    tx.promote_pending_plc_key().await.unwrap();
+    tx.commit().await.unwrap();
+    let before = rows(store.clone()).await;
     let secrets = ServerSecrets::load_or_create_from(&store, &key, &env)
         .await
         .unwrap();
-    assert_eq!(secrets.plc_keys.current_did(), Some(plc.did()));
-    assert_eq!(
-        rows(store.clone()).await,
-        vec![(plc.did(), "current".to_owned())]
+    assert_eq!(secrets.plc_keys.current_did(), Some(next.did()));
+    assert_eq!(rows(store.clone()).await, before);
+    assert!(before.contains(&(plc.did(), "secondary".to_owned())));
+}
+
+#[tokio::test]
+async fn an_entryway_s_drop_guard_refetches_every_account() {
+    let (e, s, s_url) = super::entryway_and_shard().await;
+    let owner = e.owner_with_password("olive", "olive-password-12").await;
+    let shard_pw = String::from_utf8(s.state.secrets.admin_password.to_vec()).unwrap();
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.shard.add"),
+            &owner,
+            Some(json!({"url": s_url, "adminPassword": shard_pw, "name": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let acct = e
+        .create_account(
+            "ann.entryway.example.com",
+            "ann@example.com",
+            "ann-password",
+        )
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let k1 = e.state.secrets.plc_keys.current_did().unwrap();
+    let (st, v) = e
+        .owner_call(
+            &owner,
+            "owner.keys.setPlcRotationKey",
+            json!({"generate": true}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let k2 = v["didKey"].as_str().unwrap().to_owned();
+    let (st, v) = e
+        .owner_call(
+            &owner,
+            "owner.keys.setPlcRotationKey",
+            json!({"acknowledgeNoBackup": true, "acknowledgeUnconfirmed": true}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // A fresh listing that says K2, while the document (changed through
+    // the shard, unseen here) lists only K1: an entryway re-fetches anyway.
+    e.state
+        .store
+        .set_plc_key_listing(&did, std::slice::from_ref(&k2))
+        .await
+        .unwrap();
+    let (st, v) = e
+        .owner_call(&owner, "owner.keys.dropPlcKey", json!({"didKey": k1}))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&did), "{v}");
+    assert!(held(&e).await.contains(&(k1, "secondary".into())));
+}
+
+#[tokio::test]
+async fn dropping_a_kms_plc_key_forgets_its_id_and_says_to_disable_it() {
+    let Some(key_id) = super::test_kms_k256_key().await else {
+        eprintln!("LOCUS_KMS_ENDPOINT isn't set; skipping");
+        return;
+    };
+    let h = harness(false).await;
+    let owner = h.owner_with_password("olive", "olive-password-12").await;
+    for body in [
+        json!({"kmsKeyId": key_id}),
+        json!({"acknowledgeNoBackup": true}),
+        json!({"generate": true}),
+        json!({"acknowledgeNoBackup": true}),
+    ] {
+        let (st, v) = h
+            .owner_call(&owner, "owner.keys.setPlcRotationKey", body)
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let kms_did = rows(&h)
+        .await
+        .into_iter()
+        .find(|r| r.kms_key_id.as_deref() == Some(key_id.as_str()))
+        .unwrap()
+        .did_key;
+    // No account lists it: dropped, its id forgotten, the operator told.
+    let (st, v) = h
+        .owner_call(&owner, "owner.keys.dropPlcKey", json!({"didKey": kms_did}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["next"].as_str().unwrap().contains(&key_id), "{v}");
+    assert!(
+        rows(&h)
+            .await
+            .iter()
+            .all(|r| r.kms_key_id.as_deref() != Some(key_id.as_str()))
     );
 }
