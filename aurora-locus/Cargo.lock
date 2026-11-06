@@ -227,6 +227,7 @@ name = "aurora-locus"
 version = "0.1.0-dev"
 dependencies = [
  "arc-swap",
+ "axum",
  "clap",
  "hex",
  "locus-auth",
@@ -249,6 +250,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

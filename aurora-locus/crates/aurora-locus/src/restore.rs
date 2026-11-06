@@ -782,7 +782,8 @@ pub async fn post_restore(bootstrap: &Bootstrap, opts: PostRestoreOpts) -> Resul
         (Some(_), _, _) => None,
         (None, _, r) => r.clone(),
     };
-    let ended_job = restored.paused;
+    // Any migration the restore point held, copying or paused, ends.
+    let ended_job = restored.paused || store.active_blob_migration().await.map_err(e)?.is_some();
     let epoch = tx
         .settle_restored_blobs(target_kind.name(), root.as_deref(), opts.backend.is_some())
         .await
@@ -811,4 +812,143 @@ pub async fn post_restore(bootstrap: &Bootstrap, opts: PostRestoreOpts) -> Resul
     .await?;
     store.close().await;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bootstrap(dir: &Path, role: &str) -> Bootstrap {
+        let env: HashMap<String, String> = [
+            ("LOCUS_DATA_DIR", dir.to_str().unwrap()),
+            ("LOCUS_ROLE", role),
+            ("PDS_HOSTNAME", "pds.example.com"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        Bootstrap::load(None, &env).unwrap()
+    }
+
+    fn key_file(dir: &Path, name: &str) -> (PathBuf, String) {
+        let k = K256Keypair::generate();
+        let p = dir.join(name);
+        std::fs::write(&p, k.did()).unwrap();
+        (p, k.did())
+    }
+
+    #[test]
+    fn shard_restores_need_both_entryway_keys_and_other_roles_refuse_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v, _) = key_file(dir.path(), "v");
+        let (p, _) = key_file(dir.path(), "p");
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, "not a key").unwrap();
+        let f = |v: Option<&PathBuf>, p: Option<&PathBuf>| Finish {
+            entryway_verify_key: v.cloned(),
+            entryway_plc_rotation_key: p.cloned(),
+            ..Finish::default()
+        };
+        let pds = bootstrap(dir.path(), "pds");
+        let shard = bootstrap(dir.path(), "shard");
+        assert!(shard_keys(&pds, &f(None, None)).unwrap().is_none());
+        assert!(
+            shard_keys(&pds, &f(Some(&v), None))
+                .unwrap_err()
+                .contains("for the shard role")
+        );
+        assert!(shard_keys(&pds, &f(Some(&v), Some(&p))).is_err());
+        assert!(
+            shard_keys(&shard, &f(None, None))
+                .unwrap_err()
+                .contains("needs")
+        );
+        assert!(
+            shard_keys(&shard, &f(Some(&v), None))
+                .unwrap_err()
+                .contains("needs")
+        );
+        assert!(
+            shard_keys(&shard, &f(Some(&bad), Some(&p)))
+                .unwrap_err()
+                .contains("--entryway-verify-key")
+        );
+        assert!(
+            shard_keys(&shard, &f(Some(&v), Some(&p)))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shard_restore_replaces_entryway_keys_and_refuses_earlier_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
+            .await
+            .unwrap();
+        let key = MasterKey::generate(locus_core::keys::SourceKind::Env);
+        let mut tx = store.begin().await.unwrap();
+        tx.set_shard_verify_key("did:key:old-verify", None)
+            .await
+            .unwrap();
+        tx.set_setting(
+            "entryway.plc_rotation_keys",
+            serde_json::json!(["did:key:old-plc"]),
+            "test",
+        )
+        .await
+        .unwrap();
+        for (did, handle) in [("did:plc:one", "one.test"), ("did:plc:two", "two.test")] {
+            tx.insert_account(&locus_store::accounts::NewAccount {
+                did,
+                handle,
+                email: None,
+                password_hash: None,
+                status: locus_store::accounts::Status::Active,
+                did_method: "plc",
+            })
+            .await
+            .unwrap();
+            tx.put_signing_key(did, "k256", b"key", &key).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        let before = locus_core::time::now_ms() - 1;
+        let mut report = Report::default();
+        shard_finish(
+            &store,
+            &("did:key:new-verify".into(), "did:key:new-plc".into()),
+            &mut report,
+        )
+        .await
+        .unwrap();
+        let keys: Vec<String> = store
+            .shard_verify_keys()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|k| k.did_key)
+            .collect();
+        assert_eq!(keys, ["did:key:new-verify"], "the restored key is gone");
+        let snap = Settings::load(store.clone()).await.unwrap().current();
+        assert_eq!(snap.list("entryway.plc_rotation_keys"), ["did:key:new-plc"]);
+        for did in ["did:plc:one", "did:plc:two"] {
+            assert!(
+                store.shard_revoked(did, "", before).await.unwrap(),
+                "{did}: earlier tokens refused"
+            );
+            assert!(
+                !store
+                    .shard_revoked(did, "", locus_core::time::now_ms() + 1000)
+                    .await
+                    .unwrap(),
+                "{did}: new tokens accepted"
+            );
+        }
+        assert!(
+            report.0.iter().any(|l| l.contains("2 accounts")),
+            "{:?}",
+            report.0
+        );
+        assert!(report.0.iter().any(|l| l.contains("shard add")));
+    }
 }

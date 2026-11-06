@@ -705,6 +705,8 @@ kryphocron built in.
   and no `phoneVerificationRequired`; `listRepos` gives a cursor on every
   page with rows; `getBlocks` serves only blocks a tree references; a
   duplicate app-password name is `InvalidRequest`.
+- `backup post-restore` reports a blob migration it ended whether it was
+  copying or paused (it reported only a paused one).
 - Single-label handle domains (`.test`) are accepted in setup.
 - Setup no longer adds the default relay when `PDS_CRAWLERS` is set
   (even empty) or the hostname is local.
