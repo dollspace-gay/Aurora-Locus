@@ -5,11 +5,18 @@
 //! allowlist (each with the design section that justifies it) are
 //! reported but don't fail the run.
 //!
-//! `locus-conformance plc <port>` runs the shared mock PLC directory.
+//! `locus-conformance plc <port>` runs the shared mock PLC directory,
+//! `locus-conformance appview <port>` the mock AppView.
 //! `locus-conformance run --locus <url> --reference <url> --allowlist <file>
-//!   [--admin-locus <pw>] [--admin-reference <pw>] [--report <file>]`.
+//!   --plc <url> [--mail <mail catcher API> --mail-from-locus <addr>
+//!   --mail-from-reference <addr>] [--admin-locus <pw>]
+//!   [--admin-reference <pw>] [--report <file>]`. With `--mail` both
+//! servers send email and the run is in `mail` mode, otherwise `no-mail`
+//! (allowlist entries can be limited to one with `when`).
 
+mod appview;
 mod firehose;
+mod groups;
 mod normalize;
 mod plc;
 mod runner;
@@ -41,10 +48,18 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some("appview") => {
+            let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(2583);
+            if let Err(e) = appview::serve(port).await {
+                eprintln!("mock AppView: {e}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         Some("run") => run(&args).await,
         _ => {
             eprintln!(
-                "usage: locus-conformance plc <port> | run --locus <url> --reference <url> --allowlist <file>"
+                "usage: locus-conformance plc <port> | appview <port> | run --locus <url> --reference <url> --allowlist <file>"
             );
             ExitCode::FAILURE
         }
@@ -71,15 +86,27 @@ async fn run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let allow = load_allowlist(&allow_json);
+    let mail = arg(args, "--mail");
+    let mode = if mail.is_some() { "mail" } else { "no-mail" };
+    println!("mode: {mode}");
+    let allow = load_allowlist(&allow_json, mode);
+    let plc = arg(args, "--plc").unwrap_or_else(|| "http://localhost:2582".into());
     let mut locus = Server::new(
         &locus_url,
         &arg(args, "--admin-locus").unwrap_or_else(|| "admin-pw".into()),
+        &plc,
     );
     let mut reference = Server::new(
         &ref_url,
         &arg(args, "--admin-reference").unwrap_or_else(|| "admin-pw".into()),
+        &plc,
     );
+    locus.norm.peer.clone_from(&reference.norm.host);
+    reference.norm.peer.clone_from(&locus.norm.host);
+    if let Some(api) = &mail {
+        locus.mail = arg(args, "--mail-from-locus").map(|f| (api.clone(), f));
+        reference.mail = arg(args, "--mail-from-reference").map(|f| (api.clone(), f));
+    }
     let (fl, fr) = match (
         firehose::collect(&locus_url).await,
         firehose::collect(&ref_url).await,
@@ -94,8 +121,13 @@ async fn run(args: &[String]) -> ExitCode {
     let mut report = Vec::new();
     let (mut unexpected, mut allowed) = (0usize, 0usize);
     for step in scenarios::all() {
-        let a = locus.run(&step).await;
-        let b = reference.run(&step).await;
+        let a = locus.run(&step, &reference).await;
+        let b = reference.run(&step, &locus).await;
+        if step.target == runner::Target::Peer {
+            // The other server's half of a migration: not compared.
+            println!("ok   {} (peer: {} / {})", step.name, a.status, b.status);
+            continue;
+        }
         let out = compare(&step.name, &a, &b, &allow);
         unexpected += out.unexpected.len();
         allowed += out.allowed.len();

@@ -2,9 +2,10 @@
 
 use serde_json::{Value, json};
 
+use crate::groups;
 use crate::runner::{Auth, Step};
 
-fn post(text: &str) -> Value {
+pub fn post(text: &str) -> Value {
     json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-11-06T00:00:00.000Z"})
 }
 
@@ -17,8 +18,28 @@ pub const PNG: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
-#[allow(clippy::too_many_lines)]
+/// A one-pixel GIF.
+pub const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+
+/// Every group, in order.
 pub fn all() -> Vec<Step> {
+    [
+        basics(),
+        groups::no_input_bodies(),
+        records(),
+        groups::sync(),
+        groups::migration(),
+        groups::email(),
+        groups::oauth(),
+        groups::pipethrough(),
+        groups::admin(),
+        lifecycle(),
+    ]
+    .concat()
+}
+
+/// Accounts, sessions, app passwords, service auth, handles.
+fn basics() -> Vec<Step> {
     let me = Auth::User("alice");
     vec![
         // Server.
@@ -68,6 +89,14 @@ pub fn all() -> Vec<Step> {
         Step::post("identity.updateHandle.taken", "com.atproto.identity.updateHandle", json!({"handle": "bob.test"})).auth(me),
         Step::post("identity.updateHandle.otherDomain", "com.atproto.identity.updateHandle",
             json!({"handle": "alice.elsewhere.example"})).auth(me),
+    ]
+}
+
+/// Records, blobs and the first sync reads.
+#[allow(clippy::too_many_lines)]
+fn records() -> Vec<Step> {
+    let me = Auth::User("alice");
+    vec![
         // Records.
         Step::post("repo.createRecord", "com.atproto.repo.createRecord",
             json!({"repo": "{{alice.did}}", "collection": "app.bsky.feed.post", "record": post("hello")}))
@@ -150,6 +179,14 @@ pub fn all() -> Vec<Step> {
         Step::get("sync.listRepos", "com.atproto.sync.listRepos"),
         Step::get("sync.getBlocks.missing", "com.atproto.sync.getBlocks")
             .q("did", "{{alice.did}}").q("cids", "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"),
+    ]
+}
+
+/// Takedown of bob, then the account lifecycle of alice (last: it ends
+/// alice's session).
+fn lifecycle() -> Vec<Step> {
+    let me = Auth::User("alice");
+    vec![
         // Admin.
         Step::get("admin.getAccountInfo", "com.atproto.admin.getAccountInfo").q("did", "{{bob.did}}").auth(Auth::Admin),
         Step::get("admin.getAccountInfo.noAuth", "com.atproto.admin.getAccountInfo").q("did", "{{bob.did}}"),

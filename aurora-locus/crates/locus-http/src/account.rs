@@ -66,11 +66,16 @@ pub async fn deactivate_account(
     crate::entryway::push_status(&s, did).await
 }
 
-pub async fn activate_account(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+pub async fn activate_account(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<()> {
     let authed = auth::authorization(&s, &headers, auth::FULL, &[], auth::forbid(
         "Account reactivation is not available with OAuth credentials. Sign in to your account management page to reactivate.",
     ))
     .await?;
+    crate::error::no_body(&body)?;
     let did = authed.did.as_str();
     if s.role == locus_core::bootstrap::Role::Entryway {
         return crate::entryway::activate(&s, did).await;
@@ -207,6 +212,7 @@ pub async fn check_account_status(State(s): St, headers: HeaderMap) -> XrpcResul
         .await?
         .ok_or_else(|| XrpcError::internal("account has no repository"))?;
     let valid_did = assert_valid_did_doc(&s, did).await.is_ok();
+    let (imported_blobs, expected_blobs) = s.store.blob_counts(did).await?;
     Ok(Json(json!({
         "activated": account.status == Status::Active,
         "validDid": valid_did,
@@ -215,12 +221,16 @@ pub async fn check_account_status(State(s): St, headers: HeaderMap) -> XrpcResul
         "repoBlocks": blocks,
         "indexedRecords": records,
         "privateStateValues": 0,
-        "expectedBlobs": 0,
-        "importedBlobs": 0,
+        "expectedBlobs": expected_blobs,
+        "importedBlobs": imported_blobs,
     })))
 }
 
-pub async fn request_account_delete(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+pub async fn request_account_delete(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<()> {
     let authed = auth::authorization(
         &s,
         &headers,
@@ -229,6 +239,7 @@ pub async fn request_account_delete(State(s): St, headers: HeaderMap) -> XrpcRes
         auth::forbid(auth::OAUTH_UNSUPPORTED),
     )
     .await?;
+    crate::error::no_body(&body)?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestAccountDelete-0";

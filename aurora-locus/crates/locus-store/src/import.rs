@@ -727,6 +727,22 @@ impl Store {
         }))
     }
 
+    /// `checkAccountStatus`'s blob counts, as the reference: every blob row
+    /// the account has (`importedBlobs`) and the distinct blobs its records
+    /// reference (`expectedBlobs`).
+    pub async fn blob_counts(&self, did: &str) -> CoreResult<(i64, i64)> {
+        let q = sql(
+            "SELECT (SELECT COUNT(*) FROM blob WHERE did = {1}), \
+             (SELECT COUNT(DISTINCT blob_cid) FROM record_blob WHERE did = {1})",
+            self.pg(),
+        );
+        on_pool!(self, |p| sqlx::query_as(&q)
+            .bind(did)
+            .fetch_one(p)
+            .await
+            .map_err(db_err))
+    }
+
     /// Blobs records reference that have no blob row, one record per blob,
     /// in CID order after `cursor` (as the reference's `listMissingBlobs`).
     pub async fn list_missing_blobs(

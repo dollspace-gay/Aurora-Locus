@@ -619,7 +619,11 @@ pub async fn get_recommended_did_credentials(
 }
 
 /// Emails a code that `signPlcOperation` needs.
-pub async fn request_plc_operation_signature(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+pub async fn request_plc_operation_signature(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<()> {
     let authed = auth::authorization(
         &s,
         &headers,
@@ -628,6 +632,7 @@ pub async fn request_plc_operation_signature(State(s): St, headers: HeaderMap) -
         |p| Ok(p.assert_identity("*")?),
     )
     .await?;
+    crate::error::no_body(&body)?;
     let account = s
         .store
         .account_by_did(&authed.did)

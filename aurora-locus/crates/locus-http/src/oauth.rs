@@ -384,6 +384,9 @@ fn par_error(e: OAuthError) -> OAuthError {
         "use_dpop_nonce",
         "server_error",
         "invalid_authorization_details",
+        "unauthorized_client",
+        "unsupported_response_type",
+        "temporarily_unavailable",
     ];
     if AS_IS.contains(&e.error.as_str()) {
         e

@@ -507,7 +507,7 @@ pub async fn delete_account(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<DeleteInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     let who = caller(
         &s,
         &headers,
@@ -522,7 +522,7 @@ pub async fn delete_account(
         s.store.oauth_delete_account_tokens(&input.did).await?;
     }
     admin_auth::audit(&s, &who, "admin.deleteAccount", Some(&input.did), None).await;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -535,7 +535,7 @@ pub async fn update_account_password(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<PasswordInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     let who = caller(
         &s,
         &headers,
@@ -564,7 +564,7 @@ pub async fn update_account_password(
         None,
     )
     .await;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -577,7 +577,7 @@ pub async fn update_account_email(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<EmailInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     let who = caller(
         &s,
         &headers,
@@ -609,7 +609,7 @@ pub async fn update_account_email(
         Some(json!({"before": account.email, "after": email})),
     )
     .await;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -622,7 +622,7 @@ pub async fn update_account_handle(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<HandleInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     let who = caller(
         &s,
         &headers,
@@ -643,7 +643,7 @@ pub async fn update_account_handle(
         Some(json!({"before": account.handle, "after": input.handle})),
     )
     .await;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 // ---------------------------------------------------------------- invites
@@ -727,18 +727,18 @@ pub async fn disable_account_invites(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<AccountInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     set_invites(&s, &headers, &input, true).await?;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 pub async fn enable_account_invites(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<AccountInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     set_invites(&s, &headers, &input, false).await?;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 #[derive(Deserialize, Default)]
@@ -753,7 +753,7 @@ pub async fn disable_invite_codes(
     State(s): St,
     headers: HeaderMap,
     Json(input): Json<DisableCodesInput>,
-) -> XrpcResult<Json<Value>> {
+) -> XrpcResult<()> {
     let who = caller(
         &s,
         &headers,
@@ -778,7 +778,7 @@ pub async fn disable_invite_codes(
         Some(json!({"codes": input.codes, "accounts": input.accounts})),
     )
     .await;
-    Ok(Json(json!({})))
+    Ok(())
 }
 
 fn new_code(s: &AppState) -> String {

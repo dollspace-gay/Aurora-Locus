@@ -19,6 +19,9 @@ axum = "0.8"
 tokio-tungstenite = "0.26"
 proto-blue-ws.workspace = true
 proto-blue-lex-data.workspace = true
+locus-auth.workspace = true
+base64.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true

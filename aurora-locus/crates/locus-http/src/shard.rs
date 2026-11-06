@@ -991,7 +991,7 @@ async fn create_account(
         return Err(incompatible("invalid plc operation"));
     }
     if s.store.account_by_did(did).await?.is_some() {
-        return Err(XrpcError::invalid_request("Account already exists"));
+        return Err(XrpcError::named("AlreadyExists", "Repo already exists"));
     }
     let doc_key = fields.verification_methods.get("atproto").cloned();
     let reserved = match s.store.reserved_key(did, &s.master_key).await? {
