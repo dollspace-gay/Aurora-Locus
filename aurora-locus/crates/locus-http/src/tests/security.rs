@@ -155,8 +155,13 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
     let row = h.state.store.blob(&did, &fresh_cid).await.unwrap().unwrap();
     assert_eq!(row.state, "temp", "not made permanent");
     // Reversed: the same record now goes through.
-    h.admin_call("POST", update, &moderator, Some(takedown(&fresh_cid, false)))
-        .await;
+    h.admin_call(
+        "POST",
+        update,
+        &moderator,
+        Some(takedown(&fresh_cid, false)),
+    )
+    .await;
     let (st, v) = h.create_post(&did, &access, post_with_image(&fresh)).await;
     assert_eq!(st, StatusCode::OK, "{v}");
 
@@ -192,11 +197,17 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
             "/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"
         ))
         .await;
-    assert!(plain["value"].get("embed").is_none(), "the update didn't land");
+    assert!(
+        plain["value"].get("embed").is_none(),
+        "the update didn't land"
+    );
 
     // A scanner match: quarantined and held for review.
     let (url, _) = mock_scanner().await;
-    for (k, v) in [("blobs.scanner", "webhook"), ("blobs.scanner_url", url.as_str())] {
+    for (k, v) in [
+        ("blobs.scanner", "webhook"),
+        ("blobs.scanner_url", url.as_str()),
+    ] {
         h.state.settings.set(k, json!(v), "test").await.unwrap();
     }
     let bad = b"a BAD picture";
@@ -215,7 +226,10 @@ async fn record_writes_naming_taken_down_quarantined_or_held_blobs_are_refused()
     assert_eq!((row.state.as_str(), row.review_hold), ("quarantined", true));
     let bad_ref = json!({"$type": "blob", "ref": {"$link": bad_cid}, "mimeType": "image/png", "size": bad.len()});
     let before = h.post_count(&did).await;
-    refused(h.create_post(&did, &access, post_with_image(&bad_ref)).await);
+    refused(
+        h.create_post(&did, &access, post_with_image(&bad_ref))
+            .await,
+    );
     assert_eq!(h.post_count(&did).await, before);
     let row = h.state.store.blob(&did, &bad_cid).await.unwrap().unwrap();
     assert_eq!(row.state, "quarantined", "still quarantined");
@@ -252,7 +266,9 @@ async fn no_grouped_locus_method_takes_a_lower_role() {
     let (_, user_access) = h.user("una.pds.example.com").await;
     let mut tokens = Vec::new();
     for role in [Role::Viewer, Role::Moderator, Role::Admin, Role::Owner] {
-        let t = h.operator(&format!("op-{}", role.as_str()), role.as_str()).await;
+        let t = h
+            .operator(&format!("op-{}", role.as_str()), role.as_str())
+            .await;
         tokens.push((role, format!("Bearer {t}")));
     }
     let methods = grouped_locus_methods();
@@ -279,7 +295,10 @@ async fn no_grouped_locus_method_takes_a_lower_role() {
                         &path,
                         None,
                         b"{not json".to_vec(),
-                        &[("authorization", auth), ("content-type", "application/json")],
+                        &[
+                            ("authorization", auth),
+                            ("content-type", "application/json"),
+                        ],
                     )
                     .await;
                 assert_eq!(st, StatusCode::FORBIDDEN, "{lxm} as {}", role.as_str());
@@ -314,7 +333,10 @@ async fn no_grouped_locus_method_takes_a_lower_role() {
         .admin_call("POST", &rotate, &tokens[0].1, Some(json!({})))
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    assert_eq!(h.state.store.current_generation().await.unwrap(), generation);
+    assert_eq!(
+        h.state.store.current_generation().await.unwrap(),
+        generation
+    );
 }
 
 /// What a refused admin call could have changed: the account row (handle,
@@ -325,7 +347,12 @@ async fn admin_state(
     moderator: &str,
 ) -> (Option<locus_store::accounts::Account>, Value, usize) {
     let (_, codes) = h
-        .admin_call("GET", "/xrpc/com.atproto.admin.getInviteCodes", moderator, None)
+        .admin_call(
+            "GET",
+            "/xrpc/com.atproto.admin.getInviteCodes",
+            moderator,
+            None,
+        )
         .await;
     (
         h.state.store.account_by_did(did).await.unwrap(),
@@ -411,7 +438,9 @@ async fn reference_admin_methods_refuse_lower_roles_and_change_nothing() {
 
     // The same bodies work with the role (so the refusals were the role's).
     for (m, body) in &admin_methods[1..] {
-        let (st, v) = h.admin_call("POST", &x(m), &admin, Some(body.clone())).await;
+        let (st, v) = h
+            .admin_call("POST", &x(m), &admin, Some(body.clone()))
+            .await;
         assert_eq!(st, StatusCode::OK, "{m} as admin: {v}");
     }
     for (m, body) in &moderator_methods[2..] {
@@ -460,7 +489,12 @@ async fn set_callback_token_takes_only_the_entryways_jwt_and_replaces_the_token(
         "the-second-callback-token-of-enough-length-2",
     );
     let (st, v) = h
-        .call("POST", &set_token, Some(&good()), Some(json!({"token": cb1})))
+        .call(
+            "POST",
+            &set_token,
+            Some(&good()),
+            Some(json!({"token": cb1})),
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     // Whether a callback with `token` is taken.
@@ -515,7 +549,12 @@ async fn set_callback_token_takes_only_the_entryways_jwt_and_replaces_the_token(
 
     // A second call replaces it: the old token is refused from then on.
     let (st, v) = h
-        .call("POST", &set_token, Some(&good()), Some(json!({"token": cb2})))
+        .call(
+            "POST",
+            &set_token,
+            Some(&good()),
+            Some(json!({"token": cb2})),
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(callback(cb2).await, StatusCode::OK);
@@ -593,22 +632,32 @@ async fn membership_assertions_with_another_issuer_or_type_are_rejected() {
     assert!(crate::membership::verify_assertion(&h.state, &ok, &member, &audience).await);
     // Another issuer (even one whose key is known and signed it), or no
     // issuer.
-    for iss in ["did:web:evil.example.com", "did:plc:ewvi7nxzyoun6zhxrhs64oiz", ""] {
+    for iss in [
+        "did:web:evil.example.com",
+        "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "",
+    ] {
         let t = signed_assertion(&h, &header(crate::membership::ASSERTION_TYP), &claims(iss));
         assert!(
-            !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await, "iss {iss:?}");
+            !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await,
+            "iss {iss:?}"
+        );
     }
     // Another type: a service JWT's, an access token's, none.
     for typ in ["JWT", "at+jwt", "dpop+jwt", ""] {
         let t = signed_assertion(&h, &header(typ), &claims("did:web:pds.example.com"));
         assert!(
-            !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await, "typ {typ:?}");
+            !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await,
+            "typ {typ:?}"
+        );
     }
     let mut no_typ = header(crate::membership::ASSERTION_TYP);
     no_typ.as_object_mut().unwrap().remove("typ");
     let t = signed_assertion(&h, &no_typ, &claims("did:web:pds.example.com"));
     assert!(
-            !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await, "no typ");
+        !crate::membership::verify_assertion(&h.state, &t, &member, &audience).await,
+        "no typ"
+    );
 }
 
 // ---------------------------------------------------------------- hostnames
@@ -647,8 +696,14 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
         h.update_handle(&access, "zed7.example.com").await,
         "hostname as a handle",
     );
-    taken(create("zed7.example.com", "plc").await, "hostname at signup");
-    taken(create("zed7.example.com", "web").await, "hostname as did:web");
+    taken(
+        create("zed7.example.com", "plc").await,
+        "hostname at signup",
+    );
+    taken(
+        create("zed7.example.com", "web").await,
+        "hostname as did:web",
+    );
     let (st, v) = h.update_handle(&access, "free7.example.com").await;
     assert_eq!(st, StatusCode::OK, "{v}");
 
@@ -667,7 +722,10 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
         h.update_handle(&access, "next7.example.com").await,
         "candidate as a handle",
     );
-    taken(create("next7.example.com", "web").await, "candidate as did:web");
+    taken(
+        create("next7.example.com", "web").await,
+        "candidate as did:web",
+    );
     assert!(
         h.state
             .store
@@ -678,7 +736,12 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
     );
     // Cancelled: released, and a handle can then really take it.
     let (st, _) = h
-        .admin_call("POST", &ns("owner.hostname.cancel"), &owner, Some(json!({})))
+        .admin_call(
+            "POST",
+            &ns("owner.hostname.cancel"),
+            &owner,
+            Some(json!({})),
+        )
         .await;
     assert_eq!(st, StatusCode::OK);
     let (st, v) = h.update_handle(&access, "next7.example.com").await;
@@ -705,8 +768,14 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
         h.update_handle(&access, "old7.example.com").await,
         "old host as a handle",
     );
-    taken(create("old7.example.com", "plc").await, "old host at signup");
-    taken(create("old7.example.com", "web").await, "old host as did:web");
+    taken(
+        create("old7.example.com", "plc").await,
+        "old host at signup",
+    );
+    taken(
+        create("old7.example.com", "web").await,
+        "old host as did:web",
+    );
 }
 
 // ---------------------------------------------------------------- private tier
@@ -881,7 +950,10 @@ async fn private_posts_name_only_audiences_the_writers_store_holds() {
     let (other, _) = h.user("jon.pds.example.com").await;
     let theirs = h.add_audience(&other, "3m6tttttttttt").await;
     for (target, why) in [
-        (format!("at://{did}/{AUD}/3m6nnnnnnnnnn"), "not in the store"),
+        (
+            format!("at://{did}/{AUD}/3m6nnnnnnnnnn"),
+            "not in the store",
+        ),
         (theirs, "another account's"),
     ] {
         invalid(
@@ -1119,4 +1191,175 @@ async fn audience_values_and_private_posts_follow_the_host_rules() {
     // The supported codec takes the same content.
     let (st, v) = put("laquna/0.2").await;
     assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+// ---------------------------------------------------------------- consent pages
+
+/// The consent page's security block (client, account, scopes, the allow
+/// and deny forms), with the per-request form tokens blanked.
+fn security_block(html: &str) -> String {
+    let start = html.find("<h1>").expect("a heading");
+    let end = html.rfind("</form>").expect("the forms") + "</form>".len();
+    let mut block = html[start..end].to_owned();
+    for name in ["csrf", "request_id"] {
+        block = block.replace(&hidden(html, name), "-");
+    }
+    block
+}
+
+#[tokio::test]
+async fn consent_pages_keep_their_security_block_under_every_theme() {
+    use locus_web::branding::{FONTS, RADII, SPACINGS, Theme};
+    const LB: &str = "http://localhost?scope=atproto+transition%3Ageneric";
+    const HOSTILE: &str = ".scopes { display: none } button.primary { visibility: hidden }";
+    let h = harness(false).await;
+    h.create_account("cas.pds.example.com", "cas@example.com", "hunter22")
+        .await;
+    let did = h
+        .state
+        .store
+        .account_by_handle("cas.pds.example.com")
+        .await
+        .unwrap()
+        .unwrap()
+        .did;
+
+    // Every bundled font, radius and spacing, with colours, images, links
+    // and texts; and themes that carry custom CSS and an uploaded font
+    // (portal only) aimed at the consent page.
+    let mut themes = vec![Theme::default()];
+    for font in FONTS {
+        for radius in RADII {
+            for spacing in SPACINGS {
+                let mut t = Theme {
+                    font: font.into(),
+                    radius: radius.into(),
+                    spacing: spacing.into(),
+                    service_name: format!("Brand {font} {radius} {spacing}"),
+                    logo: "logo-asset".into(),
+                    background_light: "bg-light".into(),
+                    background_dark: "bg-dark".into(),
+                    ..Theme::default()
+                };
+                t.light.primary = "#1f6feb".into();
+                t.dark.primary = "#4d8dff".into();
+                t.links.terms = "https://example.com/terms".into();
+                t.text.sign_in_heading = "Welcome back".into();
+                themes.push(t);
+            }
+        }
+    }
+    themes.push(Theme {
+        custom_css: HOSTILE.into(),
+        uploaded_font: "font-asset".into(),
+        service_name: "<b>Totally Safe</b>".into(),
+        ..Theme::default()
+    });
+
+    let browser = Browser::default();
+    let mut signed_in = false;
+    let mut first: Option<String> = None;
+    for theme in &themes {
+        h.state
+            .store
+            .save_branding_draft(&serde_json::to_string(theme).unwrap(), &[], "test")
+            .await
+            .unwrap();
+        let version = h
+            .state
+            .store
+            .publish_branding_draft("test")
+            .await
+            .unwrap()
+            .unwrap();
+        h.state.branding.invalidate();
+        crate::branding::published(&h.state).await;
+
+        // A real authorization request, to its consent page.
+        let client = DpopClient::new();
+        let (_, challenge) = pkce();
+        let (_, _, v) = client
+            .post(
+                &h,
+                "/oauth/par",
+                &[
+                    ("client_id", LB),
+                    ("response_type", "code"),
+                    ("scope", "atproto transition:generic"),
+                    ("redirect_uri", "http://127.0.0.1/"),
+                    ("code_challenge", &challenge),
+                    ("code_challenge_method", "S256"),
+                ],
+            )
+            .await;
+        let path = format!(
+            "/oauth/authorize?client_id={}&request_uri={}",
+            url::form_urlencoded::byte_serialize(LB.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(v["request_uri"].as_str().unwrap().as_bytes())
+                .collect::<String>()
+        );
+        let (_, _, page) = browser.get(&h, &path).await;
+        let (csrf, request_id) = (hidden(&page, "csrf"), hidden(&page, "request_id"));
+        let (_, _, html) = if signed_in {
+            browser
+                .post(
+                    &h,
+                    "/oauth/authorize/select",
+                    &[("csrf", &csrf), ("request_id", &request_id), ("did", &did)],
+                )
+                .await
+        } else {
+            signed_in = true;
+            browser
+                .post(
+                    &h,
+                    "/oauth/authorize/sign-in",
+                    &[
+                        ("csrf", &csrf),
+                        ("request_id", &request_id),
+                        ("identifier", "cas.pds.example.com"),
+                        ("password", "hunter22"),
+                    ],
+                )
+                .await
+        };
+        assert!(html.contains("wants access"), "{html}");
+
+        // The block is there, the same under every theme.
+        let block = security_block(&html);
+        assert!(
+            block.contains("@cas.pds.example.com")
+                && block.contains("Allow")
+                && block.contains("Deny")
+                && block.contains(r#"value="transition:generic""#),
+            "{block}"
+        );
+        match &first {
+            None => first = Some(block),
+            Some(f) => assert_eq!(&block, f, "under {theme:?}"),
+        }
+        // Only the checked variables reach it: no custom CSS, no uploaded
+        // font, inline or linked.
+        assert!(
+            html.contains(&format!("/branding/theme/{version}/vars.css"))
+                && !html.contains("full.css")
+                && !html.contains("display: none")
+                && !html.contains("<b>Totally"),
+            "{html}"
+        );
+        let (_, _, css) = h
+            .raw(
+                "GET",
+                &format!("/branding/theme/{version}/vars.css"),
+                None,
+                vec![],
+                &[],
+            )
+            .await;
+        let css = String::from_utf8(css).unwrap();
+        assert!(
+            !css.contains("display") && !css.contains("visibility") && !css.contains("@font-face"),
+            "{css}"
+        );
+    }
 }

@@ -715,6 +715,9 @@ kryphocron built in.
 - Blobs uploaded after an import whose records already use them, and blobs
   an import brings in, are now checked for being private-only.
 - The blob delete job skips keys a branding upload still uses.
+- Grouped operator methods (`.viewer.*`, `.moderator.*`, `.admin.*`,
+  `.owner.*`) are refused below the group's role before the handler runs
+  and parses the body; handlers still check their own role.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.
