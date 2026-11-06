@@ -69,8 +69,11 @@ impl Store {
              created_at = excluded.created_at, expires_at = excluded.expires_at",
             self.is_postgres(),
         );
-        exec!(self, q, id, did_key, &sealed, ttl_ms)?;
-        Ok(())
+        // A secret write: checked against the install's key first.
+        let mut tx = self.begin().await?;
+        tx.ensure_master_key(key).await?;
+        tx_exec!(&mut tx, q, id, did_key, &sealed, ttl_ms)?;
+        tx.commit().await
     }
 
     /// The unexpired reserved key under `id`: (did:key, private key).

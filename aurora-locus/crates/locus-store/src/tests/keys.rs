@@ -110,3 +110,49 @@ async fn rolling_env_apply_follows_live_nodes_only() {
         assert_eq!(env_applies(s, KEY).await, 3, "{n}");
     }
 }
+
+#[tokio::test]
+async fn a_reserved_key_is_a_checked_secret_write() {
+    use locus_core::keys::{MasterKey, SourceKind};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let key = MasterKey::generate(SourceKind::Env);
+        let other = MasterKey::generate(SourceKind::Env);
+        // The first secret write records the install's key.
+        s.reserve_key("did:plc:first", "did:key:zA", b"first", &key, 60_000)
+            .await
+            .unwrap();
+        assert!(!s.key_store_empty().await.unwrap(), "{n}");
+        // Another key: refused, and nothing sealed under it is stored.
+        assert!(
+            s.reserve_key("did:plc:other", "did:key:zB", b"other", &other, 60_000)
+                .await
+                .is_err(),
+            "{n}"
+        );
+        assert!(
+            s.reserved_key("did:plc:other", &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert!(
+            s.reserve_key("did:plc:first", "did:key:zC", b"swap", &other, 60_000)
+                .await
+                .is_err(),
+            "{n}"
+        );
+        let (did_key, private) = s
+            .reserved_key("did:plc:first", &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (did_key.as_str(), private.as_slice()),
+            ("did:key:zA", &b"first"[..]),
+            "{n}"
+        );
+    }
+}

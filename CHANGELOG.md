@@ -728,6 +728,11 @@ kryphocron built in.
 - `keys set entryway-plc-rotation-key` keeps every stored key since the
   last `--revoke-previous`, even when set again before the node reloaded
   (a quick second change dropped the key set before it).
+- A Postgres node refuses a master key file not declared shared
+  (`LOCUS_MASTER_KEY_SHARED_FILE`) even when the file exists; before, only
+  a missing file was refused.
+- Reserving a signing key checks the install's master key first, as every
+  other secret write does.
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.

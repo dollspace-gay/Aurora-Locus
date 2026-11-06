@@ -190,6 +190,19 @@ pub fn load_master_key(bootstrap: &Bootstrap, key_store_empty: bool) -> CoreResu
         MasterKeySource::Kms { .. } => Err(CoreError::Config(
             "KMS master keys aren't available in this build yet; use a file or env key".into(),
         )),
+        // Several nodes share a Postgres install: a key file each node keeps
+        // for itself could differ per node, so it must be declared shared.
+        MasterKeySource::File {
+            path,
+            shared: false,
+        } if !matches!(bootstrap.database, DatabaseUrl::Sqlite(_)) => {
+            Err(CoreError::Config(format!(
+                "the master key is the file {}, but with Postgres every node needs the same key: \
+                 give every node that file and set LOCUS_MASTER_KEY_SHARED_FILE=true, or use \
+                 LOCUS_MASTER_KEY or KMS",
+                path.display()
+            )))
+        }
         MasterKeySource::File { path, shared } => match std::fs::read_to_string(path) {
             Ok(text) => MasterKey::from_hex(&text, SourceKind::File),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -319,6 +332,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = boot(dir.path(), &[("LOCUS_DATABASE_URL", "postgres://x/y")]);
         assert!(load_master_key(&b, true).is_err());
+        assert!(!dir.path().join("master.key").exists());
+        // Nor uses a file it wasn't told is shared, even one that exists.
+        std::fs::write(dir.path().join("master.key"), "ab".repeat(32)).unwrap();
+        let e = load_master_key(&b, false).unwrap_err().to_string();
+        assert!(e.contains("LOCUS_MASTER_KEY_SHARED_FILE"), "{e}");
+        let b = boot(
+            dir.path(),
+            &[
+                ("LOCUS_DATABASE_URL", "postgres://x/y"),
+                ("LOCUS_MASTER_KEY_SHARED_FILE", "true"),
+            ],
+        );
+        assert!(load_master_key(&b, false).is_ok());
 
         // Non-persistent data dir never generates.
         let dir = tempfile::tempdir().unwrap();

@@ -842,3 +842,59 @@ async fn dropping_a_kms_plc_key_forgets_its_id_and_says_to_disable_it() {
             .all(|r| r.kms_key_id.as_deref() != Some(key_id.as_str()))
     );
 }
+
+/// Node B boots on an empty install with its own key (its boot check
+/// passes: there's no key check yet), then node A writes the first
+/// secrets. B's first secret write, its server secrets at boot, fails,
+/// and leaves nothing under B's key.
+#[tokio::test]
+async fn a_node_that_passed_the_boot_check_with_another_key_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
+        .await
+        .unwrap();
+    let a = MasterKey::generate(SourceKind::Env);
+    let b = MasterKey::generate(SourceKind::Env);
+    assert_eq!(
+        store.check_master_key(&b).await.unwrap(),
+        locus_store::secrets::KeyCheck::Empty
+    );
+    ServerSecrets::load_or_create(&store, &a).await.unwrap();
+    let p = match &store {
+        Store::Sqlite(p) => p.clone(),
+        Store::Postgres(_) => unreachable!(),
+    };
+    let sealed = || async {
+        sqlx::query_as::<_, (String, Vec<u8>)>("SELECT name, sealed FROM secret ORDER BY name")
+            .fetch_all(&p)
+            .await
+            .unwrap()
+    };
+    let before = sealed().await;
+    assert!(ServerSecrets::load_or_create(&store, &b).await.is_err());
+    // Its other secret writes: a key rotation, a token, any `keys set`.
+    let mut tx = store.begin().await.unwrap();
+    assert!(tx.put_secret("jwt", b"replaced", &b).await.is_err());
+    tx.rollback().await.unwrap();
+    let mut tx = store.begin().await.unwrap();
+    assert!(
+        tx.put_signing_key("did:plc:b", "k256", b"key", &b)
+            .await
+            .is_err()
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        store
+            .reserve_key("did:plc:b", "did:key:zB", b"key", &b, 60_000)
+            .await
+            .is_err()
+    );
+    let after = sealed().await;
+    assert_eq!(before, after);
+    assert!(after.iter().all(|(n, s)| {
+        a.open(format!("secret:{n}").as_bytes(), s).is_ok()
+            && b.open(format!("secret:{n}").as_bytes(), s).is_err()
+    }));
+    // A reads everything back.
+    ServerSecrets::load_or_create(&store, &a).await.unwrap();
+}
