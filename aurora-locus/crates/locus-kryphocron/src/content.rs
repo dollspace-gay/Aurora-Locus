@@ -91,6 +91,32 @@ fn ids(did: &str, collection: &str, rkey: &str) -> Result<(Did, Nsid, RecordKey)
     ))
 }
 
+/// One bounded decode of `content` as the record (did, collection, rkey).
+async fn decode_with(
+    decoder: &Codec,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    content: Vec<u8>,
+) -> Result<Vec<u8>, CodecError> {
+    let (did, nsid, rkey) = ids(did, collection, rkey).map_err(|_| CodecError::Malformed {
+        codec: kryphocron::CodecId::new(nsid::CODEC).expect("a valid codec id"),
+    })?;
+    let ctx = DecodeContext::new(
+        nsid,
+        rkey,
+        did,
+        None,
+        crate::audit::new_trace(),
+        SmallVec::new(),
+    );
+    let codec_id = kryphocron::CodecId::new(nsid::CODEC).expect("a valid codec id");
+    let encoded = EncodedRecord::new(codec_id, content, None);
+    decoder
+        .decode(&encoded, &ctx, Instant::now() + DEADLINE)
+        .await
+}
+
 fn to_lex(v: &Value) -> Result<LexValue, PipelineError> {
     proto_blue_lex_json::json_to_lex_with(v, proto_blue_lex_json::LexParseOptions::strict())
         .map_err(|_| invalid("Invalid postPrivate content"))
@@ -120,22 +146,7 @@ impl Encoder {
         rkey: &str,
         content: Vec<u8>,
     ) -> Result<Vec<u8>, CodecError> {
-        let (did, nsid, rkey) = ids(did, collection, rkey).map_err(|_| CodecError::Malformed {
-            codec: kryphocron::CodecId::new(nsid::CODEC).expect("a valid codec id"),
-        })?;
-        let ctx = DecodeContext::new(
-            nsid,
-            rkey,
-            did,
-            None,
-            crate::audit::new_trace(),
-            SmallVec::new(),
-        );
-        let codec_id = kryphocron::CodecId::new(nsid::CODEC).expect("a valid codec id");
-        let encoded = EncodedRecord::new(codec_id, content, None);
-        self.decoder
-            .decode(&encoded, &ctx, Instant::now() + DEADLINE)
-            .await
+        decode_with(&self.decoder, did, collection, rkey, content).await
     }
 
     /// Encodes `payload` for the record at (did, collection, rkey), stamped
@@ -389,6 +400,100 @@ mod tests {
             v[k] = x.clone();
         }
         map(v)
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The decoder locus installs (same bound), but taking its seed as
+    /// given rather than from the record identity, as the vectors do.
+    fn seeded_decoder(seed: Vec<u8>) -> Codec {
+        Codec::new(kryphocron::codec::laquna::SeedPolicy::Custom(Arc::new(
+            move |_| seed.clone(),
+        )))
+        .with_max_decoded_len(MAX_CONTENT)
+    }
+
+    /// The codec's test vectors (a file outside the repository, named
+    /// by `LOCUS_TEST_LAQUNA_VECTORS`): each artifact decodes under its
+    /// seed to its plaintext through the bounded decode locus runs; each
+    /// plaintext round-trips through locus's `encode` and `trial_decode`
+    /// for the seed's DID and rkey; each malformed artifact is refused (an
+    /// empty seed by locus's identity check, before the codec).
+    #[tokio::test]
+    async fn codec_vectors_decode_through_the_pipeline() {
+        let Ok(path) = std::env::var("LOCUS_TEST_LAQUNA_VECTORS") else {
+            eprintln!("LOCUS_TEST_LAQUNA_VECTORS unset; skipped");
+            return;
+        };
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let seed = |v: &Value| -> Option<(String, String)> {
+            let s = String::from_utf8(unhex(v["seed_hex"].as_str()?)).ok()?;
+            let mut parts = s.split("||");
+            let (did, rkey) = (parts.next()?.to_owned(), parts.next()?.to_owned());
+            Some((did, rkey))
+        };
+        let (sinks, _rx) = AuditSinks::new([0; 32]);
+        let enc = encoder();
+        let decodes = file["schema_a"].as_array().unwrap();
+        assert!(decodes.len() >= 10);
+        for v in decodes {
+            let name = v["name"].as_str().unwrap();
+            let (did, rkey) = seed(v).unwrap();
+            let plain = unhex(v["plaintext_hex"].as_str().unwrap());
+            let got = decode_with(
+                &seeded_decoder(unhex(v["seed_hex"].as_str().unwrap())),
+                &did,
+                nsid::POST_PRIVATE,
+                &rkey,
+                unhex(v["artifact_hex"].as_str().unwrap()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(got, plain, "{name}");
+            let ours = enc
+                .encode(
+                    &sinks,
+                    crate::audit::new_trace(),
+                    &did,
+                    nsid::POST_PRIVATE,
+                    &rkey,
+                    None,
+                    &plain,
+                )
+                .await
+                .unwrap();
+            let back = enc
+                .trial_decode(&did, nsid::POST_PRIVATE, &rkey, ours.content)
+                .await
+                .unwrap();
+            assert_eq!(back, plain, "{name}: round trip");
+        }
+        let errors = file["schema_b"].as_array().unwrap();
+        assert!(errors.len() >= 10);
+        for v in errors {
+            let name = v["name"].as_str().unwrap();
+            let artifact = unhex(v["artifact_hex"].as_str().unwrap());
+            let raw_seed = unhex(v["seed_hex"].as_str().unwrap());
+            let res = if raw_seed.is_empty() {
+                enc.trial_decode("", nsid::POST_PRIVATE, "", artifact).await
+            } else {
+                // The seed is given; the identity only has to be valid.
+                decode_with(
+                    &seeded_decoder(raw_seed),
+                    DID,
+                    nsid::POST_PRIVATE,
+                    RKEY,
+                    artifact,
+                )
+                .await
+            };
+            assert!(res.is_err(), "{name}: {} decoded", v["expected"]);
+        }
     }
 
     #[tokio::test]
