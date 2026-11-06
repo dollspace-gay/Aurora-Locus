@@ -47,9 +47,15 @@ pub const MAX_BLOCKS: u64 = 5_000_000;
 const MAX_LAYER: usize = 128;
 const HEADER_MAX: u64 = 1_000_000;
 /// Staged rows written per transaction.
+#[cfg(not(test))]
 const FLUSH: usize = 500;
+#[cfg(test)]
+const FLUSH: usize = 16;
 /// Rows applied per batch in the later phases.
+#[cfg(not(test))]
 const BATCH: i64 = 500;
+#[cfg(test)]
+const BATCH: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -436,7 +442,8 @@ struct Pending {
     deltas: Vec<StagedBlock>,
     new_leaves: Vec<(String, String, String)>,
     old_leaves: Vec<(String, String, String)>,
-    blobs: Vec<String>,
+    /// (blob CID, whether the reference is private-tier).
+    blobs: Vec<(String, bool)>,
 }
 
 impl Pending {
@@ -456,7 +463,12 @@ pub struct Staged {
 
 impl RepoEngine {
     /// A fenced transaction for one batch of `job`, after renewing it.
-    async fn job_tx(&self, job: &BulkJob) -> Result<Tx, ImportError> {
+    /// `point` names the batch (tests pause or crash there).
+    async fn job_tx(&self, job: &BulkJob, point: &'static str) -> Result<Tx, ImportError> {
+        #[cfg(test)]
+        fault::hit(point).await?;
+        #[cfg(not(test))]
+        let _ = point;
         if !self.store().renew_bulk_job(job).await? {
             return Err(CoreError::LeaseLost(format!("bulk job {}", job.id)).into());
         }
@@ -482,7 +494,7 @@ impl RepoEngine {
         if p.len() == 0 {
             return Ok(());
         }
-        let mut tx = self.job_tx(job).await?;
+        let mut tx = self.job_tx(job, "stage").await?;
         tx.add_import_deltas(&job.id, &p.deltas).await?;
         tx.stage_new_leaves(&job.id, &p.new_leaves).await?;
         tx.stage_old_leaves(&job.id, &p.old_leaves).await?;
@@ -532,7 +544,7 @@ impl RepoEngine {
             batch_bytes += bytes.len();
             batch.push((cid_str(&cid), bytes));
             if batch.len() >= FLUSH || batch_bytes >= 8_000_000 {
-                let mut tx = self.job_tx(job).await?;
+                let mut tx = self.job_tx(job, "car").await?;
                 tx.stage_car_blocks(&job.id, &batch).await?;
                 tx.commit().await?;
                 batch.clear();
@@ -540,7 +552,7 @@ impl RepoEngine {
             }
         }
         if !batch.is_empty() {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "car").await?;
             tx.stage_car_blocks(&job.id, &batch).await?;
             tx.commit().await?;
         }
@@ -633,7 +645,10 @@ impl RepoEngine {
                     },
                 };
                 let value = parse_record(&collection, &rkey, &bytes)?;
-                pending.blobs.extend(import_blob_cids(&value));
+                let private = locus_store::scan::is_private_tier(&collection);
+                pending
+                    .blobs
+                    .extend(import_blob_cids(&value).into_iter().map(|c| (c, private)));
                 pending.deltas.push(StagedBlock {
                     cid: vkey.clone(),
                     content: copied.then_some(bytes),
@@ -699,7 +714,8 @@ impl RepoEngine {
         };
         let new_rev = self.tids().next_after(Some(&floor));
         let total = store.import_record_count(&job.id).await?;
-        let mut tx = self.job_tx(job).await?;
+        let mut tx = self.job_tx(job, "stage-end").await?;
+        tx.settle_import_private_only(&job.id, did).await?;
         tx.stage_old_blobs(&job.id, did).await?;
         tx.set_import_rev(&job.id, &new_rev).await?;
         tx.set_bulk_counts(&job.id, 0, total).await?;
@@ -725,7 +741,7 @@ impl RepoEngine {
     ) -> Result<Vec<PendingMove>, ImportError> {
         let did = job.did.as_str();
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "increments").await?;
             let rows = tx
                 .import_blocks_batch(&job.id, BlockBatch::Positive, BATCH)
                 .await?;
@@ -747,9 +763,10 @@ impl RepoEngine {
             tx.commit().await?;
         }
         let mut moves = Vec::new();
+        let gate_on = self.media_gate_on();
         let mut after = String::new();
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "increments-blobs").await?;
             let page = tx.import_blobs_page(&job.id, &after, BATCH).await?;
             let Some(last) = page.last() else {
                 tx.rollback().await?;
@@ -767,6 +784,13 @@ impl RepoEngine {
                             from: row.storage_key.clone(),
                             to: key,
                         });
+                        // Promoted from temp: gated at once if private-only
+                        // in the new tree (no committed record uses it).
+                        tx.recompute_private_only(did, &b.cid).await?;
+                        if let Some(m) = tx.place_blob(did, &b.cid, gate_on, backend.epoch).await? {
+                            moves.retain(|p| p.cid != m.cid);
+                            moves.push(m);
+                        }
                     }
                     tx.mark_import_blob(&job.id, &b.cid, true).await?;
                 }
@@ -834,21 +858,39 @@ impl RepoEngine {
     }
 
     /// Phase 4: the record index follows the new root.
-    pub async fn import_reindex(&self, job: &BulkJob, new_rev: &str) -> Result<(), ImportError> {
+    /// Returns blob moves to finish (gating changes).
+    pub async fn import_reindex(
+        &self,
+        job: &BulkJob,
+        new_rev: &str,
+    ) -> Result<Vec<PendingMove>, ImportError> {
         let did = job.did.as_str();
         let total = self.store().import_record_count(&job.id).await?;
+        let gate_on = self.media_gate_on();
+        let mut moves: Vec<PendingMove> = Vec::new();
         let mut done = 0i64;
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "reindex").await?;
             let rows = tx.pending_import_records(&job.id, BATCH).await?;
             if rows.is_empty() {
                 tx.set_bulk_progress(&job.id, "decrements", None).await?;
                 tx.set_bulk_counts(&job.id, total, total).await?;
                 tx.commit().await?;
-                return Ok(());
+                return Ok(moves);
             }
             let wanted: Vec<String> = rows.iter().filter_map(|r| r.new_cid.clone()).collect();
             let contents = tx.staged_contents(&job.id, &wanted).await?;
+            // Blobs whose record_blob rows this batch changes.
+            let paths: Vec<(String, String)> = rows
+                .iter()
+                .map(|r| (r.collection.clone(), r.rkey.clone()))
+                .collect();
+            let mut touched: std::collections::BTreeSet<String> = tx
+                .record_blob_cids(did, &paths)
+                .await?
+                .into_values()
+                .flatten()
+                .collect();
             for r in &rows {
                 match &r.new_cid {
                     Some(cid) if r.change != "delete" => {
@@ -857,6 +899,7 @@ impl RepoEngine {
                         })?;
                         let value = parse_record(&r.collection, &r.rkey, bytes)
                             .map_err(|e| CoreError::Storage(e.to_string()))?;
+                        touched.extend(import_blob_cids(&value));
                         tx.apply_record_changes(
                             did,
                             new_rev,
@@ -907,6 +950,24 @@ impl RepoEngine {
                 tx.mark_import_record(&job.id, &r.collection, &r.rkey)
                     .await?;
             }
+            // Gating follows the index in the same batch (a blob whose last
+            // public record went is gated now), for blobs already permanent.
+            if !touched.is_empty() {
+                let backend = tx.blob_backend().await?;
+                for cid in &touched {
+                    let Some(row) = tx.blob_for_update(did, cid).await? else {
+                        continue;
+                    };
+                    if row.state != "permanent" {
+                        continue;
+                    }
+                    tx.recompute_private_only(did, cid).await?;
+                    if let Some(m) = tx.place_blob(did, cid, gate_on, backend.epoch).await? {
+                        moves.retain(|p| p.cid != m.cid);
+                        moves.push(m);
+                    }
+                }
+            }
             done += rows.len() as i64;
             tx.set_bulk_counts(&job.id, done.min(total), total).await?;
             tx.commit().await?;
@@ -923,7 +984,7 @@ impl RepoEngine {
     ) -> Result<Vec<PendingMove>, ImportError> {
         let did = job.did.as_str();
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "decrements").await?;
             let rows = tx
                 .import_blocks_batch(&job.id, BlockBatch::Negative, BATCH)
                 .await?;
@@ -948,7 +1009,7 @@ impl RepoEngine {
         let gate_on = self.media_gate_on();
         let mut after = String::new();
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "decrements-blobs").await?;
             let page = tx.import_blobs_page(&job.id, &after, BATCH).await?;
             let Some(last) = page.last() else {
                 tx.rollback().await?;
@@ -986,7 +1047,7 @@ impl RepoEngine {
             tx.commit().await?;
         }
         self.drop_staging(job).await?;
-        let mut tx = self.job_tx(job).await?;
+        let mut tx = self.job_tx(job, "finish").await?;
         tx.finish_bulk_job(&job.id, "done", None).await?;
         tx.commit().await?;
         Ok(moves)
@@ -994,7 +1055,7 @@ impl RepoEngine {
 
     async fn drop_staging(&self, job: &BulkJob) -> Result<(), ImportError> {
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "drop").await?;
             let n = tx.drop_import_staging(&job.id, 5_000).await?;
             tx.commit().await?;
             if n == 0 {
@@ -1020,7 +1081,7 @@ impl RepoEngine {
             tx.commit().await?;
         }
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "rollback").await?;
             let rows = tx
                 .import_blocks_batch(&job.id, BlockBatch::AppliedPositive, BATCH)
                 .await?;
@@ -1042,22 +1103,27 @@ impl RepoEngine {
             tx.mark_import_blocks(&job.id, &cids, false).await?;
             tx.commit().await?;
         }
+        let gate_on = self.media_gate_on();
         loop {
-            let mut tx = self.job_tx(job).await?;
+            let mut tx = self.job_tx(job, "rollback-blobs").await?;
             let cids = tx.applied_import_blobs(&job.id, BATCH).await?;
             if cids.is_empty() {
                 tx.rollback().await?;
                 break;
             }
-            tx.blob_backend().await?;
+            let backend = tx.blob_backend().await?;
             for cid in &cids {
                 tx.orphan_blob_if_unreferenced(did, cid).await?;
+                // Gating from the committed rows again (moves are left to
+                // the mover job).
+                tx.recompute_private_only(did, cid).await?;
+                tx.place_blob(did, cid, gate_on, backend.epoch).await?;
                 tx.mark_import_blob(&job.id, cid, false).await?;
             }
             tx.commit().await?;
         }
         self.drop_staging(job).await?;
-        let mut tx = self.job_tx(job).await?;
+        let mut tx = self.job_tx(job, "finish").await?;
         let error = self
             .store()
             .bulk_job_error(&job.id)
@@ -1085,7 +1151,7 @@ impl RepoEngine {
             Ok((staged, moves))
         }
         .await;
-        let (staged, moves) = match before_swap {
+        let (staged, mut moves) = match before_swap {
             Ok(v) => v,
             Err(e) => {
                 self.roll_back_after(job, &e).await;
@@ -1110,7 +1176,10 @@ impl RepoEngine {
             }
             return Err(e);
         }
-        self.import_reindex(job, &staged.new_rev).await?;
+        for m in self.import_reindex(job, &staged.new_rev).await? {
+            moves.retain(|p| p.cid != m.cid);
+            moves.push(m);
+        }
         Ok(moves)
     }
 
@@ -1136,10 +1205,15 @@ impl RepoEngine {
             .await?
             .map(|j| j.phase)
             .unwrap_or_default();
+        let mut moves = Vec::new();
         if current == "reindex" {
-            self.import_reindex(job, &rev).await?;
+            moves = self.import_reindex(job, &rev).await?;
         }
-        self.import_decrements(job, &rev).await
+        for m in self.import_decrements(job, &rev).await? {
+            moves.retain(|p| p.cid != m.cid);
+            moves.push(m);
+        }
+        Ok(moves)
     }
 
     /// Resumes an import a resumer took over: forward after the swap,
@@ -1158,4 +1232,96 @@ impl RepoEngine {
 
 fn hex_id() -> String {
     hex::encode(rand::random::<[u8; 12]>())
+}
+
+/// Test-only fault injection at a named batch (see `job_tx`): a crash
+/// (the batch fails before its transaction opens), or a pause the test
+/// releases, optionally followed by a crash. One fault at a time per
+/// thread (tokio tests run on one thread, spawned tasks included).
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use locus_core::CoreError;
+    use tokio::sync::Notify;
+
+    struct Armed {
+        point: &'static str,
+        skip: usize,
+        pause: Option<Pause>,
+        crash: bool,
+    }
+
+    /// A paused batch: `reached` fires when it gets there; `resume` lets
+    /// it go on.
+    #[derive(Clone)]
+    pub(crate) struct Pause {
+        pub reached: Arc<Notify>,
+        pub resume: Arc<Notify>,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// The batch at `point` after `skip` more of them fails.
+    pub(crate) fn crash(point: &'static str, skip: usize) {
+        ARMED.with(|a| {
+            *a.borrow_mut() = Some(Armed {
+                point,
+                skip,
+                pause: None,
+                crash: true,
+            });
+        });
+    }
+
+    /// The batch at `point` after `skip` more of them waits; once
+    /// resumed it goes on, or fails if `crash`.
+    pub(crate) fn pause(point: &'static str, skip: usize, crash: bool) -> Pause {
+        let p = Pause {
+            reached: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        };
+        ARMED.with(|a| {
+            *a.borrow_mut() = Some(Armed {
+                point,
+                skip,
+                pause: Some(p.clone()),
+                crash,
+            });
+        });
+        p
+    }
+
+    /// Whether a fault is still waiting to fire.
+    pub(crate) fn armed() -> bool {
+        ARMED.with(|a| a.borrow().is_some())
+    }
+
+    pub(crate) async fn hit(point: &'static str) -> Result<(), CoreError> {
+        let fired = ARMED.with(|a| {
+            let mut a = a.borrow_mut();
+            match a.as_mut() {
+                Some(x) if x.point == point && x.skip > 0 => {
+                    x.skip -= 1;
+                    None
+                }
+                Some(x) if x.point == point => a.take(),
+                _ => None,
+            }
+        });
+        let Some(f) = fired else {
+            return Ok(());
+        };
+        if let Some(p) = f.pause {
+            p.reached.notify_one();
+            p.resume.notified().await;
+        }
+        if f.crash {
+            return Err(CoreError::Storage(format!("injected crash at {point}")));
+        }
+        Ok(())
+    }
 }

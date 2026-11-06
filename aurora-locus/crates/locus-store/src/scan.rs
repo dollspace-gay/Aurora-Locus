@@ -249,19 +249,39 @@ impl Store {
 }
 
 /// The private-tier collections: a blob only they reference is private-only.
-const PRIVATE_COLLECTIONS: &str = "'tools.kryphocron.feed.postPrivate', 'tools.kryphocron.graph.block', \
+pub(crate) const PRIVATE_COLLECTIONS: &str = "'tools.kryphocron.feed.postPrivate', 'tools.kryphocron.graph.block', \
      'tools.kryphocron.graph.mute'";
+
+/// Whether a collection is private-tier (as [`PRIVATE_COLLECTIONS`]).
+#[must_use]
+pub fn is_private_tier(collection: &str) -> bool {
+    matches!(
+        collection,
+        "tools.kryphocron.feed.postPrivate"
+            | "tools.kryphocron.graph.block"
+            | "tools.kryphocron.graph.mute"
+    )
+}
 
 impl Tx {
     /// Sets a blob's `gated` flag to whether it's private-only: referenced,
-    /// and only by private-tier records of its account. (The media gate
-    /// applies it only while the gate is on.)
+    /// and only by private-tier records of its account. A CID an active
+    /// import's new tree references is private-only only if the new tree
+    /// says so too (`import_blob.private_only`): its records may not be
+    /// indexed yet. (The media gate applies it only while the gate is on.)
     pub async fn recompute_private_only(&mut self, did: &str, cid: &str) -> CoreResult<()> {
+        let import = format!(
+            "SELECT 1 FROM import_blob ib JOIN bulk_job j ON j.id = ib.job_id WHERE j.did = {{1}} \
+             AND ib.cid = {{2}} AND ib.in_new_tree AND j.kind = 'import' AND j.phase IN {}",
+            crate::import::ACTIVE_IMPORT_PHASES
+        );
         let q = sql(
             &format!(
-                "UPDATE blob SET gated = (EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} AND r.blob_cid = {{2}}) \
-                 AND NOT EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} AND r.blob_cid = {{2}} \
-                 AND r.collection NOT IN ({PRIVATE_COLLECTIONS}))) WHERE did = {{1}} AND cid = {{2}}"
+                "UPDATE blob SET gated = (NOT EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} \
+                 AND r.blob_cid = {{2}} AND r.collection NOT IN ({PRIVATE_COLLECTIONS})) \
+                 AND CASE WHEN EXISTS ({import}) THEN EXISTS ({import} AND ib.private_only) \
+                 ELSE EXISTS (SELECT 1 FROM record_blob r WHERE r.did = {{1}} AND r.blob_cid = {{2}}) END) \
+                 WHERE did = {{1}} AND cid = {{2}}"
             ),
             matches!(self, Tx::Postgres(_)),
         );

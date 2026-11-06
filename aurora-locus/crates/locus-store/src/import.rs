@@ -208,23 +208,89 @@ impl Tx {
         Ok(())
     }
 
-    /// Blob CIDs the new tree's changed records reference.
-    pub async fn stage_new_blobs(&mut self, job: &str, cids: &[String]) -> CoreResult<()> {
+    /// Blob CIDs the new tree's walked records reference, each with whether
+    /// that reference is private-tier (a CID is private-only while all its
+    /// references are).
+    pub async fn stage_new_blobs(&mut self, job: &str, cids: &[(String, bool)]) -> CoreResult<()> {
         let q = sql(
-            "INSERT INTO import_blob (job_id, cid, in_new_tree) VALUES ({1}, {2}, TRUE) \
-             ON CONFLICT (job_id, cid) DO UPDATE SET in_new_tree = TRUE",
+            "INSERT INTO import_blob (job_id, cid, in_new_tree, private_only) VALUES ({1}, {2}, TRUE, {3}) \
+             ON CONFLICT (job_id, cid) DO UPDATE SET in_new_tree = TRUE, private_only = \
+             CASE WHEN import_blob.in_new_tree THEN import_blob.private_only AND excluded.private_only \
+             ELSE excluded.private_only END",
             self.pg(),
         );
-        for cid in cids {
+        for (cid, private) in cids {
             on_tx!(self, q, |ex| sqlx::query(&q)
                 .bind(job)
                 .bind(cid)
+                .bind(*private)
                 .execute(ex)
                 .await
                 .map(|_| ())
                 .map_err(db_err))?;
         }
         Ok(())
+    }
+
+    /// Clears `private_only` on new-tree CIDs a public record the import
+    /// leaves unchanged references (its subtree wasn't walked).
+    pub async fn settle_import_private_only(&mut self, job: &str, did: &str) -> CoreResult<()> {
+        let q = sql(
+            &format!(
+                "UPDATE import_blob SET private_only = FALSE WHERE job_id = {{1}} AND in_new_tree \
+                 AND private_only AND EXISTS (SELECT 1 FROM record_blob rb WHERE rb.did = {{2}} \
+                 AND rb.blob_cid = import_blob.cid AND rb.collection NOT IN ({}) \
+                 AND NOT EXISTS (SELECT 1 FROM import_record ir WHERE ir.job_id = {{1}} \
+                 AND ir.collection = rb.collection AND ir.rkey = rb.rkey))",
+                crate::scan::PRIVATE_COLLECTIONS
+            ),
+            self.pg(),
+        );
+        on_tx!(self, q, |ex| sqlx::query(&q)
+            .bind(job)
+            .bind(did)
+            .execute(ex)
+            .await
+            .map(|_| ())
+            .map_err(db_err))
+    }
+
+    /// An upload's reference check, under the repo lock: a blob records
+    /// reference, or an active import's new tree does, is made permanent at
+    /// once, its gating decided (bytes to the gated store if private-only
+    /// with the gate on), and the import's row marked `applied` so a
+    /// rollback marks it unreferenced. Returns the move to finish.
+    pub async fn promote_upload(
+        &mut self,
+        did: &str,
+        cid: &str,
+        gate_on: bool,
+        epoch: i64,
+    ) -> CoreResult<Option<crate::blob::PendingMove>> {
+        let import = self.active_import_for_blob(did, cid).await?;
+        if import.is_none() && !self.blob_has_records(did, cid).await? {
+            return Ok(None);
+        }
+        let key = crate::blob::permanent_key(did, cid);
+        let mut out = None;
+        if self.reference_blob(did, cid, &key, epoch).await?.is_some() {
+            self.recompute_private_only(did, cid).await?;
+            self.place_blob(did, cid, gate_on, epoch).await?;
+            if let Some(r) = self.blob_for_update(did, cid).await?
+                && let Some(to) = r.pending_move
+            {
+                out = Some(crate::blob::PendingMove {
+                    did: did.to_owned(),
+                    cid: cid.to_owned(),
+                    from: r.storage_key,
+                    to,
+                });
+            }
+        }
+        if let Some(job) = import {
+            self.mark_import_blob(&job, cid, true).await?;
+        }
+        Ok(out)
     }
 
     /// Blob CIDs of the old tree's changed and deleted records (from their
