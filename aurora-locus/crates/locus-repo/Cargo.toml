@@ -27,6 +27,7 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest = "1"
 sqlx.workspace = true
 
 [lints]

@@ -705,6 +705,12 @@ kryphocron built in.
   and no `phoneVerificationRequired`; `listRepos` gives a cursor on every
   page with rows; `getBlocks` serves only blocks a tree references; a
   duplicate app-password name is `InvalidRequest`.
+- proto-blue pinned at a fix for its lazily loaded MST: a repository
+  emptied of every record kept the last record's tree layer, so records
+  written afterwards got a non-canonical data root (one other
+  implementations wouldn't reproduce). Found by new property tests that
+  also verify every `#commit` event from its own blocks and `getRepo`
+  since every earlier rev.
 - `backup post-restore` reports a blob migration it ended whether it was
   copying or paused (it reported only a paused one).
 - Single-label handle domains (`.test`) are accepted in setup.
