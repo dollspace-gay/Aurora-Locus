@@ -763,6 +763,9 @@ kryphocron built in.
   a missing file was refused.
 - Reserving a signing key checks the install's master key first, as every
   other secret write does.
+- The PLC key listing guard also re-fetches documents whose listing was
+  checked in the same millisecond the key was stored or demoted, which may
+  have been just before it.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

@@ -218,21 +218,31 @@ async fn the_drop_guard_refetches_what_it_can_t_trust_and_refuses_on_doubt() {
         let (h, owner) = (&h, owner.clone());
         async move { h.owner_call(&owner, "owner.keys.dropPlcKey", body).await }
     };
-    // A, with no row, is re-fetched and refuses the drop.
-    let (st, v) = drop(&k1).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert!(v["message"].as_str().unwrap().contains(&a), "{v}");
-    assert_eq!(
-        h.state.store.plc_key_listing(&a).await.unwrap(),
-        Some(vec![k1.clone()]),
-        "the guard records what it saw"
-    );
-    // Fixed; now B's stale row is re-fetched and refuses it.
-    set_rotation_keys(&h, &a, &[&k2, &k1]).await;
-    let (st, v) = drop(&k1).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    assert!(v["message"].as_str().unwrap().contains(&b), "{v}");
-    set_rotation_keys(&h, &b, &[&k1, &k2]).await;
+    // A, with no row, and B, with its stale row, are both re-fetched, and
+    // each refuses the drop until its document lists K2 too. The guard
+    // stops at the first it finds, in DID order (random here).
+    let mut named: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let (st, v) = drop(&k1).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        let message = v["message"].as_str().unwrap();
+        let did = [&a, &b]
+            .into_iter()
+            .find(|d| message.contains(d.as_str()) && !named.contains(d))
+            .unwrap_or_else(|| panic!("{v}"))
+            .clone();
+        if did == a {
+            assert_eq!(
+                h.state.store.plc_key_listing(&a).await.unwrap(),
+                Some(vec![k1.clone()]),
+                "the guard records what it saw"
+            );
+            set_rotation_keys(&h, &a, &[&k2, &k1]).await;
+        } else {
+            set_rotation_keys(&h, &b, &[&k1, &k2]).await;
+        }
+        named.push(did);
+    }
 
     // A PLC directory that can't be reached refuses too.
     let plc_url = h.state.snapshot().text("identity.plc_url").to_owned();
@@ -677,6 +687,21 @@ async fn a_pending_key_is_replaced_until_a_document_names_it() {
     // a changed env value. (This node hasn't reloaded its keys since P2
     // was stored; the guard still counts P2 as held.)
     set_rotation_keys(&h, &x, &[&k1, &p2]).await;
+    // Replacing P1 re-checked X's document just before P2 was stored; in
+    // the same millisecond, that row can't be told from a later one and
+    // must not be trusted either.
+    let p2_created = rows(&h)
+        .await
+        .into_iter()
+        .find(|r| r.did_key == p2)
+        .unwrap()
+        .created_at;
+    sqlx::query("UPDATE plc_key_listing SET checked_at = ?2 WHERE did = ?1")
+        .bind(&x)
+        .bind(p2_created)
+        .execute(&pool(&h))
+        .await
+        .unwrap();
     let (st, v) = set(json!({"generate": true})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert!(v["message"].as_str().unwrap().contains(&x), "{v}");

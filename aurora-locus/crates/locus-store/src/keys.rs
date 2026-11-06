@@ -235,12 +235,13 @@ impl Store {
 
     /// The hosted did:plc accounts whose documents must be fetched before
     /// `did_key` is removed: their listing names it, is missing, or was
-    /// checked before `since`.
+    /// checked before `since` or in the same millisecond (which may also be
+    /// before it).
     pub async fn plc_guard_candidates(&self, did_key: &str, since: i64) -> CoreResult<Vec<String>> {
         let q = sql(
             "SELECT a.did FROM account a LEFT JOIN plc_key_listing l ON l.did = a.did \
              WHERE a.did_method = 'plc' AND a.status <> 'deleted' \
-             AND (l.did IS NULL OR l.listed_keys LIKE {1} OR l.checked_at < {2}) ORDER BY a.did",
+             AND (l.did IS NULL OR l.listed_keys LIKE {1} OR l.checked_at <= {2}) ORDER BY a.did",
             pg(self),
         );
         let pattern = format!("%\"{did_key}\"%");
