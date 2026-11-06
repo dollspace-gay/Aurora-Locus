@@ -295,6 +295,15 @@ pub(crate) async fn listing_guard(
     since: i64,
     pending: bool,
 ) -> XrpcResult<()> {
+    // The held keys as stored, not as this node last loaded them: a key
+    // stored moments ago (by this node or another) counts at once.
+    let held: Vec<String> = s
+        .store
+        .plc_key_rows()
+        .await?
+        .into_iter()
+        .map(|r| r.did_key)
+        .collect();
     for did in s.store.plc_guard_candidates(did_key, since).await? {
         let keys = match crate::identity::plc_state(s, &did).await {
             Ok((Some(op), _)) => op.rotation_keys,
@@ -306,7 +315,7 @@ pub(crate) async fn listing_guard(
                 )));
             }
         };
-        let listed = s.secrets.plc_keys.listed(&keys);
+        let listed: Vec<String> = keys.iter().filter(|k| held.contains(k)).cloned().collect();
         s.store.set_plc_key_listing(&did, &listed).await?;
         let names = keys.iter().any(|k| k == did_key);
         if names && (pending || listed.iter().all(|k| k == did_key)) {
