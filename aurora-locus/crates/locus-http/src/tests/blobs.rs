@@ -21,7 +21,10 @@ fn pool(s: &AppState) -> &sqlx::SqlitePool {
 }
 
 async fn int(h: &Harness, q: &str) -> i64 {
-    sqlx::query_scalar(q).fetch_one(pool(&h.state)).await.unwrap()
+    sqlx::query_scalar(q)
+        .fetch_one(pool(&h.state))
+        .await
+        .unwrap()
 }
 
 /// The delete queue: (key, backend epoch).
@@ -71,7 +74,13 @@ impl Harness {
             )
             .await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        v["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned()
+        v["uri"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned()
     }
 
     async fn delete_post(&self, did: &str, access: &str, rkey: &str) {
@@ -216,7 +225,12 @@ async fn a_raw_key_change_during_the_final_pass_is_caught_and_the_cutover_retrie
     // pause's check (its bytes only on the old backend, a fresh key_seq).
     let raw_key = format!("blobs/{did}/{}.raw", cids[0]);
     let _hook = {
-        let (s, did, cid, key) = (h.state.clone(), did.clone(), cids[0].clone(), raw_key.clone());
+        let (s, did, cid, key) = (
+            h.state.clone(),
+            did.clone(),
+            cids[0].clone(),
+            raw_key.clone(),
+        );
         once(&h, "migrate.final_pass", move || async move {
             put(&s.blobs, &key, b"raw bytes 0").await;
             let p = pool(&s);
@@ -268,7 +282,13 @@ async fn unpaused_and_kept(h: &Harness, m: &Migration, epoch: i64) {
     let b = h.state.store.blob_backend().await.unwrap();
     assert_eq!((b.epoch, b.paused), (epoch, false), "no flip, no pause");
     assert_eq!(job_of(h).await, Some(m.id.clone()), "the job keeps it");
-    let mig = h.state.store.latest_blob_migration().await.unwrap().unwrap();
+    let mig = h
+        .state
+        .store
+        .latest_blob_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(mig.phase, "copying");
 }
 
@@ -279,7 +299,9 @@ async fn failed_and_overrunning_final_passes_clear_the_pause_and_later_verifies_
         return;
     }
     let (did, access) = h.user("fay.pds.example.com").await;
-    let first = h.upload(&access, b"there from the start", "image/png").await;
+    let first = h
+        .upload(&access, b"there from the start", "image/png")
+        .await;
     let m = migrate(&h).await;
     let epoch = h.state.store.blob_backend().await.unwrap().epoch;
 
@@ -288,7 +310,10 @@ async fn failed_and_overrunning_final_passes_clear_the_pause_and_later_verifies_
         Err(CoreError::Storage("injected".into()))
     });
     let r = step(&h.state, &m.lease).await.unwrap();
-    assert!(matches!(r, Step::CutoverRetried(ref n) if n.contains("injected")), "{r:?}");
+    assert!(
+        matches!(r, Step::CutoverRetried(ref n) if n.contains("injected")),
+        "{r:?}"
+    );
     unpaused_and_kept(&h, &m, epoch).await;
     drop(fail);
 
@@ -312,7 +337,10 @@ async fn failed_and_overrunning_final_passes_clear_the_pause_and_later_verifies_
         Ok(())
     });
     let r = step(&h.state, &m.lease).await.unwrap();
-    assert!(matches!(r, Step::CutoverRetried(ref n) if n.contains("longer")), "{r:?}");
+    assert!(
+        matches!(r, Step::CutoverRetried(ref n) if n.contains("longer")),
+        "{r:?}"
+    );
     unpaused_and_kept(&h, &m, epoch).await;
     let late = late.lock().unwrap().clone();
     assert!(m.has(&late), "the final pass copied it");
@@ -365,7 +393,13 @@ async fn the_full_verify_catches_a_gap_below_copied_through() {
     let m = migrate(&h).await;
     let r = step(&h.state, &m.lease).await.unwrap();
     assert_eq!(r, Step::Copied(105));
-    let mig = h.state.store.latest_blob_migration().await.unwrap().unwrap();
+    let mig = h
+        .state
+        .store
+        .latest_blob_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert!(mig.copied_through > 0);
     assert_eq!(mig.verified_through, 0, "nothing verified yet");
     // A gap below copied_through.
@@ -375,7 +409,13 @@ async fn the_full_verify_catches_a_gap_below_copied_through() {
     let r = step(&h.state, &m.lease).await.unwrap();
     assert_eq!(r, Step::Copied(1));
     assert!(m.has(&keys[5]));
-    let mig = h.state.store.latest_blob_migration().await.unwrap().unwrap();
+    let mig = h
+        .state
+        .store
+        .latest_blob_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(mig.verified_through, mig.copied_through);
     let r = step(&h.state, &m.lease).await.unwrap();
     assert!(matches!(r, Step::Flipped(_)), "{r:?}");
@@ -391,8 +431,12 @@ async fn the_pause_refuses_only_key_setting_writes_and_moves_restart_after_the_f
         return;
     }
     let (did, access) = h.user("pia.pds.example.com").await;
-    let a = h.upload(&access, b"promoted during the pause", "image/png").await;
-    let b = h.upload(&access, b"taken down during the pause", "image/png").await;
+    let a = h
+        .upload(&access, b"promoted during the pause", "image/png")
+        .await;
+    let b = h
+        .upload(&access, b"taken down during the pause", "image/png")
+        .await;
     let (cid_a, cid_b) = (cid_of(&a), cid_of(&b));
     let post_b = h.create_post(&did, &access, post_with(&b)).await;
     let m = migrate(&h).await;
@@ -494,7 +538,10 @@ async fn the_pause_refuses_only_key_setting_writes_and_moves_restart_after_the_f
         )
         .await;
         assert_eq!(move_epoch, epoch + 1);
-        assert!(q.contains(&(old.clone(), epoch)), "{old} queued on the old backend");
+        assert!(
+            q.contains(&(old.clone(), epoch)),
+            "{old} queued on the old backend"
+        );
     }
     // On the new backend the moves complete.
     let new_store = crate::blob_migration::active_store(&h.state).await.unwrap();
@@ -508,9 +555,18 @@ async fn the_pause_refuses_only_key_setting_writes_and_moves_restart_after_the_f
     for cid in [&cid_a, &cid_b] {
         let r = h.row(&did, cid).await;
         assert!(r.pending_move.is_none());
-        assert!(m.has(&r.storage_key), "{} on the new backend", r.storage_key);
+        assert!(
+            m.has(&r.storage_key),
+            "{} on the new backend",
+            r.storage_key
+        );
     }
-    assert!(h.row(&did, &cid_b).await.storage_key.starts_with("quarantine/"));
+    assert!(
+        h.row(&did, &cid_b)
+            .await
+            .storage_key
+            .starts_with("quarantine/")
+    );
 
     // This node hasn't reloaded: an upload's bytes go to the old backend,
     // so it's refused, writes no row, and its key is queued there.
@@ -584,15 +640,34 @@ async fn cancel_during_the_pause_clears_it_without_flipping() {
             Some(json!({})),
         )
         .await;
-    assert_eq!((st, v["id"].as_str()), (StatusCode::OK, Some(m.id.as_str())));
+    assert_eq!(
+        (st, v["id"].as_str()),
+        (StatusCode::OK, Some(m.id.as_str()))
+    );
     let after = h.state.store.blob_backend().await.unwrap();
     assert_eq!(
-        (after.active.as_str(), after.disk_root.as_deref(), after.epoch, after.paused),
-        (before.active.as_str(), before.disk_root.as_deref(), before.epoch, false),
+        (
+            after.active.as_str(),
+            after.disk_root.as_deref(),
+            after.epoch,
+            after.paused
+        ),
+        (
+            before.active.as_str(),
+            before.disk_root.as_deref(),
+            before.epoch,
+            false
+        ),
         "unpaused, not flipped"
     );
     assert_eq!(job_of(&h).await, None);
-    let mig = h.state.store.latest_blob_migration().await.unwrap().unwrap();
+    let mig = h
+        .state
+        .store
+        .latest_blob_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(mig.phase, "cancelled");
     assert_eq!(
         int(&h, "SELECT COUNT(*) FROM blob_copy").await,
@@ -632,7 +707,9 @@ async fn missing_sources_are_retried_and_dropped_with_their_row() {
     let (did, access) = h.user("moe.pds.example.com").await;
     let back = h.upload(&access, b"missing, then back", "image/png").await;
     h.create_post(&did, &access, post_with(&back)).await;
-    let gone = h.upload(&access, b"missing, then collected", "image/png").await;
+    let gone = h
+        .upload(&access, b"missing, then collected", "image/png")
+        .await;
     let (k_back, k_gone) = (
         h.row(&did, &cid_of(&back)).await.storage_key,
         h.row(&did, &cid_of(&gone)).await.storage_key,
@@ -891,7 +968,11 @@ async fn backups_under_moves_gc_and_the_delete_job_hold_every_key_the_snapshot_n
         .await
         .unwrap();
     assert!(queued(&h).await.is_empty());
-    let counter = int(&h, "SELECT seq FROM sqlite_sequence WHERE name = 'blob_delete'").await;
+    let counter = int(
+        &h,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'blob_delete'",
+    )
+    .await;
     let names: HashMap<&str, String> = {
         let mut m = HashMap::new();
         for (n, c) in &cids {
@@ -949,7 +1030,11 @@ async fn backups_under_moves_gc_and_the_delete_job_hold_every_key_the_snapshot_n
     let run = backup_ended(&h, &id).await;
     assert_eq!(run.status, "done", "{:?}", run.error);
     assert_eq!(run.delete_mark, Some(0));
-    assert_eq!(deleted_during.load(Ordering::SeqCst), 0, "nothing deleted during the backup");
+    assert_eq!(
+        deleted_during.load(Ordering::SeqCst),
+        0,
+        "nothing deleted during the backup"
+    );
     let during = queued(&h).await;
     assert!(during.len() >= 3, "{during:?}");
     assert!(
@@ -961,7 +1046,10 @@ async fn backups_under_moves_gc_and_the_delete_job_hold_every_key_the_snapshot_n
     let dir = std::path::PathBuf::from(&run.dir);
     let manifest: crate::backups::Manifest =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!((manifest.status.as_str(), manifest.missing), ("done", vec![gone_key.clone()]));
+    assert_eq!(
+        (manifest.status.as_str(), manifest.missing),
+        ("done", vec![gone_key.clone()])
+    );
     let snap = Store::open_sqlite_read_only(&dir.join("db.sqlite"))
         .await
         .unwrap();
@@ -976,7 +1064,10 @@ async fn backups_under_moves_gc_and_the_delete_job_hold_every_key_the_snapshot_n
         after = last;
     }
     snap.close().await;
-    for k in names.values().chain([&in_place, &"branding/logo9.0001".to_owned()]) {
+    for k in names
+        .values()
+        .chain([&in_place, &"branding/logo9.0001".to_owned()])
+    {
         assert!(named.contains(k), "the snapshot names {k}");
     }
     for k in &named {
@@ -1043,7 +1134,10 @@ async fn a_backup_that_loses_its_lease_mid_copy_is_marked_failed() {
         "{:?}",
         run.error
     );
-    assert!(ran.load(Ordering::SeqCst) > 0, "the delete job ran in the lapse");
+    assert!(
+        ran.load(Ordering::SeqCst) > 0,
+        "the delete job ran in the lapse"
+    );
     assert!(queued(&h).await.is_empty(), "its row was taken");
     let manifest: crate::backups::Manifest = serde_json::from_slice(
         &std::fs::read(std::path::Path::new(&run.dir).join("manifest.json")).unwrap(),

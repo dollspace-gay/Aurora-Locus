@@ -199,12 +199,11 @@ pub async fn sqlite_to_postgres(src: &Store, dst: &Store) -> CoreResult<CopyRepo
         .await
         .map_err(db_err)?
         .unwrap_or(0);
-    let marks: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(MAX(copied_through, verified_through)) FROM blob_migration",
-    )
-    .fetch_one(sp)
-    .await
-    .map_err(db_err)?;
+    let marks: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(MAX(copied_through, verified_through)) FROM blob_migration")
+            .fetch_one(sp)
+            .await
+            .map_err(db_err)?;
     let counter = counter.max(marks.unwrap_or(0));
     let copied_max: Option<i64> = sqlx::query_scalar(
         "SELECT MAX(k) FROM (SELECT MAX(key_seq) AS k FROM blob UNION ALL SELECT MAX(key_seq) FROM branding_asset) t",

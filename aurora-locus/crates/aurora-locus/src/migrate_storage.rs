@@ -47,11 +47,9 @@ pub async fn run(bootstrap: &Bootstrap, url: &str) -> Result<Vec<String>, String
         ));
     }
     if src.blob_backend().await.map_err(e)?.paused {
-        return Err(
-            "blob storage is paused for a cutover: let it finish, or \
+        return Err("blob storage is paused for a cutover: let it finish, or \
              `aurora-locus migrate blobs --cancel`"
-                .into(),
-        );
+            .into());
     }
     let dst = Store::connect(&DatabaseUrl::Postgres(url.to_owned()))
         .await

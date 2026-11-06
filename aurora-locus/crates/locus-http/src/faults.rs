@@ -7,16 +7,14 @@ use locus_core::CoreResult;
 use crate::state::AppState;
 
 #[cfg(test)]
-pub type Hook = std::sync::Arc<
-    dyn Fn() -> futures::future::BoxFuture<'static, CoreResult<()>> + Send + Sync,
->;
+pub type Hook =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, CoreResult<()>> + Send + Sync>;
 
 /// By (node address, point).
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
-static HOOKS: std::sync::Mutex<
-    Option<std::collections::HashMap<(usize, &'static str), Hook>>,
-> = std::sync::Mutex::new(None);
+static HOOKS: std::sync::Mutex<Option<std::collections::HashMap<(usize, &'static str), Hook>>> =
+    std::sync::Mutex::new(None);
 
 /// Runs the hook a test set for `point` on this node, if any; its error
 /// is the fault.

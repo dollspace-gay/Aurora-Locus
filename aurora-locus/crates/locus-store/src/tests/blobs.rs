@@ -60,18 +60,29 @@ async fn migrate_storage_waits_for_blob_migrations_and_seeds_above_the_counters(
     // GC takes the rows that drew the highest values, and the delete
     // queue drains to empty: both counters are above every row.
     let mut tx = src.begin().await.unwrap();
-    assert_eq!(tx.delete_account_blobs("did:plc:top", 100, 0).await.unwrap(), 4);
+    assert_eq!(
+        tx.delete_account_blobs("did:plc:top", 100, 0)
+            .await
+            .unwrap(),
+        4
+    );
     tx.commit().await.unwrap();
     for (id, _, _) in src.due_blob_deletes(-1_000_000, 100, None).await.unwrap() {
         let mut tx = src.begin().await.unwrap();
         tx.remove_blob_delete(id).await.unwrap();
         tx.commit().await.unwrap();
     }
-    assert_eq!(sqlite_value(src, "SELECT COUNT(*) FROM blob_delete").await, 0);
+    assert_eq!(
+        sqlite_value(src, "SELECT COUNT(*) FROM blob_delete").await,
+        0
+    );
     let counter = sqlite_value(src, "SELECT value FROM key_seq_counter WHERE id = 1").await;
     let row_max = sqlite_value(src, "SELECT MAX(key_seq) FROM blob").await;
-    let delete_counter =
-        sqlite_value(src, "SELECT seq FROM sqlite_sequence WHERE name = 'blob_delete'").await;
+    let delete_counter = sqlite_value(
+        src,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'blob_delete'",
+    )
+    .await;
     assert!(counter > row_max, "{counter} vs {row_max}");
     assert_eq!(delete_counter, 6);
 
