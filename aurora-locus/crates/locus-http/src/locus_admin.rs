@@ -24,13 +24,7 @@ type St = State<Arc<AppState>>;
 
 /// The role a method's group needs.
 fn group_role(lxm: &str) -> Role {
-    let rest = lxm.strip_prefix(locus_core::LOCUS_NS).unwrap_or(lxm);
-    match rest.trim_start_matches('.').split('.').next() {
-        Some("owner") => Role::Owner,
-        Some("admin") => Role::Admin,
-        Some("moderator") => Role::Moderator,
-        _ => Role::Viewer,
-    }
+    admin_auth::group_min(lxm).unwrap_or(Role::Viewer)
 }
 
 async fn op(s: &AppState, headers: &HeaderMap, lxm: &str) -> XrpcResult<Caller> {

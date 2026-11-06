@@ -428,6 +428,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(repair::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
+        // A grouped operator method's role, before its body is parsed.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth::group_gate,
+        ))
         // In the shard role, account management goes to the entryway; in
         // the entryway role, everything else goes to the account's shard.
         .layer(axum::middleware::from_fn_with_state(
