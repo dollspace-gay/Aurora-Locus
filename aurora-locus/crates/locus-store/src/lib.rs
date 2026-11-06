@@ -13,6 +13,7 @@ pub mod console;
 pub mod copy;
 pub mod email;
 pub mod env;
+pub mod hostnames;
 pub mod identity;
 pub mod import;
 pub mod invites;

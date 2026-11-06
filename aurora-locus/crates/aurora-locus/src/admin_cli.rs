@@ -439,6 +439,25 @@ pub enum MigrateCmd {
         #[arg(long)]
         accept_missing: bool,
     },
+    /// Moves the PDS to a new hostname: `<new>` prepares it (reserved,
+    /// checked), `--confirm` starts the migration, `--cancel` clears a
+    /// prepared one, `--close` ends a running one after its window.
+    Hostname {
+        new: Option<String>,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        cancel: bool,
+        #[arg(long)]
+        close: bool,
+        #[arg(long)]
+        status: bool,
+        /// Dev mode only: confirm without the network pre-checks.
+        #[arg(long, hide = true)]
+        skip_checks: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Copies this SQLite install into an empty Postgres database (offline).
     Storage {
         #[arg(long, value_parser = ["postgres"])]
@@ -1217,6 +1236,100 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
                 }
             } else {
                 return Err("give --to, --status, --cancel or --accept-missing".into());
+            }
+            Ok(())
+        }
+        AdminCmd::Migrate(MigrateCmd::Hostname {
+            new,
+            confirm,
+            cancel,
+            close,
+            status,
+            skip_checks,
+            yes,
+        }) => {
+            if let Some(host) = new {
+                let v = c
+                    .call(
+                        &lx("owner.hostname.prepare"),
+                        &[],
+                        Some(json!({"host": host})),
+                    )
+                    .await?;
+                println!("{} is prepared.", v["host"].as_str().unwrap_or(""));
+                if let Some(n) = v["next"].as_str() {
+                    println!("{n}");
+                }
+            } else if confirm {
+                let what = "Move this PDS to the prepared hostname: every OAuth session must sign in again, \
+                            and it isn't reversible in practice";
+                let body = merge(json!({"skipChecks": skip_checks}), reauth(c, what, yes)?);
+                let v = c
+                    .call(&lx("owner.hostname.confirm"), &[], Some(body))
+                    .await?;
+                println!("{} is the hostname now.", v["host"].as_str().unwrap_or(""));
+                if let Some(n) = v["note"].as_str() {
+                    println!("{n}");
+                }
+            } else if cancel {
+                c.call(&lx("owner.hostname.cancel"), &[], Some(json!({})))
+                    .await?;
+                println!("The prepared hostname is cleared.");
+            } else if close {
+                let v = c
+                    .call(&lx("owner.hostname.close"), &[], Some(json!({})))
+                    .await?;
+                println!(
+                    "Closed, with {} accounts still pointing at the old hostname.",
+                    v["stragglers"]
+                );
+            } else if status {
+                let v = c.call(&lx("viewer.hostname.status"), &[], None).await?;
+                println!("hostname {}", v["hostname"].as_str().unwrap_or(""));
+                for h in v["oldHostsServed"].as_array().cloned().unwrap_or_default() {
+                    println!("  still served in full: {}", h.as_str().unwrap_or(""));
+                }
+                if let Some(c) = v["candidate"].as_str() {
+                    println!("  prepared: {c}");
+                }
+                for chk in v["prechecks"].as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "    {} {}{}",
+                        if chk["ok"] == json!(true) {
+                            "ok  "
+                        } else {
+                            "FAIL"
+                        },
+                        chk["check"].as_str().unwrap_or(""),
+                        chk["why"]
+                            .as_str()
+                            .filter(|w| !w.is_empty())
+                            .map(|w| format!(": {w}"))
+                            .unwrap_or_default()
+                    );
+                }
+                for h in v["formerHosts"].as_array().cloned().unwrap_or_default() {
+                    println!("  former: {}", h.as_str().unwrap_or(""));
+                }
+                for m in v["migrations"].as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "migration {} → {}: {}",
+                        m["from"].as_str().unwrap_or(""),
+                        m["to"].as_str().unwrap_or(""),
+                        m["state"].as_str().unwrap_or("")
+                    );
+                    for x in m["stragglers"].as_array().cloned().unwrap_or_default() {
+                        println!(
+                            "    still on the old host: {} ({})",
+                            x["did"].as_str().unwrap_or(""),
+                            x["reason"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+            } else {
+                return Err(
+                    "give a new hostname, or --confirm, --cancel, --close or --status".into(),
+                );
             }
             Ok(())
         }

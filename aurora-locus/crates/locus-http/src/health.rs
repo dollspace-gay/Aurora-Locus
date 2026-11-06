@@ -24,7 +24,14 @@ type St = State<Arc<AppState>>;
 
 pub async fn health(State(s): St) -> Response {
     match s.store.now_ms().await {
-        Ok(_) => Json(json!({ "version": env!("CARGO_PKG_VERSION") })).into_response(),
+        Ok(_) => {
+            let mut res = Json(json!({ "version": env!("CARGO_PKG_VERSION") })).into_response();
+            // Lets a hostname pre-check tell this install from another server.
+            if let Ok(v) = axum::http::HeaderValue::from_str(&crate::hostnames::instance_tag(&s)) {
+                res.headers_mut().insert("x-locus-instance", v);
+            }
+            res
+        }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "version": env!("CARGO_PKG_VERSION"), "error": format!("the database doesn't answer: {e}") })),
@@ -64,7 +71,11 @@ pub async fn approved(s: &AppState, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    if name == s.hostname {
+    if name == s.hostname
+        || s.hosts().serves_in_full(&name)
+        || s.hosts().candidate.as_deref() == Some(name.as_str())
+        || s.hosts().former.contains(&name)
+    {
         return true;
     }
     if matches!(s.store.hosted_did_web_by_host(&name).await, Ok(Some(_))) {

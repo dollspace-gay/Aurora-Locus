@@ -62,7 +62,8 @@ pub async fn validate_handle(s: &AppState, raw: &str, did: Option<&str>) -> Xrpc
             "Inappropriate language in handle",
         ));
     }
-    if h == s.hostname {
+    // Every PDS hostname is reserved: current, candidate and old ones.
+    if h == s.hostname || s.store.pds_host_reserved(&h).await? {
         return Err(taken());
     }
     if let Some(web) = s.store.hosted_did_web_by_host(&h).await?
@@ -289,12 +290,14 @@ pub(crate) async fn plc_signing_key(s: &AppState, did: &str) -> Result<Option<St
     Ok(state.and_then(|op| op.verification_methods.get("atproto").cloned()))
 }
 
-/// Points the DID document's `#atproto` key at `did_key`, signed with the
-/// held key the document lists first. Returns whether it changed anything.
-pub(crate) async fn plc_set_signing_key(
+/// Changes an account's PLC document with `change`, signed with the held
+/// key its latest document lists first, unless `done` says the document
+/// already has the change. Returns whether it submitted an operation.
+pub(crate) async fn plc_update(
     s: &AppState,
     did: &str,
-    did_key: &str,
+    done: impl Fn(&Operation) -> bool,
+    change: impl Fn(&mut Operation),
 ) -> Result<bool, PlcStep> {
     let (state, prev) = plc_state(s, did).await?;
     let current =
@@ -303,17 +306,11 @@ pub(crate) async fn plc_set_signing_key(
         .store
         .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&current.rotation_keys))
         .await;
-    if current
-        .verification_methods
-        .get("atproto")
-        .map(String::as_str)
-        == Some(did_key)
-    {
+    if done(&current) {
         return Ok(false);
     }
     let mut next = current.clone();
-    next.verification_methods
-        .insert("atproto".to_owned(), did_key.to_owned());
+    change(&mut next);
     next.prev = Some(prev);
     next.validate()
         .map_err(|e| PlcStep::Refused(XrpcError::invalid_request(e.to_string())))?;
@@ -332,12 +329,64 @@ pub(crate) async fn plc_set_signing_key(
         Err(PlcClientError::Refused(m)) => Err(PlcStep::Refused(XrpcError::invalid_request(
             format!("The PLC directory refused the update: {m}"),
         ))),
-        Err(e) => match plc_signing_key(s, did).await {
+        Err(e) => match plc_state(s, did).await {
             // It applied after all.
-            Ok(Some(k)) if k == did_key => Ok(true),
+            Ok((Some(op), _)) if done(&op) => Ok(true),
             _ => Err(PlcStep::Ambiguous(upstream(e.to_string()))),
         },
     }
+}
+
+/// Points the DID document's `#atproto` key at `did_key`. Returns whether
+/// it changed anything.
+pub(crate) async fn plc_set_signing_key(
+    s: &AppState,
+    did: &str,
+    did_key: &str,
+) -> Result<bool, PlcStep> {
+    plc_update(
+        s,
+        did,
+        |op| op.verification_methods.get("atproto").map(String::as_str) == Some(did_key),
+        |op| {
+            op.verification_methods
+                .insert("atproto".to_owned(), did_key.to_owned());
+        },
+    )
+    .await
+}
+
+/// Points the DID document's `#atproto_pds` service at `endpoint`.
+pub(crate) async fn plc_set_endpoint(
+    s: &AppState,
+    did: &str,
+    endpoint: &str,
+) -> Result<bool, PlcStep> {
+    plc_update(
+        s,
+        did,
+        |op| {
+            op.services
+                .get("atproto_pds")
+                .is_some_and(|svc| svc.endpoint == endpoint)
+        },
+        |op| {
+            op.services.insert(
+                "atproto_pds".to_owned(),
+                locus_identity::plc::Service {
+                    kind: "AtprotoPersonalDataServer".to_owned(),
+                    endpoint: endpoint.to_owned(),
+                },
+            );
+        },
+    )
+    .await
+}
+
+/// Whether `did`'s PLC document holds a key this PDS can sign with.
+pub(crate) async fn plc_held_signer(s: &AppState, did: &str) -> Result<bool, PlcStep> {
+    let (state, _) = plc_state(s, did).await?;
+    Ok(state.is_some_and(|op| s.secrets.plc_keys.signer_for(&op.rotation_keys).is_some()))
 }
 
 impl PlcStep {
@@ -793,6 +842,11 @@ pub async fn well_known_did_json(State(s): St, headers: HeaderMap) -> Response {
     };
     if host == s.hostname {
         return Json(service_document(&s).to_json()).into_response();
+    }
+    if s.hosts().serves_in_full(&host) || s.hosts().former.contains(&host) {
+        let mut doc = service_document(&s);
+        doc.id = format!("did:web:{host}");
+        return Json(doc.to_json()).into_response();
     }
     match s.store.hosted_did_web_by_host(&host).await {
         Ok(Some(web)) => match web.doc.and_then(|d| serde_json::from_str::<Value>(&d).ok()) {

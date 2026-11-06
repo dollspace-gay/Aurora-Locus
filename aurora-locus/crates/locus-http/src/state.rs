@@ -533,6 +533,11 @@ pub struct AppState {
     /// Cancelled when the keys this node holds in memory changed: the node
     /// then restarts its service in place to reload them.
     pub reload: tokio_util::sync::CancellationToken,
+    /// Old, candidate and former hostnames (hostname migrations).
+    pub hosts: arc_swap::ArcSwap<crate::hostnames::Hosts>,
+    pub role: locus_core::bootstrap::Role,
+    /// Dev mode, honored (a local hostname).
+    pub dev_mode: bool,
 }
 
 /// The network resolvers, rebuilt when the settings they're made from change.
@@ -635,6 +640,38 @@ impl AppState {
             .ok_or_else(|| crate::error::XrpcError::internal("account has no signing key"))?;
         K256Keypair::from_private_key(&sk)
             .map_err(|e| crate::error::XrpcError::internal(e.to_string()))
+    }
+
+    /// The other hostnames, as loaded.
+    #[must_use]
+    pub fn hosts(&self) -> Arc<crate::hostnames::Hosts> {
+        self.hosts.load_full()
+    }
+
+    /// Whether a token's `aud` names this PDS: its service DID, or the
+    /// service DID of an old hostname still served in full.
+    #[must_use]
+    pub fn accepts_aud(&self, aud: &str) -> bool {
+        aud == self.service_did
+            || self
+                .hosts()
+                .old_full
+                .iter()
+                .any(|h| aud.strip_prefix("did:web:") == Some(h.as_str()))
+    }
+
+    /// Every service DID accepted as an audience.
+    #[must_use]
+    pub fn accepted_auds(&self) -> Vec<String> {
+        let mut v = vec![self.service_did.clone()];
+        v.extend(self.hosts().old_full.iter().map(|h| format!("did:web:{h}")));
+        v
+    }
+
+    /// Whether `host` gets this PDS's full route set as one of its names.
+    #[must_use]
+    pub fn serves(&self, host: &str) -> bool {
+        host == self.hostname || self.hosts().serves_in_full(host)
     }
 
     pub fn service_did_key(&self) -> String {

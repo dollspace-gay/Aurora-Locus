@@ -71,15 +71,28 @@ fn public_json(v: Value) -> Response {
 
 pub async fn authorization_server_metadata(State(s): St) -> Response {
     let iss = issuer(&s);
+    let mut resources = vec![iss.clone()];
+    resources.extend(s.hosts().old_full.iter().map(|h| format!("https://{h}")));
     public_json(locus_auth::oauth::metadata::authorization_server(
-        &iss,
-        &[iss.clone()],
+        &iss, &resources,
     ))
 }
 
-pub async fn protected_resource_metadata(State(s): St) -> Response {
+/// The origin a request came to, when it's one this PDS serves in full;
+/// otherwise the issuer.
+pub(crate) fn served_origin(s: &AppState, headers: &HeaderMap) -> String {
+    match crate::identity::request_host(headers) {
+        Some(h) if h != s.hostname && s.hosts().serves_in_full(&h) => format!("https://{h}"),
+        _ => issuer(s),
+    }
+}
+
+pub async fn protected_resource_metadata(State(s): St, headers: HeaderMap) -> Response {
     let iss = issuer(&s);
-    public_json(locus_auth::oauth::metadata::protected_resource(&iss, &iss))
+    let resource = served_origin(&s, &headers);
+    public_json(locus_auth::oauth::metadata::protected_resource(
+        &resource, &iss,
+    ))
 }
 
 pub async fn jwks(State(s): St) -> Response {
@@ -102,7 +115,7 @@ pub async fn dpop_proof(
         .filter_map(|v| v.to_str().ok())
         .collect();
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
-    let url = url::Url::parse(&format!("{}{path}", issuer(s)))
+    let url = url::Url::parse(&format!("{}{path}", served_origin(s, headers)))
         .map_err(|_| OAuthError::invalid_request("invalid request URL"))?;
     let proof = locus_auth::oauth::dpop::check_proof(
         &values,

@@ -26,6 +26,7 @@ clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 zeroize.workspace = true
+arc-swap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true

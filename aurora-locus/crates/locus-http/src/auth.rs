@@ -82,7 +82,7 @@ pub async fn user_service_auth(
         let key = proto_blue_common::did_doc::get_verification_material(&doc, key_id)
             .map(|k| format!("did:key:{}", k.public_key_multibase));
         if key.is_some_and(|k| jwt.verifies_with(&k)) {
-            if jwt.aud != state.service_did {
+            if !state.accepts_aud(&jwt.aud) {
                 return Err(unauthorized(service_jwt::ServiceJwtError::BadJwtAudience));
             }
             return Ok(did.to_owned());
@@ -203,12 +203,24 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
         .verify(&jws)
         .map_err(|_| invalid("Invalid token"))?;
     let p = &jws.payload;
-    if !jws.typ_is("at+jwt")
-        || p.get("iss").and_then(Value::as_str) != Some(crate::oauth::issuer(state).as_str())
-    {
+    // Tokens minted before a hostname switch carry the old issuer until
+    // they expire.
+    let iss_ok = p.get("iss").and_then(Value::as_str).is_some_and(|i| {
+        i == crate::oauth::issuer(state)
+            || state
+                .hosts()
+                .old_full
+                .iter()
+                .any(|h| i == format!("https://{h}"))
+    });
+    if !jws.typ_is("at+jwt") || !iss_ok {
         return Err(invalid("Invalid token"));
     }
-    if p.get("aud").and_then(Value::as_str) != Some(state.service_did.as_str()) {
+    if !p
+        .get("aud")
+        .and_then(Value::as_str)
+        .is_some_and(|a| state.accepts_aud(a))
+    {
         return Err(invalid(&format!(
             "Invalid audience (got: {}, expected one of: {})",
             p.get("aud").and_then(Value::as_str).unwrap_or(""),

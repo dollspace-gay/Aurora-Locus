@@ -546,6 +546,19 @@ kryphocron built in.
   transaction, with every sequence continuing above what was copied; it
   refuses a node-generated master key file (declare it shared, or rewrap
   first) and a running blob migration.
+- `aurora-locus migrate hostname <new>`: prepares a new hostname
+  (reserved against handles; `/tls-check` approves it so a certificate can
+  be issued; it serves only health), checks it reaches this install over
+  HTTPS, and `--confirm` makes it the hostname on every node. A job then
+  moves every did:plc account's PDS endpoint and every hosted did:web
+  document, with `#identity` for each, and lists accounts it can't move.
+  The old hostname keeps full service, and its service DID stays an
+  accepted token audience, while any DID document names it; then it
+  becomes a former hostname that serves its `did.json` forever and
+  redirects everything else. `--cancel`, `--close` (after
+  `identity.hostname_transition_days`) and `--status`. Refused outside
+  the standalone role. OAuth: each served host has its own
+  protected-resource metadata, and the issuer lists every served origin.
 
 ### Changed
 

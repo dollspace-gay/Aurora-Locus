@@ -112,6 +112,8 @@ pub struct LegacySessions {
     store: Store,
     secret: Zeroizing<Vec<u8>>,
     service_did: String,
+    /// Other audiences accepted (old hostnames' service DIDs).
+    also_accepted: Vec<String>,
     pub access_ttl_s: i64,
     pub refresh_ttl_s: i64,
 }
@@ -133,6 +135,7 @@ impl LegacySessions {
             store,
             secret,
             service_did,
+            also_accepted: Vec::new(),
             access_ttl_s: 120 * 60,
             refresh_ttl_s: 90 * 24 * 60 * 60,
         }
@@ -240,10 +243,22 @@ impl LegacySessions {
         })
     }
 
+    /// Also accepts tokens whose `aud` is one of `auds` (a hostname
+    /// migration's old service DIDs).
+    #[must_use]
+    pub fn accepting(mut self, auds: Vec<String>) -> Self {
+        self.also_accepted = auds;
+        self
+    }
+
+    fn aud_ok(&self, aud: &str) -> bool {
+        aud == self.service_did || self.also_accepted.iter().any(|a| a == aud)
+    }
+
     /// Verifies an access token against its session and the account.
     pub async fn verify_access(&self, token: &str) -> Result<Authed, AuthError> {
         let claims = jwt::verify(&self.secret, TYP_ACCESS, token, now_s())?;
-        if claims.cnf.is_some() || claims.lxm.is_some() || claims.aud != self.service_did {
+        if claims.cnf.is_some() || claims.lxm.is_some() || !self.aud_ok(&claims.aud) {
             return Err(AuthError::InvalidToken);
         }
         if !ACCESS_SCOPES.contains(&claims.scope.as_str()) || !claims.sub.starts_with("did:") {
@@ -288,7 +303,7 @@ impl LegacySessions {
     pub async fn refresh(&self, refresh_jwt: &str) -> Result<(Tokens, String), AuthError> {
         let now = now_s();
         let claims = jwt::verify(&self.secret, TYP_REFRESH, refresh_jwt, now)?;
-        if claims.aud != self.service_did || claims.scope != SCOPE_REFRESH {
+        if !self.aud_ok(&claims.aud) || claims.scope != SCOPE_REFRESH {
             return Err(AuthError::InvalidToken);
         }
         let id = claims.jti.ok_or(AuthError::InvalidToken)?;

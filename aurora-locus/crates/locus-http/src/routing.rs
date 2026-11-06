@@ -33,6 +33,11 @@ const IDENTITY_HOST: &[&str] = &["/.well-known/atproto-did", "/.well-known/did.j
 pub enum HostClass {
     Full,
     Identity,
+    /// A prepared hostname candidate: health and `/tls-check` only (plus
+    /// its service `did.json` when it's also a former hostname).
+    Candidate,
+    /// A former PDS hostname: its service `did.json`; the rest redirects.
+    Former,
     Unknown,
 }
 
@@ -51,8 +56,14 @@ pub async fn classify(s: &AppState, host: Option<&str>) -> HostClass {
         // No Host header (not HTTP/1.1): nothing to derive an identity from.
         return HostClass::Full;
     };
-    if host == s.hostname || is_internal_name(host) {
+    if s.serves(host) || is_internal_name(host) {
         return HostClass::Full;
+    }
+    if s.hosts().candidate.as_deref() == Some(host) {
+        return HostClass::Candidate;
+    }
+    if s.hosts().former.iter().any(|f| f == host) {
+        return HostClass::Former;
     }
     let snap = s.snapshot();
     if snap
@@ -84,7 +95,27 @@ pub async fn by_host(State(s): State<Arc<AppState>>, req: Request<Body>, next: N
     match classify(&s, host.as_deref()).await {
         HostClass::Full => next.run(req).await,
         HostClass::Identity if IDENTITY_HOST.contains(&path) => next.run(req).await,
-        HostClass::Identity | HostClass::Unknown => {
+        HostClass::Former | HostClass::Candidate
+            if path == "/.well-known/did.json"
+                && host
+                    .as_deref()
+                    .is_some_and(|h| s.hosts().former.iter().any(|f| f == h)) =>
+        {
+            next.run(req).await
+        }
+        HostClass::Former => {
+            let to = format!(
+                "{}{}",
+                s.public_url,
+                req.uri().path_and_query().map_or(path, |p| p.as_str())
+            );
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(axum::http::header::LOCATION, to)],
+            )
+                .into_response()
+        }
+        HostClass::Identity | HostClass::Candidate | HostClass::Unknown => {
             (StatusCode::NOT_FOUND, "Not found").into_response()
         }
     }

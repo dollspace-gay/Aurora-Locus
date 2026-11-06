@@ -249,6 +249,9 @@ async fn harness_build(
         branding: crate::branding::Cache::default(),
         socket_secret: crate::socket::new_secret(),
         reload: tokio_util::sync::CancellationToken::new(),
+        hosts: arc_swap::ArcSwap::from_pointee(crate::hostnames::Hosts::default()),
+        role: locus_core::bootstrap::Role::Pds,
+        dev_mode: false,
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -12491,4 +12494,265 @@ async fn blob_migrations_wait_on_missing_sources_and_cancel() {
     );
     let flipped = step(&h.state, &lease).await.unwrap();
     assert!(matches!(flipped, Step::Flipped(_)), "{flipped:?}");
+}
+
+impl Harness {
+    /// A request to `host` (not the PDS hostname).
+    async fn raw_at(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap();
+        let res = self.app.clone().oneshot(req).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, headers, bytes)
+    }
+
+    async fn reload_hosts(&self) {
+        let hosts = crate::hostnames::Hosts::load(&self.state.store, &self.state.hostname)
+            .await
+            .unwrap();
+        self.state.hosts.store(Arc::new(hosts));
+    }
+}
+
+#[tokio::test]
+async fn hostname_candidates_are_reserved_and_serve_only_health() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (_, access) = h.user("pia.pds.example.com").await;
+    let owner = h.owner_with_password("oto", "oto-password-1234").await;
+    let prepare_path = ns("owner.hostname.prepare");
+    let prepare =
+        |host: &str| h.admin_call("POST", &prepare_path, &owner, Some(json!({"host": host})));
+    assert_eq!(
+        prepare("pia.pds.example.com").await.0,
+        StatusCode::BAD_REQUEST,
+        "a handle host"
+    );
+    assert_eq!(
+        prepare("pds.example.com").await.0,
+        StatusCode::BAD_REQUEST,
+        "the hostname"
+    );
+    let (st, v) = prepare("next.pds.example.com").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        prepare("other.example.com").await.0.is_client_error(),
+        "one at a time"
+    );
+    // Reserved against handles from now on.
+    let (st, v) = h
+        .post(
+            "com.atproto.identity.updateHandle",
+            Some(&access),
+            json!({"handle": "next.pds.example.com"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("HandleNotAvailable")),
+        "{v}"
+    );
+    h.reload_hosts().await;
+    // Health and /tls-check only.
+    let (st, headers, _) = h
+        .raw_at("next.pds.example.com", "GET", "/xrpc/_health")
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        headers["x-locus-instance"].to_str().unwrap(),
+        crate::hostnames::instance_tag(&h.state)
+    );
+    let (st, _, _) = h
+        .raw_at(
+            "next.pds.example.com",
+            "GET",
+            "/xrpc/com.atproto.server.describeServer",
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "no identity on a candidate");
+    assert!(crate::health::approved(&h.state, "next.pds.example.com").await);
+    // Confirming needs the pre-checks (no HTTPS in tests) and re-auth.
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("owner.hostname.confirm"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "re-auth");
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("owner.hostname.confirm"),
+            &owner,
+            Some(json!({"password": "oto-password-1234", "skipChecks": true})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains("pre-check"), "{v}");
+    let (_, v) = h
+        .admin_call("GET", &ns("viewer.hostname.status"), &owner, None)
+        .await;
+    assert_eq!(v["candidate"], json!("next.pds.example.com"), "{v}");
+    assert_eq!(v["prechecks"][1]["ok"], json!(false), "{v}");
+    // Cancel: the candidate goes.
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("owner.hostname.cancel"),
+            &owner,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    h.reload_hosts().await;
+    assert!(!crate::health::approved(&h.state, "next.pds.example.com").await);
+    assert!(
+        !h.state
+            .store
+            .pds_host_reserved("next.pds.example.com")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn after_a_hostname_migration_the_old_host_keeps_serving_then_redirects() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, _) = h.user("quinn.pds.example.com").await;
+    let old = "old.example.net";
+    // This node is the new hostname: a migration from `old` is running.
+    h.state
+        .store
+        .prepare_hostname_migration("m1", old, &h.state.hostname, "test")
+        .await
+        .unwrap();
+    assert!(
+        h.state
+            .store
+            .confirm_hostname_migration("m1", 0)
+            .await
+            .unwrap()
+    );
+    h.reload_hosts().await;
+    assert_eq!(h.state.hosts().old_full, [old]);
+
+    // The old host keeps full service, with its own service DID accepted.
+    let (st, _, _) = h
+        .raw_at(old, "GET", "/xrpc/com.atproto.server.describeServer")
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, _, doc) = h.raw_at(old, "GET", "/.well-known/did.json").await;
+    let doc: Value = serde_json::from_slice(&doc).unwrap();
+    assert_eq!(doc["id"], json!(format!("did:web:{old}")));
+    assert_eq!(
+        doc["service"][0]["serviceEndpoint"],
+        json!(h.state.public_url)
+    );
+    assert!(h.state.accepts_aud(&format!("did:web:{old}")));
+    assert!(h.state.accepts_aud(&h.state.service_did));
+    assert!(!h.state.accepts_aud("did:web:elsewhere.example"));
+    assert!(crate::health::approved(&h.state, old).await);
+    let (_, _, pr) = h
+        .raw_at(old, "GET", "/.well-known/oauth-protected-resource")
+        .await;
+    let pr: Value = serde_json::from_slice(&pr).unwrap();
+    assert_eq!(
+        pr["resource"],
+        json!(format!("https://{old}")),
+        "its own origin"
+    );
+    assert_eq!(
+        pr["authorization_servers"],
+        json!([crate::oauth::issuer(&h.state)])
+    );
+    let (_, _, asm) = h
+        .raw(
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            None,
+            vec![],
+            &[],
+        )
+        .await;
+    let asm: Value = serde_json::from_slice(&asm).unwrap();
+    assert!(
+        asm["protected_resources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("https://{old}"))),
+        "{asm}"
+    );
+    // The old host and every PDS hostname stay reserved.
+    assert!(h.state.store.pds_host_reserved(old).await.unwrap());
+
+    // The job moves the account's PDS endpoint (still the old host's, as
+    // for an account created before the migration) and announces it.
+    {
+        let mut plc = h.plc.lock().unwrap();
+        let op = plc.log.get_mut(&did).unwrap().last_mut().unwrap();
+        op["services"]["atproto_pds"]["endpoint"] = json!(format!("https://{old}"));
+    }
+    let before = h.outbox_kinds(&did).await.len();
+    assert!(crate::hostnames::step(&h.state).await.unwrap());
+    let endpoint = h.plc.lock().unwrap().last(&did).unwrap()["services"]["atproto_pds"]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(endpoint, h.state.public_url);
+    assert_eq!(h.outbox_kinds(&did).await.len(), before + 1);
+    assert_eq!(h.outbox_kinds(&did).await.last().unwrap(), "identity");
+    // No stragglers and the window is over: the old host becomes former.
+    assert!(crate::hostnames::step(&h.state).await.unwrap());
+    let m = h.state.store.hostname_migrations().await.unwrap();
+    assert_eq!(
+        (m[0].state.as_str(), m[0].former_at.is_some()),
+        ("done", true)
+    );
+    h.reload_hosts().await;
+    assert_eq!(h.state.hosts().former, [old]);
+    assert!(
+        !h.state.accepts_aud(&format!("did:web:{old}")),
+        "no document names it"
+    );
+    let (st, headers, _) = h
+        .raw_at(old, "GET", "/xrpc/com.atproto.server.describeServer?x=1")
+        .await;
+    assert_eq!(st, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        headers["location"].to_str().unwrap(),
+        format!(
+            "{}/xrpc/com.atproto.server.describeServer?x=1",
+            h.state.public_url
+        )
+    );
+    let (st, _, doc) = h.raw_at(old, "GET", "/.well-known/did.json").await;
+    assert_eq!(st, StatusCode::OK, "its service document is served forever");
+    let doc: Value = serde_json::from_slice(&doc).unwrap();
+    assert_eq!(doc["id"], json!(format!("did:web:{old}")));
+    assert!(
+        crate::health::approved(&h.state, old).await,
+        "its certificate never lapses"
+    );
+    let (_, v) = h
+        .admin_call(
+            "GET",
+            &ns("viewer.hostname.status"),
+            &format!("Bearer {}", h.operator("vic", "viewer").await),
+            None,
+        )
+        .await;
+    assert_eq!(v["formerHosts"], json!([old]), "{v}");
 }

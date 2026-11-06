@@ -36,6 +36,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
+arc-swap.workspace = true
 tracing.workspace = true
 hex.workspace = true
 rand.workspace = true

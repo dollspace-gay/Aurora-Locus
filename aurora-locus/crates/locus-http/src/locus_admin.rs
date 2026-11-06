@@ -71,6 +71,17 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("owner.revokeApiToken"), post(revoke_api_token))
         .route(at!("owner.keys.show"), get(crate::keys::show))
         .route(
+            at!("owner.hostname.prepare"),
+            post(crate::hostnames::prepare),
+        )
+        .route(
+            at!("owner.hostname.confirm"),
+            post(crate::hostnames::confirm),
+        )
+        .route(at!("owner.hostname.cancel"), post(crate::hostnames::cancel))
+        .route(at!("owner.hostname.close"), post(crate::hostnames::close))
+        .route(at!("viewer.hostname.status"), get(crate::hostnames::status))
+        .route(
             at!("admin.migrateBlobs.start"),
             post(crate::blob_migration::start),
         )

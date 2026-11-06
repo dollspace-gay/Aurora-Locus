@@ -880,6 +880,13 @@ pub static REGISTRY: &[Def] = &[
         description: "Milliseconds every other S3 request may take (0: no limit beyond the client's). Takes effect on restart.",
     },
     Def {
+        key: "identity.hostname_transition_days",
+        kind: Kind::Int { min: 1, max: 365 },
+        default: "30",
+        env: None,
+        description: "After a hostname migration, the least time the old hostname keeps full service before the migration can end (it ends only once every account has moved).",
+    },
+    Def {
         key: "blobs.cutover_max_pause_ms",
         kind: Kind::Int {
             min: 5_000,
