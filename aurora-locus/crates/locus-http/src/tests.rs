@@ -1,6 +1,7 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
 mod keys;
+mod keys_shard;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -140,6 +140,20 @@ pub async fn kms_master_key(
     Ok(MasterKey::from_bytes(*key, SourceKind::Kms))
 }
 
+/// The hostname a node serves, and whether `PDS_HOSTNAME` was refused:
+/// after setup, the one setup chose (a different `PDS_HOSTNAME` is
+/// refused); before, `PDS_HOSTNAME`.
+fn served_hostname(
+    chosen: Option<&str>,
+    setup_mode: bool,
+    configured: Option<&str>,
+) -> (String, bool) {
+    match chosen {
+        Some(h) if !setup_mode => (h.to_owned(), configured.is_some_and(|c| c != h)),
+        _ => (configured.unwrap_or("localhost").to_owned(), false),
+    }
+}
+
 /// Where this node writes the setup token: `<data>/setup-token`, when the
 /// data directory persists.
 fn token_path(bootstrap: &Bootstrap) -> Option<std::path::PathBuf> {
@@ -265,21 +279,18 @@ impl Node {
             .hostname
             .as_deref()
             .map(locus_core::setup::normalize_host);
-        let hostname = match setup.as_ref().and_then(|r| r.hostname.clone()) {
-            Some(h) if !setup_mode => {
-                if bootstrap_hostname.as_deref().is_some_and(|b| b != h) {
-                    tracing::warn!(
-                        configured = bootstrap_hostname.as_deref().unwrap_or(""),
-                        serving = %h,
-                        "PDS_HOSTNAME differs from the hostname setup chose; it's ignored (the hostname changes only by migration)"
-                    );
-                }
-                h
-            }
-            _ => bootstrap_hostname
-                .clone()
-                .unwrap_or_else(|| "localhost".to_owned()),
-        };
+        let (hostname, refused) = served_hostname(
+            setup.as_ref().and_then(|r| r.hostname.as_deref()),
+            setup_mode,
+            bootstrap_hostname.as_deref(),
+        );
+        if refused {
+            tracing::warn!(
+                configured = bootstrap_hostname.as_deref().unwrap_or(""),
+                serving = %hostname,
+                "PDS_HOSTNAME differs from the hostname setup chose; it's ignored (the hostname changes only by migration)"
+            );
+        }
         if setup_mode {
             announce_setup_token(&store, &bootstrap).await?;
         } else if let Some(p) = token_path(&bootstrap).filter(|p| p.exists()) {
@@ -1474,4 +1485,34 @@ pub fn cancel_on_signal(cancel: CancellationToken) {
         }
         cancel.cancel();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::served_hostname;
+
+    #[test]
+    fn a_changed_hostname_is_refused_after_setup() {
+        let h = |c, m, e| served_hostname(c, m, e);
+        // After setup: the chosen hostname; a different env value is
+        // refused (warned about), an equal one or none isn't.
+        assert_eq!(
+            h(Some("pds.example.com"), false, Some("new.example.com")),
+            ("pds.example.com".into(), true)
+        );
+        assert_eq!(
+            h(Some("pds.example.com"), false, Some("pds.example.com")),
+            ("pds.example.com".into(), false)
+        );
+        assert_eq!(
+            h(Some("pds.example.com"), false, None),
+            ("pds.example.com".into(), false)
+        );
+        // In setup mode the env value is used.
+        assert_eq!(
+            h(Some("pds.example.com"), true, Some("new.example.com")),
+            ("new.example.com".into(), false)
+        );
+        assert_eq!(h(None, true, None), ("localhost".into(), false));
+    }
 }

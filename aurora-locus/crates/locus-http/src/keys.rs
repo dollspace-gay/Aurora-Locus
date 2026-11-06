@@ -738,12 +738,15 @@ async fn set_entryway_value(
     input: &SetSecretInput,
     value: &str,
 ) -> XrpcResult<Json<Value>> {
-    let Some(ew) = &s.entryway else {
+    if s.entryway.is_none() {
         return Err(XrpcError::invalid_request(
             "The entryway values are set only in the shard role",
         ));
-    };
+    }
     let bad = |e: String| XrpcError::invalid_request(e);
+    // The stored keys, not this node's loaded ones: an earlier change may
+    // not have reloaded yet.
+    let stored = s.store.load_snapshot().await?;
     let mut tx = s.store.begin().await?;
     let (fingerprint_of, shown): (Vec<u8>, Value) = match input.name.as_str() {
         "entryway-verify-key" => {
@@ -756,7 +759,13 @@ async fn set_entryway_value(
             let k = crate::shard::parse_k256_key(value).map_err(bad)?;
             let mut keys = vec![k.clone()];
             if !input.revoke_previous {
-                keys.extend(ew.plc_rotation_keys.iter().filter(|x| **x != k).cloned());
+                keys.extend(
+                    stored
+                        .list("entryway.plc_rotation_keys")
+                        .into_iter()
+                        .filter(|x| *x != k)
+                        .map(str::to_owned),
+                );
             }
             tx.set_setting("entryway.plc_rotation_keys", json!(keys), &who.actor)
                 .await?;
