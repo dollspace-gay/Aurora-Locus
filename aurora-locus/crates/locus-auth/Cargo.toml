@@ -36,6 +36,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 tempfile.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
+proptest = "1"
 
 [lints]
 workspace = true

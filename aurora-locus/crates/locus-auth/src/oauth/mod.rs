@@ -4,6 +4,8 @@
 pub mod client;
 pub mod dpop;
 pub mod error;
+#[cfg(test)]
+mod fuzz;
 pub mod jose;
 pub mod metadata;
 pub mod request;
