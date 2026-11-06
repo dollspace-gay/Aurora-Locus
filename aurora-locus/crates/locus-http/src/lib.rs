@@ -19,6 +19,7 @@ pub mod console_sections;
 pub mod email;
 pub mod entryway;
 pub mod error;
+mod faults;
 pub mod health;
 pub mod hostnames;
 pub mod identity;

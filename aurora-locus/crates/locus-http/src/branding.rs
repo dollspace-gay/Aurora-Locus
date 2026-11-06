@@ -228,7 +228,7 @@ pub async fn asset(State(s): St, Path(id): Path<String>) -> Response {
     let Ok(Some(row)) = s.store.branding_asset(&id).await else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
-    let reader = match s.blobs.read(&row.storage_key, None).await {
+    let reader = match crate::blob_migration::read_tracked(&s, &row.storage_key, None).await {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };

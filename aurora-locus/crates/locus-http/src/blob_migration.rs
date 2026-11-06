@@ -37,9 +37,44 @@ const PAGE: i64 = 500;
 
 /// The migration's target store.
 async fn target_store(s: &AppState, m: &BlobMigration) -> CoreResult<BlobStore> {
-    match m.target.as_str() {
+    open_store(s, &m.target, m.disk_root.as_deref()).await
+}
+
+/// The store `blob_backend` names now, at its epoch: what a node whose
+/// own store predates a flip reads from until it reloads.
+pub async fn active_store(s: &AppState) -> CoreResult<BlobStore> {
+    let b = s.store.blob_backend().await?;
+    Ok(open_store(s, &b.active, b.disk_root.as_deref())
+        .await?
+        .with_epoch(b.epoch))
+}
+
+/// Reads a tracked key. A miss on a node whose store predates a flip
+/// reloads the node and reads once from the backend that's active now.
+pub async fn read_tracked(
+    s: &AppState,
+    key: &str,
+    range: Option<(u64, u64)>,
+) -> CoreResult<Option<locus_blob::Reader>> {
+    let storage = |e: locus_blob::BlobError| CoreError::Storage(e.to_string());
+    if let Some(r) = s.blobs.read(key, range).await.map_err(storage)? {
+        return Ok(Some(r));
+    }
+    if s.store.blob_backend().await?.epoch == s.blobs.epoch() {
+        return Ok(None);
+    }
+    crate::keys::reload_soon(s);
+    active_store(s)
+        .await?
+        .read(key, range)
+        .await
+        .map_err(storage)
+}
+
+async fn open_store(s: &AppState, kind: &str, disk_root: Option<&str>) -> CoreResult<BlobStore> {
+    match kind {
         "disk" => {
-            let root = match &m.disk_root {
+            let root = match disk_root {
                 Some(r) => std::path::PathBuf::from(r),
                 None => s.scratch.root().to_path_buf(),
             };
@@ -163,20 +198,32 @@ pub async fn step(s: &AppState, lease: &LeaseToken) -> CoreResult<Step> {
     }
     let target = target_store(s, &m).await?;
     target.check().await?;
-    // A copy pass, then its verify.
+    // A copy pass over the rows changed since the last one.
     let mark = s.store.key_seq_mark(lease).await?;
     let changed = copy_range(s, lease, &target, m.copied_through, mark).await?;
+    crate::faults::at(s, "migrate.copy_pass").await?;
+    // Until a pass finds few changes nothing is verified; then the full
+    // verify (every row up to the mark) runs once, and every later pass
+    // verifies its own range.
+    if m.verified_through == 0 && changed > FEW_CHANGES {
+        s.store
+            .set_migration_marks(lease, &m.id, mark, 0, None)
+            .await?;
+        return Ok(Step::Copied(changed));
+    }
     let gaps = copy_range(s, lease, &target, m.verified_through, mark).await?;
+    s.store
+        .set_migration_marks(lease, &m.id, mark, mark, None)
+        .await?;
     if gaps > 0 {
+        // A fault: another pass before the cutover.
         tracing::warn!(
             id = m.id,
             gaps,
             "blob migration verify found rows without a copy; copied"
         );
+        return Ok(Step::Copied(changed + gaps));
     }
-    s.store
-        .set_migration_marks(lease, &m.id, mark, mark, None)
-        .await?;
     if changed > FEW_CHANGES {
         return Ok(Step::Copied(changed));
     }
@@ -228,6 +275,7 @@ pub async fn step(s: &AppState, lease: &LeaseToken) -> CoreResult<Step> {
         // The final pass: everything above the verified mark, then its verify
         // (acknowledged missing sources count; nothing can change meanwhile).
         copy_range(s, lease, &target, mark, i64::MAX).await?;
+        crate::faults::at(s, "migrate.final_pass").await?;
         let gaps = s.store.uncopied_between(mark, i64::MAX, true, 1).await?;
         let unacked = s
             .store
