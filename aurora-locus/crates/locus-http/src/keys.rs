@@ -339,6 +339,12 @@ pub struct SetPlcInput {
     /// Make the pending key current without a key backup.
     #[serde(default)]
     acknowledge_no_backup: bool,
+    /// Entryway role: a shard the operator set the pending key on.
+    confirm: Option<String>,
+    /// Entryway role: make the pending key current although shards are
+    /// unconfirmed (they refuse genesis operations signed with it).
+    #[serde(default)]
+    acknowledge_unconfirmed: bool,
     #[serde(flatten)]
     reauth: Reauth,
 }
@@ -351,23 +357,78 @@ pub async fn set_plc_rotation_key(
 ) -> XrpcResult<Json<Value>> {
     let who = owner(&s, &headers, locus_nsid!("owner.keys.setPlcRotationKey")).await?;
     admin_auth::reauth(&s, &who, &input.reauth).await?;
+    let rows = s.store.plc_key_rows().await?;
+    let pending = rows.iter().find(|r| r.role == PlcKeyRole::Pending.as_str());
+    // Entryway role: a shard set to the pending key by hand.
+    if let Some(name) = &input.confirm {
+        if s.role != locus_core::bootstrap::Role::Entryway {
+            return Err(XrpcError::invalid_request(
+                "--confirm is for the entryway role",
+            ));
+        }
+        let p = pending.ok_or_else(|| XrpcError::invalid_request("No key is pending"))?;
+        s.store
+            .shard(name)
+            .await?
+            .ok_or_else(|| XrpcError::invalid_request("No such shard"))?;
+        let (left, promoted) = s.store.confirm_pending_shard(name).await?;
+        admin_auth::audit(
+            &s,
+            &who,
+            "keys.plcRotationKey.confirm",
+            Some(&p.did_key),
+            Some(json!({"shard": name})),
+        )
+        .await;
+        if promoted.is_some() {
+            reload_soon(&s);
+        }
+        return Ok(Json(json!({
+            "didKey": p.did_key,
+            "role": if promoted.is_some() { "current" } else { "pending" },
+            "unconfirmed": left,
+        })));
+    }
     let actions = [
         input.generate,
         input.private_key_hex.is_some(),
         input.kms_key_id.is_some(),
         input.discard_pending,
-        input.acknowledge_no_backup,
+        input.acknowledge_no_backup || input.acknowledge_unconfirmed,
     ];
     if actions.iter().filter(|a| **a).count() != 1 {
         return Err(XrpcError::invalid_request(
-            "Give exactly one of generate, privateKeyHex, kmsKeyId, discardPending or acknowledgeNoBackup",
+            "Give exactly one of generate, privateKeyHex, kmsKeyId, discardPending, acknowledgeNoBackup or acknowledgeUnconfirmed",
         ));
     }
-    let rows = s.store.plc_key_rows().await?;
-    let pending = rows.iter().find(|r| r.role == PlcKeyRole::Pending.as_str());
-    if input.acknowledge_no_backup {
+    let confirmed = s.store.pending_confirmed_shards().await?;
+    if !confirmed.is_empty() && (input.discard_pending || actions[..3].iter().any(|a| *a)) {
+        return Err(XrpcError::invalid_request(format!(
+            "Shards were set to the pending key ({}); complete the change before setting another",
+            confirmed.join(", ")
+        )));
+    }
+    if input.acknowledge_no_backup || input.acknowledge_unconfirmed {
         let p = pending.ok_or_else(|| XrpcError::invalid_request("No key is pending"))?;
         let mut tx = s.store.begin().await?;
+        let unconfirmed = tx.unconfirmed_shards().await?;
+        if !unconfirmed.is_empty() && !input.acknowledge_unconfirmed {
+            return Err(XrpcError::invalid_request(format!(
+                "These shards aren't confirmed for the pending key: {} (set it there, then --confirm <shard>, or --acknowledge-unconfirmed)",
+                unconfirmed.join(", ")
+            )));
+        }
+        let backed_up = s
+            .store
+            .key_state()
+            .await?
+            .last_backup_at
+            .is_some_and(|b| b > p.created_at);
+        if !backed_up && !input.acknowledge_no_backup {
+            return Err(XrpcError::invalid_request(
+                "No key backup holds the pending key yet (or give --acknowledge-no-backup)",
+            ));
+        }
         tx.promote_pending_plc_key().await?;
         tx.commit().await?;
         admin_auth::audit(
@@ -375,7 +436,7 @@ pub async fn set_plc_rotation_key(
             &who,
             "keys.plcRotationKey.current",
             Some(&p.did_key),
-            Some(json!({"withoutBackup": true})),
+            Some(json!({"withoutBackup": input.acknowledge_no_backup, "unconfirmed": input.acknowledge_unconfirmed})),
         )
         .await;
         reload_soon(&s);

@@ -339,7 +339,27 @@ impl Tx {
 
     /// Revokes sessions: one by id, every session of an account, or every
     /// session made with one app password. Returns how many were revoked.
+    /// Revokes sessions. On an entryway, an account on a locus shard gets a
+    /// `revokeSessions` callback queued in the same transaction: the
+    /// sessions' ids, or for all of them every token issued before now.
     pub async fn revoke_sessions(
+        &mut self,
+        did: &str,
+        filter: SessionFilter<'_>,
+    ) -> CoreResult<u64> {
+        let sids: Option<Vec<String>> = match filter {
+            SessionFilter::One(id) => Some(vec![id.to_owned()]),
+            SessionFilter::All => None,
+            SessionFilter::AppPassword(name) => Some(self.app_password_sessions(did, name).await?),
+        };
+        let n = self.revoke_sessions_here(did, filter).await?;
+        if n > 0 || sids.is_none() {
+            self.queue_revocation(did, sids.as_deref()).await?;
+        }
+        Ok(n)
+    }
+
+    async fn revoke_sessions_here(
         &mut self,
         did: &str,
         filter: SessionFilter<'_>,

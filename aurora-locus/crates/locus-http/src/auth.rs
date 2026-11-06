@@ -218,7 +218,13 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
                 .and_then(Value::as_i64)
                 .is_some_and(|iat| iat * 1000 <= t)
         });
-    if imported {
+    if state.sessions.is_entryway() {
+        if state.sessions.entryway_verifies(&jws) {
+            Ok(())
+        } else {
+            Err(locus_auth::oauth::jose::JoseError("Invalid token".into()))
+        }
+    } else if imported {
         locus_auth::oauth::jose::verify_hs256(state.sessions.secret(), &jws)
     } else {
         state.secrets.oauth_key.verify(&jws)
@@ -238,11 +244,15 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
     if !jws.typ_is("at+jwt") || !iss_ok {
         return Err(invalid("Invalid token"));
     }
-    if !p
-        .get("aud")
-        .and_then(Value::as_str)
-        .is_some_and(|a| state.accepts_aud(a))
-    {
+    // An entryway's OAuth tokens are addressed to the account's shard.
+    let aud = p.get("aud").and_then(Value::as_str).unwrap_or("");
+    let shard_aud = if state.sessions.is_entryway() {
+        let sub = p.get("sub").and_then(Value::as_str).unwrap_or("");
+        state.store.account_shard_did(sub).await?.as_deref() == Some(aud)
+    } else {
+        false
+    };
+    if !(state.accepts_aud(aud) || shard_aud) {
         return Err(invalid(&format!(
             "Invalid audience (got: {}, expected one of: {})",
             p.get("aud").and_then(Value::as_str).unwrap_or(""),

@@ -624,6 +624,24 @@ kryphocron built in.
   `admin.deleteAccount`), and forwards repo and other calls to the
   account's shard. `com.atproto.temp.dereferenceScope` is served (a locus
   entryway sends full scopes).
+- Entryway pushes to locus shards, through a durable per-shard outbox
+  (delivered in order, kept until the shard acknowledges; a later
+  private-tier block for the same account, or a later key set, replaces
+  a queued one): every session revocation (logout, password change or
+  reset, app-password revoke, OAuth revoke, takedown) is queued in the
+  same transaction as `revokeSessions`, private-tier blocks as
+  `setPrivateTierBlock`, and re-adding a shard re-sends the keys and
+  every account's block. OAuth tokens from an entryway are ES256K,
+  addressed to the account's shard with the full scope and `sid` = the
+  grant, so shards check them statelessly. `keys rotate-entryway-key`
+  sends shards `{old, new}`, switches signing once every shard has it
+  (`--confirm <shard>` for a non-locus one) and sends `{new}` two hours
+  later. `keys set plc-rotation-key --confirm <shard>` records shards set
+  to a pending PLC rotation key, which becomes current only once every
+  shard taking accounts is confirmed (or with `--acknowledge-unconfirmed`);
+  once one is, the pending key can't be replaced or discarded. The
+  console's Shards page lists the shards, their queues and a rotation's
+  progress.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

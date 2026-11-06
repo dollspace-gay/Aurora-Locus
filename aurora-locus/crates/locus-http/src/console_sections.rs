@@ -52,6 +52,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/admin/limits", get(limits))
         .route("/admin/storage", get(storage))
         .route("/admin/jobs", get(jobs))
+        .route("/admin/shards", get(shards))
         .route("/admin/audit", get(audit))
         .route("/admin/audit/export", get(audit_export))
         .route("/admin/logs", get(logs))
@@ -1362,6 +1363,103 @@ pub async fn jobs(State(s): St, headers: HeaderMap) -> Response {
             .collect(),
         empty: "None.".into(),
     });
+    web::render(&p, StatusCode::OK)
+}
+
+// ---------------------------------------------------------------- shards
+
+/// `GET /admin/shards`: in the entryway role, the shards behind it, their
+/// queued callbacks, and a token-key rotation's progress. (Added, weighted
+/// and drained with `aurora-locus shard`.)
+pub async fn shards(State(s): St, headers: HeaderMap) -> Response {
+    let op = op_or_return!(s, headers);
+    let entryway = s.role == locus_core::bootstrap::Role::Entryway;
+    let mut p = section(
+        &s,
+        &op,
+        PageId::Shards,
+        if entryway {
+            "The PDSes behind this entryway. Add, weight and drain them with `aurora-locus shard`."
+        } else {
+            "Shards are for the entryway role; this node isn't one."
+        },
+    )
+    .await;
+    if !entryway {
+        return web::render(&p, StatusCode::OK);
+    }
+    let backlog = s.store.shard_backlog().await.unwrap_or_default();
+    let shards = s.store.shards().await.unwrap_or_default();
+    p.tables.push(Table {
+        title: "Shards".into(),
+        cols: cols(&[
+            ("name", "Name"),
+            ("text", "URL"),
+            ("num", "Accounts"),
+            ("num", "Weight"),
+            ("state", "Kind"),
+            ("state", "Placement"),
+            ("num", "Queued callbacks"),
+            ("text", "Last error"),
+        ]),
+        rows: shards
+            .iter()
+            .map(|sh| {
+                let (queued, err) = backlog
+                    .iter()
+                    .find(|(n, _, _)| *n == sh.name)
+                    .map_or((0, None), |(_, q, e)| (*q, e.clone()));
+                vec![
+                    Cell::new("name", sh.name.clone()),
+                    Cell::new("text", sh.url.clone()),
+                    Cell::new("num", sh.accounts.to_string()),
+                    Cell::new("num", sh.weight.to_string()),
+                    Cell::new("state", if sh.locus { "locus" } else { "non-locus" })
+                        .pill(if sh.locus { "fine" } else { "amber" }),
+                    Cell::new(
+                        "state",
+                        if sh.draining {
+                            "draining"
+                        } else {
+                            "taking accounts"
+                        },
+                    )
+                    .pill(if sh.draining { "amber" } else { "fine" }),
+                    Cell::new("num", queued.to_string()),
+                    Cell::new("text", err.unwrap_or_default()),
+                ]
+            })
+            .collect(),
+        empty: "No shard yet: `aurora-locus shard add <url> --admin-password-file <file>`.".into(),
+    });
+    if let Ok(Some(r)) = s.store.key_rotation().await
+        && r.finished_at.is_none()
+    {
+        let acked = r.acknowledged_shards();
+        p.tables.push(Table {
+            title: "Token key rotation".into(),
+            cols: cols(&[("name", "Shard"), ("state", "Has the new key")]),
+            rows: shards
+                .iter()
+                .map(|sh| {
+                    let ok = acked.contains(&sh.name) || r.switched_at.is_some();
+                    vec![
+                        Cell::new("name", sh.name.clone()),
+                        Cell::new(
+                            "state",
+                            match (ok, sh.locus) {
+                                (true, _) => "yes",
+                                (false, true) => "being sent",
+                                (false, false) => "update it, then --confirm",
+                            },
+                        )
+                        .pill(if ok { "fine" } else { "amber" }),
+                    ]
+                })
+                .collect(),
+            empty: "None.".into(),
+        });
+    }
     web::render(&p, StatusCode::OK)
 }
 

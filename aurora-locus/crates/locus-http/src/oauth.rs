@@ -687,6 +687,53 @@ fn access_token(
     s.secrets.oauth_key.sign(header, &claims)
 }
 
+/// An access token: this PDS's (stateful, ES256), or in the entryway role
+/// one a shard checks statelessly: ES256K with the entryway's token key,
+/// addressed to the account's shard, with the full scope and `sid` = the
+/// grant's id (stable across refreshes, so a shard can revoke it).
+#[allow(clippy::too_many_arguments)]
+async fn mint_access(
+    s: &AppState,
+    grant: i64,
+    token_id: &str,
+    did: &str,
+    client_id: &str,
+    jkt: Option<&str>,
+    scope: &str,
+    iat_ms: i64,
+    exp_ms: i64,
+) -> Result<String, OAuthError> {
+    if s.role != locus_core::bootstrap::Role::Entryway {
+        return Ok(access_token(
+            s, token_id, did, client_id, jkt, iat_ms, exp_ms,
+        ));
+    }
+    let aud = s
+        .store
+        .account_shard_did(did)
+        .await
+        .map_err(store_err)?
+        .unwrap_or_else(|| s.service_did.clone());
+    let mut claims = json!({
+        "iss": issuer(s),
+        "jti": token_id,
+        "sid": grant.to_string(),
+        "sub": did,
+        "aud": aud,
+        "iat": iat_ms / 1000,
+        "exp": exp_ms / 1000,
+        "client_id": client_id,
+        "scope": scope,
+    });
+    if let Some(j) = jkt {
+        claims["cnf"] = json!({ "jkt": j });
+    }
+    let key = crate::entryway::token_key(s)
+        .await
+        .map_err(|e| OAuthError::server_error(&e.message))?;
+    Ok(crate::entryway::sign_jws(&key, "at+jwt", &claims))
+}
+
 fn token_expiry(client: &Client, now: i64, created: i64) -> Result<i64, OAuthError> {
     let lifetime = oreq::TOKEN_MAX_AGE_MS.min(created + client.session_lifetime_ms() - now);
     if lifetime <= 250 {
@@ -866,20 +913,11 @@ async fn code_grant(
     let scope = crate::lexicon::token_scope(s, p.scope.as_deref().unwrap_or("atproto"))
         .await
         .map_err(|e| OAuthError::invalid_request(e.description))?;
-    let at = access_token(
-        s,
-        &token_id,
-        &did,
-        &client.id,
-        p.dpop_jkt.as_deref(),
-        now,
-        expires,
-    );
     s.store
         .oauth_create_token(&TokenRow {
             id: 0,
             did: did.clone(),
-            token_id,
+            token_id: token_id.clone(),
             created_at: now,
             updated_at: now,
             expires_at: expires,
@@ -894,6 +932,24 @@ async fn code_grant(
         })
         .await
         .map_err(store_err)?;
+    let grant = s
+        .store
+        .oauth_token(&token_id)
+        .await
+        .map_err(store_err)?
+        .map_or(0, |r| r.id);
+    let at = mint_access(
+        s,
+        grant,
+        &token_id,
+        &did,
+        &client.id,
+        p.dpop_jkt.as_deref(),
+        &scope,
+        now,
+        expires,
+    )
+    .await?;
     Ok(token_response(
         &at,
         refresh.as_deref(),
@@ -975,15 +1031,18 @@ async fn refresh_grant(
             )
             .await
             .map_err(store_err)?;
-        let at = access_token(
+        let at = mint_access(
             s,
+            row.id,
             &token_id,
             &row.did,
             &client.id,
             p.dpop_jkt.as_deref(),
+            &scope,
             now,
             expires,
-        );
+        )
+        .await?;
         Ok(token_response(
             &at,
             Some(&next),

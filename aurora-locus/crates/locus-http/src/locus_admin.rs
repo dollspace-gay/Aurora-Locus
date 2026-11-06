@@ -324,6 +324,8 @@ pub async fn set_private_tier_block(
     s.store
         .set_private_tier_blocked(&input.did, input.blocked)
         .await?;
+    // On an entryway, the account's locus shard is told.
+    crate::entryway::queue_block(&s, &input.did, input.blocked).await?;
     admin_auth::audit(
         &s,
         &who,

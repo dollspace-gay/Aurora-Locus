@@ -13922,4 +13922,287 @@ async fn entryway_methods_are_refused_in_other_roles() {
         )
         .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    h.console_operator("vic", "viewer", "vic-password-1234")
+        .await;
+    let b = Browser::default();
+    h.console_sign_in(&b, "vic", "vic-password-1234").await;
+    let (st, _, page) = b.get(&h, "/admin/shards").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(page.contains("this node isn"), "{page}");
+}
+
+#[tokio::test]
+async fn an_entryway_pushes_revocations_blocks_and_key_changes_to_its_shards() {
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (e, s, s_url) = entryway_and_shard().await;
+    let owner = e.owner_with_password("ena", "ena-password-123").await;
+    let reauth = json!({"password": "ena-password-123"});
+    let shard_pw = String::from_utf8(s.state.secrets.admin_password.to_vec()).unwrap();
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.shard.add"),
+            &owner,
+            Some(json!({"url": s_url, "adminPassword": shard_pw, "name": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // The add queued the current keys; deliver them.
+    crate::entryway::deliver_pushes(&e.state).await.unwrap();
+    let (_, acct) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": "cal.entryway.example.com", "email": "cal@example.com", "password": "cal-password"})),
+        )
+        .await;
+    let did = acct["did"].as_str().unwrap().to_owned();
+    let first = acct["accessJwt"].as_str().unwrap().to_owned();
+    let (_, sess) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(json!({"identifier": did, "password": "cal-password"})),
+        )
+        .await;
+    let access = sess["accessJwt"].as_str().unwrap().to_owned();
+    let refresh = sess["refreshJwt"].as_str().unwrap().to_owned();
+    let sr = &s;
+    let works = |t: String| async move {
+        sr.call(
+            "GET",
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            Some(&t),
+            None,
+        )
+        .await
+        .0
+    };
+    assert_eq!(works(access.clone()).await, StatusCode::OK);
+
+    // Logout: the shard refuses that session's tokens once the push lands.
+    let (st, _) = e
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.deleteSession",
+            Some(&refresh),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        works(access.clone()).await,
+        StatusCode::OK,
+        "not yet delivered"
+    );
+    assert_eq!(crate::entryway::deliver_pushes(&e.state).await.unwrap(), 1);
+    assert_eq!(works(access.clone()).await, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        works(first.clone()).await,
+        StatusCode::OK,
+        "another session"
+    );
+
+    // A password change refuses every earlier token.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            "/xrpc/com.atproto.admin.updateAccountPassword",
+            &e.basic_admin(),
+            Some(json!({"did": did, "password": "cal-password-2"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    crate::entryway::deliver_pushes(&e.state).await.unwrap();
+    assert_eq!(works(first.clone()).await, StatusCode::BAD_REQUEST);
+
+    // Private-tier blocks: the latest queued one wins (FIFO, superseded).
+    for blocked in [true, false, true] {
+        let (st, v) = e
+            .admin_call(
+                "POST",
+                &ns("moderator.account.setPrivateTierBlock"),
+                &owner,
+                Some(json!({"did": did, "blocked": blocked})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    let backlog = e.state.store.shard_backlog().await.unwrap();
+    assert_eq!(backlog, [("s1".to_owned(), 1, None)]);
+    // The console's shards page lists it with its queue.
+    e.console_operator("cora", "viewer", "cora-password-123")
+        .await;
+    let b = Browser::default();
+    e.console_sign_in(&b, "cora", "cora-password-123").await;
+    let (st, _, page) = b.get(&e, "/admin/shards").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        page.contains(&s_url) && page.contains("taking accounts"),
+        "{page}"
+    );
+    crate::entryway::deliver_pushes(&e.state).await.unwrap();
+    assert!(s.state.store.private_tier_blocked(&did).await.unwrap());
+
+    // A token-key rotation: the shard takes {old, new}, then signing
+    // switches; two hours later the shard keeps only the new key.
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &ns("owner.keys.rotateEntrywayKey"),
+            &owner,
+            Some(reauth.clone()),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (old, new) = (
+        v["oldKey"].as_str().unwrap().to_owned(),
+        v["newKey"].as_str().unwrap().to_owned(),
+    );
+    crate::entryway::rotation_step(&e.state).await.unwrap();
+    assert!(
+        e.state
+            .store
+            .key_rotation()
+            .await
+            .unwrap()
+            .unwrap()
+            .switched_at
+            .is_none(),
+        "not acknowledged yet"
+    );
+    crate::entryway::deliver_pushes(&e.state).await.unwrap();
+    let mut keys: Vec<String> = s
+        .state
+        .store
+        .shard_verify_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.did_key)
+        .collect();
+    keys.sort();
+    let mut both = vec![old.clone(), new.clone()];
+    both.sort();
+    assert_eq!(keys, both);
+    crate::entryway::rotation_step(&e.state).await.unwrap();
+    assert!(
+        e.state
+            .store
+            .key_rotation()
+            .await
+            .unwrap()
+            .unwrap()
+            .switched_at
+            .is_some()
+    );
+    assert_eq!(
+        crate::entryway::token_key(&e.state).await.unwrap().did(),
+        new
+    );
+    let locus_store::Store::Sqlite(pool) = &e.state.store else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE entryway_key_rotation SET switched_at = switched_at - 7300000")
+        .execute(pool)
+        .await
+        .unwrap();
+    crate::entryway::rotation_step(&e.state).await.unwrap();
+    crate::entryway::deliver_pushes(&e.state).await.unwrap();
+    let keys: Vec<String> = s
+        .state
+        .store
+        .shard_verify_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.did_key)
+        .collect();
+    assert_eq!(keys, [new.clone()]);
+    assert!(
+        e.state
+            .store
+            .key_rotation()
+            .await
+            .unwrap()
+            .unwrap()
+            .finished_at
+            .is_some()
+    );
+
+    // A new PLC rotation key becomes current only once the shard is
+    // confirmed (besides the key backup).
+    let set = ns("owner.keys.setPlcRotationKey");
+    let before = e.state.secrets.plc_keys.current_did().unwrap();
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"generate": true}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let pending = v["didKey"].as_str().unwrap().to_owned();
+    e.state
+        .store
+        .record_key_backup(locus_core::time::now_ms() + 1000, "test")
+        .await
+        .unwrap();
+    let current = || async {
+        e.state
+            .store
+            .plc_key_rows()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.role == "current")
+            .unwrap()
+            .did_key
+    };
+    assert_eq!(current().await, before, "the shard isn't confirmed");
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"discardPending": true}), &reauth)),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "discardable before any confirmation: {v}"
+    );
+    let (_, v) = e
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"generate": true}), &reauth)),
+        )
+        .await;
+    let pending = {
+        let _ = pending;
+        v["didKey"].as_str().unwrap().to_owned()
+    };
+    e.state
+        .store
+        .record_key_backup(locus_core::time::now_ms() + 1000, "test")
+        .await
+        .unwrap();
+    let (st, v) = e
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"confirm": "s1"}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["role"], "current");
+    assert_eq!(current().await, pending);
 }

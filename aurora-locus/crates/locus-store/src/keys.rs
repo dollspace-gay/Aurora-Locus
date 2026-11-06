@@ -182,12 +182,55 @@ impl Store {
             tx_pg(&tx),
         );
         let pending: Option<(String,)> = tx_run!(&mut tx, q, fetch_optional, started_at)?;
+        // On an entryway, every shard taking new accounts must have been
+        // confirmed for the pending key first.
         let promoted = match pending {
-            Some(_) => tx.promote_pending_plc_key().await?,
-            None => None,
+            Some(_) if tx.unconfirmed_shards().await?.is_empty() => {
+                tx.promote_pending_plc_key().await?
+            }
+            _ => None,
         };
         tx.commit().await?;
         Ok(promoted)
+    }
+
+    /// The shards confirmed for the pending PLC rotation key.
+    pub async fn pending_confirmed_shards(&self) -> CoreResult<Vec<String>> {
+        let q = "SELECT confirmed_shards FROM plc_rotation_key WHERE role = 'pending'";
+        let r: Option<(String,)> = run!(self, q, fetch_optional,)?;
+        Ok(r.and_then(|(j,)| serde_json::from_str(&j).ok())
+            .unwrap_or_default())
+    }
+
+    /// Records a shard as confirmed for the pending key (`keys set
+    /// plc-rotation-key --confirm <shard>`). Returns the shards still
+    /// unconfirmed, and the key made current if this was the last one and
+    /// a key backup holds it.
+    pub async fn confirm_pending_shard(
+        &self,
+        shard: &str,
+    ) -> CoreResult<(Vec<String>, Option<String>)> {
+        let mut list = self.pending_confirmed_shards().await?;
+        if !list.iter().any(|x| x == shard) {
+            list.push(shard.to_owned());
+        }
+        let mut tx = self.begin().await?;
+        let q = sql(
+            "UPDATE plc_rotation_key SET confirmed_shards = {1} WHERE role = 'pending'",
+            tx_pg(&tx),
+        );
+        tx_exec!(&mut tx, q, serde_json::to_string(&list).unwrap_or_default())?;
+        let left = tx.unconfirmed_shards().await?;
+        let q = "SELECT p.did_key FROM plc_rotation_key p, key_state k \
+                 WHERE p.role = 'pending' AND k.id = 1 AND k.last_backup_at > p.created_at";
+        let backed: Option<(String,)> = tx_run!(&mut tx, q, fetch_optional,)?;
+        let promoted = if left.is_empty() && backed.is_some() {
+            tx.promote_pending_plc_key().await?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok((left, promoted))
     }
 
     /// The hosted did:plc accounts whose documents must be fetched before
@@ -418,6 +461,26 @@ impl Tx {
     /// Re-encrypts every stored secret and account signing key from `old`
     /// to `new` and makes `new` the install's key (its `master_key_check`),
     /// all in this transaction. Returns (secrets, signing keys) rewrapped.
+    /// Shards taking new accounts (not draining) not yet confirmed for the
+    /// pending PLC rotation key (none outside the entryway role).
+    pub async fn unconfirmed_shards(&mut self) -> CoreResult<Vec<String>> {
+        let q = sql(
+            "SELECT name FROM shard WHERE draining = {1} ORDER BY name",
+            tx_pg(self),
+        );
+        let names: Vec<(String,)> = tx_run!(self, q, fetch_all, false)?;
+        let q = "SELECT confirmed_shards FROM plc_rotation_key WHERE role = 'pending'";
+        let r: Option<(String,)> = tx_run!(self, q, fetch_optional,)?;
+        let confirmed: Vec<String> = r
+            .and_then(|(j,)| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        Ok(names
+            .into_iter()
+            .map(|(n,)| n)
+            .filter(|n| !confirmed.contains(n))
+            .collect())
+    }
+
     pub async fn rewrap_all(&mut self, old: &MasterKey, new: &MasterKey) -> CoreResult<(u64, u64)> {
         tx_exec!(self, "DELETE FROM master_key_check",)?;
         self.ensure_master_key(new).await?;

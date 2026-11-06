@@ -375,9 +375,9 @@ impl Node {
                 )
                 .accepting_imported(self.store.reference_import().await?.map(|m| m.imported_at));
         let sessions = if self.bootstrap.role == locus_core::bootstrap::Role::Entryway {
-            let key = locus_http::entryway::load_or_create_token_key(&self.store, &self.master_key)
-                .await?;
-            sessions.with_entryway(locus_http::entryway::session_keys(key)?)
+            sessions.with_entryway(
+                locus_http::entryway::entryway_keys(&self.store, &self.master_key).await?,
+            )
         } else {
             sessions
         };
@@ -465,6 +465,9 @@ impl Node {
             self.spawn_audience_jobs(Arc::clone(&state));
             // A shard holds no PLC rotation key: the entryway signs its
             // accounts' operations and runs the key scan.
+            if self.bootstrap.role == locus_core::bootstrap::Role::Entryway {
+                self.spawn_shard_outbox(Arc::clone(&state));
+            }
             if self.bootstrap.role != locus_core::bootstrap::Role::Shard {
                 self.spawn_identity_repair(Arc::clone(&state));
                 self.spawn_plc_key_scan(Arc::clone(&state));
@@ -1147,6 +1150,38 @@ impl Node {
 
     /// The PLC key scan (which held keys each account's document lists),
     /// on one node at a time.
+    /// Entryway role: delivers the shard outbox and steps a token-key
+    /// rotation, on one node at a time.
+    fn spawn_shard_outbox(&mut self, state: Arc<AppState>) {
+        const NAME: &str = "shard-outbox";
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                NAME.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        while !cancel.is_cancelled() {
+                            if let Err(e) = locus_http::entryway::deliver_pushes(&state).await {
+                                tracing::warn!("shard outbox: {e:?}");
+                            }
+                            if let Err(e) = locus_http::entryway::rotation_step(&state).await {
+                                tracing::warn!("entryway key rotation: {e:?}");
+                            }
+                            tokio::select! {
+                                () = cancel.cancelled() => {}
+                                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            )));
+    }
+
     fn spawn_plc_key_scan(&mut self, state: Arc<AppState>) {
         const NAME: &str = "plc-key-scan";
         self.tasks

@@ -163,6 +163,19 @@ impl LegacySessions {
         self
     }
 
+    /// Whether a JWS verifies with an accepted entryway key (the entryway's
+    /// own OAuth tokens).
+    #[must_use]
+    pub fn entryway_verifies(&self, jws: &crate::oauth::jose::Jws) -> bool {
+        self.entryway.as_ref().is_some_and(|e| {
+            jws.alg() == "ES256K"
+                && e.accepted.iter().any(|k| {
+                    k.verify("ES256K", &jws.signing_input, &jws.signature)
+                        .is_ok()
+                })
+        })
+    }
+
     /// Whether this is the entryway role.
     #[must_use]
     pub fn is_entryway(&self) -> bool {

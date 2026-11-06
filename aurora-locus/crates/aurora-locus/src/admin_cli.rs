@@ -402,6 +402,15 @@ pub enum KeysCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Entryway role: a new token key. Locus shards get it at once;
+    /// signing switches once every shard has it (`--confirm <shard>` for a
+    /// non-locus shard updated by hand).
+    RotateEntrywayKey {
+        #[arg(long, value_name = "SHARD")]
+        confirm: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// The reference's rotate-keys: points each account's PLC document at
     /// the signing key stored here, then announces #identity and a fresh
     /// commit's #sync.
@@ -652,6 +661,14 @@ pub enum KeysSetCmd {
         /// Remove the pending key.
         #[arg(long)]
         discard_pending: bool,
+        /// Entryway role: this shard was set to the pending key (`keys set
+        /// entryway-plc-rotation-key` there).
+        #[arg(long, value_name = "SHARD")]
+        confirm: Option<String>,
+        /// Entryway role: make the pending key current although some
+        /// shards aren't confirmed (they refuse genesis ops signed with it).
+        #[arg(long)]
+        acknowledge_unconfirmed: bool,
         #[arg(long)]
         yes: bool,
     },
@@ -1088,12 +1105,16 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             kms_key_id,
             acknowledge_no_backup,
             discard_pending,
+            confirm,
+            acknowledge_unconfirmed,
             yes,
         }) => {
             let mut body = json!({
                 "generate": generate,
                 "acknowledgeNoBackup": acknowledge_no_backup,
+                "acknowledgeUnconfirmed": acknowledge_unconfirmed,
                 "discardPending": discard_pending,
+                "confirm": confirm,
             });
             if let Some(f) = &file {
                 body["privateKeyHex"] = json!(*read_key(f)?);
@@ -1101,7 +1122,9 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             if let Some(id) = &kms_key_id {
                 body["kmsKeyId"] = json!(id);
             }
-            let what = if discard_pending {
+            let what = if confirm.is_some() {
+                "Record the shard as set to the pending PLC rotation key"
+            } else if discard_pending {
                 "Remove the pending PLC rotation key"
             } else if acknowledge_no_backup {
                 "Make the pending PLC rotation key current without a key backup that holds it"
@@ -1192,6 +1215,36 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 "Replace the admin token used toward the entryway",
             )
             .await
+        }
+        KeysCmd::RotateEntrywayKey { confirm, yes } => {
+            let body = match &confirm {
+                Some(name) => json!({"confirm": name}),
+                None => reauth(c, "Rotate the entryway's token key", yes)?,
+            };
+            let v = c
+                .call(&lx("owner.keys.rotateEntrywayKey"), &[], Some(body))
+                .await?;
+            match confirm {
+                Some(name) => println!(
+                    "{name} confirmed for {}.",
+                    v["newKey"].as_str().unwrap_or("")
+                ),
+                None => {
+                    println!(
+                        "New token key {} (old {}); locus shards get it now.",
+                        v["newKey"].as_str().unwrap_or(""),
+                        v["oldKey"].as_str().unwrap_or("")
+                    );
+                    for n in v["confirmByHand"].as_array().into_iter().flatten() {
+                        println!(
+                            "  {}: set it there, then `keys rotate-entryway-key --confirm {}`",
+                            n.as_str().unwrap_or(""),
+                            n.as_str().unwrap_or("")
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         KeysCmd::RotateServiceKey { yes } => {
             let body = reauth(c, "Give the service DID a new signing key", yes)?;

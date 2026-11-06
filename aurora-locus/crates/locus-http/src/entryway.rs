@@ -84,6 +84,21 @@ pub fn session_keys(key: K256Keypair) -> locus_core::CoreResult<locus_auth::sess
     })
 }
 
+/// A compact ES256K JWS of `claims`, `typ` as given.
+#[must_use]
+pub fn sign_jws(key: &K256Keypair, typ: &str, claims: &Value) -> String {
+    use base64::Engine;
+    use proto_blue_crypto::Signer;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let input = format!(
+        "{}.{}",
+        b64(json!({"typ": typ, "alg": "ES256K"}).to_string().as_bytes()),
+        b64(claims.to_string().as_bytes())
+    );
+    let sig = key.sign(input.as_bytes()).unwrap_or_default();
+    format!("{input}.{}", b64(&sig))
+}
+
 /// The entryway's token key, from the key store.
 pub async fn token_key(s: &AppState) -> XrpcResult<K256Keypair> {
     let bytes = s
@@ -682,6 +697,7 @@ async fn owner(s: &AppState, headers: &HeaderMap, lxm: &str) -> XrpcResult<admin
 
 fn shard_view(sh: &Shard) -> Value {
     json!({
+        "backlog": Value::Null,
         "name": sh.name,
         "url": sh.url,
         "did": sh.did,
@@ -872,6 +888,15 @@ pub async fn add_shard(
             input.weight.unwrap_or(1).max(0),
         )
         .await?;
+    // A locus shard gets the current keys and blocks (a shard restored
+    // from a backup lost the ones it acknowledged since); one that's no
+    // longer locus loses its queue, which the operator applies by hand.
+    let dropped = if callback.is_some() {
+        requeue_shard(&s, &name).await?;
+        Vec::new()
+    } else {
+        s.store.drop_shard_pushes(&name).await?
+    };
     admin_auth::audit(
         &s,
         &who,
@@ -885,13 +910,42 @@ pub async fn add_shard(
         .shard(&name)
         .await?
         .ok_or_else(|| XrpcError::internal("the shard vanished"))?;
-    Ok(Json(shard_view(&sh)))
+    let mut out = shard_view(&sh);
+    if !dropped.is_empty() {
+        out["droppedCallbacks"] = json!(
+            dropped
+                .iter()
+                .map(|d| json!({"kind": d.kind, "body": d.body}))
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(Json(out))
 }
 
 pub async fn list_shards(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
     owner(&s, &headers, locus_nsid!("owner.shard.list")).await?;
-    let shards: Vec<Value> = s.store.shards().await?.iter().map(shard_view).collect();
-    Ok(Json(json!({ "shards": shards })))
+    let backlog = s.store.shard_backlog().await?;
+    let shards: Vec<Value> = s
+        .store
+        .shards()
+        .await?
+        .iter()
+        .map(|sh| {
+            let mut v = shard_view(sh);
+            if let Some((_, n, err)) = backlog.iter().find(|(name, _, _)| *name == sh.name) {
+                v["backlog"] = json!({"queued": n, "lastError": err});
+            }
+            v
+        })
+        .collect();
+    let rotation = s.store.key_rotation().await?.map(|r| {
+        json!({
+            "oldKey": r.old_key, "newKey": r.new_key,
+            "acknowledged": r.acknowledged_shards(),
+            "switchedAt": r.switched_at, "finishedAt": r.finished_at,
+        })
+    });
+    Ok(Json(json!({ "shards": shards, "rotation": rotation })))
 }
 
 #[derive(Deserialize)]
@@ -946,8 +1000,322 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("owner.shard.add"), post(add_shard))
         .route(at!("owner.shard.list"), get(list_shards))
         .route(at!("owner.shard.update"), post(update_shard))
+        .route(at!("owner.keys.rotateEntrywayKey"), post(rotate_key))
         .route(
             "/xrpc/com.atproto.temp.dereferenceScope",
             get(dereference_scope),
         )
+}
+
+// ---------------------------------------------------------------- token keys
+
+/// The next token key during a rotation (until the switch).
+pub const NEXT_KEY_SECRET: &str = "entryway_token_key_next";
+/// The previous token key after a switch (until the rotation ends).
+pub const PREV_KEY_SECRET: &str = "entryway_token_key_prev";
+/// How long after the switch the old key stays accepted: the longest
+/// legacy access-token lifetime.
+pub const ROTATION_OVERLAP_MS: i64 = 2 * 60 * 60 * 1000;
+
+async fn secret_key(
+    store: &locus_store::Store,
+    master: &locus_core::keys::MasterKey,
+    name: &str,
+) -> locus_core::CoreResult<Option<K256Keypair>> {
+    match store.get_secret(name, master).await? {
+        Some(b) => K256Keypair::from_private_key(&b)
+            .map(Some)
+            .map_err(|e| CoreError::Config(format!("{name}: {e}"))),
+        None => Ok(None),
+    }
+}
+
+/// The token keys a node signs and verifies with: the current key, plus
+/// the next one while a rotation waits for its switch, or the previous one
+/// for two hours after it.
+pub async fn entryway_keys(
+    store: &locus_store::Store,
+    master: &locus_core::keys::MasterKey,
+) -> locus_core::CoreResult<locus_auth::session::EntrywayKeys> {
+    let current = load_or_create_token_key(store, master).await?;
+    let mut keys = session_keys(current)?;
+    if let Some(r) = store.key_rotation().await?
+        && r.finished_at.is_none()
+    {
+        let other = if r.switched_at.is_none() {
+            secret_key(store, master, NEXT_KEY_SECRET).await?
+        } else {
+            secret_key(store, master, PREV_KEY_SECRET).await?
+        };
+        if let Some(k) = other {
+            keys.accepted
+                .push(crate::shard::did_key_verifier(&k.did()).map_err(CoreError::Config)?);
+        }
+    }
+    Ok(keys)
+}
+
+/// The verify keys shards should accept now (did:key).
+pub async fn accepted_verify_keys(s: &AppState) -> XrpcResult<Vec<String>> {
+    let mut keys = vec![token_key(s).await?.did()];
+    if let Some(r) = s.store.key_rotation().await?
+        && r.finished_at.is_none()
+    {
+        for k in [r.old_key, r.new_key] {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// Queues the current accepted verify keys, and every account's
+/// private-tier block, to a locus shard (a re-add, after a shard restore).
+async fn requeue_shard(s: &AppState, shard: &str) -> XrpcResult<()> {
+    let keys = accepted_verify_keys(s).await?;
+    let mut tx = s.store.begin().await?;
+    tx.queue_shard_push(shard, "setVerifyKeys", "", &json!({"keys": keys}))
+        .await?;
+    tx.commit().await?;
+    for (did, blocked) in s.store.shard_accounts_blocks(shard).await? {
+        s.store
+            .queue_shard_push(
+                shard,
+                "setPrivateTierBlock",
+                &did,
+                &json!({"did": did, "blocked": blocked}),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Queues an account's private-tier block to its locus shard.
+pub async fn queue_block(s: &AppState, did: &str, blocked: bool) -> XrpcResult<()> {
+    if s.role != locus_core::bootstrap::Role::Entryway {
+        return Ok(());
+    }
+    let mut tx = s.store.begin().await?;
+    if let Some(shard) = tx.account_locus_shard(did).await? {
+        tx.queue_shard_push(
+            &shard,
+            "setPrivateTierBlock",
+            did,
+            &json!({"did": did, "blocked": blocked}),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Deserialize, Default)]
+pub struct RotateInput {
+    /// A non-locus shard the operator updated by hand.
+    confirm: Option<String>,
+    #[serde(flatten)]
+    reauth: admin_auth::Reauth,
+}
+
+/// `owner.keys.rotateEntrywayKey`: a new token key. Every locus shard is
+/// sent `{old, new}`; signing switches once every shard has it (a
+/// non-locus shard is confirmed by hand with `confirm`), and two hours
+/// later shards are sent `{new}`.
+pub async fn rotate_key(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<RotateInput>,
+) -> XrpcResult<Json<Value>> {
+    use proto_blue_crypto::ExportableKeypair;
+    let who = owner(&s, &headers, locus_nsid!("owner.keys.rotateEntrywayKey")).await?;
+    if let Some(name) = &input.confirm {
+        let r = s
+            .store
+            .key_rotation()
+            .await?
+            .filter(|r| r.switched_at.is_none())
+            .ok_or_else(|| XrpcError::invalid_request("No rotation is waiting for shards"))?;
+        s.store
+            .shard(name)
+            .await?
+            .ok_or_else(|| XrpcError::invalid_request("No such shard"))?;
+        s.store.acknowledge_rotation(name).await?;
+        admin_auth::audit(
+            &s,
+            &who,
+            "keys.rotateEntrywayKey",
+            Some(name),
+            Some(json!({"confirmed": name})),
+        )
+        .await;
+        return Ok(Json(json!({"newKey": r.new_key, "confirmed": name})));
+    }
+    admin_auth::reauth(&s, &who, &input.reauth).await?;
+    let old = token_key(&s).await?;
+    let new = K256Keypair::generate();
+    let mut tx = s.store.begin().await?;
+    if !tx.start_key_rotation(&old.did(), &new.did()).await? {
+        return Err(XrpcError::invalid_request("A rotation is already running"));
+    }
+    tx.put_secret(NEXT_KEY_SECRET, &new.export_private_key(), &s.master_key)
+        .await?;
+    let shards = s.store.shards().await?;
+    for sh in shards.iter().filter(|sh| sh.locus) {
+        tx.queue_shard_push(
+            &sh.name,
+            "setVerifyKeys",
+            "",
+            &json!({"keys": [old.did(), new.did()]}),
+        )
+        .await?;
+    }
+    tx.bump_key_generation().await?;
+    tx.commit().await?;
+    admin_auth::audit(
+        &s,
+        &who,
+        "keys.rotateEntrywayKey",
+        None,
+        Some(json!({"old": old.did(), "new": new.did()})),
+    )
+    .await;
+    crate::keys::reload_soon(&s);
+    let waiting: Vec<&str> = shards
+        .iter()
+        .filter(|sh| !sh.locus)
+        .map(|sh| sh.name.as_str())
+        .collect();
+    Ok(Json(
+        json!({"oldKey": old.did(), "newKey": new.did(), "confirmByHand": waiting}),
+    ))
+}
+
+/// One step of a rotation: switch once every shard has `{old, new}`; end
+/// two hours later, sending `{new}`.
+pub async fn rotation_step(s: &AppState) -> XrpcResult<()> {
+    use proto_blue_crypto::ExportableKeypair;
+    let Some(r) = s.store.key_rotation().await? else {
+        return Ok(());
+    };
+    if r.finished_at.is_some() {
+        return Ok(());
+    }
+    match r.switched_at {
+        None => {
+            let acked = r.acknowledged_shards();
+            let shards = s.store.shards().await?;
+            if !shards.iter().all(|sh| acked.contains(&sh.name)) {
+                return Ok(());
+            }
+            let next = secret_key(&s.store, &s.master_key, NEXT_KEY_SECRET)
+                .await?
+                .ok_or_else(|| XrpcError::internal("the rotation's next key is missing"))?;
+            let old = token_key(s).await?;
+            let mut tx = s.store.begin().await?;
+            tx.put_secret(PREV_KEY_SECRET, &old.export_private_key(), &s.master_key)
+                .await?;
+            tx.put_secret(TOKEN_KEY_SECRET, &next.export_private_key(), &s.master_key)
+                .await?;
+            tx.bump_key_generation().await?;
+            tx.commit().await?;
+            s.store.mark_rotation(true).await?;
+            tracing::info!(key = %next.did(), "entryway token key switched");
+            crate::keys::reload_soon(s);
+        }
+        Some(at) if locus_core::time::now_ms() - at >= ROTATION_OVERLAP_MS => {
+            let mut tx = s.store.begin().await?;
+            for sh in s.store.shards().await?.iter().filter(|sh| sh.locus) {
+                tx.queue_shard_push(&sh.name, "setVerifyKeys", "", &json!({"keys": [r.new_key]}))
+                    .await?;
+            }
+            tx.bump_key_generation().await?;
+            tx.commit().await?;
+            s.store.mark_rotation(false).await?;
+            s.store.delete_secret(PREV_KEY_SECRET).await?;
+            s.store.delete_secret(NEXT_KEY_SECRET).await?;
+            tracing::info!("entryway token key rotation finished");
+            crate::keys::reload_soon(s);
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- delivery
+
+/// Delivers queued callbacks: per locus shard, oldest first, stopping at a
+/// failure (so a later value never lands before an earlier one). A
+/// definite refusal (a 4xx other than 401, 408 or 429) is dropped and
+/// logged, so one bad row can't hold the queue. Returns how many were
+/// delivered.
+pub async fn deliver_pushes(s: &AppState) -> XrpcResult<usize> {
+    let client = crate::pipethrough::client(s, false)?;
+    let mut delivered = 0;
+    for sh in s.store.shards().await?.into_iter().filter(|sh| sh.locus) {
+        let Some(token) = s
+            .store
+            .get_secret(&callback_token_secret(&sh.name), &s.master_key)
+            .await?
+        else {
+            continue;
+        };
+        let token = String::from_utf8_lossy(&token).into_owned();
+        for _ in 0..100 {
+            let Some(row) = s.store.next_shard_push(&sh.name).await? else {
+                break;
+            };
+            let body: Value = serde_json::from_str(&row.body).unwrap_or_default();
+            let res = client
+                .post(format!(
+                    "{}/xrpc/{}.shard.{}",
+                    sh.url,
+                    locus_core::LOCUS_NS,
+                    row.kind
+                ))
+                .bearer_auth(&token)
+                .json(&body)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            let delay = (1000_i64 << row.attempts.clamp(0, 9)).min(300_000);
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    s.store.delete_shard_push(row.id).await?;
+                    delivered += 1;
+                    if row.kind == "setVerifyKeys"
+                        && let Some(rot) = s.store.key_rotation().await?
+                        && rot.switched_at.is_none()
+                        && body["keys"].as_array().is_some_and(|k| {
+                            k.iter().any(|x| x == &json!(rot.new_key))
+                                && k.iter().any(|x| x == &json!(rot.old_key))
+                        })
+                    {
+                        s.store.acknowledge_rotation(&sh.name).await?;
+                    }
+                }
+                Ok(r)
+                    if r.status().is_client_error()
+                        && !matches!(r.status().as_u16(), 401 | 408 | 429) =>
+                {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    tracing::warn!(shard = %sh.name, kind = %row.kind, %status, "a shard refused a callback; dropped: {text}");
+                    s.store.delete_shard_push(row.id).await?;
+                }
+                Ok(r) => {
+                    let e = format!("{}", r.status());
+                    s.store.retry_shard_push(row.id, &e, delay).await?;
+                    break;
+                }
+                Err(e) => {
+                    s.store
+                        .retry_shard_push(row.id, &e.to_string(), delay)
+                        .await?;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(delivered)
 }

@@ -4,7 +4,7 @@
 use locus_core::CoreResult;
 
 use crate::blob::sql;
-use crate::{Store, db_err};
+use crate::{Store, Tx, db_err};
 
 impl Store {
     /// Records `value` in `namespace` for `ttl_ms`; false if it was already
@@ -328,15 +328,32 @@ impl Store {
     }
 
     /// Deletes a grant (and its spent refresh tokens).
+    /// Ends a grant. On an entryway, the account's locus shard is told to
+    /// refuse its tokens (`sid` = the grant's id), in the same transaction.
     pub async fn oauth_delete_token(&self, id: i64) -> CoreResult<()> {
+        let pg = self.is_postgres();
+        let mut tx = self.begin().await?;
+        let q = sql("SELECT did FROM oauth_token WHERE id = {1}", pg);
+        let did: Option<(String,)> = match &mut tx {
+            Tx::Sqlite(t) => sqlx::query_as(&q).bind(id).fetch_optional(&mut **t).await,
+            Tx::Postgres(t) => sqlx::query_as(&q).bind(id).fetch_optional(&mut **t).await,
+        }
+        .map_err(db_err)?;
         for q in [
             "DELETE FROM oauth_used_refresh WHERE token_id = {1}",
             "DELETE FROM oauth_token WHERE id = {1}",
         ] {
-            let q = sql(q, self.is_postgres());
-            exec!(self, q, id)?;
+            let q = sql(q, pg);
+            match &mut tx {
+                Tx::Sqlite(t) => sqlx::query(&q).bind(id).execute(&mut **t).await.map(|_| ()),
+                Tx::Postgres(t) => sqlx::query(&q).bind(id).execute(&mut **t).await.map(|_| ()),
+            }
+            .map_err(db_err)?;
         }
-        Ok(())
+        if let Some((did,)) = did {
+            tx.queue_revocation(&did, Some(&[id.to_string()])).await?;
+        }
+        tx.commit().await
     }
 
     /// Every grant of an account (password reset and takedown revoke them
