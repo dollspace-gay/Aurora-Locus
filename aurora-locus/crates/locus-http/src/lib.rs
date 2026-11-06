@@ -29,6 +29,7 @@ pub mod lexicon;
 pub mod locus_admin;
 pub mod media_gate;
 pub mod membership;
+pub mod metrics;
 pub mod oauth;
 pub mod oauth_ui;
 pub mod pipethrough;
@@ -64,6 +65,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/xrpc/_health", get(health::health))
         .route("/healthz", get(health::healthz))
+        .route("/metrics", get(metrics::serve))
         .route("/readyz", get(health::readyz))
         .route("/tls-check", get(health::tls_check))
         .route(
@@ -445,6 +447,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             ratelimit::middleware,
         ))
+        .layer(axum::middleware::from_fn(metrics::record))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             routing::headers_and_deadline,

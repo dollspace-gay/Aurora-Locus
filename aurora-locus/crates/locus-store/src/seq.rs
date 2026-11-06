@@ -14,6 +14,8 @@ pub struct OutboxRow {
     pub did: String,
     pub kind: String,
     pub payload: Vec<u8>,
+    /// When the row was queued (ms).
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +96,9 @@ impl Tx {
 
     /// Every visible outbox row, oldest id first, up to `limit`.
     pub async fn outbox_batch(&mut self, limit: i64) -> CoreResult<Vec<OutboxRow>> {
-        let rows: Vec<(i64, String, String, Vec<u8>)> = on_tx!(
+        let rows: Vec<(i64, String, String, Vec<u8>, i64)> = on_tx!(
             self,
-            "SELECT id, did, kind, payload FROM outbox ORDER BY id LIMIT {1}",
+            "SELECT id, did, kind, payload, created_at FROM outbox ORDER BY id LIMIT {1}",
             |q, ex| sqlx::query_as(q)
                 .bind(limit)
                 .fetch_all(ex)
@@ -105,11 +107,12 @@ impl Tx {
         )?;
         Ok(rows
             .into_iter()
-            .map(|(id, did, kind, payload)| OutboxRow {
+            .map(|(id, did, kind, payload, created_at)| OutboxRow {
                 id,
                 did,
                 kind,
                 payload,
+                created_at,
             })
             .collect())
     }

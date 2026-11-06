@@ -232,6 +232,17 @@ pub async fn run_leased<F, Fut>(
             Some(r) => r,
             None => handle.await,
         };
+        let outcome = match &res {
+            Ok(Ok(())) => "ok",
+            Ok(Err(CoreError::LeaseLost(_))) => "lease_lost",
+            Ok(Err(_)) => "failed",
+            Err(_) => "panicked",
+        };
+        locus_core::metrics::inc(
+            "locus_job_runs_total",
+            &[("job", &name), ("outcome", outcome)],
+            1,
+        );
         match res {
             Ok(Ok(())) => {}
             Ok(Err(CoreError::LeaseLost(m))) => tracing::warn!(lease = %name, "job stopped: {m}"),

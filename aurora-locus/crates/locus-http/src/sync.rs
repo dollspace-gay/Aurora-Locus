@@ -120,6 +120,7 @@ async fn serve(
                     pos = ev.seq;
                 }
                 Err(RecvError::Lagged(_)) => {
+                    locus_core::metrics::inc("locus_firehose_dropped_total", &[], 1);
                     let _ = tx.send(send(locus_sync::error_frame("ConsumerTooSlow", "Stream consumer too slow"))).await;
                     let _ = tx.close().await;
                     return;

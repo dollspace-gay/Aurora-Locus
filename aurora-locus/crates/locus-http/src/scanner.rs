@@ -34,6 +34,18 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Scans the bytes at `storage_key`.
 pub async fn scan_key(s: &AppState, did: &str, cid: &str, mime: &str, storage_key: &str) -> Scan {
+    let scan = scan_key_once(s, did, cid, mime, storage_key).await;
+    let result = match &scan {
+        Scan::NotConfigured => return scan,
+        Scan::Allowed => "allowed",
+        Scan::Matched { .. } => "matched",
+        Scan::Unavailable(_) => "unavailable",
+    };
+    locus_core::metrics::inc("locus_scanner_calls_total", &[("result", result)], 1);
+    scan
+}
+
+async fn scan_key_once(s: &AppState, did: &str, cid: &str, mime: &str, storage_key: &str) -> Scan {
     let snap = s.snapshot();
     if snap.text("blobs.scanner") == "none" {
         return Scan::NotConfigured;

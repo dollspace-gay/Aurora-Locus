@@ -486,6 +486,7 @@ impl RepoEngine {
     /// (handlers skip the no-op cases the reference skips, like a put of an
     /// identical record).
     pub async fn commit(&self, req: CommitRequest<'_>) -> Result<CommitOutcome, CommitError> {
+        let _timer = locus_core::metrics::Timer::start("locus_repo_commit_seconds");
         let did = req.did;
         let lock = self.repo_lock(did);
         let _held = lock.lock().await;

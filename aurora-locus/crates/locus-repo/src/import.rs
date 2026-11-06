@@ -515,6 +515,7 @@ impl RepoEngine {
         car: &Path,
         signing_key: Option<&str>,
     ) -> Result<Staged, ImportError> {
+        let _timer = locus_core::metrics::Timer::start("locus_repo_verify_seconds");
         let did = job.did.as_str();
         let store = self.store();
         let file = tokio::fs::File::open(car)

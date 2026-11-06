@@ -208,6 +208,15 @@ impl Store {
         }
     }
 
+    /// Pool connections: (open, idle).
+    #[must_use]
+    pub fn pool_stats(&self) -> (u32, usize) {
+        match self {
+            Store::Sqlite(p) => (p.size(), p.num_idle()),
+            Store::Postgres(p) => (p.size(), p.num_idle()),
+        }
+    }
+
     pub fn is_postgres(&self) -> bool {
         matches!(self, Self::Postgres(_))
     }

@@ -552,6 +552,27 @@ pub static REGISTRY: &[Def] = &[
         description: "Repo write points per account per day.",
     },
     Def {
+        key: "metrics.enabled",
+        kind: Kind::Bool,
+        default: "true",
+        env: Some("LOCUS_METRICS_ENABLED"),
+        description: "Serve Prometheus metrics at /metrics (to the allowed addresses, or with the token).",
+    },
+    Def {
+        key: "metrics.allowed_ips",
+        kind: Kind::TextList { max_len: 64 },
+        default: r#"["127.0.0.0/8", "::1/128"]"#,
+        env: Some("LOCUS_METRICS_ALLOWED_IPS"),
+        description: "Client IPs or CIDRs that may read /metrics without the token.",
+    },
+    Def {
+        key: "metrics.token",
+        kind: Kind::Text { max_len: 512 },
+        default: r#""""#,
+        env: Some("LOCUS_METRICS_TOKEN"),
+        description: "A bearer token that reads /metrics from anywhere. Empty: none.",
+    },
+    Def {
         key: "sync.max_subscribers",
         kind: Kind::Int {
             min: 0,

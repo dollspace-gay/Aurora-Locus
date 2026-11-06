@@ -677,6 +677,13 @@ kryphocron built in.
   are shared through Redis; without it they stay in the database. A node
   that can't reach its Redis doesn't start. Nodes warn at boot when
   another live node has a different role or Redis URL.
+- Prometheus metrics at `/metrics`: XRPC requests and latency by NSID
+  and status, commit and import-verify time, sequencer lag and events,
+  firehose subscribers and drops, job runs, rate-limit refusals, blob
+  bytes, database pool connections, kryphocron encodes, scanner calls and
+  gated media fetches. Readable from `metrics.allowed_ips` (loopback by
+  default) or with `metrics.token` (`LOCUS_METRICS_TOKEN`); off with
+  `metrics.enabled`.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

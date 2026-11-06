@@ -14799,3 +14799,76 @@ async fn redis_holds_rate_limits_and_replay_windows() {
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers().contains_key("retry-after"));
 }
+
+#[tokio::test]
+async fn metrics_are_served_to_allowed_addresses_or_the_token() {
+    let h = harness(false).await;
+    let get = |peer: &'static str, token: Option<&'static str>| {
+        let h = &h;
+        async move {
+            let mut req = Request::builder()
+                .uri("/metrics")
+                .header("host", h.state.hostname.clone());
+            if let Some(t) = token {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            let mut req = req.body(Body::empty()).unwrap();
+            let addr: std::net::SocketAddr = format!("{peer}:40000").parse().unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(addr));
+            let res = h.app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+    let (did, access) = h.user("met.pds.example.com").await;
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("m")})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    h.call("GET", "/xrpc/not..valid", None, None).await;
+
+    let (st, body) = get("127.0.0.1", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        body.contains(
+            r#"locus_http_requests_total{nsid="com.atproto.repo.createRecord",status="200"}"#
+        ),
+        "{body}"
+    );
+    assert!(body.contains(
+        r#"locus_http_request_seconds_bucket{nsid="com.atproto.repo.createRecord",le="+Inf"}"#
+    ));
+    assert!(body.contains(r#"locus_http_requests_total{nsid="invalid","#));
+    assert!(body.contains("locus_repo_commit_seconds_count"));
+    assert!(body.contains(r#"locus_db_pool_connections{state="idle"}"#));
+    assert!(body.contains("# TYPE locus_firehose_subscribers gauge"));
+
+    // Elsewhere: refused, unless with the token.
+    assert_eq!(get("203.0.113.9", None).await.0, StatusCode::FORBIDDEN);
+    h.state
+        .settings
+        .set("metrics.token", json!("metrics-token-123"), "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        get("203.0.113.9", Some("wrong")).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get("203.0.113.9", Some("metrics-token-123")).await.0,
+        StatusCode::OK
+    );
+    h.state
+        .settings
+        .set("metrics.enabled", json!(false), "test")
+        .await
+        .unwrap();
+    assert_eq!(get("127.0.0.1", None).await.0, StatusCode::NOT_FOUND);
+}

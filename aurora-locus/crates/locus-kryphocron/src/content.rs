@@ -151,6 +151,7 @@ impl Encoder {
         audience: Option<&str>,
         payload: &[u8],
     ) -> Result<EncodedRecord, PipelineError> {
+        locus_core::metrics::inc("locus_kryphocron_encodes_total", &[], 1);
         let (d, n, r) = ids(did, collection, rkey)?;
         let audience = audience.and_then(|a| AtUri::new(a).ok());
         let subject = TargetRepresentation::structural_only(StructuralRepresentation::Resource {

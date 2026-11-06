@@ -269,6 +269,9 @@ pub async fn limit(s: &AppState, list: &[(Bucket, &str, i64)]) -> XrpcResult<()>
             continue;
         }
         let st = consume(s, *b, key, *points).await;
+        if st.exceeded {
+            locus_core::metrics::inc("locus_rate_limit_hits_total", &[("bucket", b.name)], 1);
+        }
         exceeded |= st.exceeded;
         if let Ok(mut sl) = slot.lock() {
             sl.statuses.push(st);
@@ -527,6 +530,7 @@ pub struct SubscriberGuard {
 
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
+        locus_core::metrics::add("locus_firehose_subscribers", &[], -1.0);
         let mut map = self
             .s
             .limits
@@ -573,6 +577,7 @@ pub fn subscribe(s: &Arc<AppState>) -> XrpcResult<SubscriberGuard> {
         ));
     }
     *map.entry(key).or_default() += 1;
+    locus_core::metrics::add("locus_firehose_subscribers", &[], 1.0);
     Ok(SubscriberGuard {
         s: Arc::clone(s),
         ip,

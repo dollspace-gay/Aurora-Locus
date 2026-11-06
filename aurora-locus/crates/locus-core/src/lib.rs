@@ -7,6 +7,7 @@ pub mod key_backup;
 pub mod keys;
 pub mod lease;
 pub mod logs;
+pub mod metrics;
 pub mod settings;
 pub mod setup;
 pub mod time;

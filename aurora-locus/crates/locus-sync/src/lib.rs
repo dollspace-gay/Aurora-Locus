@@ -34,6 +34,11 @@ pub async fn sequence_once(
     tx.fence(lease).await?;
     let state = tx.lock_seq_state().await?;
     let rows = tx.outbox_batch(batch).await?;
+    #[allow(clippy::cast_precision_loss)]
+    let lag = rows.first().map_or(0.0, |r| {
+        (locus_core::time::now_ms() - r.created_at).max(0) as f64 / 1000.0
+    });
+    locus_core::metrics::set("locus_sequencer_lag_seconds", &[], lag);
     if rows.is_empty() {
         tx.rollback().await?;
         return Ok(0);
@@ -48,6 +53,7 @@ pub async fn sequence_once(
     }
     tx.set_last_seq(seq).await?;
     tx.commit().await?;
+    locus_core::metrics::inc("locus_sequencer_events_total", &[], rows.len() as u64);
     Ok(rows.len())
 }
 

@@ -861,6 +861,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
     let cid = written.cid.to_string_base32();
     let mime = locus_blob::mime_type(&written.head, content_type.as_deref());
     let size = i64::try_from(written.size).unwrap_or(i64::MAX);
+    locus_core::metrics::inc("locus_blob_bytes_total", &[], written.size);
 
     // Scanned in temp storage, before it can be used.
     use crate::scanner::Scan;
@@ -1033,6 +1034,12 @@ async fn gated_blob(s: &Arc<AppState>, headers: &HeaderMap, did: &str, cid: &str
     };
     if gate && (res.extensions().get::<GatedBlob>().is_some() || !res.status().is_success()) {
         crate::media_gate::no_store(&mut res);
+        let outcome = if res.status().is_success() {
+            "served"
+        } else {
+            "refused"
+        };
+        locus_core::metrics::inc("locus_gated_fetches_total", &[("outcome", outcome)], 1);
     }
     res
 }
