@@ -715,6 +715,11 @@ kryphocron built in.
 - Blobs uploaded after an import whose records already use them, and blobs
   an import brings in, are now checked for being private-only.
 - The blob delete job skips keys a branding upload still uses.
+- A shard stops accepting a previous entryway verify key when its 2 h
+  overlap ends (it accepted it until the next restart or key change).
+- `keys set entryway-plc-rotation-key` keeps every stored key since the
+  last `--revoke-previous`, even when set again before the node reloaded
+  (a quick second change dropped the key set before it).
 
 - proto-blue is pinned to `skydeval/proto-blue` `feat/lazy-mst` (`a88e52e`),
   which adds the lazily loaded MST.

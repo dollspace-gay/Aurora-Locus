@@ -51,8 +51,8 @@ pub struct Entryway {
     /// Its URL, without a trailing slash (also the OAuth issuer).
     pub url: String,
     pub did: String,
-    /// Accepted token verify keys (did:key, key).
-    verify_keys: Vec<(String, PublicJwk)>,
+    /// Accepted token verify keys (did:key, key, accepted until in ms).
+    verify_keys: Vec<(String, PublicJwk, Option<i64>)>,
     /// Accepted PLC rotation keys for genesis operations, current first.
     pub plc_rotation_keys: Vec<String>,
     admin_token: Zeroizing<String>,
@@ -163,7 +163,7 @@ impl Entryway {
             .into_iter()
             .map(|r| {
                 did_key_verifier(&r.did_key)
-                    .map(|v| (r.did_key.clone(), v))
+                    .map(|v| (r.did_key.clone(), v, r.expires_at))
                     .map_err(CoreError::Config)
             })
             .collect::<CoreResult<Vec<_>>>()?;
@@ -232,7 +232,7 @@ impl Entryway {
             did: did.to_owned(),
             verify_keys: verify
                 .iter()
-                .map(|k| (k.clone(), did_key_verifier(k).expect("a k256 did:key")))
+                .map(|k| (k.clone(), did_key_verifier(k).expect("a k256 did:key"), None))
                 .collect(),
             plc_rotation_keys: plc.to_vec(),
             admin_token: Zeroizing::new("entryway-admin".into()),
@@ -243,15 +243,18 @@ impl Entryway {
     /// The accepted verify keys (did:key).
     #[must_use]
     pub fn verify_key_ids(&self) -> Vec<String> {
-        self.verify_keys.iter().map(|(k, _)| k.clone()).collect()
+        self.verify_keys.iter().map(|(k, ..)| k.clone()).collect()
     }
 
-    /// Checks an ES256K JWS against the accepted verify keys.
+    /// Checks an ES256K JWS against the accepted verify keys. A previous
+    /// key stops being accepted when its overlap ends, without a reload.
     fn verify(&self, jws: &Jws) -> bool {
+        let now = locus_core::time::now_ms();
         jws.alg() == "ES256K"
-            && self.verify_keys.iter().any(|(_, k)| {
-                k.verify("ES256K", &jws.signing_input, &jws.signature)
-                    .is_ok()
+            && self.verify_keys.iter().any(|(_, k, until)| {
+                until.is_none_or(|t| t > now)
+                    && k.verify("ES256K", &jws.signing_input, &jws.signature)
+                        .is_ok()
             })
     }
 
