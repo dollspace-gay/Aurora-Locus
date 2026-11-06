@@ -387,13 +387,16 @@ pub async fn delete_due_accounts(s: &AppState) -> locus_core::CoreResult<usize> 
 /// Parses an RFC 3339 datetime into ms since the epoch (UTC offsets and
 /// fractional seconds accepted).
 pub(crate) fn parse_datetime_ms(s: &str) -> Option<i64> {
+    // Every field is unsigned ASCII digits, at most 4 of them.
+    let num = |s: &str| -> Option<i64> {
+        if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
     let (date, rest) = s.split_once('T')?;
     let mut d = date.splitn(3, '-');
-    let (y, m, day): (i64, i64, i64) = (
-        d.next()?.parse().ok()?,
-        d.next()?.parse().ok()?,
-        d.next()?.parse().ok()?,
-    );
+    let (y, m, day) = (num(d.next()?)?, num(d.next()?)?, num(d.next()?)?);
     let (time, offset_min) =
         if let Some(t) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
             (t, 0)
@@ -402,16 +405,20 @@ pub(crate) fn parse_datetime_ms(s: &str) -> Option<i64> {
             let (t, off) = rest.split_at(i);
             let sign = if off.starts_with('-') { -1 } else { 1 };
             let (oh, om) = off[1..].split_once(':')?;
-            (
-                t,
-                sign * (oh.parse::<i64>().ok()? * 60 + om.parse::<i64>().ok()?),
-            )
+            let (oh, om) = (num(oh)?, num(om)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            (t, sign * (oh * 60 + om))
         };
     let mut t = time.splitn(3, ':');
-    let (hh, mm): (i64, i64) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    let (hh, mm) = (num(t.next()?)?, num(t.next()?)?);
     let sec = t.next()?;
     let (ss, frac) = sec.split_once('.').unwrap_or((sec, "0"));
-    let ss: i64 = ss.parse().ok()?;
+    let ss = num(ss)?;
+    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
     if !(1..=12).contains(&m) || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
         return None;
@@ -448,5 +455,59 @@ mod tests {
         );
         assert_eq!(parse_datetime_ms("not a date"), None);
         assert_eq!(parse_datetime_ms("2023-13-01T00:00:00Z"), None);
+    }
+
+    fn vectors(file: &str) -> Vec<String> {
+        let path = format!(
+            "{}/../../interop-test-files/syntax/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+            .split('\n')
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn interop_datetime_vectors() {
+        let valid = vectors("datetime_syntax_valid.txt");
+        assert!(valid.len() > 30);
+        for d in &valid {
+            assert!(parse_datetime_ms(d).is_some(), "{d:?} refused");
+        }
+        // 1985-04-12T23:20:50Z, and its offsets.
+        let base = 482_196_050_000;
+        assert_eq!(parse_datetime_ms(&valid[0]), Some(base + 123));
+        assert_eq!(
+            parse_datetime_ms("1985-04-12T23:20:50.123-07:00"),
+            Some(base + 123 + 7 * 3_600_000)
+        );
+        assert_eq!(
+            parse_datetime_ms("1985-04-12T23:20:50.123+01:45"),
+            Some(base + 123 - 105 * 60_000)
+        );
+        for d in vectors("datetime_parse_invalid.txt") {
+            assert_eq!(parse_datetime_ms(&d), None, "{d:?} accepted");
+        }
+    }
+
+    /// Inputs that panicked (a multi-byte character inside the fraction,
+    /// an overflowing year or offset) or were taken with signs.
+    #[test]
+    fn hostile_datetimes_are_refused_without_panicking() {
+        for d in [
+            "2024-01-01T00:00:00.11\u{e9}Z",
+            "2024-01-01T00:00:00.\u{e9}Z",
+            "99999999999999999-01-01T00:00:00Z",
+            "2024-01-01T00:00:00+99999999999999999:00",
+            "2024-01-01T-1:00:00Z",
+            "2024-01-01T00:00:+5Z",
+            "2024-01-01T00:00:00.Z",
+            "2024-01-01T00:00:00.-1Z",
+        ] {
+            assert_eq!(parse_datetime_ms(d), None, "{d:?}");
+        }
     }
 }

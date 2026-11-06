@@ -121,6 +121,33 @@ mod tests {
     }
 
     #[test]
+    fn interop_tid_vectors() {
+        let read = |f: &str| {
+            let path = format!(
+                "{}/../../interop-test-files/syntax/{f}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{path}: {e}"))
+                .split('\n')
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let valid = read("tid_syntax_valid.txt");
+        assert!(valid.len() >= 6);
+        for t in &valid {
+            let v = decode(t).unwrap_or_else(|| panic!("{t:?} refused"));
+            assert_eq!(encode(v), *t, "round trip");
+        }
+        let invalid = read("tid_syntax_invalid.txt");
+        assert!(invalid.len() >= 6);
+        for t in &invalid {
+            assert_eq!(decode(t), None, "{t:?} accepted");
+        }
+    }
+
+    #[test]
     fn rejects_invalid() {
         assert_eq!(decode("short"), None);
         assert_eq!(decode("zzzzzzzzzzzzz"), None); // high bit set

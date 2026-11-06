@@ -153,6 +153,44 @@ mod tests {
         }
     }
 
+    fn vectors(file: &str) -> Vec<String> {
+        let path = format!(
+            "{}/../../interop-test-files/syntax/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+            .split('\n')
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn interop_tid_and_at_uri_vectors() {
+        for t in vectors("tid_syntax_valid.txt") {
+            assert!(check_rkey(&t).is_ok(), "{t:?}");
+        }
+        for t in vectors("tid_syntax_invalid.txt") {
+            assert!(check_rkey(&t).is_err(), "{t:?}");
+        }
+        // Valid AT-URIs split into the parts the syntax parser finds.
+        let uris = vectors("aturi_syntax_valid.txt");
+        assert!(uris.len() > 20);
+        for u in &uris {
+            let parsed = proto_blue_syntax::AtUri::new(u).unwrap();
+            assert_eq!(
+                split_uri(u),
+                Some((
+                    parsed.authority(),
+                    parsed.collection().unwrap_or(""),
+                    parsed.rkey().unwrap_or("")
+                )),
+                "{u}"
+            );
+        }
+    }
+
     #[test]
     fn rkeys_are_tids() {
         assert!(check_record(DID, nsid::LIKE, "self", &map(serde_json::json!({}))).is_err());

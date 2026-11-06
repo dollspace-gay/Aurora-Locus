@@ -107,10 +107,50 @@ pub struct PreparedRecord {
 }
 
 /// Parses a record from request JSON in strict mode: no floats, safe
-/// integers only, well-formed `$link`/`$bytes`/blob refs.
+/// integers only, and, as the reference's strict parse, `$link` and
+/// `$bytes` objects with no other fields, every `$type` a non-empty string
+/// and every `$type: "blob"` object a complete blob ref.
 pub fn parse_json(json: &Value) -> Result<LexValue, InvalidRecord> {
+    check_strict_shapes(json)?;
     proto_blue_lex_json::json_to_lex_with(json, proto_blue_lex_json::LexParseOptions::strict())
         .map_err(|e| bad(format!("Invalid record: {e}")))
+}
+
+fn check_strict_shapes(json: &Value) -> Result<(), InvalidRecord> {
+    match json {
+        Value::Object(m) => {
+            if (m.contains_key("$link") || m.contains_key("$bytes")) && m.len() != 1 {
+                return Err(bad("Invalid record: extra fields in a $link or $bytes object"));
+            }
+            match m.get("$type") {
+                None => {}
+                Some(Value::String(t)) if t == "blob" && !is_blob_ref(m) => {
+                    return Err(bad("Invalid record: invalid blob object"));
+                }
+                Some(Value::String(t)) if !t.is_empty() => {}
+                Some(Value::String(_)) => return Err(bad("Invalid record: empty $type property")),
+                Some(_) => return Err(bad("Invalid record: invalid $type property")),
+            }
+            m.values().try_for_each(check_strict_shapes)
+        }
+        Value::Array(a) => a.iter().try_for_each(check_strict_shapes),
+        _ => Ok(()),
+    }
+}
+
+/// `{$type: "blob", ref: {$link}, mimeType: "a/b", size: n}`, nothing else
+/// (the link itself is checked by the parse).
+fn is_blob_ref(m: &serde_json::Map<String, Value>) -> bool {
+    m.len() == 4
+        && m.get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains('/'))
+        && m.get("size")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n <= (1 << 53) - 1)
+        && m.get("ref")
+            .and_then(Value::as_object)
+            .is_some_and(|r| r.get("$link").is_some_and(Value::is_string))
 }
 
 /// Checks an rkey's syntax and the reference's slur filter.
@@ -198,7 +238,7 @@ fn validate_record(
 }
 
 /// The record schema's key type: `tid`, `nsid`, `literal:<value>` or `any`.
-fn check_key_type(collection: &str, key: Option<&str>, rkey: &str) -> Result<(), InvalidRecord> {
+pub(crate) fn check_key_type(collection: &str, key: Option<&str>, rkey: &str) -> Result<(), InvalidRecord> {
     let ok = match key.unwrap_or("any") {
         "tid" => proto_blue_syntax::Tid::new(rkey).is_ok(),
         "nsid" => proto_blue_syntax::Nsid::new(rkey).is_ok(),

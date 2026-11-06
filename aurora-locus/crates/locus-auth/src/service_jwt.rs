@@ -106,14 +106,13 @@ impl Unverified {
     /// Whether the signature verifies against `did_key`.
     #[must_use]
     pub fn verifies_with(&self, did_key: &str) -> bool {
-        proto_blue_crypto::verify_signature(
-            did_key,
-            self.signing_input.as_bytes(),
-            &self.sig,
-            false,
-        )
-        .unwrap_or(false)
+        signature_ok(did_key, self.signing_input.as_bytes(), &self.sig)
     }
+}
+
+/// An atproto signature check: compact low-S signatures only.
+fn signature_ok(did_key: &str, input: &[u8], sig: &[u8]) -> bool {
+    proto_blue_crypto::verify_signature(did_key, input, sig, false).unwrap_or(false)
 }
 
 /// Parses a service JWT and checks what needs no key, in the reference's
@@ -173,6 +172,31 @@ pub fn parse(token: &str, lxm: Option<&str>, now: i64) -> Result<Unverified, Ser
 mod tests {
     use super::*;
     use proto_blue_crypto::K256Keypair;
+
+    /// The interop signature fixtures (P-256 and K-256, high-S and DER
+    /// forms included) give the fixture's verdict.
+    #[test]
+    fn interop_signature_fixtures() {
+        let path = format!(
+            "{}/../../interop-test-files/crypto/signature-fixtures.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let cases: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cases.len() >= 6);
+        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
+        for c in &cases {
+            let msg = b64.decode(c["messageBase64"].as_str().unwrap()).unwrap();
+            let sig = b64.decode(c["signatureBase64"].as_str().unwrap()).unwrap();
+            let key = c["publicKeyDid"].as_str().unwrap();
+            assert_eq!(
+                signature_ok(key, &msg, &sig),
+                c["validSignature"].as_bool().unwrap(),
+                "{}",
+                c["comment"]
+            );
+        }
+    }
 
     #[test]
     fn create_and_check() {

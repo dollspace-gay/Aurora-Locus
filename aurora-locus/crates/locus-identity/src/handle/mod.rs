@@ -24,8 +24,9 @@ pub enum HandleError {
 }
 
 /// Lowercases and checks atproto handle syntax, refusing disallowed TLDs.
+/// Surrounding whitespace is a syntax error, as in the reference.
 pub fn normalize_and_validate(handle: &str) -> Result<String, HandleError> {
-    let handle = handle.trim().to_ascii_lowercase();
+    let handle = handle.to_ascii_lowercase();
     if proto_blue_syntax::Handle::new(&handle).is_err() {
         return Err(HandleError::Syntax("Invalid handle".into()));
     }
@@ -147,6 +148,47 @@ mod tests {
         assert!(normalize_and_validate("single").is_err());
         assert!(normalize_and_validate("alice.local").is_err());
         assert!(normalize_and_validate("alice.onion").is_err());
+    }
+
+    /// The non-comment lines of an interop syntax file, untrimmed.
+    fn vectors(file: &str) -> Vec<String> {
+        let path = format!(
+            "{}/../../interop-test-files/syntax/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+            .split('\n')
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn interop_handle_vectors() {
+        let valid = vectors("handle_syntax_valid.txt");
+        assert!(valid.len() > 40);
+        for h in &valid {
+            // Valid syntax normalizes to lowercase; only a disallowed TLD
+            // (a separate rule) refuses it.
+            let lower = h.to_ascii_lowercase();
+            match normalize_and_validate(h) {
+                Ok(n) => assert_eq!(n, lower, "{h:?}"),
+                Err(HandleError::Invalid(_)) => assert!(
+                    DISALLOWED_TLDS.contains(&lower.rsplit('.').next().unwrap()),
+                    "{h:?}"
+                ),
+                Err(e) => panic!("{h:?} refused: {e}"),
+            }
+        }
+        let invalid = vectors("handle_syntax_invalid.txt");
+        assert!(invalid.len() > 20);
+        for h in &invalid {
+            assert!(
+                matches!(normalize_and_validate(h), Err(HandleError::Syntax(_))),
+                "{h:?} accepted"
+            );
+        }
     }
 
     #[test]
