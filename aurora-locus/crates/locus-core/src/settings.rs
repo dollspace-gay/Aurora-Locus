@@ -880,6 +880,37 @@ pub static REGISTRY: &[Def] = &[
         description: "Milliseconds every other S3 request may take (0: no limit beyond the client's). Takes effect on restart.",
     },
     Def {
+        key: "backups.dir",
+        kind: Kind::Text { max_len: 1024 },
+        default: r#""""#,
+        env: Some("LOCUS_BACKUPS_DIR"),
+        description: "Where `backup create` writes backups, one directory each (empty: <data>/backups). Keep copies off this server too.",
+    },
+    Def {
+        key: "backups.every_hours",
+        kind: Kind::Int { min: 0, max: 720 },
+        default: "0",
+        env: None,
+        description: "Hours between scheduled backups (0: none). Scheduled backups include a key backup when a backup passphrase is set (`keys set backup-passphrase`).",
+    },
+    Def {
+        key: "backups.keep",
+        kind: Kind::Int { min: 1, max: 1000 },
+        default: "7",
+        env: None,
+        description: "How many finished backups to keep in the backup directory; older ones are removed.",
+    },
+    Def {
+        key: "sync.restore_seq_margin",
+        kind: Kind::Int {
+            min: 0,
+            max: 1_000_000_000,
+        },
+        default: "1000000",
+        env: None,
+        description: "After a restore, how far above the seq relays report the next event's seq starts, so a relay whose cursor is ahead of what it reports still gets the new events.",
+    },
+    Def {
         key: "deploy.proxy_mode",
         kind: Kind::Choice(&["caddy", "cloudflare", "other", "direct"]),
         default: r#""caddy""#,

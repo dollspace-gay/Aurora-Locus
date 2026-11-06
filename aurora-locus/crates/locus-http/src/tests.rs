@@ -12159,3 +12159,98 @@ async fn a_kms_plc_rotation_key_signs_in_kms() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn backups_hold_the_database_every_object_it_names_and_the_keys() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, access) = h.user("bob.pds.example.com").await;
+    let blob = h.upload(&access, b"backed up bytes", "image/png").await;
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    let row = h.state.store.blob(&did, &cid).await.unwrap().unwrap();
+    let owner = format!("Bearer {}", h.operator("bea", "owner").await);
+    let admin = format!("Bearer {}", h.operator("ada", "admin").await);
+    assert_eq!(
+        h.admin_call("POST", &ns("owner.backup.create"), &admin, Some(json!({})))
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "owners only"
+    );
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("owner.backup.create"),
+            &owner,
+            Some(json!({"passphrase": "backup passphrase 9"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let id = v["id"].as_str().unwrap().to_owned();
+    let dir = std::path::PathBuf::from(v["dir"].as_str().unwrap());
+    // One at a time.
+    let (st, _) = h
+        .admin_call("POST", &ns("owner.backup.create"), &owner, Some(json!({})))
+        .await;
+    assert!(st == StatusCode::BAD_REQUEST || st == StatusCode::OK);
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, l) = h
+            .admin_call("GET", &ns("viewer.backup.list"), &owner, None)
+            .await;
+        let run = l["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == json!(id))
+            .cloned()
+            .unwrap();
+        status = run["status"].as_str().unwrap().to_owned();
+        if status != "running" {
+            assert_eq!(run["keysBackup"], json!(true), "{run}");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "done");
+    let manifest: crate::backups::Manifest =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        (
+            manifest.status.as_str(),
+            manifest.objects,
+            manifest.missing.len()
+        ),
+        ("done", 1, 0)
+    );
+    assert_eq!(manifest.master_key_id, h.state.master_key.key_id());
+    assert_eq!(
+        std::fs::read(dir.join("objects").join(&row.storage_key)).unwrap(),
+        b"backed up bytes"
+    );
+    let snap = locus_store::Store::connect(&locus_core::bootstrap::DatabaseUrl::Sqlite(
+        dir.join("db.sqlite"),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        snap.account_by_did(&did).await.unwrap().is_some(),
+        "the database is in it"
+    );
+    snap.close().await;
+    let keys = std::fs::read(dir.join("keys.backup")).unwrap();
+    assert!(locus_core::key_backup::open(&keys, "backup passphrase 9").is_ok());
+    // A backup without a passphrase has no key backup.
+    let (st, v) = h
+        .admin_call("POST", &ns("owner.backup.create"), &owner, Some(json!({})))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let dir2 = std::path::PathBuf::from(v["dir"].as_str().unwrap());
+    for _ in 0..100 {
+        if dir2.join("manifest.json").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!dir2.join("keys.backup").exists());
+}

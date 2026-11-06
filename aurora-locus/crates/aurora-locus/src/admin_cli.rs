@@ -420,6 +420,58 @@ pub enum RewrapTo {
 }
 
 #[derive(Subcommand)]
+pub enum BackupCmd {
+    /// A backup of a SQLite install, made by the running node: the
+    /// database, every object it names, and a key backup.
+    Create {
+        /// Read the key backup's passphrase from this file (or `-` for
+        /// stdin) instead of asking.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// No key backup (the database's secrets still need the master key).
+        #[arg(long)]
+        no_keys: bool,
+        /// Wait until it's done.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Backups made, newest first.
+    List,
+    /// Restores a backup into an empty install (offline).
+    Restore {
+        dir: PathBuf,
+        /// Where the objects go.
+        #[arg(long, value_enum)]
+        backend: crate::restore::BackendKind,
+        /// The disk store's root (`--backend disk`; default the data dir).
+        #[arg(long)]
+        disk_root: Option<PathBuf>,
+        /// Restore a backup that failed (objects may be missing).
+        #[arg(long)]
+        accept_failed: bool,
+        #[arg(long)]
+        seq_floor: Option<i64>,
+        /// A fresh commit and #sync per active account.
+        #[arg(long)]
+        emit_sync: bool,
+    },
+    /// After a Postgres point-in-time recovery, before any node starts
+    /// (offline).
+    PostRestore {
+        #[arg(long, value_enum)]
+        backend: Option<crate::restore::BackendKind>,
+        #[arg(long)]
+        disk_root: Option<PathBuf>,
+        #[arg(long)]
+        accept_missing_majority: bool,
+        #[arg(long)]
+        seq_floor: Option<i64>,
+        #[arg(long)]
+        emit_sync: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum IdentityCmd {
     /// The reference's publish-identity: an #identity event for each DID.
     Publish {
@@ -435,6 +487,13 @@ pub enum KeysSetCmd {
     /// The secret legacy sessions are signed with (signs every legacy
     /// session out). Read from a file, or `-` for stdin.
     JwtSecret {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The passphrase scheduled backups encrypt their key backup with.
+    BackupPassphrase {
         #[arg(long)]
         file: PathBuf,
         #[arg(long)]
@@ -507,6 +566,8 @@ pub enum AdminCmd {
     Keys(KeysCmd),
     #[command(subcommand)]
     Identity(IdentityCmd),
+    #[command(subcommand)]
+    Backup(BackupCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -869,6 +930,16 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             )
             .await
         }
+        KeysCmd::Set(KeysSetCmd::BackupPassphrase { file, yes }) => {
+            set_secret(
+                c,
+                "backup-passphrase",
+                &file,
+                yes,
+                "Set the scheduled backups' key backup passphrase",
+            )
+            .await
+        }
         KeysCmd::Set(KeysSetCmd::DpopSecret { file, yes }) => {
             set_secret(
                 c,
@@ -977,6 +1048,76 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match cmd {
         AdminCmd::Keys(k) => keys(c, k).await,
+        AdminCmd::Backup(BackupCmd::Create {
+            passphrase_file,
+            no_keys,
+            wait,
+        }) => {
+            let passphrase = if no_keys {
+                None
+            } else {
+                Some(match &passphrase_file {
+                    Some(f) => read_key(f)?,
+                    None => zeroize::Zeroizing::new(secret(
+                        "A passphrase for the key backup (at least 12 characters)",
+                    )?),
+                })
+            };
+            let v = c
+                .call(
+                    &lx("owner.backup.create"),
+                    &[],
+                    Some(json!({"passphrase": passphrase.as_deref().map(String::as_str)})),
+                )
+                .await?;
+            let id = v["id"].as_str().unwrap_or("").to_owned();
+            println!(
+                "Backup {id} started, into {}.",
+                v["dir"].as_str().unwrap_or("")
+            );
+            if wait {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let l = c.call(&lx("viewer.backup.list"), &[], None).await?;
+                    let run = l["backups"]
+                        .as_array()
+                        .and_then(|b| b.iter().find(|r| r["id"] == json!(id)).cloned())
+                        .unwrap_or_default();
+                    match run["status"].as_str() {
+                        Some("running") => continue,
+                        Some("done") => {
+                            println!(
+                                "Done: {} objects ({} missing), key backup: {}.",
+                                run["objects"], run["missing"], run["keysBackup"]
+                            );
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "The backup failed: {}",
+                                run["error"].as_str().unwrap_or("?")
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        AdminCmd::Backup(BackupCmd::List) => {
+            let l = c.call(&lx("viewer.backup.list"), &[], None).await?;
+            for r in l["backups"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}  {:<7}  {} objects, {} missing  {}",
+                    r["id"].as_str().unwrap_or(""),
+                    r["status"].as_str().unwrap_or(""),
+                    r["objects"],
+                    r["missing"],
+                    r["dir"].as_str().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        AdminCmd::Backup(_) => Err("backup restore and post-restore run offline, from main".into()),
         AdminCmd::Identity(IdentityCmd::Publish { dids, file }) => {
             let dids = dids_from(dids, file.as_deref(), false)?;
             let v = c

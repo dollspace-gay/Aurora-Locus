@@ -765,20 +765,23 @@ impl Store {
             .collect())
     }
 
-    /// Queued deletes older than the grace period: (id, key, epoch).
+    /// Queued deletes older than the grace period, with ids up to `max_id`
+    /// (a running backup's delete mark): (id, key, epoch).
     pub async fn due_blob_deletes(
         &self,
         grace_ms: i64,
         limit: i64,
+        max_id: Option<i64>,
     ) -> CoreResult<Vec<(i64, String, i64)>> {
         let q = sql(
             "SELECT id, storage_key, backend_epoch FROM blob_delete WHERE enqueued_at < {now} - {1} \
-             ORDER BY id LIMIT {2}",
+             AND id <= {3} ORDER BY id LIMIT {2}",
             self.is_pg_store(),
         );
         on_pool!(self, q, q, |q, p| sqlx::query_as(q)
             .bind(grace_ms)
             .bind(limit)
+            .bind(max_id.unwrap_or(i64::MAX))
             .fetch_all(p)
             .await
             .map_err(db_err))

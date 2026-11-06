@@ -540,7 +540,7 @@ fn fingerprint(value: &[u8]) -> String {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSecretInput {
-    /// `jwt-secret` or `dpop-secret`.
+    /// `jwt-secret`, `dpop-secret` or `backup-passphrase`.
     name: String,
     value: String,
     #[serde(flatten)]
@@ -576,9 +576,20 @@ pub async fn set_secret(
                 })?;
             (secret_names::DPOP_SECRET, Zeroizing::new(b))
         }
+        "backup-passphrase" => {
+            if value.chars().count() < locus_core::key_backup::MIN_PASSPHRASE {
+                return Err(XrpcError::invalid_request(
+                    "A backup passphrase is at least 12 characters",
+                ));
+            }
+            (
+                crate::backups::PASSPHRASE_SECRET,
+                Zeroizing::new(value.as_bytes().to_vec()),
+            )
+        }
         other => {
             return Err(XrpcError::invalid_request(format!(
-                "{other} isn't a secret this sets (jwt-secret, dpop-secret)"
+                "{other} isn't a secret this sets (jwt-secret, dpop-secret, backup-passphrase)"
             )));
         }
     };

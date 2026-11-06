@@ -32,6 +32,7 @@ status="${PIPESTATUS[0]}"
 # The blob store's own tests again against the S3 container, when it's up.
 if [ "$status" = 0 ] && running locus-test-s3; then
   LOCUS_TEST_S3_ENDPOINT=http://127.0.0.1:59000 LOCUS_TEST_S3_GATED_BUCKET=locus-test-gated \
+    LOCUS_TEST_S3_VERSIONED_BUCKET=locus-test-versioned \
     AWS_ACCESS_KEY_ID=locus AWS_SECRET_ACCESS_KEY=locus-secret \
     cargo test -p locus-blob --quiet 2>&1 | grep -E 'test result|FAILED|panicked|^error'
   status="${PIPESTATUS[0]}"

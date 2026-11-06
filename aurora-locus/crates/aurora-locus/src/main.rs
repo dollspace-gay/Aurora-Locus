@@ -6,6 +6,7 @@ mod admin_cli;
 mod deploy;
 mod logging;
 mod node;
+mod restore;
 mod rewrap;
 mod setup_cli;
 
@@ -146,6 +147,70 @@ async fn main() {
             }
         }
         Command::Healthcheck { url } => std::process::exit(admin_cli::healthcheck(&url).await),
+        Command::Admin(admin_cli::AdminCmd::Backup(
+            cmd @ (admin_cli::BackupCmd::Restore { .. } | admin_cli::BackupCmd::PostRestore { .. }),
+        )) => {
+            let bootstrap = bootstrap_or_exit();
+            let _log = logging::init(LogFormat::Pretty);
+            let result = match cmd {
+                admin_cli::BackupCmd::Restore {
+                    dir,
+                    backend,
+                    disk_root,
+                    accept_failed,
+                    seq_floor,
+                    emit_sync,
+                } => {
+                    restore::restore(
+                        &bootstrap,
+                        restore::RestoreOpts {
+                            dir,
+                            backend,
+                            disk_root,
+                            accept_failed,
+                            finish: restore::Finish {
+                                seq_floor,
+                                emit_sync,
+                            },
+                        },
+                    )
+                    .await
+                }
+                admin_cli::BackupCmd::PostRestore {
+                    backend,
+                    disk_root,
+                    accept_missing_majority,
+                    seq_floor,
+                    emit_sync,
+                } => {
+                    restore::post_restore(
+                        &bootstrap,
+                        restore::PostRestoreOpts {
+                            backend,
+                            disk_root,
+                            accept_missing_majority,
+                            finish: restore::Finish {
+                                seq_floor,
+                                emit_sync,
+                            },
+                        },
+                    )
+                    .await
+                }
+                _ => unreachable!("matched above"),
+            };
+            match result {
+                Ok(report) => {
+                    for line in report.0 {
+                        println!("{line}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Nothing was changed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Admin(admin_cli::AdminCmd::Keys(admin_cli::KeysCmd::Rewrap {
             to,
             path,

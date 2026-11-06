@@ -293,6 +293,15 @@ impl BlobStore {
         copy_verified_between(self, from, self, to, cid).await
     }
 
+    /// Brings back a deleted copy from the bucket's versions, where the
+    /// store keeps them (S3 with versioning). Returns whether it did.
+    pub async fn restore_newest_version(&self, key: &str) -> Result<bool, BlobError> {
+        match self {
+            Self::Disk(_) => Ok(false),
+            Self::S3(s) => s.restore_newest_version(key).await,
+        }
+    }
+
     /// Whether the store answers (for S3, every bucket).
     pub async fn check(&self) -> Result<(), BlobError> {
         match self {
@@ -383,6 +392,52 @@ pub async fn s3_config(
             .filter(|n| *n > 0)
             .map(Duration::from_millis),
     }))
+}
+
+/// S3 settings with each `PDS_BLOBSTORE_S3_*` (and
+/// `LOCUS_BLOBSTORE_S3_GATED_BUCKET`) value in `env` taking precedence, as
+/// a restore takes them: the restored settings, overridable by env. None
+/// if there's no bucket either way.
+#[must_use]
+pub fn s3_env_overrides(
+    config: Option<S3Config>,
+    env: &HashMap<String, String>,
+) -> Option<S3Config> {
+    let get = |k: &str| {
+        env.get(k)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let mut c = match (config, get("PDS_BLOBSTORE_S3_BUCKET")) {
+        (Some(c), _) => c,
+        (None, Some(_)) => S3Config {
+            upload_timeout: Duration::from_secs(20),
+            ..S3Config::default()
+        },
+        (None, None) => return None,
+    };
+    if let Some(v) = get("PDS_BLOBSTORE_S3_BUCKET") {
+        c.bucket = v;
+    }
+    if let Some(v) = get("LOCUS_BLOBSTORE_S3_GATED_BUCKET") {
+        c.gated_bucket = Some(v);
+    }
+    if let Some(v) = get("PDS_BLOBSTORE_S3_REGION") {
+        c.region = Some(v);
+    }
+    if let Some(v) = get("PDS_BLOBSTORE_S3_ENDPOINT") {
+        c.endpoint = Some(v);
+    }
+    if let Some(v) = get("PDS_BLOBSTORE_S3_FORCE_PATH_STYLE") {
+        c.force_path_style = matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
+    }
+    if let Some(v) = get("PDS_BLOBSTORE_S3_ACCESS_KEY_ID") {
+        c.access_key_id = v;
+    }
+    if let Some(v) = get("PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY") {
+        c.secret_access_key = v;
+    }
+    Some(c)
 }
 
 /// The blob store this node uses: the install's active backend
@@ -534,8 +589,16 @@ pub async fn run_deletes(
     grace_ms: i64,
     limit: i64,
 ) -> CoreResult<usize> {
+    // While a backup runs: nothing until its delete mark is recorded,
+    // then nothing queued after its snapshot, so every key it names is
+    // still there to copy.
+    let max_id = match store.backup_delete_limit().await? {
+        None => None,
+        Some(None) => return Ok(0),
+        Some(Some(mark)) => Some(mark),
+    };
     let mut n = 0;
-    for (id, key, _epoch) in store.due_blob_deletes(grace_ms, limit).await? {
+    for (id, key, _epoch) in store.due_blob_deletes(grace_ms, limit, max_id).await? {
         if !store.blob_key_in_use(&key).await? {
             if let Err(e) = blobs.delete(&key).await {
                 tracing::warn!(key, "blob delete failed, will retry: {e}");
@@ -760,6 +823,48 @@ mod tests {
             assert_eq!(s3.size(&k).await.unwrap(), None);
         }
         assert!(s3.read("../escape", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn s3_versions_bring_a_deleted_copy_back() {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let (Some(endpoint), Some(bucket)) = (
+            var("LOCUS_TEST_S3_ENDPOINT"),
+            var("LOCUS_TEST_S3_VERSIONED_BUCKET"),
+        ) else {
+            eprintln!("LOCUS_TEST_S3_VERSIONED_BUCKET isn't set; skipping");
+            return;
+        };
+        let s3 = BlobStore::S3(
+            S3Store::new(&S3Config {
+                bucket,
+                endpoint: Some(endpoint),
+                force_path_style: true,
+                access_key_id: var("AWS_ACCESS_KEY_ID").unwrap_or_default(),
+                secret_access_key: var("AWS_SECRET_ACCESS_KEY").unwrap_or_default(),
+                upload_timeout: Duration::from_secs(30),
+                ..S3Config::default()
+            })
+            .unwrap(),
+        );
+        let key = format!("blobs/did:plc:v/{}.1", locus_store::blob::new_generation());
+        s3.write_stream(&key, chunks(&[b"first"]), 100)
+            .await
+            .unwrap();
+        s3.write_stream(&key, chunks(&[b"second"]), 100)
+            .await
+            .unwrap();
+        s3.delete(&key).await.unwrap();
+        assert_eq!(s3.size(&key).await.unwrap(), None);
+        assert!(s3.restore_newest_version(&key).await.unwrap());
+        let r = s3.read(&key, None).await.unwrap().unwrap();
+        assert_eq!(bytes_of(r).await, b"second", "the newest version");
+        let never = format!("blobs/did:plc:v/{}.1", locus_store::blob::new_generation());
+        assert!(!s3.restore_newest_version(&never).await.unwrap());
+        // Disk keeps no versions.
+        let dir = tempfile::tempdir().unwrap();
+        let disk = BlobStore::Disk(DiskStore::new(dir.path()));
+        assert!(!disk.restore_newest_version("blobs/x").await.unwrap());
     }
 
     #[test]

@@ -2209,3 +2209,161 @@ async fn rewrap_moves_every_secret_to_the_new_key_on_both_backends() {
         tx.commit().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn backups_hold_the_delete_job_and_restores_settle_blobs_on_both_backends() {
+    use std::time::Duration;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let queue = |key: &'static str| async move {
+            let mut tx = s.begin().await.unwrap();
+            tx.queue_blob_delete(key, 1).await.unwrap();
+            tx.commit().await.unwrap();
+        };
+        queue("tmp/a").await;
+        assert_eq!(
+            s.backup_delete_limit().await.unwrap(),
+            None,
+            "{n}: no backup"
+        );
+        // A running backup with a live lease and no mark yet: nothing.
+        let lease = s
+            .try_acquire_lease(
+                crate::backups::BACKUP_LEASE,
+                "node-1",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        s.start_backup_run("b1", "/backups/b1", "test")
+            .await
+            .unwrap();
+        assert_eq!(s.backup_delete_limit().await.unwrap(), Some(None), "{n}");
+        let mark = s.max_blob_delete_id().await.unwrap();
+        s.set_backup_mark("b1", mark).await.unwrap();
+        queue("tmp/b").await;
+        assert_eq!(
+            s.backup_delete_limit().await.unwrap(),
+            Some(Some(mark)),
+            "{n}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let due = s.due_blob_deletes(0, 10, Some(mark)).await.unwrap();
+        assert_eq!(
+            due.iter().map(|d| d.1.as_str()).collect::<Vec<_>>(),
+            ["tmp/a"],
+            "{n}: only rows up to the mark"
+        );
+        assert_eq!(
+            s.due_blob_deletes(0, 10, None).await.unwrap().len(),
+            2,
+            "{n}"
+        );
+        // A lapsed lease frees the delete job.
+        s.release_lease(&lease).await.unwrap();
+        assert_eq!(s.backup_delete_limit().await.unwrap(), None, "{n}");
+        s.finish_backup_run("b1", "done", 3, 1, true, None)
+            .await
+            .unwrap();
+        let runs = s.backup_runs(5).await.unwrap();
+        assert_eq!(
+            (runs[0].status.as_str(), runs[0].objects, runs[0].with_keys),
+            ("done", 3, true),
+            "{n}"
+        );
+
+        // Tracked keys, pending moves and the restore's settling.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob("did:plc:a", "bafy1", "image/png", 3, "tmp/x1")
+            .await
+            .unwrap();
+        tx.reference_blob("did:plc:a", "bafy1", "blobs/did:plc:a/bafy1.g1", 1)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            s.tracked_keys_after("", 10).await.unwrap(),
+            ["tmp/x1"],
+            "{n}"
+        );
+        assert_eq!(
+            s.pending_keys_after("", 10).await.unwrap(),
+            ["blobs/did:plc:a/bafy1.g1"],
+            "{n}"
+        );
+        s.start_backup_run("b2", "/backups/b2", "test")
+            .await
+            .unwrap();
+        // A lease of the old install's node, still unexpired.
+        s.try_acquire_lease("sequencer", "old-node", Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tx = s.begin().await.unwrap();
+        let epoch = tx.settle_restored_blobs("s3", None, true).await.unwrap();
+        assert_eq!(tx.restart_pending_moves(epoch).await.unwrap(), 1, "{n}");
+        tx.commit().await.unwrap();
+        let backend = s.blob_backend().await.unwrap();
+        assert_eq!(
+            (backend.active.as_str(), backend.epoch),
+            ("s3", epoch),
+            "{n}"
+        );
+        assert_eq!(epoch, 2, "{n}: bumped");
+        let row = s.blob("did:plc:a", "bafy1").await.unwrap().unwrap();
+        let fresh = row.pending_move.unwrap();
+        assert!(
+            fresh.starts_with("blobs/did:plc:a/bafy1.") && fresh != "blobs/did:plc:a/bafy1.g1",
+            "{n}: a fresh key in the same store"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let queued: Vec<String> = s
+            .due_blob_deletes(0, 10, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.1)
+            .collect();
+        assert!(
+            queued.contains(&"blobs/did:plc:a/bafy1.g1".to_owned()),
+            "{n}: old target queued"
+        );
+        assert_eq!(
+            s.backup_runs(5).await.unwrap()[0].status,
+            "ended",
+            "{n}: the snapshot's running backup ends"
+        );
+        assert!(
+            s.try_acquire_lease("sequencer", "new-node", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}: the old install's leases are released"
+        );
+        // The seq floor only rises.
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(tx.raise_seq_floor(5000).await.unwrap(), 5000);
+        assert_eq!(tx.raise_seq_floor(10).await.unwrap(), 5000, "{n}");
+        tx.commit().await.unwrap();
+        // SQLite snapshots; Postgres installs are told about PITR.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.sqlite");
+        match s {
+            crate::Store::Sqlite(_) => {
+                s.sqlite_snapshot(&path).await.unwrap();
+                let snap = crate::Store::connect(&locus_core::bootstrap::DatabaseUrl::Sqlite(
+                    path.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(snap.seq_state().await.unwrap().last_seq, 5000);
+                snap.close().await;
+            }
+            crate::Store::Postgres(_) => {
+                assert!(s.sqlite_snapshot(&path).await.is_err());
+            }
+        }
+    }
+}

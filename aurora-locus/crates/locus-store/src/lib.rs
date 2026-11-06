@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod admin;
+pub mod backups;
 pub mod blob;
 pub mod branding;
 pub mod bulk;
@@ -115,6 +116,21 @@ impl Store {
                 Ok(Self::Postgres(pool))
             }
         }
+    }
+
+    /// Opens a SQLite file read-only, changing nothing in it (a backup's
+    /// snapshot).
+    pub async fn open_sqlite_read_only(path: &std::path::Path) -> CoreResult<Self> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .immutable(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(opts)
+            .await
+            .map_err(db_err)?;
+        Ok(Self::Sqlite(pool))
     }
 
     fn migrator(&self) -> &'static Migrator {

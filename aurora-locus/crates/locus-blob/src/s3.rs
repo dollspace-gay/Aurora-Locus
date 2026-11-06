@@ -404,6 +404,40 @@ impl S3Store {
         }
     }
 
+    /// On a versioned bucket, makes the newest version of `key` that isn't
+    /// a delete marker current again. Returns whether there was one.
+    pub async fn restore_newest_version(&self, key: &str) -> Result<bool, BlobError> {
+        check_key(key)?;
+        let bucket = self.bucket_for(key);
+        let out = self
+            .client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .map_err(backend)?;
+        // S3 lists a key's versions newest first (timestamps can tie).
+        let newest = out.versions().iter().find(|v| v.key() == Some(key));
+        let Some(version) = newest.and_then(|v| v.version_id()) else {
+            return Ok(false);
+        };
+        let source = format!(
+            "{bucket}/{}?versionId={}",
+            percent_path(key),
+            percent_path(version)
+        );
+        self.client
+            .copy_object()
+            .bucket(bucket)
+            .key(key)
+            .copy_source(source)
+            .send()
+            .await
+            .map_err(backend)?;
+        Ok(true)
+    }
+
     /// Whether every bucket answers.
     pub async fn check(&self) -> Result<(), BlobError> {
         let mut buckets = vec![self.bucket.as_str()];
@@ -420,4 +454,18 @@ impl S3Store {
         }
         Ok(())
     }
+}
+
+/// A key for a copy source: everything but unreserved characters and `/`
+/// percent-encoded.
+fn percent_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }

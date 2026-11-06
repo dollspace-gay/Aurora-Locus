@@ -514,6 +514,25 @@ kryphocron built in.
 - `aurora-locus keys rewrap --to file --path <new> | env --out <file> |
   kms --kms-key-id <id>` (offline): re-encrypts every stored secret under
   a new master key in one transaction; nothing changes if it fails.
+- Backups for SQLite installs: `aurora-locus backup create
+  [--passphrase-file] [--wait]` (or scheduled with
+  `backups.every_hours`, keeping `backups.keep`) writes a consistent
+  database snapshot, every object it names, a key backup and, last, a
+  manifest; the delete job holds off while one runs, so nothing the
+  snapshot names is deleted before it's copied. `backup list`.
+- `backup restore <dir> --backend disk|s3` (offline, only into an empty
+  install, every refusal before anything is written): restores the
+  database and objects, restarts pending blob moves, releases the old
+  install's leases, sets the next event's seq above what relays report
+  (`--seq-floor`, `sync.restore_seq_margin`), lists accounts whose live
+  DID documents don't list their restored signing key, re-announces every
+  account (`#identity`, `#account`) and, with `--emit-sync`, writes a
+  fresh commit and `#sync` for each active one.
+- `backup post-restore` for after a Postgres point-in-time recovery:
+  checks every tracked object, brings deleted ones back from a versioned
+  bucket's earlier versions (or, with `--backend`, from the restored
+  backend), stops when most are missing, ends a running blob migration,
+  and finishes as `backup restore` does.
 
 ### Changed
 

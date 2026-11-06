@@ -430,6 +430,7 @@ impl Node {
             self.spawn_audience_jobs(Arc::clone(&state));
             self.spawn_identity_repair(Arc::clone(&state));
             self.spawn_plc_key_scan(Arc::clone(&state));
+            self.spawn_backup_schedule(Arc::clone(&state));
             self.spawn_account_jobs(Arc::clone(&state));
             self.spawn_blob_jobs(Arc::clone(&state));
             self.spawn_sync_jobs(Arc::clone(&state));
@@ -990,6 +991,36 @@ impl Node {
                 }
             }
         }));
+    }
+
+    /// Scheduled backups (`backups.every_hours`), checked every ten
+    /// minutes on one node at a time; the backup itself takes its own
+    /// lease.
+    fn spawn_backup_schedule(&mut self, state: Arc<AppState>) {
+        const NAME: &str = "backup-schedule";
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                NAME.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        loop {
+                            let result =
+                                locus_http::backups::schedule_step(Arc::clone(&state)).await;
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state.store.record_job_run(NAME, err.as_deref(), None).await;
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(600)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
     }
 
     /// The PLC key scan (which held keys each account's document lists),

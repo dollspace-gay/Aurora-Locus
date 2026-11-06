@@ -8,6 +8,7 @@ pub mod admin_auth;
 pub mod audience;
 pub mod audience_sync;
 pub mod auth;
+pub mod backups;
 pub mod branding;
 pub mod bsky;
 pub mod cloudflare;
