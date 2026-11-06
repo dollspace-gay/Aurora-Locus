@@ -708,3 +708,415 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
     taken(create("old7.example.com", "plc").await, "old host at signup");
     taken(create("old7.example.com", "web").await, "old host as did:web");
 }
+
+// ---------------------------------------------------------------- private tier
+
+/// Another PDS holding one private post: `getRecord` serves it (and nothing
+/// else), `listRecords` lists no kryphocron blocks, and assertions for the
+/// audience are issued (as `did:web:127.0.0.1`) to whoever asks, signed
+/// with `key`.
+async fn mock_remote_pds(
+    parent: Value,
+    audience: String,
+    key: Arc<proto_blue_crypto::K256Keypair>,
+) -> String {
+    use base64::Engine;
+    let app = Router::new().route(
+        "/xrpc/{nsid}",
+        get(
+            move |Path(nsid): Path<String>,
+                  axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+                  headers: axum::http::HeaderMap| {
+                let (parent, audience, key) = (parent.clone(), audience.clone(), key.clone());
+                async move {
+                    match nsid.as_str() {
+                        "com.atproto.repo.getRecord"
+                            if q.get("collection").map(String::as_str) == Some(POST_PRIVATE) =>
+                        {
+                            axum::Json(json!({"uri": "x", "cid": "x", "value": parent}))
+                                .into_response()
+                        }
+                        "com.atproto.repo.listRecords" => {
+                            axum::Json(json!({"records": []})).into_response()
+                        }
+                        n if n == crate::membership::ASSERTION_LXM => {
+                            // The caller is the service token's issuer.
+                            let bearer = headers["authorization"].to_str().unwrap()[7..].to_owned();
+                            let payload: Value = serde_json::from_slice(
+                                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .decode(bearer.split('.').nth(1).unwrap())
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            let now = locus_core::time::now_ms() / 1000;
+                            let token = es256k_jwt(
+                                &key,
+                                crate::membership::ASSERTION_TYP,
+                                &json!({"iss": "did:web:127.0.0.1", "sub": payload["iss"],
+                                    "audienceUri": audience, "aud": q["aud"],
+                                    "iat": now, "exp": now + 120, "jti": "a1"}),
+                            );
+                            axum::Json(json!({"token": token})).into_response()
+                        }
+                        _ => (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error": "RecordNotFound"})),
+                        )
+                            .into_response(),
+                    }
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn block_checks_against_a_remote_parent_fail_closed() {
+    let h = harness_build(HarnessOpts {
+        ssrf_protection: false,
+        ..HarnessOpts::default()
+    })
+    .await;
+    let (script, _) = h.with_prism().await;
+    // The parent's author is on another PDS.
+    let author = format!("did:plc:{}", "r".repeat(24));
+    let audience = format!("at://{author}/{AUD}/3m6aaaaaaaaaa");
+    let parent_uri = format!("at://{author}/{POST_PRIVATE}/3m6parentpare");
+    let parent = json!({"$type": POST_PRIVATE, "createdAt": "2024-01-01T00:00:00.000Z",
+        "audienceList": audience, "encodedContent": {"$bytes": "AAECAwQFBgc"},
+        "encodedContentCodec": "laquna/0.2"});
+    let key = Arc::new(proto_blue_crypto::K256Keypair::generate());
+    let remote = mock_remote_pds(parent, audience.clone(), key.clone()).await;
+    h.plc.lock().unwrap().log.insert(
+        author.clone(),
+        vec![json!({"type": "plc_operation", "alsoKnownAs": ["at://far.example.net"],
+            "verificationMethods": {"atproto": key.did()},
+            "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": remote}}})],
+    );
+    h.state
+        .kr
+        .membership
+        .seed_issuer_key("127.0.0.1", &key.did());
+    let parent_ref = json!({"uri": parent_uri, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"});
+    // Two writers, each a known member of the private tier.
+    let mut writers = Vec::new();
+    for (handle, rkey) in [
+        ("wyn.pds.example.com", "3m6wwwwwwwwww"),
+        ("xia.pds.example.com", "3m6xxxxxxxxxx"),
+    ] {
+        let (did, access) = h.user(handle).await;
+        let mine = h.add_audience(&did, rkey).await;
+        let (st, v) = h
+            .private_post_as(&did, &access, private_post("x", &mine))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        writers.push((did, access));
+    }
+    let relationships = |status: u16, body: Value| {
+        set_script(&script, "app.bsky.graph.getRelationships", status, body);
+    };
+    let reply = |w: usize| h.reply_as(&writers[w].0, &writers[w].1, &parent_ref, &audience);
+    let forbidden = |(st, v): (StatusCode, Value), why: &str| {
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("Forbidden")),
+            "{why}: {v}"
+        );
+    };
+
+    // The block-source AppView answers 501 or another error: the reply is
+    // refused, as if blocked.
+    relationships(501, json!({"error": "MethodNotImplemented"}));
+    forbidden(reply(0).await, "501");
+    relationships(500, json!({"error": "InternalServerError"}));
+    forbidden(reply(0).await, "500");
+    relationships(400, json!({"error": "InvalidRequest"}));
+    forbidden(reply(0).await, "400");
+    relationships(429, json!({"error": "RateLimitExceeded"}));
+    forbidden(reply(0).await, "429");
+    // A real block is enforced.
+    relationships(
+        200,
+        json!({"relationships": [{"did": author, "blockedBy": "at://x/app.bsky.graph.block/1"}]}),
+    );
+    forbidden(reply(1).await, "blocked");
+    // No block: the same reply goes through (so the refusals were the
+    // block check's).
+    relationships(200, json!({"relationships": [{"did": author}]}));
+    let (st, v) = reply(0).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn private_posts_name_only_audiences_the_writers_store_holds() {
+    let h = harness(false).await;
+    let (script, _) = h.with_prism().await;
+    let (did, access) = h.user("ivy.pds.example.com").await;
+    let mine = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let (st, post) = h
+        .private_post_as(&did, &access, private_post("x", &mine))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{post}");
+    let rkey = post["uri"].as_str().unwrap().rsplit('/').next().unwrap();
+    let invalid = |(st, v): (StatusCode, Value), why: &str| {
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{why}: {v}"
+        );
+    };
+
+    // updatePostPrivate to an audience the store lacks (a complete listing
+    // lacks it too), or to someone else's: refused, the post unchanged.
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": []}),
+    );
+    let (other, _) = h.user("jon.pds.example.com").await;
+    let theirs = h.add_audience(&other, "3m6tttttttttt").await;
+    for (target, why) in [
+        (format!("at://{did}/{AUD}/3m6nnnnnnnnnn"), "not in the store"),
+        (theirs, "another account's"),
+    ] {
+        invalid(
+            h.post(
+                "tools.kryphocron.feed.updatePostPrivate",
+                Some(&access),
+                json!({"repo": did, "rkey": rkey, "audienceList": target}),
+            )
+            .await,
+            why,
+        );
+    }
+    assert_eq!(
+        h.record_value(&did, POST_PRIVATE, rkey).await["audienceList"],
+        json!(mine)
+    );
+
+    // A URI the refresh finds in prism but that is deleted here (a pending
+    // delete): InvalidRequest, not adopted.
+    let (did2, access2) = h.user("kai.pds.example.com").await;
+    h.add_audience(&did2, "3m6cccccccccc").await;
+    let mut row = h
+        .state
+        .store
+        .kr_audience(&did2, "3m6cccccccccc")
+        .await
+        .unwrap()
+        .unwrap();
+    row.pending = "delete".into();
+    h.state.store.put_kr_audience(&row).await.unwrap();
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did2, "3m6cccccccccc", "v9", &[])]}),
+    );
+    let pending = format!("at://{did2}/{AUD}/3m6cccccccccc");
+    invalid(
+        h.private_post_as(&did2, &access2, private_post("x", &pending))
+            .await,
+        "pending delete",
+    );
+
+    // Or a tombstone: a complete listing deleted it, a later page has it.
+    let (did3, access3) = h.user("lev.pds.example.com").await;
+    h.add_audience(&did3, "3m6dddddddddd").await;
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": []}),
+    );
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    crate::audience::refresh(
+        &h.state,
+        &did3,
+        crate::audience::Trigger::Background,
+        None,
+        far,
+    )
+    .await
+    .unwrap();
+    assert!(
+        h.state
+            .store
+            .audience_tombstone(&did3, "3m6dddddddddd")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    set_script(
+        &script,
+        "app.nearhorizon.private.listAudiences",
+        200,
+        json!({"audiences": [prism_audience(&did3, "3m6dddddddddd", "v1", &[])]}),
+    );
+    let gone = format!("at://{did3}/{AUD}/3m6dddddddddd");
+    invalid(
+        h.private_post_as(&did3, &access3, private_post("x", &gone))
+            .await,
+        "tombstoned",
+    );
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did3, "3m6dddddddddd")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn audience_values_and_private_posts_follow_the_host_rules() {
+    let h = harness(false).await;
+    let (_, seen) = h.with_prism().await;
+    let (owner, access) = h.user("max.pds.example.com").await;
+    let base = || {
+        json!({"$type": AUD, "mode": "list", "members": [],
+            "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z"})
+    };
+    let with = |k: &str, v: Value| {
+        let mut r = base();
+        r[k] = v;
+        r
+    };
+    let ok = |r: &Value| crate::audience::check_value(&h.state, &owner, r).is_ok();
+    let dids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("did:plc:m{i:023}")).collect() };
+
+    // Members: at most 1000; each a DID of at most 256 bytes.
+    assert!(ok(&with("members", json!(dids(1000)))));
+    assert!(!ok(&with("members", json!(dids(1001)))), "1001 members");
+    let long = format!("did:plc:{}", "a".repeat(248));
+    assert_eq!(long.len(), 256);
+    assert!(ok(&with("members", json!([long]))));
+    assert!(
+        !ok(&with("members", json!([format!("{long}a")]))),
+        "a 257-byte DID"
+    );
+    assert!(!ok(&with("members", json!(["not a did"]))));
+    assert!(!ok(&with("members", json!("did:plc:abc"))), "not a list");
+
+    // Name: 1-64 graphemes, at most 640 bytes.
+    assert!(ok(&with("name", json!("a".repeat(64)))));
+    assert!(!ok(&with("name", json!("a".repeat(65)))), "65 graphemes");
+    assert!(!ok(&with("name", json!("   "))), "empty once trimmed");
+    // A 10-byte grapheme: e-acute and four combining acutes.
+    let g10 = "\u{e9}\u{301}\u{301}\u{301}\u{301}";
+    assert_eq!(g10.len(), 10);
+    assert!(ok(&with("name", json!(g10.repeat(64)))), "640 bytes");
+    let g11 = "a\u{301}\u{301}\u{301}\u{301}\u{301}";
+    assert_eq!(g11.len(), 11);
+    let over = format!("{}{g11}", g10.repeat(63));
+    assert!(!ok(&with("name", json!(over))), "641 bytes in 64 graphemes");
+
+    // Body: at most 512 KiB.
+    let mut padded = with("pad", json!(""));
+    let len = serde_json::to_vec(&padded).unwrap().len();
+    padded["pad"] = json!("x".repeat(512 * 1024 - len));
+    assert!(ok(&padded), "exactly 512 KiB");
+    padded["pad"] = json!("x".repeat(512 * 1024 - len + 1));
+    assert!(!ok(&padded), "a byte over");
+
+    // Mode: one of the known ones; `members` required for `list` (also
+    // when the mode is left out).
+    for m in crate::audience::MODES {
+        assert!(ok(&with("mode", json!(m))), "{m}");
+    }
+    assert!(!ok(&with("mode", json!("friends"))), "unknown mode");
+    assert!(!ok(&with("mode", json!(3))), "mode not a string");
+    let mut no_members = base();
+    no_members.as_object_mut().unwrap().remove("members");
+    assert!(!ok(&no_members), "list without members");
+    no_members.as_object_mut().unwrap().remove("mode");
+    assert!(!ok(&no_members), "default list without members");
+    no_members["mode"] = json!("everyone");
+    assert!(ok(&no_members), "everyone needs no members");
+
+    // Over HTTP: refused before anything reaches prism.
+    let posts = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count()
+    };
+    let before = posts();
+    for bad in [
+        with("members", json!(dids(1001))),
+        with("mode", json!("friends")),
+        with("name", json!("a".repeat(65))),
+    ] {
+        let (st, v) = h
+            .post(
+                "tools.kryphocron.policy.manageAudience",
+                Some(&access),
+                json!({"repo": owner, "record": bad}),
+            )
+            .await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{v}"
+        );
+    }
+    assert_eq!(posts(), before, "prism was never asked");
+
+    // Pre-encoded content in a codec locus doesn't support. The content is
+    // valid for the record (taken from a post locus encoded at that rkey);
+    // only the codec named is wrong.
+    let mine = h.add_audience(&owner, "3m6aaaaaaaaaa").await;
+    let (st, post) = h
+        .private_post_as(&owner, &access, private_post("hello", &mine))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{post}");
+    let rkey = post["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let stored = h.record_value(&owner, POST_PRIVATE, &rkey).await;
+    let (st, _) = h
+        .post(
+            "com.atproto.repo.deleteRecord",
+            Some(&access),
+            json!({"repo": owner, "collection": POST_PRIVATE, "rkey": rkey}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let put = |codec: &str| {
+        let mut rec = stored.clone();
+        rec["encodedContentCodec"] = json!(codec);
+        h.post(
+            "com.atproto.repo.putRecord",
+            Some(&access),
+            json!({"repo": owner, "collection": POST_PRIVATE, "rkey": rkey, "record": rec}),
+        )
+    };
+    for codec in ["laquna/0.1", "laquna/0.3", "rot13"] {
+        let (st, v) = put(codec).await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("InvalidRequest")),
+            "{codec}: {v}"
+        );
+    }
+    let (_, list) = h
+        .get(format!(
+            "/xrpc/com.atproto.repo.listRecords?repo={owner}&collection={POST_PRIVATE}"
+        ))
+        .await;
+    assert!(list["records"].as_array().unwrap().is_empty(), "{list}");
+    // The supported codec takes the same content.
+    let (st, v) = put("laquna/0.2").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
