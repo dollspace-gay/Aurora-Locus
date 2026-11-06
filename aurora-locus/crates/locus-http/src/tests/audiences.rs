@@ -443,7 +443,8 @@ async fn sending_attempts_and_earlier_adoptions_match() {
     h.set("kryphocron.prism_request_timeout_ms", json!(1000))
         .await;
     let stamp = "2024-05-01T10:00:00.000Z";
-    let sent = json!({"$type": AUD, "members": ["did:plc:a"], "createdAt": stamp, "updatedAt": stamp});
+    let sent =
+        json!({"$type": AUD, "members": ["did:plc:a"], "createdAt": stamp, "updatedAt": stamp});
     let mut entry = prism_audience(&did, A, "v1", &["did:plc:a"]);
     entry["record"]["createdAt"] = json!(stamp);
     entry["record"]["updatedAt"] = json!(stamp);
@@ -502,7 +503,13 @@ async fn local_audience(h: &Harness, did: &str, access: &str) -> String {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     h.state.kr.prism.set(false);
-    v["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned()
+    v["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -519,7 +526,13 @@ async fn a_local_audience_is_created_in_prism_once() {
         .await;
     assert_eq!(st, StatusCode::OK);
     let local = local_audience(&h, &did, &access).await;
-    let row = h.state.store.kr_audience(&did, &local).await.unwrap().unwrap();
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, &local)
+        .await
+        .unwrap()
+        .unwrap();
     let listing = |started_at| crate::audience::Refreshed {
         complete: true,
         started_at,
@@ -549,11 +562,13 @@ async fn a_local_audience_is_created_in_prism_once() {
     assert_eq!(stub.calls(CREATE), 0, "another node's create is open");
 
     // Expired, but the listing started before it expired: still not sent.
-    sqlx::query("UPDATE kr_audience_attempt SET outcome = 'expired', expires_at = ? WHERE id = 'n1'")
-        .bind(now - 1000)
-        .execute(h.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE kr_audience_attempt SET outcome = 'expired', expires_at = ? WHERE id = 'n1'",
+    )
+    .bind(now - 1000)
+    .execute(h.pool())
+    .await
+    .unwrap();
     crate::audience_sync::sync_account(&h.state, &did, &listing(now - 2000))
         .await
         .unwrap();
@@ -579,7 +594,14 @@ async fn a_local_audience_is_created_in_prism_once() {
     );
     crate::faults::set(&h.state, "audience.created", None);
     assert_eq!(stub.calls(CREATE), 1);
-    assert!(h.state.store.audience_alias(&did, &local).await.unwrap().is_none());
+    assert!(
+        h.state
+            .store
+            .audience_alias(&did, &local)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // After the restart, a refresh lists prism's audience; the attempt
     // (a `sending` leftover once the timeout passes) matches it and maps.
@@ -606,7 +628,14 @@ async fn a_local_audience_is_created_in_prism_once() {
         Some("3m6pmappedmap"),
         "mapped by the matching"
     );
-    assert!(h.state.store.kr_audience(&did, &local).await.unwrap().is_none());
+    assert!(
+        h.state
+            .store
+            .kr_audience(&did, &local)
+            .await
+            .unwrap()
+            .is_none()
+    );
     h.state.store.set_next_poll(&did, 0).await.unwrap();
     crate::audience_sync::poll_once(&h.state, &cancel)
         .await
@@ -711,7 +740,8 @@ async fn re_pointing_commits_once_per_repo_batch_and_waits_its_turn() {
         .unwrap()
         .unwrap()
         .0;
-    let parent = json!({"uri": format!("at://{owner}/{POST_PRIVATE}/{}", rkeys[0]), "cid": parent_cid});
+    let parent =
+        json!({"uri": format!("at://{owner}/{POST_PRIVATE}/{}", rkeys[0]), "cid": parent_cid});
     let (st, reply) = h
         .reply_as(&member, &member_access, &parent, &local_uri)
         .await;
@@ -935,9 +965,15 @@ async fn readiness_takes_the_newer_row_and_failed_probes_change_nothing() {
     // The newer of the two rows decides.
     put(perm(&member, "membership", "member", true, 2000)).await;
     put(perm(&member, "probe", "notReady", false, 1000)).await;
-    assert!(!check().await.unwrap(), "the newer probe row says not ready");
+    assert!(
+        !check().await.unwrap(),
+        "the newer probe row says not ready"
+    );
     put(perm(&member, "probe", "notReady", false, 3000)).await;
-    assert!(check().await.unwrap(), "the newer membership row says ready");
+    assert!(
+        check().await.unwrap(),
+        "the newer membership row says ready"
+    );
 
     // With no rows the probe asks prism; a 429 or a 5xx writes no row.
     h.state.store.delete_kr_permissions(&member).await.unwrap();
@@ -971,7 +1007,11 @@ async fn readiness_takes_the_newer_row_and_failed_probes_change_nothing() {
     assert!(!check().await.unwrap());
     let r = row("probe").await.expect("notEnrolled");
     assert_eq!(
-        (r.status.as_str(), r.private_read, r.expires_at - r.checked_at),
+        (
+            r.status.as_str(),
+            r.private_read,
+            r.expires_at - r.checked_at
+        ),
         ("notEnrolled", false, 5_000)
     );
     let mine = h.add_audience(&member, B).await;
@@ -1110,7 +1150,14 @@ async fn another_prism_did_discards_the_copy_aliases_and_both_rows() {
             .is_empty(),
         "the local {local} too"
     );
-    assert!(h.state.store.audience_aliases(&did).await.unwrap().is_empty());
+    assert!(
+        h.state
+            .store
+            .audience_aliases(&did)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     for source in ["membership", "probe"] {
         assert!(
             h.state
@@ -1165,11 +1212,28 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
             )
             .await;
             assert_eq!(st, StatusCode::OK, "{condition} {c}: {v}");
-            made.push((c, v["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned()));
+            made.push((
+                c,
+                v["uri"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            ));
         }
-        let (st, v) = h.private_post_as(&did, &access, private_post("x", &mine)).await;
+        let (st, v) = h
+            .private_post_as(&did, &access, private_post("x", &mine))
+            .await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        let post = v["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned();
+        let post = v["uri"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
         let aud_rkey = format!("3m6gone{n}aaaaa");
         h.add_audience(&did, &aud_rkey).await;
 
@@ -1194,7 +1258,11 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
                 ("Forbidden", StatusCode::FORBIDDEN)
             }
             _ => {
-                h.state.store.set_private_tier_blocked(&did, true).await.unwrap();
+                h.state
+                    .store
+                    .set_private_tier_blocked(&did, true)
+                    .await
+                    .unwrap();
                 ("Forbidden", StatusCode::FORBIDDEN)
             }
         };
@@ -1226,7 +1294,8 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
             );
         }
         refused(
-            h.private_post_as(&did, &access, private_post("x", &mine)).await,
+            h.private_post_as(&did, &access, private_post("x", &mine))
+                .await,
             "createPostPrivate",
         );
         refused(
@@ -1263,7 +1332,12 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
             .await;
             assert_eq!(st, StatusCode::OK, "{condition}: delete {c}: {v}");
             assert!(
-                h.state.store.record_entry(&did, c, rkey).await.unwrap().is_none(),
+                h.state
+                    .store
+                    .record_entry(&did, c, rkey)
+                    .await
+                    .unwrap()
+                    .is_none(),
                 "{condition}: {c} gone"
             );
         }
@@ -1274,7 +1348,12 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
         .await;
         assert_eq!(st, StatusCode::OK, "{condition}: deletePostPrivate: {v}");
         assert!(
-            h.state.store.record_entry(&did, POST_PRIVATE, &post).await.unwrap().is_none()
+            h.state
+                .store
+                .record_entry(&did, POST_PRIVATE, &post)
+                .await
+                .unwrap()
+                .is_none()
         );
         let (st, v) = call(
             "tools.kryphocron.policy.deleteAudience",
@@ -1283,7 +1362,12 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
         .await;
         assert_eq!(st, StatusCode::OK, "{condition}: deleteAudience: {v}");
         assert!(
-            h.state.store.kr_audience(&did, &aud_rkey).await.unwrap().is_none(),
+            h.state
+                .store
+                .kr_audience(&did, &aud_rkey)
+                .await
+                .unwrap()
+                .is_none(),
             "{condition}: the audience is gone (or a pending delete)"
         );
         // An audience the store never held: a no-op (with the tier on,
@@ -1306,14 +1390,22 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
         .await;
         assert_eq!(st, StatusCode::OK, "{condition}: unknown audience: {v}");
         if n < 2 {
-            assert_eq!(stub.seen.lock().unwrap().len(), calls, "{condition}: no prism call");
+            assert_eq!(
+                stub.seen.lock().unwrap().len(),
+                calls,
+                "{condition}: no prism call"
+            );
         }
 
         // Back on.
         h.set("appview.url", json!(stub.url)).await;
         h.set("appview.did", json!("did:web:prism.test")).await;
         h.set("kryphocron.private_tier_enabled", json!(true)).await;
-        h.state.store.set_private_tier_blocked(&did, false).await.unwrap();
+        h.state
+            .store
+            .set_private_tier_blocked(&did, false)
+            .await
+            .unwrap();
         h.state.store.delete_kr_permissions(&did).await.unwrap();
         stub.set(
             "app.nearhorizon.actor.getMembership",
@@ -1369,7 +1461,10 @@ async fn a_hung_prism_is_an_outage_and_errors_are_not() {
     });
     h.set("appview.url", json!(hung_url)).await;
     assert!(matches!(list().await, Prism::Timeout));
-    assert!(wait_for(true, 3000).await, "a timed-out probe marks it down");
+    assert!(
+        wait_for(true, 3000).await,
+        "a timed-out probe marks it down"
+    );
 
     // Down: proxied audience calls are answered from the store, prism's
     // version token from before the outage passing the swap once.
@@ -1391,7 +1486,10 @@ async fn a_hung_prism_is_an_outage_and_errors_are_not() {
                     &proxy,
                 )
                 .await;
-            (st, serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null))
+            (
+                st,
+                serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
+            )
         }
     };
     let (st, v) = update("3m6prismcid22").await;
@@ -1475,23 +1573,38 @@ async fn local_audiences_are_flagged_never_deleted_and_paced() {
     stub.set(CREATE, 400, json!({"error": "InvalidRequest"}));
     h.set("kryphocron.audience_max_per_account", json!(1)).await;
     assert_eq!(sync().await, 0, "no room in prism");
-    let row = h.state.store.kr_audience(&did, &collide).await.unwrap().unwrap();
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, &collide)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.origin, "local", "never deleted by a listing");
     assert_eq!(flagged(&collide).await.as_deref(), Some("limit"));
-    h.set("kryphocron.audience_max_per_account", json!(200)).await;
+    h.set("kryphocron.audience_max_per_account", json!(200))
+        .await;
     let mut theirs = prism_audience(&did, &collide, "v9", &["did:plc:theirs"]);
     theirs["record"]["name"] = json!("theirs");
     stub.set(LIST, 200, json!({"audiences": [page_a, theirs]}));
     // (The limit flag clears with room, then the collision flags it.)
     sync().await;
-    let row = h.state.store.kr_audience(&did, &collide).await.unwrap().unwrap();
+    let row = h
+        .state
+        .store
+        .kr_audience(&did, &collide)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (row.origin.as_str(), row.members_json.as_str()),
         ("local", "[\"did:plc:friend\"]"),
         "not adopted"
     );
     assert!(
-        flagged(&collide).await.is_some_and(|f| f.contains("collision")),
+        flagged(&collide)
+            .await
+            .is_some_and(|f| f.contains("collision")),
         "{:?}",
         flagged(&collide).await
     );
@@ -1549,7 +1662,10 @@ async fn local_audiences_are_flagged_never_deleted_and_paced() {
             sent["record"]["createdAt"].as_str(),
             sent["record"]["updatedAt"].as_str()
         ),
-        (Some(created.created_at.as_str()), Some(created.updated_at.as_str())),
+        (
+            Some(created.created_at.as_str()),
+            Some(created.updated_at.as_str())
+        ),
         "the local stamps"
     );
 }
@@ -1609,14 +1725,21 @@ async fn store_miss_refreshes_are_retryable_until_a_listing_settles_them() {
     let post = |rkey: &'static str| {
         let (h, did, access) = (&h, did.clone(), access.clone());
         async move {
-            h.private_post_as(&did, &access, private_post("x", &format!("at://{did}/{AUD}/{rkey}")))
-                .await
+            h.private_post_as(
+                &did,
+                &access,
+                private_post("x", &format!("at://{did}/{AUD}/{rkey}")),
+            )
+            .await
         }
     };
     let retryable = |(st, v): (StatusCode, Value), what: &str| {
         assert_eq!(
             (st, v["error"].as_str()),
-            (StatusCode::SERVICE_UNAVAILABLE, Some("TemporarilyUnavailable")),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("TemporarilyUnavailable")
+            ),
             "{what}: {v}"
         );
     };
@@ -1634,7 +1757,11 @@ async fn store_miss_refreshes_are_retryable_until_a_listing_settles_them() {
     clear().await;
     retryable(post(B).await, "timeout");
     // A later retry finds it.
-    stub.set(LIST, 200, json!({"audiences": [prism_audience(&did, B, "v1", &[])]}));
+    stub.set(
+        LIST,
+        200,
+        json!({"audiences": [prism_audience(&did, B, "v1", &[])]}),
+    );
     clear().await;
     let (st, v) = post(B).await;
     assert_eq!(st, StatusCode::OK, "{v}");
