@@ -295,6 +295,22 @@ pub(crate) async fn listing_guard(
     since: i64,
     pending: bool,
 ) -> XrpcResult<()> {
+    // The held keys as stored, not as this node last loaded them: a key
+    // stored moments ago (by this node or another) counts at once.
+    let held: Vec<String> = s
+        .store
+        .plc_key_rows()
+        .await?
+        .into_iter()
+        .map(|r| r.did_key)
+        .collect();
+    // An entryway doesn't see the ops its shards submit, so its listings
+    // can't be trusted: every account is re-fetched.
+    let since = if s.role == locus_core::bootstrap::Role::Entryway {
+        i64::MAX
+    } else {
+        since
+    };
     for did in s.store.plc_guard_candidates(did_key, since).await? {
         let keys = match crate::identity::plc_state(s, &did).await {
             Ok((Some(op), _)) => op.rotation_keys,
@@ -306,7 +322,7 @@ pub(crate) async fn listing_guard(
                 )));
             }
         };
-        let listed = s.secrets.plc_keys.listed(&keys);
+        let listed: Vec<String> = keys.iter().filter(|k| held.contains(k)).cloned().collect();
         s.store.set_plc_key_listing(&did, &listed).await?;
         let names = keys.iter().any(|k| k == did_key);
         if names && (pending || listed.iter().all(|k| k == did_key)) {
@@ -559,7 +575,14 @@ pub async fn drop_plc_key(
     )
     .await;
     reload_soon(&s);
-    Ok(Json(json!({"didKey": row.did_key, "role": "dropped"})))
+    Ok(Json(json!({
+        "didKey": row.did_key,
+        "role": "dropped",
+        "kmsKeyId": row.kms_key_id,
+        "next": row.kms_key_id.as_ref().map(|id| format!(
+            "This PDS no longer uses the KMS key {id}: disable it in KMS."
+        )),
+    })))
 }
 
 /// One step of the PLC key scan: starts a pass when one is due (a key
@@ -715,12 +738,15 @@ async fn set_entryway_value(
     input: &SetSecretInput,
     value: &str,
 ) -> XrpcResult<Json<Value>> {
-    let Some(ew) = &s.entryway else {
+    if s.entryway.is_none() {
         return Err(XrpcError::invalid_request(
             "The entryway values are set only in the shard role",
         ));
-    };
+    }
     let bad = |e: String| XrpcError::invalid_request(e);
+    // The stored keys, not this node's loaded ones: an earlier change may
+    // not have reloaded yet.
+    let stored = s.store.load_snapshot().await?;
     let mut tx = s.store.begin().await?;
     let (fingerprint_of, shown): (Vec<u8>, Value) = match input.name.as_str() {
         "entryway-verify-key" => {
@@ -733,7 +759,13 @@ async fn set_entryway_value(
             let k = crate::shard::parse_k256_key(value).map_err(bad)?;
             let mut keys = vec![k.clone()];
             if !input.revoke_previous {
-                keys.extend(ew.plc_rotation_keys.iter().filter(|x| **x != k).cloned());
+                keys.extend(
+                    stored
+                        .list("entryway.plc_rotation_keys")
+                        .into_iter()
+                        .filter(|x| *x != k)
+                        .map(str::to_owned),
+                );
             }
             tx.set_setting("entryway.plc_rotation_keys", json!(keys), &who.actor)
                 .await?;

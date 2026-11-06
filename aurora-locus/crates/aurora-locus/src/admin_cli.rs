@@ -1403,9 +1403,13 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 json!({"didKey": did_key}),
                 reauth(c, &format!("Forget the PLC rotation key {did_key}"), yes)?,
             );
-            c.call(&lx("owner.keys.dropPlcKey"), &[], Some(body))
+            let v = c
+                .call(&lx("owner.keys.dropPlcKey"), &[], Some(body))
                 .await?;
             println!("{did_key} is no longer held.");
+            if let Some(next) = v["next"].as_str() {
+                println!("{next}");
+            }
             Ok(())
         }
     }

@@ -2,6 +2,8 @@
 //! `LOCUS_TEST_POSTGRES_URL` points at a server (each test gets its own
 //! throwaway database).
 
+mod keys;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

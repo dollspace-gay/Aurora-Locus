@@ -745,6 +745,24 @@ kryphocron built in.
 - Grouped operator methods (`.viewer.*`, `.moderator.*`, `.admin.*`,
   `.owner.*`) are refused below the group's role before the handler runs
   and parses the body; handlers still check their own role.
+- The PLC key listing guard counts every stored PLC rotation key as held,
+  so a node that hasn't reloaded since a pending key was stored can't
+  record a listing without it and then let that key be discarded or
+  replaced while a document names it.
+- In the entryway role the PLC key listing guard re-fetches every
+  account's document, since an entryway doesn't see the ops its shards
+  submit.
+- `keys drop-plc-key` of a KMS-backed key says to disable that key in KMS.
+- A shard stops accepting a previous entryway verify key when its 2 h
+  overlap ends (it accepted it until the next restart or key change).
+- `keys set entryway-plc-rotation-key` keeps every stored key since the
+  last `--revoke-previous`, even when set again before the node reloaded
+  (a quick second change dropped the key set before it).
+- A Postgres node refuses a master key file not declared shared
+  (`LOCUS_MASTER_KEY_SHARED_FILE`) even when the file exists; before, only
+  a missing file was refused.
+- Reserving a signing key checks the install's master key first, as every
+  other secret write does.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

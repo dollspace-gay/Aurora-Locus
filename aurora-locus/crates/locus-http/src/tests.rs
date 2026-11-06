@@ -3,6 +3,8 @@
 mod blobs;
 mod bulk;
 mod security;
+mod keys;
+mod keys_shard;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
