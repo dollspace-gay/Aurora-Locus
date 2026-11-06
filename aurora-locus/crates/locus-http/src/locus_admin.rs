@@ -70,6 +70,20 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("owner.createApiToken"), post(create_api_token))
         .route(at!("owner.revokeApiToken"), post(revoke_api_token))
         .route(at!("owner.keys.show"), get(crate::keys::show))
+        .route(at!("owner.keys.setSecret"), post(crate::keys::set_secret))
+        .route(
+            at!("owner.keys.rotateServiceKey"),
+            post(crate::keys::rotate_service_key),
+        )
+        .route(at!("owner.keys.import"), post(crate::keys::import))
+        .route(
+            at!("admin.keys.rotateAccountKeys"),
+            post(crate::keys::rotate_account_keys),
+        )
+        .route(
+            at!("admin.identity.publish"),
+            post(crate::keys::publish_identity),
+        )
         .route(at!("owner.keys.backup"), post(crate::keys::backup))
         .route(
             at!("owner.keys.setPlcRotationKey"),

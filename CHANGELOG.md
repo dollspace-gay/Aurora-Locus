@@ -491,6 +491,19 @@ kryphocron built in.
 - A background scan records which held PLC rotation keys each account's
   document lists, after a key becomes current and daily while an older
   key is held.
+- `keys set jwt-secret` and `keys set dpop-secret` (read from a file or
+  stdin; only a fingerprint is audited), and `keys rotate-service-key`. A
+  changed `PDS_JWT_SECRET` or `PDS_DPOP_SECRET` is ignored with a warning
+  that names the command.
+- `keys rotate-account <did>… [--file]` and `identity publish <did>…
+  [--file]`, the reference's `rotate-keys` and `publish-identity`
+  scripts: the first points each account's PLC document at its stored
+  signing key and announces `#identity` and a fresh commit's `#sync`.
+- `keys import <backup>`: adds the PLC rotation keys this PDS lacks as
+  secondary signers, and restores an account's signing key from the
+  backup where its live DID document lists that key and not the stored
+  one (with a fresh commit and `#sync` for active accounts); it reports
+  accounts whose documents list neither.
 
 ### Changed
 

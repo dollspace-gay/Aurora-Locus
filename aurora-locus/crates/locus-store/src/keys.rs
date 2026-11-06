@@ -317,6 +317,35 @@ impl Tx {
         Ok(replaced.map(|r| r.0))
     }
 
+    /// Adds a held PLC rotation key as a secondary signer (from a key
+    /// backup). Returns false if the key is already held.
+    pub async fn insert_secondary_plc_key(
+        &mut self,
+        did_key: &str,
+        private: &[u8],
+        key: &MasterKey,
+    ) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT 1 FROM plc_rotation_key WHERE did_key = {1}",
+            tx_pg(self),
+        );
+        let held: Option<(i32,)> = tx_run!(self, q, fetch_optional, did_key)?;
+        if held.is_some() {
+            return Ok(false);
+        }
+        self.put_secret(&plc_key_secret_name(did_key), private, key)
+            .await?;
+        self.insert_plc_rotation_key(did_key, PlcKeyRole::Secondary)
+            .await?;
+        let q = sql(
+            "UPDATE plc_rotation_key SET secondary_since = {now} WHERE did_key = {1}",
+            tx_pg(self),
+        );
+        tx_exec!(self, q, did_key)?;
+        self.bump_key_generation().await?;
+        Ok(true)
+    }
+
     /// Removes a pending or secondary PLC rotation key and its private
     /// half. The current key can't be removed.
     pub async fn remove_plc_key(&mut self, did_key: &str) -> CoreResult<()> {

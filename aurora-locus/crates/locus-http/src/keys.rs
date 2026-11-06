@@ -510,3 +510,363 @@ pub async fn plc_scan_step(s: &AppState, batch: i64) -> locus_core::CoreResult<u
     }
     Ok(dids.len())
 }
+
+/// The fingerprint of a secret value, for the audit log (never the value).
+fn fingerprint(value: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(&sha2::Sha256::digest(value)[..8])
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSecretInput {
+    /// `jwt-secret` or `dpop-secret`.
+    name: String,
+    value: String,
+    #[serde(flatten)]
+    reauth: Reauth,
+}
+
+/// `owner.keys.setSecret`: replaces a secret a changed env value can't
+/// (the JWT and DPoP secrets), applied on every node within seconds.
+pub async fn set_secret(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<SetSecretInput>,
+) -> XrpcResult<Json<Value>> {
+    use crate::state::secret_names;
+    let who = owner(&s, &headers, locus_nsid!("owner.keys.setSecret")).await?;
+    admin_auth::reauth(&s, &who, &input.reauth).await?;
+    let value = Zeroizing::new(input.value.trim().to_owned());
+    let (slot, bytes): (&str, Zeroizing<Vec<u8>>) = match input.name.as_str() {
+        "jwt-secret" => {
+            if value.len() < 32 {
+                return Err(XrpcError::invalid_request(
+                    "A JWT secret is at least 32 characters",
+                ));
+            }
+            (secret_names::JWT, Zeroizing::new(value.as_bytes().to_vec()))
+        }
+        "dpop-secret" => {
+            let b = hex::decode(value.as_str())
+                .ok()
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| {
+                    XrpcError::invalid_request("A DPoP secret is 32 bytes, as 64 hex characters")
+                })?;
+            (secret_names::DPOP_SECRET, Zeroizing::new(b))
+        }
+        other => {
+            return Err(XrpcError::invalid_request(format!(
+                "{other} isn't a secret this sets (jwt-secret, dpop-secret)"
+            )));
+        }
+    };
+    let mut tx = s.store.begin().await?;
+    tx.put_secret(slot, &bytes, &s.master_key).await?;
+    tx.bump_key_generation().await?;
+    tx.commit().await?;
+    admin_auth::audit(
+        &s,
+        &who,
+        "keys.setSecret",
+        Some(&input.name),
+        Some(json!({"fingerprint": fingerprint(&bytes)})),
+    )
+    .await;
+    reload_soon(&s);
+    Ok(Json(
+        json!({"name": input.name, "fingerprint": fingerprint(&bytes)}),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+pub struct ReauthOnly {
+    #[serde(flatten)]
+    reauth: Reauth,
+}
+
+/// `owner.keys.rotateServiceKey`: a new key for the service's own DID
+/// document and the tokens it signs.
+pub async fn rotate_service_key(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<ReauthOnly>,
+) -> XrpcResult<Json<Value>> {
+    let who = owner(&s, &headers, locus_nsid!("owner.keys.rotateServiceKey")).await?;
+    admin_auth::reauth(&s, &who, &input.reauth).await?;
+    let pair = K256Keypair::generate();
+    let private = Zeroizing::new(pair.export_private_key());
+    let mut tx = s.store.begin().await?;
+    tx.put_secret(
+        crate::state::secret_names::SERVICE_KEY,
+        &private,
+        &s.master_key,
+    )
+    .await?;
+    tx.bump_key_generation().await?;
+    tx.commit().await?;
+    admin_auth::audit(
+        &s,
+        &who,
+        "keys.rotateServiceKey",
+        Some(&pair.did()),
+        Some(json!({"previous": s.secrets.service_key.did()})),
+    )
+    .await;
+    reload_soon(&s);
+    Ok(Json(json!({"didKey": pair.did()})))
+}
+
+#[derive(Deserialize)]
+pub struct DidsInput {
+    dids: Vec<String>,
+}
+
+/// `admin.keys.rotateAccountKeys`: the reference's `rotate-keys`. For
+/// each account, points its PLC document's signing key at the one stored
+/// here if it lists another, then announces `#identity` and a fresh
+/// commit's `#sync`.
+pub async fn rotate_account_keys(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<DidsInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = admin_auth::require(
+        &s,
+        &headers,
+        locus_nsid!("admin.keys.rotateAccountKeys"),
+        Surface::Locus,
+        Role::Admin,
+    )
+    .await?;
+    let mut results = Vec::new();
+    for did in &input.dids {
+        let outcome = rotate_one(&s, did).await;
+        results.push(match &outcome {
+            Ok(changed) => json!({"did": did, "ok": true, "plcUpdated": changed}),
+            Err(m) => json!({"did": did, "ok": false, "error": m}),
+        });
+    }
+    admin_auth::audit(
+        &s,
+        &who,
+        "keys.rotateAccountKeys",
+        None,
+        Some(json!({"dids": input.dids.len()})),
+    )
+    .await;
+    Ok(Json(json!({"results": results})))
+}
+
+async fn rotate_one(s: &AppState, did: &str) -> Result<bool, String> {
+    let account = s
+        .store
+        .account_by_did(did)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("no such account")?;
+    if account.did_method != "plc" {
+        return Err("not a did:plc account".into());
+    }
+    let key = s.signing_key(did).await.map_err(|e| e.message)?;
+    let changed = crate::identity::plc_set_signing_key(s, did, &key.did())
+        .await
+        .map_err(|e| e.message())?;
+    crate::identity::emit_identity(s, did)
+        .await
+        .map_err(|e| e.message)?;
+    s.repo
+        .resign_with_sync(did, &key)
+        .await
+        .map_err(|e| format!("couldn't write the new commit: {e}"))?;
+    Ok(changed)
+}
+
+/// `admin.identity.publish`: the reference's `publish-identity`, an
+/// `#identity` for each DID.
+pub async fn publish_identity(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<DidsInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = admin_auth::require(
+        &s,
+        &headers,
+        locus_nsid!("admin.identity.publish"),
+        Surface::Locus,
+        Role::Admin,
+    )
+    .await?;
+    let mut results = Vec::new();
+    for did in &input.dids {
+        let hosted = s.store.account_by_did(did).await?.is_some();
+        let r = if hosted {
+            crate::identity::emit_identity(&s, did)
+                .await
+                .map_err(|e| e.message)
+        } else {
+            Err("no such account".into())
+        };
+        results.push(match r {
+            Ok(()) => json!({"did": did, "ok": true}),
+            Err(m) => json!({"did": did, "ok": false, "error": m}),
+        });
+    }
+    admin_auth::audit(
+        &s,
+        &who,
+        "identity.publish",
+        None,
+        Some(json!({"dids": input.dids.len()})),
+    )
+    .await;
+    Ok(Json(json!({"results": results})))
+}
+
+/// The path key imports are posted to (it takes a large body).
+pub const IMPORT_PATH: &str = concat!("/xrpc/", locus_nsid!("owner.keys.import"));
+/// The largest key backup an import takes.
+pub const MAX_IMPORT_BODY: i64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ImportHead {
+    passphrase: String,
+    #[serde(flatten)]
+    reauth: Reauth,
+}
+
+/// `owner.keys.import`: reads a key backup (the body is a JSON line with
+/// the passphrase and re-auth, then the backup file). Adds the PLC rotation
+/// keys this PDS lacks as secondary signers, and replaces an account's
+/// signing key with the backup's where the account's live DID document
+/// lists the backup's key and not the stored one (a fresh commit and
+/// `#sync` follow for active accounts). Nothing else is changed. Reports
+/// what it did, and every account whose document lists neither key.
+pub async fn import(State(s): St, headers: HeaderMap, body: Body) -> XrpcResult<Json<Value>> {
+    use locus_core::key_backup::Entry;
+    let who = owner(&s, &headers, locus_nsid!("owner.keys.import")).await?;
+    let bytes = axum::body::to_bytes(body, usize::try_from(MAX_IMPORT_BODY).unwrap_or(usize::MAX))
+        .await
+        .map_err(|_| XrpcError::invalid_request("The key backup couldn't be read"))?;
+    let nl = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or_else(|| XrpcError::invalid_request("Send the passphrase line, then the backup"))?;
+    let head: ImportHead = serde_json::from_slice(&bytes[..nl])
+        .map_err(|_| XrpcError::invalid_request("Send the passphrase line, then the backup"))?;
+    admin_auth::reauth(&s, &who, &head.reauth).await?;
+    let passphrase = Zeroizing::new(head.passphrase);
+    let (header, entries) =
+        locus_core::key_backup::open(&bytes[nl + 1..], &passphrase).map_err(XrpcError::from)?;
+    drop(bytes);
+
+    let mut secrets = std::collections::HashMap::new();
+    let mut plc_keys = Vec::new();
+    let mut signing = Vec::new();
+    for e in entries {
+        match e {
+            Entry::Secret { name, value } => {
+                secrets.insert(name, value);
+            }
+            Entry::PlcKey { did_key, .. } => plc_keys.push(did_key),
+            Entry::SigningKey {
+                did,
+                key_type,
+                value,
+            } => signing.push((did, key_type, value)),
+        }
+    }
+
+    let mut added = Vec::new();
+    for did_key in &plc_keys {
+        let Some(private) = secrets.get(&locus_store::identity::plc_key_secret_name(did_key))
+        else {
+            continue;
+        };
+        let Ok(pair) = K256Keypair::from_private_key(private) else {
+            continue;
+        };
+        if pair.did() != *did_key {
+            continue;
+        }
+        let mut tx = s.store.begin().await?;
+        let new = tx
+            .insert_secondary_plc_key(did_key, private, &s.master_key)
+            .await?;
+        tx.commit().await?;
+        if new {
+            added.push(did_key.clone());
+        }
+    }
+
+    let (mut replaced, mut kept, mut neither, mut skipped) = (Vec::new(), 0, Vec::new(), 0);
+    for (did, key_type, private) in signing {
+        let account = match s.store.account_by_did(&did).await? {
+            Some(a) if a.did_method == "plc" && key_type == "k256" => a,
+            // Gone, did:web (its restored document is authoritative), or
+            // a key type locus doesn't use.
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let Ok(backup_key) = K256Keypair::from_private_key(&private) else {
+            skipped += 1;
+            continue;
+        };
+        let stored = s.signing_key(&did).await.ok().map(|k| k.did());
+        if stored.as_deref() == Some(backup_key.did().as_str()) {
+            kept += 1;
+            continue;
+        }
+        let live = match crate::identity::plc_signing_key(&s, &did).await {
+            Ok(k) => k,
+            Err(e) => {
+                neither.push(json!({"did": did, "error": e.message()}));
+                continue;
+            }
+        };
+        if live.as_deref() == Some(backup_key.did().as_str()) {
+            let mut tx = s.store.begin().await?;
+            tx.put_signing_key(&did, "k256", &private, &s.master_key)
+                .await?;
+            tx.commit().await?;
+            if account.status == locus_store::accounts::Status::Active
+                && let Err(e) = s.repo.resign_with_sync(&did, &backup_key).await
+            {
+                tracing::warn!(did, "couldn't write a commit with the restored key: {e}");
+            }
+            replaced.push(did);
+        } else if live.is_some() && live == stored {
+            kept += 1;
+        } else {
+            neither.push(json!({"did": did}));
+        }
+    }
+    admin_auth::audit(
+        &s,
+        &who,
+        "keys.import",
+        None,
+        Some(json!({
+            "backupCreatedAt": header.created_at,
+            "plcKeysAdded": added.len(),
+            "signingKeysReplaced": replaced.len(),
+        })),
+    )
+    .await;
+    if !added.is_empty() {
+        reload_soon(&s);
+    }
+    Ok(Json(json!({
+        "plcKeysAdded": added,
+        "signingKeysReplaced": replaced,
+        "signingKeysKept": kept,
+        "skipped": skipped,
+        "listNeitherKey": neither,
+        "next": if neither.is_empty() { Value::Null } else {
+            json!("Accounts whose DID document lists neither key need `aurora-locus identity publish` or `repair identity`.")
+        },
+    })))
+}

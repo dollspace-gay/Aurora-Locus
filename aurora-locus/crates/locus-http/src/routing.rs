@@ -116,6 +116,8 @@ pub async fn limit_body(
         snap.int("limits.repo_write_body")
     } else if path == crate::branding::UPLOAD_PATH {
         crate::branding::MAX_UPLOAD_BODY
+    } else if path == crate::keys::IMPORT_PATH {
+        crate::keys::MAX_IMPORT_BODY
     } else {
         snap.int("limits.json_body")
     })

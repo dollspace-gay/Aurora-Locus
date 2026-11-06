@@ -309,6 +309,66 @@ impl RepoEngine {
         Ok((guard, tx))
     }
 
+    /// A fresh commit over the repository's current data, signed with
+    /// `signer`, announced with `#sync` only (no `#commit`: nothing in the
+    /// tree changed). Used after an account's signing key changes, so
+    /// relays can check the new key without waiting for the next write.
+    pub async fn resign_with_sync(
+        &self,
+        did: &str,
+        signer: &dyn Signer,
+    ) -> Result<Cid, CommitError> {
+        let lock = self.repo_lock(did);
+        let _held = lock.lock().await;
+        let mut tx = self.store.begin().await?;
+        tx.lock_repo(did).await?;
+        if tx.write_blocked(did).await? {
+            return Err(CommitError::WriteBlocked);
+        }
+        let root = tx
+            .repo_root(did)
+            .await?
+            .ok_or_else(|| CommitError::RepoNotFound(did.to_owned()))?;
+        let data = parse_cid(&root.data_cid)?;
+        let rev = self.tids.next_after(Some(&root.rev));
+        let commit = sign_commit(
+            &UnsignedCommit::new(did.to_owned(), data, rev.clone(), None),
+            signer,
+        )?;
+        let bytes = commit.to_cbor()?;
+        let cid = commit.cid()?;
+        tx.apply_block_deltas(
+            did,
+            &rev,
+            &[
+                BlockDelta {
+                    cid: cid_str(&cid),
+                    bytes: Some(bytes.clone()),
+                    delta: 1,
+                },
+                BlockDelta {
+                    cid: root.commit_cid.clone(),
+                    bytes: None,
+                    delta: -1,
+                },
+            ],
+        )
+        .await?;
+        tx.set_repo_root(
+            did,
+            &RepoRoot {
+                commit_cid: cid_str(&cid),
+                rev: rev.clone(),
+                data_cid: root.data_cid.clone(),
+            },
+        )
+        .await?;
+        let body = crate::event::sync_body(did, &rev, &cid, &bytes)?;
+        tx.insert_outbox(did, "sync", &body).await?;
+        tx.commit().await?;
+        Ok(cid)
+    }
+
     /// Creates an account's empty repository in its own transaction, with
     /// its `#commit` event.
     pub async fn create_repo(

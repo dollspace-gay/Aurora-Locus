@@ -269,6 +269,84 @@ async fn apply_handle(
     Ok(())
 }
 
+/// `#identity` with no handle, as the reference's `publish-identity`
+/// sequences it, in order with the DID's commits.
+pub(crate) async fn emit_identity(s: &AppState, did: &str) -> XrpcResult<()> {
+    let (_lock, mut tx) = s
+        .repo
+        .locked_tx(did)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let body = identity_body(did, None).map_err(|e| XrpcError::internal(e.to_string()))?;
+    tx.insert_outbox(did, "identity", &body).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The account's signing key (`#atproto`) its latest PLC document lists.
+pub(crate) async fn plc_signing_key(s: &AppState, did: &str) -> Result<Option<String>, PlcStep> {
+    let (state, _) = plc_state(s, did).await?;
+    Ok(state.and_then(|op| op.verification_methods.get("atproto").cloned()))
+}
+
+/// Points the DID document's `#atproto` key at `did_key`, signed with the
+/// held key the document lists first. Returns whether it changed anything.
+pub(crate) async fn plc_set_signing_key(
+    s: &AppState,
+    did: &str,
+    did_key: &str,
+) -> Result<bool, PlcStep> {
+    let (state, prev) = plc_state(s, did).await?;
+    let current =
+        state.ok_or_else(|| PlcStep::Refused(XrpcError::invalid_request("DID is tombstoned")))?;
+    let _ = s
+        .store
+        .set_plc_key_listing(did, &s.secrets.plc_keys.listed(&current.rotation_keys))
+        .await;
+    if current
+        .verification_methods
+        .get("atproto")
+        .map(String::as_str)
+        == Some(did_key)
+    {
+        return Ok(false);
+    }
+    let mut next = current.clone();
+    next.verification_methods
+        .insert("atproto".to_owned(), did_key.to_owned());
+    next.prev = Some(prev);
+    next.validate()
+        .map_err(|e| PlcStep::Refused(XrpcError::invalid_request(e.to_string())))?;
+    let signer = s
+        .secrets
+        .plc_keys
+        .signer_for(&current.rotation_keys)
+        .ok_or_else(no_held_key)?;
+    let signed = next
+        .sign(signer)
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let plc = s.plc().map_err(PlcStep::Ambiguous)?;
+    match plc.submit(did, &signed).await {
+        Ok(()) => Ok(true),
+        Err(PlcClientError::Refused(m)) => Err(PlcStep::Refused(XrpcError::invalid_request(
+            format!("The PLC directory refused the update: {m}"),
+        ))),
+        Err(e) => match plc_signing_key(s, did).await {
+            // It applied after all.
+            Ok(Some(k)) if k == did_key => Ok(true),
+            _ => Err(PlcStep::Ambiguous(upstream(e.to_string()))),
+        },
+    }
+}
+
+impl PlcStep {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Refused(e) | Self::Ambiguous(e) => e.message.clone(),
+        }
+    }
+}
+
 /// A PLC step that failed: refused (nothing changed) or ambiguous (it may
 /// have applied; the repair job finds out).
 pub(crate) enum PlcStep {

@@ -68,6 +68,32 @@ impl Client {
         query: &[(String, String)],
         body: Option<Value>,
     ) -> Result<(u16, Vec<u8>), String> {
+        let body = body.map(|b| (b.to_string().into_bytes(), "application/json"));
+        self.send(nsid, query, body).await
+    }
+
+    /// Calls `nsid` as a procedure with a raw body of `content_type`.
+    pub async fn call_bytes(
+        &self,
+        nsid: &str,
+        bytes: Vec<u8>,
+        content_type: &'static str,
+    ) -> Result<Value, String> {
+        let (status, out) = self.send(nsid, &[], Some((bytes, content_type))).await?;
+        let v = answer_json(&out);
+        if (200..300).contains(&status) {
+            Ok(v)
+        } else {
+            Err(answer_error(status, &v))
+        }
+    }
+
+    async fn send(
+        &self,
+        nsid: &str,
+        query: &[(String, String)],
+        body: Option<(Vec<u8>, &'static str)>,
+    ) -> Result<(u16, Vec<u8>), String> {
         let path = if query.is_empty() {
             format!("/xrpc/{nsid}")
         } else {
@@ -77,8 +103,11 @@ impl Client {
             Self::Http { url, token } => {
                 let client = reqwest::Client::new();
                 let url = format!("{}{path}", url.trim_end_matches('/'));
-                let req = match &body {
-                    Some(b) => client.post(url).json(b),
+                let req = match body {
+                    Some((b, ct)) => client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, ct)
+                        .body(b),
                     None => client.get(url),
                 };
                 let res = req
@@ -96,10 +125,12 @@ impl Client {
                 let mut stream = tokio::net::UnixStream::connect(sock)
                     .await
                     .map_err(|e| format!("can't reach the admin socket {}: {e} (is a node running? or use --url and --token)", sock.display()))?;
-                let payload = body.as_ref().map(Value::to_string).unwrap_or_default();
+                let (method, payload, ct) = match body {
+                    Some((b, ct)) => ("POST", b, ct),
+                    None => ("GET", Vec::new(), "application/json"),
+                };
                 let head = format!(
-                    "{} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                    if body.is_some() { "POST" } else { "GET" },
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
                     payload.len()
                 );
                 stream
@@ -107,7 +138,7 @@ impl Client {
                     .await
                     .map_err(|e| e.to_string())?;
                 stream
-                    .write_all(payload.as_bytes())
+                    .write_all(&payload)
                     .await
                     .map_err(|e| e.to_string())?;
                 let mut raw = Vec::new();
@@ -333,6 +364,29 @@ pub enum KeysCmd {
     },
     #[command(subcommand)]
     Set(KeysSetCmd),
+    /// A new key for the service's own DID document.
+    RotateServiceKey {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The reference's rotate-keys: points each account's PLC document at
+    /// the signing key stored here, then announces #identity and a fresh
+    /// commit's #sync.
+    RotateAccount {
+        dids: Vec<String>,
+        /// A file of DIDs, one per line (did:plc ones are used).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Reads a key backup: adds the PLC rotation keys this PDS lacks, and
+    /// restores account signing keys their live DID documents list.
+    Import {
+        backup: PathBuf,
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Forgets a secondary PLC rotation key no account's document still
     /// needs (each document that may list it is checked first).
     DropPlcKey {
@@ -343,7 +397,33 @@ pub enum KeysCmd {
 }
 
 #[derive(Subcommand)]
+pub enum IdentityCmd {
+    /// The reference's publish-identity: an #identity event for each DID.
+    Publish {
+        dids: Vec<String>,
+        /// A file of DIDs, one per line.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum KeysSetCmd {
+    /// The secret legacy sessions are signed with (signs every legacy
+    /// session out). Read from a file, or `-` for stdin.
+    JwtSecret {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The DPoP nonce secret (64 hex characters; clients retry once).
+    DpopSecret {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
     /// A new PLC rotation key for the PDS. It's stored pending and becomes
     /// current once a key backup holds it (or with
     /// --acknowledge-no-backup); the previous key keeps signing for the
@@ -399,6 +479,8 @@ pub enum AdminCmd {
     Kryphocron(KryphocronCmd),
     #[command(subcommand)]
     Keys(KeysCmd),
+    #[command(subcommand)]
+    Identity(IdentityCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -560,6 +642,81 @@ fn ago(at_ms: i64) -> String {
     }
 }
 
+/// DIDs from the command line and a file (one per line).
+fn dids_from(
+    mut dids: Vec<String>,
+    file: Option<&std::path::Path>,
+    plc_only: bool,
+) -> Result<Vec<String>, String> {
+    if let Some(f) = file {
+        let text = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        dids.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| {
+                    if plc_only {
+                        l.starts_with("did:plc:")
+                    } else {
+                        !l.is_empty()
+                    }
+                })
+                .map(str::to_owned),
+        );
+    }
+    if let Some(bad) = dids.iter().find(|d| !d.starts_with("did:")) {
+        return Err(format!("{bad} isn't a DID"));
+    }
+    if dids.is_empty() {
+        return Err("Give DIDs, or --file".into());
+    }
+    Ok(dids)
+}
+
+fn report_results(v: &Value) -> Result<(), String> {
+    let mut failed = 0;
+    for r in v["results"].as_array().cloned().unwrap_or_default() {
+        let did = r["did"].as_str().unwrap_or("");
+        if r["ok"] == json!(true) {
+            let note = if r["plcUpdated"] == json!(true) {
+                " (PLC document updated)"
+            } else {
+                ""
+            };
+            println!("{did}: done{note}");
+        } else {
+            failed += 1;
+            println!("{did}: failed: {}", r["error"].as_str().unwrap_or("?"));
+        }
+    }
+    if failed > 0 {
+        Err(format!("{failed} failed"))
+    } else {
+        Ok(())
+    }
+}
+
+async fn set_secret(
+    c: &Client,
+    name: &str,
+    file: &std::path::Path,
+    yes: bool,
+    what: &str,
+) -> Result<(), String> {
+    let value = read_key(file)?;
+    let body = merge(
+        json!({"name": name, "value": *value}),
+        reauth(c, what, yes)?,
+    );
+    let v = c
+        .call(&format!("{NS}.owner.keys.setSecret"), &[], Some(body))
+        .await?;
+    println!(
+        "{name} replaced (fingerprint {}). Every node picks it up within seconds.",
+        v["fingerprint"].as_str().unwrap_or("")
+    );
+    Ok(())
+}
+
 async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match k {
@@ -672,6 +829,105 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        KeysCmd::Set(KeysSetCmd::JwtSecret { file, yes }) => {
+            set_secret(
+                c,
+                "jwt-secret",
+                &file,
+                yes,
+                "Replace the JWT secret (every legacy session signs out)",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::DpopSecret { file, yes }) => {
+            set_secret(
+                c,
+                "dpop-secret",
+                &file,
+                yes,
+                "Replace the DPoP nonce secret",
+            )
+            .await
+        }
+        KeysCmd::RotateServiceKey { yes } => {
+            let body = reauth(c, "Give the service DID a new signing key", yes)?;
+            let v = c
+                .call(&lx("owner.keys.rotateServiceKey"), &[], Some(body))
+                .await?;
+            println!(
+                "The service key is now {}.",
+                v["didKey"].as_str().unwrap_or("")
+            );
+            Ok(())
+        }
+        KeysCmd::RotateAccount { dids, file } => {
+            let dids = dids_from(dids, file.as_deref(), true)?;
+            for chunk in dids.chunks(50) {
+                let v = c
+                    .call(
+                        &lx("admin.keys.rotateAccountKeys"),
+                        &[],
+                        Some(json!({"dids": chunk})),
+                    )
+                    .await?;
+                report_results(&v)?;
+            }
+            Ok(())
+        }
+        KeysCmd::Import {
+            backup,
+            passphrase_file,
+            yes,
+        } => {
+            let file = std::fs::read(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+            let header = locus_core::key_backup::header(&file).map_err(|e| e.to_string())?;
+            println!(
+                "A key backup of {}, made {}.",
+                header.service_did,
+                ago(header.created_at)
+            );
+            let pass = match &passphrase_file {
+                Some(f) => read_key(f)?,
+                None => zeroize::Zeroizing::new(
+                    rpassword::prompt_password("Its passphrase: ").map_err(|e| e.to_string())?,
+                ),
+            };
+            // Checked here first, so a wrong passphrase costs no round trip.
+            locus_core::key_backup::open(&file, &pass).map_err(|e| e.to_string())?;
+            let auth = reauth(c, "Import keys from this backup", yes)?;
+            let mut head = merge(json!({"passphrase": *pass}), auth)
+                .to_string()
+                .into_bytes();
+            head.push(b'\n');
+            head.extend_from_slice(&file);
+            let v = c
+                .call_bytes(&lx("owner.keys.import"), head, "application/octet-stream")
+                .await?;
+            println!(
+                "PLC rotation keys added: {}",
+                v["plcKeysAdded"].as_array().map_or(0, Vec::len)
+            );
+            println!(
+                "Account signing keys restored: {} (kept: {}, skipped: {})",
+                v["signingKeysReplaced"].as_array().map_or(0, Vec::len),
+                v["signingKeysKept"],
+                v["skipped"]
+            );
+            for a in v["listNeitherKey"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "  lists neither key: {}{}",
+                    a["did"].as_str().unwrap_or(""),
+                    a["error"]
+                        .as_str()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default()
+                );
+            }
+            if let Some(n) = v["next"].as_str() {
+                println!("{n}");
+            }
+            Ok(())
+        }
         KeysCmd::DropPlcKey { did_key, yes } => {
             let body = merge(
                 json!({"didKey": did_key}),
@@ -690,6 +946,17 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match cmd {
         AdminCmd::Keys(k) => keys(c, k).await,
+        AdminCmd::Identity(IdentityCmd::Publish { dids, file }) => {
+            let dids = dids_from(dids, file.as_deref(), false)?;
+            let v = c
+                .call(
+                    &lx("admin.identity.publish"),
+                    &[],
+                    Some(json!({"dids": dids})),
+                )
+                .await?;
+            report_results(&v)
+        }
         AdminCmd::Status => {
             let caps = c.call(&lx("describeCapabilities"), &[], None).await?;
             println!("aurora-locus {}", caps["version"].as_str().unwrap_or("?"));

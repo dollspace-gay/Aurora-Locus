@@ -302,6 +302,27 @@ impl ServerSecrets {
             Ok(p) if !p.is_empty() => Zeroizing::new(p.into_bytes()),
             _ => stored_admin,
         };
+        // Secrets are imported from env only on the first boot; a later
+        // change is refused (its change path is `keys set`).
+        if let Ok(v) = std::env::var("PDS_JWT_SECRET")
+            && !v.is_empty()
+            && v.as_bytes() != jwt.as_slice()
+        {
+            tracing::warn!(
+                "PDS_JWT_SECRET differs from the stored JWT secret and is ignored; \
+                 change it with `aurora-locus keys set jwt-secret`"
+            );
+        }
+        if let Ok(v) = std::env::var("PDS_DPOP_SECRET")
+            && let Ok(b) = hex::decode(v.trim())
+            && b.len() == 32
+            && b != dpop.as_slice()
+        {
+            tracing::warn!(
+                "PDS_DPOP_SECRET differs from the stored DPoP secret and is ignored; \
+                 change it with `aurora-locus keys set dpop-secret`"
+            );
+        }
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))

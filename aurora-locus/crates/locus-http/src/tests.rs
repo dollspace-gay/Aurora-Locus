@@ -11756,3 +11756,284 @@ async fn a_changed_env_plc_key_becomes_pending_once() {
         "an unchanged env value never overrides a later change"
     );
 }
+
+impl Harness {
+    /// Stores a new signing key for `did`, returning it.
+    async fn swap_signing_key(&self, did: &str) -> proto_blue_crypto::K256Keypair {
+        use proto_blue_crypto::ExportableKeypair as _;
+        let k = proto_blue_crypto::K256Keypair::generate();
+        let mut tx = self.state.store.begin().await.unwrap();
+        tx.put_signing_key(did, "k256", &k.export_private_key(), &self.state.master_key)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        k
+    }
+
+    fn plc_signing_key(&self, did: &str) -> Option<String> {
+        self.plc.lock().unwrap().last(did).and_then(|op| {
+            op["verificationMethods"]["atproto"]
+                .as_str()
+                .map(str::to_owned)
+        })
+    }
+}
+
+#[tokio::test]
+async fn account_keys_rotate_identities_publish_and_secrets_change() {
+    use proto_blue_crypto::Keypair as _;
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, _) = h.user("lou.pds.example.com").await;
+    let owner = h.owner_with_password("ola", "ola-password-1234").await;
+    let reauth = json!({"password": "ola-password-1234"});
+
+    // rotate-keys: the PLC document follows the stored key, then #identity
+    // and a fresh commit's #sync.
+    let stored = h.swap_signing_key(&did).await;
+    assert_ne!(h.plc_signing_key(&did), Some(stored.did()));
+    let root_before = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.keys.rotateAccountKeys"),
+            &owner,
+            Some(json!({"dids": [did, "did:plc:nobodyhere"]})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["results"][0]["plcUpdated"], json!(true), "{v}");
+    assert_eq!(v["results"][1]["ok"], json!(false));
+    assert_eq!(h.plc_signing_key(&did), Some(stored.did()));
+    let kinds = h.outbox_kinds(&did).await;
+    assert_eq!(&kinds[kinds.len() - 2..], ["identity", "sync"]);
+    let root = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    assert_eq!(root.data_cid, root_before.data_cid, "same tree");
+    assert_ne!(root.commit_cid, root_before.commit_cid, "a new commit");
+    let commit = h
+        .state
+        .store
+        .block(&did, &root.commit_cid)
+        .await
+        .unwrap()
+        .unwrap();
+    let parsed = proto_blue_repo::commit::SignedCommit::from_lex_value(
+        &proto_blue_lex_cbor::decode(&commit).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        proto_blue_repo::commit::verify_commit_sig(&parsed, &stored.did()).unwrap(),
+        "signed with the stored key"
+    );
+    // Already up to date: no PLC op, still announced.
+    let ops = h.plc.lock().unwrap().log[&did].len();
+    let (_, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.keys.rotateAccountKeys"),
+            &owner,
+            Some(json!({"dids": [did]})),
+        )
+        .await;
+    assert_eq!(v["results"][0]["plcUpdated"], json!(false), "{v}");
+    assert_eq!(h.plc.lock().unwrap().log[&did].len(), ops);
+
+    // publish-identity.
+    let before = h.outbox_kinds(&did).await.len();
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &ns("admin.identity.publish"),
+            &owner,
+            Some(json!({"dids": [did]})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let kinds = h.outbox_kinds(&did).await;
+    assert_eq!(
+        (kinds.len(), kinds.last().map(String::as_str)),
+        (before + 1, Some("identity"))
+    );
+
+    // keys set jwt-secret / dpop-secret.
+    let set = ns("owner.keys.setSecret");
+    let call = |body: Value| h.admin_call("POST", &set, &owner, Some(merge(body, &reauth)));
+    assert_eq!(
+        call(json!({"name": "jwt-secret", "value": "short"}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(json!({"name": "dpop-secret", "value": "nothex"}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(json!({"name": "hostname", "value": "x"})).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let jwt = "a new jwt secret that is long enough!!";
+    let (st, v) = call(json!({"name": "jwt-secret", "value": jwt})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        h.state
+            .store
+            .get_secret("jwt_secret", &h.state.master_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        jwt.as_bytes()
+    );
+    let audit = h.state.store.audit_entries(None, 20).await.unwrap();
+    let row = audit.iter().find(|a| a.action == "keys.setSecret").unwrap();
+    assert!(
+        !row.detail_json.clone().unwrap_or_default().contains(jwt),
+        "only a fingerprint is audited"
+    );
+    let (st, _) = call(json!({"name": "dpop-secret", "value": "11".repeat(32)})).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // rotate-service-key.
+    let old = h.state.secrets.service_key.did();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("owner.keys.rotateServiceKey"),
+            &owner,
+            Some(reauth.clone()),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let stored_service = h
+        .state
+        .store
+        .get_secret("service_signing_key", &h.state.master_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let new = proto_blue_crypto::K256Keypair::from_private_key(&stored_service).unwrap();
+    assert_eq!(v["didKey"], json!(new.did()));
+    assert_ne!(new.did(), old);
+}
+
+#[tokio::test]
+async fn key_imports_restore_what_live_documents_list() {
+    use proto_blue_crypto::{ExportableKeypair as _, Keypair as _};
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, _) = h.user("max.pds.example.com").await;
+    let (other, _) = h.user("ned.pds.example.com").await;
+    let owner = h.owner_with_password("oz", "oz-password-12345").await;
+    let rotate_path = ns("admin.keys.rotateAccountKeys");
+    let rotate = |dids: Vec<&String>| {
+        h.admin_call("POST", &rotate_path, &owner, Some(json!({"dids": dids})))
+    };
+    let k1 = h.state.signing_key(&did).await.unwrap();
+    // A held secondary PLC key, in the backup, later lost.
+    let extra = proto_blue_crypto::K256Keypair::generate();
+    let mut tx = h.state.store.begin().await.unwrap();
+    assert!(
+        tx.insert_secondary_plc_key(
+            &extra.did(),
+            &extra.export_private_key(),
+            &h.state.master_key
+        )
+        .await
+        .unwrap()
+    );
+    tx.commit().await.unwrap();
+    // The account's key changes after the snapshot: K2 is stored and listed.
+    let k2 = h.swap_signing_key(&did).await;
+    assert_eq!(rotate(vec![&did]).await.0, StatusCode::OK);
+    let (st, backup) = h.backup_bytes(&owner, "import passphrase").await;
+    assert_eq!(st, StatusCode::OK);
+    // The other account: the backup has its key, but its document moves on
+    // to a key the backup doesn't have, and the stored one is a third.
+    let _k4 = h.swap_signing_key(&other).await;
+    rotate(vec![&other]).await;
+    let _k5 = h.swap_signing_key(&other).await;
+    // A restore brings the old state back: K1 stored, the extra key gone.
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.put_signing_key(&did, "k256", &k1.export_private_key(), &h.state.master_key)
+        .await
+        .unwrap();
+    tx.remove_plc_key(&extra.did()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let body = |head: Value| {
+        let mut b = head.to_string().into_bytes();
+        b.push(b'\n');
+        b.extend_from_slice(&backup);
+        b
+    };
+    let post = |bytes: Vec<u8>| {
+        let h = &h;
+        let owner = owner.clone();
+        async move {
+            let (st, _, out) = h
+                .raw(
+                    "POST",
+                    &format!("/xrpc/{}.owner.keys.import", locus_core::LOCUS_NS),
+                    None,
+                    bytes,
+                    &[
+                        ("authorization", &owner),
+                        ("content-type", "application/octet-stream"),
+                    ],
+                )
+                .await;
+            (
+                st,
+                serde_json::from_slice::<Value>(&out).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, _) = post(body(json!({"passphrase": "import passphrase"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "re-authentication first");
+    let (st, _) = post(body(
+        json!({"passphrase": "the wrong one!!", "password": "oz-password-12345"}),
+    ))
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let syncs_before = h
+        .outbox_kinds(&did)
+        .await
+        .iter()
+        .filter(|k| *k == "sync")
+        .count();
+    let (st, v) = post(body(
+        json!({"passphrase": "import passphrase", "password": "oz-password-12345"}),
+    ))
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["plcKeysAdded"], json!([extra.did()]), "{v}");
+    assert_eq!(v["signingKeysReplaced"], json!([did]), "{v}");
+    assert_eq!(v["listNeitherKey"][0]["did"], json!(other), "{v}");
+    assert_eq!(h.state.signing_key(&did).await.unwrap().did(), k2.did());
+    assert_eq!(
+        h.outbox_kinds(&did)
+            .await
+            .iter()
+            .filter(|k| *k == "sync")
+            .count(),
+        syncs_before + 1,
+        "a fresh commit's #sync for the active account"
+    );
+    let held = h.state.store.plc_key_rows().await.unwrap();
+    assert!(
+        held.iter()
+            .any(|r| r.did_key == extra.did() && r.role == "secondary")
+    );
+    // Run again: nothing more to do.
+    let (_, v) = post(body(
+        json!({"passphrase": "import passphrase", "password": "oz-password-12345"}),
+    ))
+    .await;
+    assert_eq!(
+        (v["plcKeysAdded"].clone(), v["signingKeysReplaced"].clone()),
+        (json!([]), json!([]))
+    );
+}
