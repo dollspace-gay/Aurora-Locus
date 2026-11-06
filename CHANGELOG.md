@@ -504,6 +504,16 @@ kryphocron built in.
   backup where its live DID document lists that key and not the stored
   one (with a fresh commit and `#sync` for active accounts); it reports
   accounts whose documents list neither.
+- AWS KMS (or a compatible service, `LOCUS_KMS_ENDPOINT`): a master key
+  from KMS (`LOCUS_MASTER_KEY_SOURCE=kms`, `LOCUS_MASTER_KEY_KMS_ID`), a
+  data key kept wrapped in the database so every node unwraps the same
+  one; and a PLC rotation key that signs in KMS
+  (`PDS_PLC_ROTATION_KEY_KMS_KEY_ID`, as the reference, or `keys set
+  plc-rotation-key --kms-key-id`), never stored here. Key backups name
+  KMS keys by id.
+- `aurora-locus keys rewrap --to file --path <new> | env --out <file> |
+  kms --kms-key-id <id>` (offline): re-encrypts every stored secret under
+  a new master key in one transaction; nothing changes if it fails.
 
 ### Changed
 

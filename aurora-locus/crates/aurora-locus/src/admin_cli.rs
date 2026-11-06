@@ -387,6 +387,22 @@ pub enum KeysCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Changes the master key's source (offline: stop every node first).
+    /// Every secret is re-encrypted under the new key in one transaction.
+    Rewrap {
+        #[arg(long, value_enum)]
+        to: RewrapTo,
+        /// The new key file (`--to file`); a new path.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Where to write the new key (`--to env`), to move into
+        /// LOCUS_MASTER_KEY.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The KMS key (`--to kms`).
+        #[arg(long)]
+        kms_key_id: Option<String>,
+    },
     /// Forgets a secondary PLC rotation key no account's document still
     /// needs (each document that may list it is checked first).
     DropPlcKey {
@@ -394,6 +410,13 @@ pub enum KeysCmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum RewrapTo {
+    File,
+    Env,
+    Kms,
 }
 
 #[derive(Subcommand)]
@@ -435,6 +458,9 @@ pub enum KeysSetCmd {
         /// Read the private key (hex) from this file, or `-` for stdin.
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Or a secp256k1 key in KMS (ECC_SECG_P256K1), which signs there.
+        #[arg(long)]
+        kms_key_id: Option<String>,
         /// Make the pending key current without a key backup.
         #[arg(long)]
         acknowledge_no_backup: bool,
@@ -796,6 +822,7 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
         KeysCmd::Set(KeysSetCmd::PlcRotationKey {
             generate,
             file,
+            kms_key_id,
             acknowledge_no_backup,
             discard_pending,
             yes,
@@ -807,6 +834,9 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             });
             if let Some(f) = &file {
                 body["privateKeyHex"] = json!(*read_key(f)?);
+            }
+            if let Some(id) = &kms_key_id {
+                body["kmsKeyId"] = json!(id);
             }
             let what = if discard_pending {
                 "Remove the pending PLC rotation key"
@@ -928,6 +958,7 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        KeysCmd::Rewrap { .. } => Err("keys rewrap runs offline, from main".into()),
         KeysCmd::DropPlcKey { did_key, yes } => {
             let body = merge(
                 json!({"didKey": did_key}),

@@ -16,8 +16,24 @@ if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx lo
     done
 fi
 
+# KMS tests run when the local KMS container is up (local-kms takes any
+# credentials).
+running() { command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qx "$1"; }
+if running locus-test-kms; then
+  export LOCUS_TEST_KMS_ENDPOINT=http://127.0.0.1:59100 LOCUS_KMS_ENDPOINT=http://127.0.0.1:59100
+  export AWS_REGION=eu-west-2 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-locus}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-locus-secret}"
+fi
+
 cargo fmt --all
 cargo clippy --workspace --all-targets --quiet --message-format short -- -D warnings
 set +o pipefail
 cargo test --workspace --quiet 2>&1 | grep -E 'test result|FAILED|panicked|^error'
-exit "${PIPESTATUS[0]}"
+status="${PIPESTATUS[0]}"
+# The blob store's own tests again against the S3 container, when it's up.
+if [ "$status" = 0 ] && running locus-test-s3; then
+  LOCUS_TEST_S3_ENDPOINT=http://127.0.0.1:59000 LOCUS_TEST_S3_GATED_BUCKET=locus-test-gated \
+    AWS_ACCESS_KEY_ID=locus AWS_SECRET_ACCESS_KEY=locus-secret \
+    cargo test -p locus-blob --quiet 2>&1 | grep -E 'test result|FAILED|panicked|^error'
+  status="${PIPESTATUS[0]}"
+fi
+exit "$status"

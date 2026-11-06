@@ -322,9 +322,10 @@ pub(crate) async fn plc_set_signing_key(
         .plc_keys
         .signer_for(&current.rotation_keys)
         .ok_or_else(no_held_key)?;
-    let signed = next
-        .sign(signer)
-        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let signed = signer
+        .sign_op(&next)
+        .await
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e)))?;
     let plc = s.plc().map_err(PlcStep::Ambiguous)?;
     match plc.submit(did, &signed).await {
         Ok(()) => Ok(true),
@@ -404,9 +405,10 @@ async fn plc_set_handle(s: &AppState, did: &str, handle: &str) -> Result<(), Plc
         .plc_keys
         .signer_for(&current.rotation_keys)
         .ok_or_else(no_held_key)?;
-    let signed = next
-        .sign(signer)
-        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let signed = signer
+        .sign_op(&next)
+        .await
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e)))?;
     let plc = s.plc().map_err(PlcStep::Ambiguous)?;
     match plc.submit(did, &signed).await {
         Ok(()) => {}
@@ -441,8 +443,10 @@ pub(crate) async fn plc_tombstone(s: &AppState, did: &str) -> Result<(), PlcStep
         .plc_keys
         .signer_for(&current.rotation_keys)
         .ok_or_else(no_held_key)?;
-    let t = plc::sign_tombstone(&prev, signer)
-        .map_err(|e| PlcStep::Refused(XrpcError::internal(e.to_string())))?;
+    let t = signer
+        .sign_tombstone(&prev)
+        .await
+        .map_err(|e| PlcStep::Refused(XrpcError::internal(e)))?;
     let plc = s.plc().map_err(PlcStep::Ambiguous)?;
     match plc.submit(did, &t).await {
         Ok(()) => Ok(()),
@@ -667,9 +671,7 @@ pub async fn sign_plc_operation(
         .plc_keys
         .signer_for(&current.rotation_keys)
         .ok_or_else(|| no_held_key().into_error())?;
-    let signed = next
-        .sign(signer)
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let signed = signer.sign_op(&next).await.map_err(XrpcError::internal)?;
     Ok(Json(json!({ "operation": signed.to_json() })))
 }
 

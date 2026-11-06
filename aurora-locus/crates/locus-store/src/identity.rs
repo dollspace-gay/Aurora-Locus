@@ -43,6 +43,8 @@ pub struct PlcRotationKey {
     pub did_key: String,
     pub role: PlcKeyRole,
     pub created_at: i64,
+    /// For a key held in KMS, its KMS key id (no private half is stored).
+    pub kms_key_id: Option<String>,
 }
 
 /// The key-store name of a PLC rotation key's private half.
@@ -131,17 +133,19 @@ macro_rules! on_tx {
 impl Store {
     /// Every held PLC rotation key.
     pub async fn plc_rotation_keys(&self) -> CoreResult<Vec<PlcRotationKey>> {
-        let sql = "SELECT did_key, role, created_at FROM plc_rotation_key ORDER BY created_at";
-        let rows: Vec<(String, String, i64)> = on_pool!(self, sql, sql, |q, p| sqlx::query_as(q)
-            .fetch_all(p)
-            .await
-            .map_err(db_err))?;
+        let sql = "SELECT did_key, role, created_at, kms_key_id FROM plc_rotation_key ORDER BY created_at";
+        let rows: Vec<(String, String, i64, Option<String>)> =
+            on_pool!(self, sql, sql, |q, p| sqlx::query_as(q)
+                .fetch_all(p)
+                .await
+                .map_err(db_err))?;
         rows.into_iter()
-            .map(|(did_key, role, created_at)| {
+            .map(|(did_key, role, created_at, kms_key_id)| {
                 Ok(PlcRotationKey {
                     did_key,
                     role: PlcKeyRole::parse(&role)?,
                     created_at,
+                    kms_key_id,
                 })
             })
             .collect()

@@ -2117,3 +2117,95 @@ async fn branding_on_both_backends() {
         assert!(s.branding_active().await.unwrap().is_none());
     }
 }
+
+#[tokio::test]
+async fn rewrap_moves_every_secret_to_the_new_key_on_both_backends() {
+    use crate::secrets::KeyCheck;
+    use locus_core::keys::{MasterKey, SourceKind};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let old = MasterKey::generate(SourceKind::File);
+        let new = MasterKey::generate(SourceKind::Kms);
+        let mut tx = s.begin().await.unwrap();
+        for i in 0..1100 {
+            tx.put_secret(&format!("s{i:04}"), format!("v{i}").as_bytes(), &old)
+                .await
+                .unwrap();
+        }
+        tx.put_signing_key("did:plc:x", "k256", b"key", &old)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // The wrong current key fails and changes nothing.
+        let other = MasterKey::generate(SourceKind::Env);
+        let mut tx = s.begin().await.unwrap();
+        assert!(tx.rewrap_all(&other, &new).await.is_err(), "{n}");
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            s.check_master_key(&old).await.unwrap(),
+            KeyCheck::Matches,
+            "{n}"
+        );
+
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(
+            tx.rewrap_all(&old, &new).await.unwrap(),
+            (1100, 1),
+            "{n}: every page"
+        );
+        tx.set_master_key_wrap(Some(("kms-1", b"wrapped")))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            s.check_master_key(&new).await.unwrap(),
+            KeyCheck::Matches,
+            "{n}"
+        );
+        assert!(s.check_master_key(&old).await.is_err(), "{n}");
+        assert_eq!(
+            s.get_secret("s1099", &new)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"v1099",
+            "{n}"
+        );
+        assert!(s.get_secret("s0000", &old).await.is_err(), "{n}");
+        assert_eq!(
+            s.get_signing_key("did:plc:x", &new)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_slice(),
+            b"key"
+        );
+        assert_eq!(
+            s.master_key_wrap().await.unwrap(),
+            Some(("kms-1".to_owned(), b"wrapped".to_vec())),
+            "{n}"
+        );
+        // Back to a non-KMS key: the wrap goes.
+        let mut tx = s.begin().await.unwrap();
+        tx.rewrap_all(&new, &old).await.unwrap();
+        tx.set_master_key_wrap(None).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(s.master_key_wrap().await.unwrap(), None, "{n}");
+        // The first wrap recorded wins.
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(
+            tx.put_master_key_wrap("k-a", b"a").await.unwrap(),
+            ("k-a".to_owned(), b"a".to_vec())
+        );
+        assert_eq!(
+            tx.put_master_key_wrap("k-b", b"b").await.unwrap(),
+            ("k-a".to_owned(), b"a".to_vec()),
+            "{n}"
+        );
+        tx.commit().await.unwrap();
+    }
+}

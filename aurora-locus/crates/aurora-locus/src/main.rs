@@ -6,6 +6,7 @@ mod admin_cli;
 mod deploy;
 mod logging;
 mod node;
+mod rewrap;
 mod setup_cli;
 
 use std::path::PathBuf;
@@ -145,6 +146,33 @@ async fn main() {
             }
         }
         Command::Healthcheck { url } => std::process::exit(admin_cli::healthcheck(&url).await),
+        Command::Admin(admin_cli::AdminCmd::Keys(admin_cli::KeysCmd::Rewrap {
+            to,
+            path,
+            out,
+            kms_key_id,
+        })) => {
+            let bootstrap = bootstrap_or_exit();
+            let _log = logging::init(LogFormat::Pretty);
+            let target = match (to, path, out, kms_key_id) {
+                (admin_cli::RewrapTo::File, Some(p), _, _) => rewrap::Target::File(p),
+                (admin_cli::RewrapTo::Env, _, Some(out), _) => rewrap::Target::Env { out },
+                (admin_cli::RewrapTo::Kms, _, _, Some(id)) => rewrap::Target::Kms(id),
+                _ => {
+                    eprintln!(
+                        "--to file needs --path, --to env needs --out, --to kms needs --kms-key-id"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            match rewrap::run(&bootstrap, target).await {
+                Ok(next) => println!("{next}"),
+                Err(e) => {
+                    eprintln!("Nothing was changed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         #[cfg(unix)]
         Command::Admin(cmd) => {
             let client = match (cli.url, cli.token) {

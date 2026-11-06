@@ -60,6 +60,16 @@ pub struct PlcKeyRow {
     pub created_at: i64,
     pub current_since: Option<i64>,
     pub secondary_since: Option<i64>,
+    pub kms_key_id: Option<String>,
+}
+
+/// Where a held PLC rotation key's private half is.
+#[derive(Clone, Copy)]
+pub enum PlcKeySource<'a> {
+    /// In the key store.
+    Private(&'a [u8]),
+    /// In KMS, by key id.
+    Kms(&'a str),
 }
 
 /// How the accounts' documents list the held keys, from `plc_key_listing`.
@@ -84,6 +94,18 @@ fn tx_pg(tx: &Tx) -> bool {
 }
 
 impl Store {
+    /// The KMS-wrapped master key, if the install has one (None also when
+    /// the schema doesn't have the table yet: a fresh database).
+    pub async fn master_key_wrap(&self) -> CoreResult<Option<(String, Vec<u8>)>> {
+        let q = "SELECT kms_key_id, wrapped FROM master_key_wrap WHERE id = 1";
+        let r: Result<Option<(String, Vec<u8>)>, CoreError> = run!(self, q, fetch_optional,);
+        match r {
+            Ok(v) => Ok(v),
+            Err(e) if e.to_string().contains("master_key_wrap") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn key_state(&self) -> CoreResult<KeyState> {
         let q = "SELECT generation, last_backup_at, last_backup_by, scan_cursor, scan_started_at, \
                  scan_completed_at FROM key_state WHERE id = 1";
@@ -99,7 +121,7 @@ impl Store {
 
     /// Every held PLC rotation key, oldest first.
     pub async fn plc_key_rows(&self) -> CoreResult<Vec<PlcKeyRow>> {
-        let q = "SELECT did_key, role, created_at, current_since, secondary_since \
+        let q = "SELECT did_key, role, created_at, current_since, secondary_since, kms_key_id \
                  FROM plc_rotation_key ORDER BY created_at";
         run!(self, q, fetch_all,)
     }
@@ -276,7 +298,7 @@ impl Tx {
     pub async fn store_pending_plc_key(
         &mut self,
         did_key: &str,
-        private: &[u8],
+        source: PlcKeySource<'_>,
         key: &MasterKey,
     ) -> CoreResult<Option<String>> {
         let q = sql(
@@ -308,9 +330,7 @@ impl Tx {
             );
             tx_exec!(self, q, did_key)?;
         } else {
-            self.put_secret(&plc_key_secret_name(did_key), private, key)
-                .await?;
-            self.insert_plc_rotation_key(did_key, PlcKeyRole::Pending)
+            self.insert_held_plc_key(did_key, PlcKeyRole::Pending, source, key)
                 .await?;
         }
         self.bump_key_generation().await?;
@@ -322,7 +342,7 @@ impl Tx {
     pub async fn insert_secondary_plc_key(
         &mut self,
         did_key: &str,
-        private: &[u8],
+        source: PlcKeySource<'_>,
         key: &MasterKey,
     ) -> CoreResult<bool> {
         let q = sql(
@@ -333,9 +353,7 @@ impl Tx {
         if held.is_some() {
             return Ok(false);
         }
-        self.put_secret(&plc_key_secret_name(did_key), private, key)
-            .await?;
-        self.insert_plc_rotation_key(did_key, PlcKeyRole::Secondary)
+        self.insert_held_plc_key(did_key, PlcKeyRole::Secondary, source, key)
             .await?;
         let q = sql(
             "UPDATE plc_rotation_key SET secondary_since = {now} WHERE did_key = {1}",
@@ -344,6 +362,102 @@ impl Tx {
         tx_exec!(self, q, did_key)?;
         self.bump_key_generation().await?;
         Ok(true)
+    }
+
+    /// A held key's row, with its private half in the key store or its KMS
+    /// key id recorded.
+    pub async fn insert_held_plc_key(
+        &mut self,
+        did_key: &str,
+        role: PlcKeyRole,
+        source: PlcKeySource<'_>,
+        key: &MasterKey,
+    ) -> CoreResult<()> {
+        if let PlcKeySource::Private(private) = source {
+            self.put_secret(&plc_key_secret_name(did_key), private, key)
+                .await?;
+        }
+        self.insert_plc_rotation_key(did_key, role).await?;
+        if let PlcKeySource::Kms(id) = source {
+            let q = sql(
+                "UPDATE plc_rotation_key SET kms_key_id = {2} WHERE did_key = {1}",
+                tx_pg(self),
+            );
+            tx_exec!(self, q, did_key, id)?;
+        }
+        Ok(())
+    }
+
+    /// Records the KMS-wrapped master key, unless one already is (the first
+    /// node wins). Returns the one recorded.
+    pub async fn put_master_key_wrap(
+        &mut self,
+        kms_key_id: &str,
+        wrapped: &[u8],
+    ) -> CoreResult<(String, Vec<u8>)> {
+        let q = sql(
+            "INSERT INTO master_key_wrap (id, kms_key_id, wrapped, created_at) VALUES (1, {1}, {2}, {now}) \
+             ON CONFLICT (id) DO NOTHING",
+            tx_pg(self),
+        );
+        tx_exec!(self, q, kms_key_id, wrapped)?;
+        let q = "SELECT kms_key_id, wrapped FROM master_key_wrap WHERE id = 1";
+        tx_run!(self, q, fetch_one,)
+    }
+
+    /// Replaces (or, with None, removes) the KMS-wrapped master key, for a
+    /// key-source change.
+    pub async fn set_master_key_wrap(&mut self, wrap: Option<(&str, &[u8])>) -> CoreResult<()> {
+        tx_exec!(self, "DELETE FROM master_key_wrap",)?;
+        if let Some((id, wrapped)) = wrap {
+            self.put_master_key_wrap(id, wrapped).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-encrypts every stored secret and account signing key from `old`
+    /// to `new` and makes `new` the install's key (its `master_key_check`),
+    /// all in this transaction. Returns (secrets, signing keys) rewrapped.
+    pub async fn rewrap_all(&mut self, old: &MasterKey, new: &MasterKey) -> CoreResult<(u64, u64)> {
+        tx_exec!(self, "DELETE FROM master_key_check",)?;
+        self.ensure_master_key(new).await?;
+        let pg = tx_pg(self);
+        let (mut secrets, mut signing) = (0u64, 0u64);
+        let mut after = String::new();
+        loop {
+            let q = sql(
+                "SELECT name, sealed FROM secret WHERE name > {1} ORDER BY name LIMIT 500",
+                pg,
+            );
+            let page: Vec<(String, Vec<u8>)> = tx_run!(self, q, fetch_all, &after)?;
+            let Some(last) = page.last().map(|r| r.0.clone()) else {
+                break;
+            };
+            for (name, sealed) in page {
+                let plain = old.open(&secret_aad(&name), &sealed)?;
+                self.put_secret(&name, &plain, new).await?;
+                secrets += 1;
+            }
+            after = last;
+        }
+        let mut after = String::new();
+        loop {
+            let q = sql(
+                "SELECT did, key_type, sealed FROM signing_key WHERE did > {1} ORDER BY did LIMIT 500",
+                pg,
+            );
+            let page: Vec<(String, String, Vec<u8>)> = tx_run!(self, q, fetch_all, &after)?;
+            let Some(last) = page.last().map(|r| r.0.clone()) else {
+                break;
+            };
+            for (did, key_type, sealed) in page {
+                let plain = old.open(&signing_key_aad(&did), &sealed)?;
+                self.put_signing_key(&did, &key_type, &plain, new).await?;
+                signing += 1;
+            }
+            after = last;
+        }
+        Ok((secrets, signing))
     }
 
     /// Removes a pending or secondary PLC rotation key and its private

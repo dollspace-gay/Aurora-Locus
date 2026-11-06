@@ -73,7 +73,12 @@ pub async fn open_store(
         }
         _ => None,
     };
-    let master_key = Arc::new(locus_core::keys::load_master_key(bootstrap, empty)?);
+    let master_key = Arc::new(match &bootstrap.master_key {
+        locus_core::bootstrap::MasterKeySource::Kms { key_id } => {
+            kms_master_key(&store, key_id, empty).await?
+        }
+        _ => locus_core::keys::load_master_key(bootstrap, empty)?,
+    });
     if let Some(path) = generated_path {
         tracing::warn!(
             path = %path.display(),
@@ -84,6 +89,53 @@ pub async fn open_store(
     tracing::info!(key_id = %master_key.key_id(), source = master_key.source().as_str(), "master key checked");
     store.migrate().await?;
     Ok((store, master_key))
+}
+
+/// The master key from KMS: the install's data key, kept wrapped by KMS in
+/// the database so every node unwraps the same one. A new install's first
+/// node makes it (a node racing it uses whichever was recorded first).
+pub async fn kms_master_key(
+    store: &Store,
+    key_id: &str,
+    key_store_empty: bool,
+) -> CoreResult<locus_core::keys::MasterKey> {
+    use locus_core::keys::{MasterKey, SourceKind};
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let kms = locus_identity::kms::Kms::from_env(&env)
+        .map_err(|e| CoreError::Config(format!("the KMS master key: {e}")))?;
+    let unwrap = |e: locus_identity::kms::KmsError| {
+        CoreError::Config(format!("couldn't unwrap the master key with KMS: {e}"))
+    };
+    if let Some((recorded, wrapped)) = store.master_key_wrap().await? {
+        if recorded != key_id {
+            tracing::warn!(
+                configured = key_id,
+                recorded,
+                "the master key is wrapped by another KMS key than LOCUS_MASTER_KEY_KMS_ID names; using the recorded one"
+            );
+        }
+        let key = kms.decrypt(&recorded, &wrapped).await.map_err(unwrap)?;
+        return Ok(MasterKey::from_bytes(*key, SourceKind::Kms));
+    }
+    if !key_store_empty {
+        return Err(CoreError::Config(
+            "the database's secrets are under a master key that isn't from KMS; \
+             switch with `aurora-locus keys rewrap --to kms` first"
+                .into(),
+        ));
+    }
+    // A new install: the table has to exist before the key is recorded.
+    store.migrate().await?;
+    let (plain, wrapped) = kms.generate_data_key(key_id).await.map_err(unwrap)?;
+    let mut tx = store.begin().await?;
+    let (recorded, kept) = tx.put_master_key_wrap(key_id, &wrapped).await?;
+    tx.commit().await?;
+    let key = if kept == wrapped {
+        plain
+    } else {
+        kms.decrypt(&recorded, &kept).await.map_err(unwrap)?
+    };
+    Ok(MasterKey::from_bytes(*key, SourceKind::Kms))
 }
 
 /// Where this node writes the setup token: `<data>/setup-token`, when the

@@ -92,6 +92,12 @@ impl MasterKey {
         Self::from_bytes(rand::random(), source)
     }
 
+    /// The key as hex, for a key file or `LOCUS_MASTER_KEY`.
+    #[must_use]
+    pub fn to_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(self.key.as_slice()))
+    }
+
     #[must_use]
     pub fn source(&self) -> SourceKind {
         self.source

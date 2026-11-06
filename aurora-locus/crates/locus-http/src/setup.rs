@@ -24,7 +24,6 @@ use locus_web::setup::{
     CheckRow, Choice, DnsRow, SetupForm, Step, StepPage, TokenPage, step_links,
 };
 use locus_web::view::{Link, MessagePage, Shell};
-use proto_blue_crypto::Keypair;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

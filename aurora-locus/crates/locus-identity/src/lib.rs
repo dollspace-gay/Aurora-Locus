@@ -4,6 +4,7 @@
 pub mod did_doc;
 pub mod fetch;
 pub mod handle;
+pub mod kms;
 pub mod plc;
 pub mod plc_client;
 pub mod resolve;

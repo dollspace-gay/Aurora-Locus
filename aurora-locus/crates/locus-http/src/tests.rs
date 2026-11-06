@@ -826,7 +826,14 @@ async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
         )]),
         prev: None,
     };
-    let genesis = op.sign(h.state.secrets.plc_keys.current()).unwrap();
+    let genesis = h
+        .state
+        .secrets
+        .plc_keys
+        .current()
+        .sign_op(&op)
+        .await
+        .unwrap();
     let orphan = genesis.genesis_did().unwrap();
     h.plc
         .lock()
@@ -1512,7 +1519,14 @@ async fn deactivation_and_activation_check_the_did_document() {
     let SignedOp::Operation { op, .. } = &moved else {
         unreachable!()
     };
-    let moved = op.sign(h.state.secrets.plc_keys.current()).unwrap();
+    let moved = h
+        .state
+        .secrets
+        .plc_keys
+        .current()
+        .sign_op(op)
+        .await
+        .unwrap();
     h.plc
         .lock()
         .unwrap()
@@ -11498,7 +11512,7 @@ async fn key_backups_hold_every_key_and_make_a_pending_plc_key_current() {
     assert_eq!(header.master_key_id, h.state.master_key.key_id());
     let has = |f: &dyn Fn(&Entry) -> bool| entries.iter().any(f);
     assert!(has(
-        &|e| matches!(e, Entry::PlcKey { did_key, role } if *did_key == first && role == "current")
+        &|e| matches!(e, Entry::PlcKey { did_key, role, .. } if *did_key == first && role == "current")
     ));
     assert!(has(
         &|e| matches!(e, Entry::Secret { name, .. } if *name == format!("plc_rotation_key/{first}"))
@@ -11720,9 +11734,15 @@ async fn a_changed_env_plc_key_becomes_pending_once() {
                 .collect::<Vec<_>>()
         }
     };
-    crate::state::apply_env_plc_key(&h.state.store, &h.state.master_key, &env_key)
-        .await
-        .unwrap();
+    let env_private = env_key.export_private_key();
+    crate::state::apply_env_plc_key(
+        &h.state.store,
+        &h.state.master_key,
+        &env_key.did(),
+        locus_store::keys::PlcKeySource::Private(&env_private),
+    )
+    .await
+    .unwrap();
     let after = rows(&h).await;
     assert!(
         after.contains(&(env_key.did(), "pending".into())),
@@ -11739,7 +11759,7 @@ async fn a_changed_env_plc_key_becomes_pending_once() {
     use proto_blue_crypto::ExportableKeypair as _;
     tx.store_pending_plc_key(
         &other.did(),
-        &other.export_private_key(),
+        locus_store::keys::PlcKeySource::Private(&other.export_private_key()),
         &h.state.master_key,
     )
     .await
@@ -11747,9 +11767,15 @@ async fn a_changed_env_plc_key_becomes_pending_once() {
     tx.promote_pending_plc_key().await.unwrap();
     tx.commit().await.unwrap();
     let before = rows(&h).await;
-    crate::state::apply_env_plc_key(&h.state.store, &h.state.master_key, &env_key)
-        .await
-        .unwrap();
+    let env_private = env_key.export_private_key();
+    crate::state::apply_env_plc_key(
+        &h.state.store,
+        &h.state.master_key,
+        &env_key.did(),
+        locus_store::keys::PlcKeySource::Private(&env_private),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rows(&h).await,
         before,
@@ -11938,7 +11964,7 @@ async fn key_imports_restore_what_live_documents_list() {
     assert!(
         tx.insert_secondary_plc_key(
             &extra.did(),
-            &extra.export_private_key(),
+            locus_store::keys::PlcKeySource::Private(&extra.export_private_key()),
             &h.state.master_key
         )
         .await
@@ -12035,5 +12061,101 @@ async fn key_imports_restore_what_live_documents_list() {
     assert_eq!(
         (v["plcKeysAdded"].clone(), v["signingKeysReplaced"].clone()),
         (json!([]), json!([]))
+    );
+}
+
+/// A new secp256k1 key in the test KMS (`LOCUS_KMS_ENDPOINT`, local-kms),
+/// or None to skip. local-kms takes unsigned calls.
+async fn test_kms_k256_key() -> Option<String> {
+    let endpoint = std::env::var("LOCUS_KMS_ENDPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let v: Value = reqwest::Client::new()
+        .post(endpoint)
+        .header("X-Amz-Target", "TrentService.CreateKey")
+        .header("Content-Type", "application/x-amz-json-1.1")
+        .body(r#"{"KeySpec":"ECC_SECG_P256K1","KeyUsage":"SIGN_VERIFY"}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    Some(v["KeyMetadata"]["KeyId"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn a_kms_plc_rotation_key_signs_in_kms() {
+    use locus_core::key_backup::Entry;
+    let Some(key_id) = test_kms_k256_key().await else {
+        eprintln!("LOCUS_KMS_ENDPOINT isn't set; skipping");
+        return;
+    };
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("kim", "kim-password-1234").await;
+    let set = ns("owner.keys.setPlcRotationKey");
+    let reauth = json!({"password": "kim-password-1234"});
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"kmsKeyId": key_id}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let did_key = v["didKey"].as_str().unwrap().to_owned();
+    assert!(did_key.starts_with("did:key:zQ3s"));
+    let row = h
+        .state
+        .store
+        .plc_key_rows()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.did_key == did_key)
+        .unwrap();
+    assert_eq!(row.kms_key_id.as_deref(), Some(key_id.as_str()));
+    assert!(
+        h.state
+            .store
+            .get_secret(&format!("plc_rotation_key/{did_key}"), &h.state.master_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "no private half here"
+    );
+    // A backup names it by its KMS id.
+    let (_, bytes) = h.backup_bytes(&owner, "kms backup passphrase").await;
+    let (_, entries) = locus_core::key_backup::open(&bytes, "kms backup passphrase").unwrap();
+    assert!(entries.iter().any(|e| matches!(
+        e,
+        Entry::PlcKey { did_key: d, kms_key_id: Some(k), .. } if *d == did_key && *k == key_id
+    )));
+    // Current (the backup made it so); a node loading the keys signs in KMS.
+    let keys = crate::state::PlcKeys::load_or_create(&h.state.store, &h.state.master_key)
+        .await
+        .unwrap();
+    let current = keys.current();
+    assert_eq!(current.did(), did_key);
+    assert!(matches!(current, crate::state::PlcSigner::Kms { .. }));
+    let op = locus_identity::plc::Operation {
+        rotation_keys: vec![did_key.clone()],
+        verification_methods: [("atproto".to_owned(), did_key.clone())].into(),
+        also_known_as: vec!["at://kms.pds.example.com".into()],
+        services: std::collections::BTreeMap::new(),
+        prev: None,
+    };
+    let signed = current.sign_op(&op).await.unwrap();
+    let sig = match &signed {
+        locus_identity::plc::SignedOp::Operation { sig, .. } => sig.clone(),
+        other => panic!("{other:?}"),
+    };
+    let raw =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig).unwrap();
+    assert!(
+        proto_blue_crypto::verify_signature(&did_key, &op.signing_bytes().unwrap(), &raw, false)
+            .unwrap()
     );
 }

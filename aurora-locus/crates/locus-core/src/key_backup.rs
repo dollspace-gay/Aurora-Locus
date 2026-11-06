@@ -106,8 +106,14 @@ pub enum Entry {
         #[serde(with = "b64")]
         value: Zeroizing<Vec<u8>>,
     },
-    /// A held PLC rotation key and its role then.
-    PlcKey { did_key: String, role: String },
+    /// A held PLC rotation key and its role then; a KMS-held one carries
+    /// its KMS key id (its private half never leaves KMS).
+    PlcKey {
+        did_key: String,
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kms_key_id: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Entry {
@@ -115,7 +121,7 @@ impl std::fmt::Debug for Entry {
         match self {
             Self::Secret { name, .. } => write!(f, "Secret({name})"),
             Self::SigningKey { did, .. } => write!(f, "SigningKey({did})"),
-            Self::PlcKey { did_key, role } => write!(f, "PlcKey({did_key}, {role})"),
+            Self::PlcKey { did_key, role, .. } => write!(f, "PlcKey({did_key}, {role})"),
         }
     }
 }
@@ -326,6 +332,7 @@ mod tests {
             Entry::PlcKey {
                 did_key: "did:key:zA".into(),
                 role: "current".into(),
+                kms_key_id: None,
             },
         ];
         let b = vec![Entry::SigningKey {

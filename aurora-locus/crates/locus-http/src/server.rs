@@ -393,9 +393,13 @@ async fn register_plc_did(
     };
     op.validate()
         .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
-    let genesis = op
-        .sign(s.secrets.plc_keys.current())
-        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let genesis = s
+        .secrets
+        .plc_keys
+        .current()
+        .sign_op(&op)
+        .await
+        .map_err(XrpcError::internal)?;
     let did = genesis
         .genesis_did()
         .map_err(|e| XrpcError::internal(e.to_string()))?;

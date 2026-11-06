@@ -9,7 +9,6 @@ use locus_core::bootstrap::Bootstrap;
 use locus_core::setup::{self as rules, ProxyMode, SetupPlan};
 use locus_http::setup::{self, CheckEnv, Outcome};
 use locus_store::email::{Sender, SenderStatus};
-use proto_blue_crypto::Keypair;
 
 use crate::node;
 

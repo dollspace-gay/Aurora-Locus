@@ -154,14 +154,24 @@ impl Operation {
 
     /// Signs this operation with a rotation key.
     pub fn sign(&self, signer: &dyn Signer) -> Result<SignedOp, PlcError> {
-        let bytes = cbor(&self.to_lex())?;
         let sig = signer
-            .sign(&bytes)
+            .sign(&self.signing_bytes()?)
             .map_err(|e| PlcError::Sign(e.to_string()))?;
-        Ok(SignedOp::Operation {
+        Ok(self.with_signature(&sig))
+    }
+
+    /// The bytes a rotation key signs (for a signer elsewhere, e.g. KMS).
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, PlcError> {
+        cbor(&self.to_lex())
+    }
+
+    /// This operation with a signature over `signing_bytes`.
+    #[must_use]
+    pub fn with_signature(&self, sig: &[u8]) -> SignedOp {
+        SignedOp::Operation {
             op: self.clone(),
             sig: URL_SAFE_NO_PAD.encode(sig),
-        })
+        }
     }
 }
 
@@ -261,6 +271,20 @@ pub fn sign_tombstone(prev: &str, signer: &dyn Signer) -> Result<SignedOp, PlcEr
         prev: prev.to_owned(),
         sig: URL_SAFE_NO_PAD.encode(sig),
     })
+}
+
+/// The bytes a rotation key signs for a tombstone of `prev`'s DID.
+pub fn tombstone_signing_bytes(prev: &str) -> Result<Vec<u8>, PlcError> {
+    cbor(&tombstone_lex(prev, None))
+}
+
+/// A tombstone with a signature over `tombstone_signing_bytes`.
+#[must_use]
+pub fn tombstone_with_signature(prev: &str, sig: &[u8]) -> SignedOp {
+    SignedOp::Tombstone {
+        prev: prev.to_owned(),
+        sig: URL_SAFE_NO_PAD.encode(sig),
+    }
 }
 
 fn tombstone_lex(prev: &str, sig: Option<&str>) -> LexValue {

@@ -1,6 +1,7 @@
 //! Shared state for every handler, and the server secrets created on first
 //! boot.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use locus_auth::session::LegacySessions;
@@ -12,6 +13,7 @@ use locus_identity::resolve::{ResolverConfig, Resolvers};
 use locus_repo::RepoEngine;
 use locus_store::Store;
 use locus_store::identity::{PlcKeyRole, plc_key_secret_name};
+use locus_store::keys::PlcKeySource;
 use locus_store::runtime::Settings;
 use proto_blue_crypto::{ExportableKeypair, K256Keypair, Keypair};
 use zeroize::Zeroizing;
@@ -51,34 +53,113 @@ pub struct ServerSecrets {
     pub admin_password: Zeroizing<Vec<u8>>,
 }
 
+/// A PLC rotation key this PDS can sign with: in the key store, or in KMS.
+pub enum PlcSigner {
+    Local(K256Keypair),
+    Kms {
+        did: String,
+        key_id: String,
+        kms: locus_identity::kms::Kms,
+    },
+}
+
+impl PlcSigner {
+    /// Its did:key.
+    #[must_use]
+    pub fn did(&self) -> String {
+        match self {
+            Self::Local(k) => k.did(),
+            Self::Kms { did, .. } => did.clone(),
+        }
+    }
+
+    /// A compact secp256k1 signature over `msg` (hashed with SHA-256).
+    pub async fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Local(k) => proto_blue_crypto::Signer::sign(k, msg).map_err(|e| e.to_string()),
+            Self::Kms { key_id, kms, .. } => {
+                kms.sign_k256(key_id, msg).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Signs a PLC operation.
+    pub async fn sign_op(
+        &self,
+        op: &locus_identity::plc::Operation,
+    ) -> Result<locus_identity::plc::SignedOp, String> {
+        let bytes = op.signing_bytes().map_err(|e| e.to_string())?;
+        Ok(op.with_signature(&self.sign(&bytes).await?))
+    }
+
+    /// Signs a tombstone of the DID whose latest operation is `prev`.
+    pub async fn sign_tombstone(
+        &self,
+        prev: &str,
+    ) -> Result<locus_identity::plc::SignedOp, String> {
+        let bytes =
+            locus_identity::plc::tombstone_signing_bytes(prev).map_err(|e| e.to_string())?;
+        Ok(locus_identity::plc::tombstone_with_signature(
+            prev,
+            &self.sign(&bytes).await?,
+        ))
+    }
+}
+
 /// The PDS's held PLC rotation keys: the current one, plus any pending or
 /// secondary ones it can still sign with.
 pub struct PlcKeys {
     /// Index of the current key in `held`.
     current: usize,
-    held: Vec<(String, PlcKeyRole, K256Keypair)>,
+    held: Vec<(String, PlcKeyRole, PlcSigner)>,
+}
+
+/// A PLC rotation key from env: a private key, or a KMS key id.
+enum EnvPlcKey {
+    Hex(Zeroizing<Vec<u8>>),
+    Kms(String),
+}
+
+fn kms_from_env() -> CoreResult<locus_identity::kms::Kms> {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    locus_identity::kms::Kms::from_env(&env).map_err(|e| CoreError::Config(e.to_string()))
+}
+
+/// The did:key of a KMS-held PLC rotation key.
+pub async fn kms_did_key(key_id: &str) -> CoreResult<String> {
+    kms_from_env()?
+        .k256_did_key(key_id)
+        .await
+        .map_err(|e| CoreError::Config(e.to_string()))
 }
 
 impl PlcKeys {
     /// Loads the held keys. On first boot the current key is created:
-    /// imported from `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` if set,
-    /// otherwise generated. Later, a changed env value is stored as the
-    /// pending key (it becomes current after a key backup), as
-    /// `keys set plc-rotation-key` does.
+    /// from `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` or
+    /// `PDS_PLC_ROTATION_KEY_KMS_KEY_ID` if set, otherwise generated. Later,
+    /// a changed env value is stored as the pending key (it becomes current
+    /// after a key backup), as `keys set plc-rotation-key` does.
     pub async fn load_or_create(store: &Store, key: &MasterKey) -> CoreResult<Self> {
         let env_key = env_plc_key()?;
+        let env_did = match &env_key {
+            Some(EnvPlcKey::Hex(h)) => Some(keypair_from(h)?.did()),
+            Some(EnvPlcKey::Kms(id)) => Some(kms_did_key(id).await?),
+            None => None,
+        };
         if store.plc_rotation_keys().await?.is_empty() {
-            let candidate = match &env_key {
-                Some(k) => keypair_from(k)?,
-                None => K256Keypair::generate(),
+            let generated;
+            let (did_key, source) = match (&env_key, &env_did) {
+                (Some(EnvPlcKey::Hex(h)), Some(did)) => (did.clone(), PlcKeySource::Private(h)),
+                (Some(EnvPlcKey::Kms(id)), Some(did)) => (did.clone(), PlcKeySource::Kms(id)),
+                _ => {
+                    let k = K256Keypair::generate();
+                    generated = Zeroizing::new(k.export_private_key());
+                    (k.did(), PlcKeySource::Private(&generated))
+                }
             };
-            let did_key = candidate.did();
-            let private = Zeroizing::new(candidate.export_private_key());
             let mut tx = store.begin().await?;
-            tx.put_secret_if_absent(&plc_key_secret_name(&did_key), &private, key)
-                .await?;
             match tx
-                .insert_plc_rotation_key(&did_key, PlcKeyRole::Current)
+                .insert_held_plc_key(&did_key, PlcKeyRole::Current, source, key)
                 .await
             {
                 Ok(()) => {
@@ -92,33 +173,64 @@ impl PlcKeys {
                 Err(CoreError::Conflict(_)) => tx.rollback().await?,
                 Err(e) => return Err(e),
             }
-        } else if let Some(k) = &env_key {
-            apply_env_plc_key(store, key, &keypair_from(k)?).await?;
+        } else if let (Some(k), Some(did)) = (&env_key, &env_did) {
+            let source = match k {
+                EnvPlcKey::Hex(h) => PlcKeySource::Private(h),
+                EnvPlcKey::Kms(id) => PlcKeySource::Kms(id),
+            };
+            apply_env_plc_key(store, key, did, source).await?;
         }
         let mut held = Vec::new();
+        let mut kms: Option<locus_identity::kms::Kms> = None;
         for row in store.plc_rotation_keys().await? {
-            let bytes = store
-                .get_secret(&plc_key_secret_name(&row.did_key), key)
-                .await?
-                .ok_or_else(|| {
-                    CoreError::Config(format!(
-                        "PLC rotation key {} is missing from the key store",
-                        row.did_key
-                    ))
-                })?;
-            let pair = K256Keypair::from_private_key(&bytes).map_err(|e| {
-                CoreError::Config(format!(
-                    "stored PLC rotation key {} is invalid: {e}",
-                    row.did_key
-                ))
-            })?;
-            if pair.did() != row.did_key {
-                return Err(CoreError::Config(format!(
-                    "stored PLC rotation key doesn't match its id {}",
-                    row.did_key
-                )));
-            }
-            held.push((row.did_key, row.role, pair));
+            let signer = match &row.kms_key_id {
+                Some(id) => {
+                    if kms.is_none() {
+                        kms = Some(kms_from_env()?);
+                    }
+                    let client = kms.clone().unwrap_or_else(|| unreachable!());
+                    let did = client
+                        .k256_did_key(id)
+                        .await
+                        .map_err(|e| CoreError::Config(format!("PLC rotation key {id}: {e}")))?;
+                    if did != row.did_key {
+                        return Err(CoreError::Config(format!(
+                            "the KMS key {id} isn't the PLC rotation key {}",
+                            row.did_key
+                        )));
+                    }
+                    PlcSigner::Kms {
+                        did,
+                        key_id: id.clone(),
+                        kms: client,
+                    }
+                }
+                None => {
+                    let bytes = store
+                        .get_secret(&plc_key_secret_name(&row.did_key), key)
+                        .await?
+                        .ok_or_else(|| {
+                            CoreError::Config(format!(
+                                "PLC rotation key {} is missing from the key store",
+                                row.did_key
+                            ))
+                        })?;
+                    let pair = K256Keypair::from_private_key(&bytes).map_err(|e| {
+                        CoreError::Config(format!(
+                            "stored PLC rotation key {} is invalid: {e}",
+                            row.did_key
+                        ))
+                    })?;
+                    if pair.did() != row.did_key {
+                        return Err(CoreError::Config(format!(
+                            "stored PLC rotation key doesn't match its id {}",
+                            row.did_key
+                        )));
+                    }
+                    PlcSigner::Local(pair)
+                }
+            };
+            held.push((row.did_key, row.role, signer));
         }
         let current = held
             .iter()
@@ -128,13 +240,13 @@ impl PlcKeys {
     }
 
     /// The key new genesis operations and recommendations name.
-    pub fn current(&self) -> &K256Keypair {
+    pub fn current(&self) -> &PlcSigner {
         &self.held[self.current].2
     }
 
     /// The held key to sign an account's next op with: the first one its
     /// latest document lists, in document order.
-    pub fn signer_for<'a>(&'a self, rotation_keys: &[String]) -> Option<&'a K256Keypair> {
+    pub fn signer_for<'a>(&'a self, rotation_keys: &[String]) -> Option<&'a PlcSigner> {
         rotation_keys.iter().find_map(|k| {
             self.held
                 .iter()
@@ -165,12 +277,26 @@ impl PlcKeys {
 /// under (its hash is of the public did:key).
 pub const PLC_ENV_APPLIED: &str = "env:PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX";
 
-fn env_plc_key() -> CoreResult<Option<Zeroizing<Vec<u8>>>> {
-    match std::env::var("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX") {
-        Ok(h) if !h.trim().is_empty() => Ok(Some(Zeroizing::new(hex::decode(h.trim()).map_err(
+fn env_plc_key() -> CoreResult<Option<EnvPlcKey>> {
+    let get = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    match (
+        get("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX"),
+        get("PDS_PLC_ROTATION_KEY_KMS_KEY_ID"),
+    ) {
+        (Some(_), Some(_)) => Err(CoreError::Config(
+            "set PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX or PDS_PLC_ROTATION_KEY_KMS_KEY_ID, not both"
+                .into(),
+        )),
+        (Some(h), None) => Ok(Some(EnvPlcKey::Hex(Zeroizing::new(hex::decode(h).map_err(
             |e| CoreError::Config(format!("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: {e}")),
-        )?))),
-        _ => Ok(None),
+        )?)))),
+        (None, Some(id)) => Ok(Some(EnvPlcKey::Kms(id))),
+        (None, None) => Ok(None),
     }
 }
 
@@ -190,9 +316,10 @@ fn env_hash(did_key: &str) -> String {
 pub(crate) async fn apply_env_plc_key(
     store: &Store,
     key: &MasterKey,
-    env: &K256Keypair,
+    did_key: &str,
+    source: PlcKeySource<'_>,
 ) -> CoreResult<()> {
-    let did_key = env.did();
+    let did_key = did_key.to_owned();
     let hash = env_hash(&did_key);
     let previous = store.env_applied_hashes().await?.remove(PLC_ENV_APPLIED);
     if previous.as_deref() == Some(hash.as_str()) {
@@ -223,8 +350,7 @@ pub(crate) async fn apply_env_plc_key(
             tx.rollback().await?;
             return Ok(());
         }
-        let private = Zeroizing::new(env.export_private_key());
-        tx.store_pending_plc_key(&did_key, &private, key).await?;
+        tx.store_pending_plc_key(&did_key, source, key).await?;
         tracing::warn!(
             did_key,
             "the PLC rotation key from PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX is pending: it becomes \

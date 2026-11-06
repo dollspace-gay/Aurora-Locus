@@ -156,6 +156,7 @@ pub(crate) async fn backup_stream(
                             .map(|r| Entry::PlcKey {
                                 did_key: r.did_key,
                                 role: r.role,
+                                kms_key_id: r.kms_key_id,
                             })
                             .collect(),
                         false,
@@ -306,6 +307,8 @@ pub struct SetPlcInput {
     generate: bool,
     /// Or this private key (hex, secp256k1).
     private_key_hex: Option<String>,
+    /// Or this KMS key (secp256k1, ECC_SECG_P256K1), which signs in KMS.
+    kms_key_id: Option<String>,
     /// Remove the pending key instead.
     #[serde(default)]
     discard_pending: bool,
@@ -327,12 +330,13 @@ pub async fn set_plc_rotation_key(
     let actions = [
         input.generate,
         input.private_key_hex.is_some(),
+        input.kms_key_id.is_some(),
         input.discard_pending,
         input.acknowledge_no_backup,
     ];
     if actions.iter().filter(|a| **a).count() != 1 {
         return Err(XrpcError::invalid_request(
-            "Give exactly one of generate, privateKeyHex, discardPending or acknowledgeNoBackup",
+            "Give exactly one of generate, privateKeyHex, kmsKeyId, discardPending or acknowledgeNoBackup",
         ));
     }
     let rows = s.store.plc_key_rows().await?;
@@ -370,25 +374,41 @@ pub async fn set_plc_rotation_key(
         reload_soon(&s);
         return Ok(Json(json!({"didKey": p.did_key, "role": "discarded"})));
     }
-    let pair = match &input.private_key_hex {
-        Some(h) => {
-            let bytes = Zeroizing::new(
-                hex::decode(h.trim())
-                    .map_err(|_| XrpcError::invalid_request("The private key isn't hex"))?,
-            );
-            K256Keypair::from_private_key(&bytes)
-                .map_err(|_| XrpcError::invalid_request("That isn't a secp256k1 private key"))?
-        }
-        None => K256Keypair::generate(),
+    let pair =
+        match (&input.private_key_hex, &input.kms_key_id) {
+            (Some(h), _) => {
+                let bytes = Zeroizing::new(
+                    hex::decode(h.trim())
+                        .map_err(|_| XrpcError::invalid_request("The private key isn't hex"))?,
+                );
+                Some(K256Keypair::from_private_key(&bytes).map_err(|_| {
+                    XrpcError::invalid_request("That isn't a secp256k1 private key")
+                })?)
+            }
+            (None, Some(_)) => None,
+            (None, None) => Some(K256Keypair::generate()),
+        };
+    let did_key = match (&pair, &input.kms_key_id) {
+        (Some(p), _) => p.did(),
+        (None, Some(id)) => crate::state::kms_did_key(id)
+            .await
+            .map_err(|e| XrpcError::invalid_request(e.to_string()))?,
+        (None, None) => unreachable!("a key is generated"),
     };
-    let did_key = pair.did();
     if let Some(p) = pending.filter(|p| p.did_key != did_key) {
         listing_guard(&s, &p.did_key, p.created_at, true).await?;
     }
-    let private = Zeroizing::new(pair.export_private_key());
+    let private = pair
+        .as_ref()
+        .map(|p| Zeroizing::new(p.export_private_key()));
+    let source = match (&private, &input.kms_key_id) {
+        (Some(p), _) => locus_store::keys::PlcKeySource::Private(p),
+        (None, Some(id)) => locus_store::keys::PlcKeySource::Kms(id),
+        (None, None) => unreachable!("one of the actions is set"),
+    };
     let mut tx = s.store.begin().await?;
     let replaced = tx
-        .store_pending_plc_key(&did_key, &private, &s.master_key)
+        .store_pending_plc_key(&did_key, source, &s.master_key)
         .await?;
     tx.commit().await?;
     admin_auth::audit(
@@ -769,7 +789,11 @@ pub async fn import(State(s): St, headers: HeaderMap, body: Body) -> XrpcResult<
             Entry::Secret { name, value } => {
                 secrets.insert(name, value);
             }
-            Entry::PlcKey { did_key, .. } => plc_keys.push(did_key),
+            Entry::PlcKey {
+                did_key,
+                kms_key_id,
+                ..
+            } => plc_keys.push((did_key, kms_key_id)),
             Entry::SigningKey {
                 did,
                 key_type,
@@ -779,20 +803,19 @@ pub async fn import(State(s): St, headers: HeaderMap, body: Body) -> XrpcResult<
     }
 
     let mut added = Vec::new();
-    for did_key in &plc_keys {
-        let Some(private) = secrets.get(&locus_store::identity::plc_key_secret_name(did_key))
-        else {
-            continue;
+    for (did_key, kms_key_id) in &plc_keys {
+        let private = secrets.get(&locus_store::identity::plc_key_secret_name(did_key));
+        let source = match (private, kms_key_id) {
+            (Some(p), _) => match K256Keypair::from_private_key(p) {
+                Ok(pair) if pair.did() == *did_key => locus_store::keys::PlcKeySource::Private(p),
+                _ => continue,
+            },
+            (None, Some(id)) => locus_store::keys::PlcKeySource::Kms(id),
+            (None, None) => continue,
         };
-        let Ok(pair) = K256Keypair::from_private_key(private) else {
-            continue;
-        };
-        if pair.did() != *did_key {
-            continue;
-        }
         let mut tx = s.store.begin().await?;
         let new = tx
-            .insert_secondary_plc_key(did_key, private, &s.master_key)
+            .insert_secondary_plc_key(did_key, source, &s.master_key)
             .await?;
         tx.commit().await?;
         if new {
