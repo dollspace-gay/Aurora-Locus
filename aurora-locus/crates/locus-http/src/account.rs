@@ -493,6 +493,39 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 4096, ..Default::default() })]
+
+        /// Arbitrary, near-datetime, and valid-but-for-one-field strings
+        /// never panic.
+        #[test]
+        fn datetime_parsing_never_panics(
+            s in proptest::prop_oneof![
+                ".{0,40}",
+                "[0-9+\\-]{1,6}-[0-9]{1,3}-[0-9]{1,3}T[0-9\\-]{1,3}:[0-9]{1,3}:[0-9+\\-]{1,3}(\\.[0-9]{0,3}.{0,3}[0-9]{0,2})?(Z|[+\\-][0-9]{1,5}:[0-9]{1,4})",
+                "(2024|.{1,5})-(01|.{1,3})-(01|.{1,3})T(00|.{1,3}):(00|.{1,3}):(00|.{1,3})(\\.[0-9]{0,3}.{0,2})?(Z|[+\\-](01|.{1,6}):(00|.{1,4})|.{0,3})",
+            ],
+        ) {
+            let _ = parse_datetime_ms(&s);
+        }
+
+        #[test]
+        fn valid_datetimes_parse_to_their_instant(
+            y in 1970i64..10_000, m in 1i64..=12, d in 1i64..=28,
+            hh in 0i64..24, mm in 0i64..60, ss in 0i64..60, ms in 0i64..1000,
+            off_h in 0i64..14, off_m in 0i64..60, east in proptest::bool::ANY,
+        ) {
+            let z = format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z");
+            let at = parse_datetime_ms(&z).unwrap();
+            proptest::prop_assert_eq!(locus_core::time::iso8601(at), z);
+            // The same wall time at an offset is that far from UTC.
+            let sign = if east { '+' } else { '-' };
+            let o = format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}{sign}{off_h:02}:{off_m:02}");
+            let shift = (off_h * 60 + off_m) * 60_000;
+            proptest::prop_assert_eq!(parse_datetime_ms(&o), Some(if east { at - shift } else { at + shift }));
+        }
+    }
+
     /// Inputs that panicked (a multi-byte character inside the fraction,
     /// an overflowing year or offset) or were taken with signs.
     #[test]

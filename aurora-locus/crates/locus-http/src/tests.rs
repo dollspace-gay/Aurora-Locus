@@ -4,6 +4,7 @@ mod blobs;
 mod bulk;
 mod keys;
 mod keys_shard;
+mod protocol;
 mod security;
 
 use std::collections::HashMap;

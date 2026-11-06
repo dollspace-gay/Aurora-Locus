@@ -164,6 +164,31 @@ mod tests {
             .collect()
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 2048, ..Default::default() })]
+
+        /// Arbitrary and handle-like strings: every rule answers, none
+        /// panics, and what's accepted is lowercase and accepted again.
+        #[test]
+        fn handle_rules_never_panic(
+            s in proptest::prop_oneof![
+                ".{0,40}",
+                "[a-zA-Z0-9.\\-_ ]{0,30}(\\.example\\.com)?",
+                "[a-z]{1,20}\\.[a-z]{2,6}",
+            ],
+            min in 0usize..6,
+            max in 0usize..30,
+        ) {
+            if let Ok(n) = normalize_and_validate(&s) {
+                proptest::prop_assert_eq!(&n, &n.to_ascii_lowercase());
+                proptest::prop_assert_eq!(normalize_and_validate(&n), Ok(n.clone()));
+            }
+            let _ = ensure_service_constraints(&s, &domains(), LabelLimits { min, max }, &[s.clone()], false);
+            let _ = has_explicit_slur(&s);
+            let _ = is_reserved(&s);
+        }
+    }
+
     #[test]
     fn interop_handle_vectors() {
         let valid = vectors("handle_syntax_valid.txt");

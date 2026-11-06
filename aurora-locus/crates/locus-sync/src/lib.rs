@@ -20,6 +20,13 @@ use proto_blue_ws::frame::{ErrorFrame, Frame, MessageFrame};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod fault;
+#[cfg(test)]
+mod fuzz;
+#[cfg(test)]
+mod seq_props;
+
 /// One sequencer pass: moves up to `batch` outbox rows into the log, in
 /// outbox-id order, fenced on the sequencer's lease. A deleted account's
 /// `#account` event schedules the purge of its earlier events
@@ -30,8 +37,12 @@ pub async fn sequence_once(
     batch: i64,
     preservation_ms: i64,
 ) -> CoreResult<usize> {
+    #[cfg(test)]
+    fault::hit("begin", &lease.holder).await;
     let mut tx = store.begin().await?;
     tx.fence(lease).await?;
+    #[cfg(test)]
+    fault::hit("fenced", &lease.holder).await;
     let state = tx.lock_seq_state().await?;
     let rows = tx.outbox_batch(batch).await?;
     #[allow(clippy::cast_precision_loss)]
