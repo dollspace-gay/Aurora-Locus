@@ -24,7 +24,7 @@ const PAGE: i64 = 500;
 
 #[derive(Deserialize)]
 pub struct SubscribeParams {
-    cursor: Option<i64>,
+    cursor: Option<String>,
 }
 
 pub async fn subscribe_repos(
@@ -36,7 +36,23 @@ pub async fn subscribe_repos(
         Ok(g) => g,
         Err(e) => return axum::response::IntoResponse::into_response(e),
     };
-    ws.on_upgrade(move |socket| serve(s, socket, p.cursor, place))
+    // A cursor that isn't an integer is refused in an error frame, as the
+    // reference.
+    let cursor = match p.cursor.as_deref().map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => {
+            return ws.on_upgrade(|socket| async move {
+                let (mut tx, _) = socket.split();
+                let frame =
+                    locus_sync::error_frame("InvalidRequest", "Error: cursor must be an integer");
+                let _ = tx.send(Message::Binary(frame.into())).await;
+                let _ = tx.close().await;
+                drop(place);
+            });
+        }
+    };
+    ws.on_upgrade(move |socket| serve(s, socket, cursor, place))
 }
 
 async fn serve(
@@ -154,6 +170,33 @@ use crate::error::{XrpcError, XrpcResult};
 const CAR: &str = "application/vnd.ipld.car";
 const BLOCK_PAGE: i64 = 1000;
 
+/// Query parameters checked against their lexicon formats, as the
+/// reference does before the handler runs.
+enum Format {
+    Did,
+    Tid,
+    Nsid,
+    RecordKey,
+}
+
+fn check(nsid: &str, params: &[(Format, Option<&str>)]) -> XrpcResult<()> {
+    for (format, value) in params {
+        let Some(v) = value else { continue };
+        let (ok, name) = match format {
+            Format::Did => (proto_blue_syntax::Did::new(v).is_ok(), "DID"),
+            Format::Tid => (proto_blue_syntax::Tid::new(v).is_ok(), "TID string"),
+            Format::Nsid => (proto_blue_syntax::Nsid::new(v).is_ok(), "NSID"),
+            Format::RecordKey => (proto_blue_syntax::RecordKey::new(v).is_ok(), "record key"),
+        };
+        if !ok {
+            return Err(XrpcError::invalid_request(format!(
+                "Invalid {nsid} params: Invalid {name} (got \"{v}\")"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The reference's `assertRepoAvailability`: a missing or deleted account
 /// is `RepoNotFound`; for anyone but its owner, a taken-down, suspended or
 /// deactivated one is refused.
@@ -240,6 +283,13 @@ pub async fn get_repo(
     headers: HeaderMap,
     Query(p): Query<GetRepoParams>,
 ) -> XrpcResult<Response> {
+    check(
+        "com.atproto.sync.getRepo",
+        &[
+            (Format::Did, Some(&p.did)),
+            (Format::Tid, p.since.as_deref()),
+        ],
+    )?;
     available(&s, &headers, &p.did).await?;
     let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
         XrpcError::named(
@@ -288,6 +338,14 @@ pub async fn get_record(
     headers: HeaderMap,
     Query(p): Query<SyncGetRecordParams>,
 ) -> XrpcResult<Response> {
+    check(
+        "com.atproto.sync.getRecord",
+        &[
+            (Format::Did, Some(&p.did)),
+            (Format::Nsid, Some(&p.collection)),
+            (Format::RecordKey, Some(&p.rkey)),
+        ],
+    )?;
     available(&s, &headers, &p.did).await?;
     let (commit, blocks) = s
         .repo
@@ -331,6 +389,12 @@ pub async fn get_blocks(
             _ => {}
         }
     }
+    if p.cids.is_empty() {
+        return Err(XrpcError::invalid_request(
+            "Invalid com.atproto.sync.getBlocks params: Missing required key \"cids\"",
+        ));
+    }
+    check("com.atproto.sync.getBlocks", &[(Format::Did, Some(&p.did))])?;
     available(&s, &headers, &p.did).await?;
     let mut car = locus_repo::car::header(None);
     let mut missing = Vec::new();
@@ -360,6 +424,10 @@ pub async fn get_latest_commit(
     headers: HeaderMap,
     Query(p): Query<DidParam>,
 ) -> XrpcResult<Json<Value>> {
+    check(
+        "com.atproto.sync.getLatestCommit",
+        &[(Format::Did, Some(&p.did))],
+    )?;
     available(&s, &headers, &p.did).await?;
     let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
         XrpcError::named(
@@ -376,6 +444,7 @@ pub async fn get_head(
     headers: HeaderMap,
     Query(p): Query<DidParam>,
 ) -> XrpcResult<Json<Value>> {
+    check("com.atproto.sync.getHead", &[(Format::Did, Some(&p.did))])?;
     available(&s, &headers, &p.did).await?;
     let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
         XrpcError::named(
@@ -395,6 +464,10 @@ fn status_fields(status: Status) -> (bool, Option<&'static str>) {
 
 /// Status for everyone, as the reference (no refusals; `rev` only while active).
 pub async fn get_repo_status(State(s): St, Query(p): Query<DidParam>) -> XrpcResult<Json<Value>> {
+    check(
+        "com.atproto.sync.getRepoStatus",
+        &[(Format::Did, Some(&p.did))],
+    )?;
     let account = s
         .store
         .account_by_did(&p.did)
@@ -479,6 +552,13 @@ pub async fn list_blobs(
     headers: HeaderMap,
     Query(p): Query<ListBlobsParams>,
 ) -> XrpcResult<Json<Value>> {
+    check(
+        "com.atproto.sync.listBlobs",
+        &[
+            (Format::Did, Some(&p.did)),
+            (Format::Tid, p.since.as_deref()),
+        ],
+    )?;
     available(&s, &headers, &p.did).await?;
     let limit = p.limit.unwrap_or(500);
     if !(1..=1000).contains(&limit) {

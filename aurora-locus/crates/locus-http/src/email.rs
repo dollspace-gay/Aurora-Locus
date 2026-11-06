@@ -145,11 +145,16 @@ pub async fn send(
     }
 }
 
-pub async fn request_email_confirmation(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+pub async fn request_email_confirmation(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<()> {
     let authed = auth::authorization(&s, &headers, auth::STANDARD, &[], |p| {
         Ok(p.assert_account("email", "manage")?)
     })
     .await?;
+    crate::error::no_body(&body)?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestEmailConfirmation-0";
@@ -196,7 +201,11 @@ pub async fn confirm_email(
     Ok(())
 }
 
-pub async fn request_email_update(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+pub async fn request_email_update(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<Json<Value>> {
     let authed = auth::authorization(
         &s,
         &headers,
@@ -207,6 +216,7 @@ pub async fn request_email_update(State(s): St, headers: HeaderMap) -> XrpcResul
         ),
     )
     .await?;
+    crate::error::no_body(&body)?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestEmailUpdate-0";

@@ -200,7 +200,7 @@ pub async fn create_account(
                 )));
             }
             if s.store.account_by_did(did).await?.is_some() {
-                return Err(XrpcError::invalid_request("Account already exists"));
+                return Err(XrpcError::named("AlreadyExists", "Repo already exists"));
             }
             Some(did.to_owned())
         }
@@ -698,8 +698,17 @@ pub async fn get_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Va
     Ok(Json(out))
 }
 
-pub async fn refresh_session(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+pub async fn refresh_session(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<Json<Value>> {
     let token = auth::bearer(&headers)?;
+    if !body.is_empty() {
+        // The token is checked first, without using it.
+        s.sessions.check_refresh(token, false)?;
+        crate::error::no_body(&body)?;
+    }
     let (tokens, did) = s.sessions.refresh(token).await?;
     let account = s.store.account_by_did(&did).await?.ok_or_else(|| {
         XrpcError::new(
@@ -712,8 +721,16 @@ pub async fn refresh_session(State(s): St, headers: HeaderMap) -> XrpcResult<Jso
     Ok(Json(session_json(&account, &tokens, did_doc)))
 }
 
-pub async fn delete_session(State(s): St, headers: HeaderMap) -> XrpcResult<()> {
+pub async fn delete_session(
+    State(s): St,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<()> {
     let token = auth::bearer(&headers)?;
+    if !body.is_empty() {
+        s.sessions.check_refresh(token, true)?;
+        crate::error::no_body(&body)?;
+    }
     s.sessions.delete(token).await?;
     Ok(())
 }

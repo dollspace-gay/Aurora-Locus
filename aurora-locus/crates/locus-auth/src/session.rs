@@ -510,6 +510,21 @@ impl LegacySessions {
         ))
     }
 
+    /// Checks a refresh token's signature and claims without using it (an
+    /// expired one passes with `allow_expired`).
+    pub fn check_refresh(&self, refresh_jwt: &str, allow_expired: bool) -> Result<(), AuthError> {
+        let claims = match self.verify(TYP_REFRESH, refresh_jwt, now_s()) {
+            Err(JwtError::Expired) if allow_expired => {
+                self.verify(TYP_REFRESH, refresh_jwt, i64::MIN)?
+            }
+            other => other?,
+        };
+        if !self.aud_ok(&claims.aud) || claims.scope != SCOPE_REFRESH {
+            return Err(AuthError::InvalidToken);
+        }
+        Ok(())
+    }
+
     /// Ends the session a refresh token belongs to (an expired token is
     /// accepted, as the reference).
     pub async fn delete(&self, refresh_jwt: &str) -> Result<(), AuthError> {

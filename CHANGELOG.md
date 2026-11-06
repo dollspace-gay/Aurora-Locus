@@ -705,6 +705,22 @@ kryphocron built in.
   and no `phoneVerificationRequired`; `listRepos` gives a cursor on every
   page with rows; `getBlocks` serves only blocks a tree references; a
   duplicate app-password name is `InvalidRequest`.
+- More answers match the reference PDS: procedures with no input refuse a
+  request body (`InvalidRequest`, after auth); sync reads check their DID,
+  TID, NSID and record-key parameters and `getBlocks` requires `cids`; a
+  firehose cursor that isn't an integer gets an `InvalidRequest` error
+  frame instead of a refused upgrade; `createAccount` for a DID that
+  already has an account is `AlreadyExists`; operator methods without
+  output answer with an empty body; PAR keeps `unsupported_response_type`;
+  a DPoP proof is checked before the access token it comes with.
+- The differential conformance run covers sync and firehose cursors, a
+  migration between the two servers, email flows (with a mail catcher in
+  `MAIL=1` mode), OAuth metadata and PAR, pipethrough to a mock AppView,
+  preferences, and operator methods and takedowns.
+- `checkAccountStatus` reports `importedBlobs` and `expectedBlobs` (they
+  were always 0).
+- A deactivated account can upload blobs again, as the reference, so a
+  migration's blobs can arrive before activation.
 - proto-blue pinned at a fix for its lazily loaded MST: a repository
   emptied of every record kept the last record's tree layer, so records
   written afterwards got a non-canonical data root (one other

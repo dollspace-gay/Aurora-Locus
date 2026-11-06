@@ -48,6 +48,18 @@ impl XrpcError {
     }
 }
 
+/// A procedure whose lexicon has no input refuses a body, as the
+/// reference (checked after auth; an empty body is fine).
+pub fn no_body(body: &[u8]) -> XrpcResult<()> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(XrpcError::invalid_request(
+            "A request body was provided when none was expected",
+        ))
+    }
+}
+
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         let mut res = (

@@ -58,6 +58,11 @@ fn api(r: crate::error::XrpcResult<Json<Value>>) -> Result<Value, String> {
     r.map(|j| j.0).map_err(|e| e.message)
 }
 
+/// The same for a method with no output.
+fn api_unit(r: crate::error::XrpcResult<()>) -> Result<Value, String> {
+    r.map(|()| Value::Null).map_err(|e| e.message)
+}
+
 /// An account's page. A `%` in the DID is written `%25`, so the path
 /// decodes back to the DID.
 #[must_use]
@@ -445,27 +450,31 @@ pub async fn account_action(
         "invites" => {
             let body = Json(input(json!({"account": did})));
             if flag("disabled") {
-                api(crate::admin::disable_account_invites(st(), h, body).await)
+                api_unit(crate::admin::disable_account_invites(st(), h, body).await)
             } else {
-                api(crate::admin::enable_account_invites(st(), h, body).await)
+                api_unit(crate::admin::enable_account_invites(st(), h, body).await)
             }
         }
-        "handle" => api(crate::admin::update_account_handle(
-            st(),
-            h,
-            Json(input(
-                json!({"did": did, "handle": web::field(&form, "handle")}),
-            )),
-        )
-        .await),
-        "email" => api(crate::admin::update_account_email(
-            st(),
-            h,
-            Json(input(
-                json!({"account": did, "email": web::field(&form, "email")}),
-            )),
-        )
-        .await),
+        "handle" => api_unit(
+            crate::admin::update_account_handle(
+                st(),
+                h,
+                Json(input(
+                    json!({"did": did, "handle": web::field(&form, "handle")}),
+                )),
+            )
+            .await,
+        ),
+        "email" => api_unit(
+            crate::admin::update_account_email(
+                st(),
+                h,
+                Json(input(
+                    json!({"account": did, "email": web::field(&form, "email")}),
+                )),
+            )
+            .await,
+        ),
         "password" => {
             let pw = form
                 .iter()
@@ -474,12 +483,14 @@ pub async fn account_action(
             if pw.is_empty() {
                 Err("Enter the new password.".into())
             } else {
-                api(crate::admin::update_account_password(
-                    st(),
-                    h,
-                    Json(input(json!({"did": did, "password": pw}))),
+                api_unit(
+                    crate::admin::update_account_password(
+                        st(),
+                        h,
+                        Json(input(json!({"did": did, "password": pw}))),
+                    )
+                    .await,
                 )
-                .await)
             }
         }
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
@@ -574,13 +585,14 @@ pub async fn delete(
         )
         .await;
     }
-    match api(crate::admin::delete_account(
-        State(Arc::clone(&s)),
-        op.api_headers(),
-        Json(input(json!({"did": did}))),
-    )
-    .await)
-    {
+    match api_unit(
+        crate::admin::delete_account(
+            State(Arc::clone(&s)),
+            op.api_headers(),
+            Json(input(json!({"did": did}))),
+        )
+        .await,
+    ) {
         Ok(_) => web::redirect("/admin/accounts?done=deleted"),
         Err(e) => delete_confirm(&s, &op, &did, &a.handle, Some(e), StatusCode::BAD_REQUEST).await,
     }
@@ -708,13 +720,14 @@ pub async fn disable_invite(State(s): St, headers: HeaderMap, body: Bytes) -> Re
         Err(r) => return r,
     };
     let code = web::field(&form, "code");
-    match api(crate::admin::disable_invite_codes(
-        State(Arc::clone(&s)),
-        op.api_headers(),
-        Json(input(json!({"codes": [code]}))),
-    )
-    .await)
-    {
+    match api_unit(
+        crate::admin::disable_invite_codes(
+            State(Arc::clone(&s)),
+            op.api_headers(),
+            Json(input(json!({"codes": [code]}))),
+        )
+        .await,
+    ) {
         Ok(_) => web::redirect("/admin/invites"),
         Err(e) => {
             render_invites(

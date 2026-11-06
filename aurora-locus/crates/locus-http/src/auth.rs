@@ -207,6 +207,13 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
         .and_then(|v| v.split_once(' ').map(|(_, t)| t.trim().to_owned()))
         .filter(|t| !t.is_empty())
         .ok_or_else(|| invalid("Malformed token"))?;
+    // The proof is checked before the token, as the reference.
+    let info = crate::routing::REQUEST
+        .try_with(Clone::clone)
+        .map_err(|_| XrpcError::internal("no request context"))?;
+    let proof = crate::oauth::dpop_proof(state, &info.method, &info.uri, headers, Some(&token))
+        .await
+        .map_err(XrpcError::from)?;
     let jws =
         locus_auth::oauth::jose::Jws::decode(&token).map_err(|_| invalid("Malformed token"))?;
     // Tokens a reference PDS issued before the install was imported from
@@ -266,12 +273,6 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
     {
         return Err(invalid("Token expired"));
     }
-    let info = crate::routing::REQUEST
-        .try_with(Clone::clone)
-        .map_err(|_| XrpcError::internal("no request context"))?;
-    let proof = crate::oauth::dpop_proof(state, &info.method, &info.uri, headers, Some(&token))
-        .await
-        .map_err(XrpcError::from)?;
     let jkt = p
         .get("cnf")
         .and_then(|c| c.get("jkt"))

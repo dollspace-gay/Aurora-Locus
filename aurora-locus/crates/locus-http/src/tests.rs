@@ -2,6 +2,7 @@
 
 mod blobs;
 mod bulk;
+mod conformance;
 mod keys;
 mod keys_shard;
 mod security;
@@ -1076,11 +1077,25 @@ impl Harness {
         self.mail.lock().unwrap().len()
     }
 
+    /// A procedure call; `{}` to a method with no input sends no body
+    /// (such methods refuse one).
     async fn post(&self, path: &str, auth: Option<&str>, body: Value) -> (StatusCode, Value) {
-        self.call("POST", &format!("/xrpc/{path}"), auth, Some(body))
+        let body = (!(NO_INPUT.contains(&path) && body == json!({}))).then_some(body);
+        self.call("POST", &format!("/xrpc/{path}"), auth, body)
             .await
     }
 }
+
+/// The procedures whose lexicon has no input.
+const NO_INPUT: &[&str] = &[
+    "com.atproto.identity.requestPlcOperationSignature",
+    "com.atproto.server.activateAccount",
+    "com.atproto.server.deleteSession",
+    "com.atproto.server.refreshSession",
+    "com.atproto.server.requestAccountDelete",
+    "com.atproto.server.requestEmailConfirmation",
+    "com.atproto.server.requestEmailUpdate",
+];
 
 #[tokio::test]
 async fn email_confirmation_and_change() {

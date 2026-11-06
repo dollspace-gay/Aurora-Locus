@@ -826,8 +826,10 @@ pub async fn email_action(
         v
     };
     let result = match action.as_str() {
-        "send-confirm" => said(crate::email::request_email_confirmation(st(), u.bearer(&s)).await)
-            .map(|()| "sent"),
+        "send-confirm" => said(
+            crate::email::request_email_confirmation(st(), u.bearer(&s), Default::default()).await,
+        )
+        .map(|()| "sent"),
         "confirm" => said(
             crate::email::confirm_email(
                 st(),
@@ -837,7 +839,9 @@ pub async fn email_action(
             .await,
         )
         .map(|()| "confirmed"),
-        "send-update" => match said(crate::email::request_email_update(st(), u.bearer(&s)).await) {
+        "send-update" => match said(
+            crate::email::request_email_update(st(), u.bearer(&s), Default::default()).await,
+        ) {
             Ok(Json(v)) if v["tokenRequired"] == json!(false) => Ok("not-needed"),
             Ok(_) => Ok("sent"),
             Err(e) => Err(e),
@@ -1388,7 +1392,14 @@ pub async fn identity_action(
     let st = || State(Arc::clone(&s));
     match action.as_str() {
         "send" => {
-            match said(crate::identity::request_plc_operation_signature(st(), u.bearer(&s)).await) {
+            match said(
+                crate::identity::request_plc_operation_signature(
+                    st(),
+                    u.bearer(&s),
+                    Default::default(),
+                )
+                .await,
+            ) {
                 Ok(()) => web::redirect("/account/identity?done=sent"),
                 Err(e) => identity_render(&s, &u, None, vec![e], StatusCode::BAD_REQUEST).await,
             }
@@ -1520,7 +1531,7 @@ pub async fn deactivate(State(s): St, headers: HeaderMap, body: Bytes) -> Respon
     };
     let st = || State(Arc::clone(&s));
     let r = if web::field(&f, "to") == "on" {
-        said(crate::account::activate_account(st(), u.bearer(&s)).await)
+        said(crate::account::activate_account(st(), u.bearer(&s), Default::default()).await)
     } else {
         said(crate::account::deactivate_account(st(), u.bearer(&s), Json(input(json!({})))).await)
     };
@@ -1598,7 +1609,7 @@ pub async fn delete_action(
     };
     let st = || State(Arc::clone(&s));
     match action.as_str() {
-        "send" => match said(crate::account::request_account_delete(st(), u.bearer(&s)).await) {
+        "send" => match said(crate::account::request_account_delete(st(), u.bearer(&s), Default::default()).await) {
             Ok(()) => web::redirect("/account/delete?done=sent"),
             Err(e) => delete_render(&s, &u, None, vec![e], StatusCode::BAD_REQUEST).await,
         },

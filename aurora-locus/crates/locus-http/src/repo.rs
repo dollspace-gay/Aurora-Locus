@@ -836,7 +836,9 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         .await?
         .did
     };
-    let account = auth::account_checked(&s, &did, true).await?;
+    // A deactivated account can upload (a migration's blobs arrive before
+    // activation), as the reference's `checkTakedown` only.
+    let account = auth::account_checked(&s, &did, false).await?;
     crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::UPLOAD_BLOB]).await?;
     let limit = u64::try_from(s.snapshot().int("blobs.upload_limit")).unwrap_or(u64::MAX);
     let content_type = headers
