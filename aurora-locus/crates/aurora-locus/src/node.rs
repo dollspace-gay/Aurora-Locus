@@ -40,6 +40,9 @@ pub struct Node {
     cancel: CancellationToken,
     /// Fires when setup completes while this node is in setup mode.
     setup_done: CancellationToken,
+    /// Cancelled when the install's keys changed: the service restarts in
+    /// place to reload them.
+    reload: CancellationToken,
     /// In setup mode until setup completes.
     pub setup_mode: bool,
     /// This node's recent log lines, for the console.
@@ -231,6 +234,7 @@ impl Node {
             outer,
             cancel,
             setup_done: CancellationToken::new(),
+            reload: CancellationToken::new(),
             logs: log.ring(),
             setup_mode,
             tasks: Vec::new(),
@@ -289,6 +293,8 @@ impl Node {
             format!("https://{hostname}")
         };
         let service_did = format!("did:web:{hostname}");
+        // Read before the keys, so a change made while they load is seen.
+        let key_generation = self.store.key_state().await?.generation;
         let secrets = ServerSecrets::load_or_create(&self.store, &self.master_key).await?;
         let sessions =
             LegacySessions::new(self.store.clone(), secrets.jwt.clone(), service_did.clone());
@@ -355,8 +361,10 @@ impl Node {
             logs: Arc::clone(&self.logs),
             branding: locus_http::branding::Cache::default(),
             socket_secret: locus_http::socket::new_secret(),
+            reload: self.reload.clone(),
         });
         self.setup_done = state.setup.completed.clone();
+        self.spawn_key_watch(key_generation);
         if self.setup_mode {
             self.tasks.push(tokio::spawn(locus_http::setup::watch(
                 Arc::clone(&state),
@@ -369,6 +377,7 @@ impl Node {
             self.spawn_kryphocron_jobs(Arc::clone(&state));
             self.spawn_audience_jobs(Arc::clone(&state));
             self.spawn_identity_repair(Arc::clone(&state));
+            self.spawn_plc_key_scan(Arc::clone(&state));
             self.spawn_account_jobs(Arc::clone(&state));
             self.spawn_blob_jobs(Arc::clone(&state));
             self.spawn_sync_jobs(Arc::clone(&state));
@@ -907,6 +916,70 @@ impl Node {
     /// Retries identity changes that didn't finish (handle changes after an
     /// unclear PLC answer, tombstones of DIDs from failed sign-ups), on one
     /// node at a time.
+    /// Watches the install's key generation; a change (another node, or
+    /// this one, changed a key nodes hold in memory) restarts the service.
+    fn spawn_key_watch(&mut self, generation: i64) {
+        let store = self.store.clone();
+        let reload = self.reload.clone();
+        let cancel = self.cancel.clone();
+        self.tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+                match store.key_state().await {
+                    Ok(k) if k.generation != generation => {
+                        reload.cancel();
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("key generation check failed: {e}"),
+                }
+            }
+        }));
+    }
+
+    /// The PLC key scan (which held keys each account's document lists),
+    /// on one node at a time.
+    fn spawn_plc_key_scan(&mut self, state: Arc<AppState>) {
+        const NAME: &str = "plc-key-scan";
+        self.tasks
+            .push(tokio::spawn(locus_store::runtime::run_leased(
+                self.store.clone(),
+                NAME.into(),
+                self.node_id.clone(),
+                DEFAULT_LEASE_TTL,
+                self.cancel.clone(),
+                move |_lease, cancel| {
+                    let state = Arc::clone(&state);
+                    async move {
+                        loop {
+                            let result = locus_http::keys::plc_scan_step(&state, 100).await;
+                            let idle = match &result {
+                                Ok(0) => true,
+                                Ok(n) => {
+                                    tracing::debug!(checked = n, "PLC key scan");
+                                    false
+                                }
+                                Err(e) => {
+                                    tracing::warn!("PLC key scan failed: {e}");
+                                    true
+                                }
+                            };
+                            let err = result.as_ref().err().map(ToString::to_string);
+                            let _ = state.store.record_job_run(NAME, err.as_deref(), None).await;
+                            let wait = if idle { 60 } else { 1 };
+                            tokio::select! {
+                                () = cancel.cancelled() => return Ok(()),
+                                () = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                            }
+                        }
+                    }
+                },
+            )));
+    }
+
     fn spawn_identity_repair(&mut self, state: Arc<AppState>) {
         const NAME: &str = "identity-repair";
         const EVERY: Duration = Duration::from_secs(30);
@@ -1068,6 +1141,10 @@ impl Node {
         let ended = tokio::select! {
             () = self.cancel.cancelled() => Ended::Stopped,
             () = self.setup_done.cancelled() => Ended::Restart,
+            () = self.reload.cancelled() => {
+                tracing::info!("the install's keys changed; reloading");
+                Ended::Restart
+            }
         };
         // A shutdown during the restart wins.
         let ended = if self.outer.is_cancelled() {

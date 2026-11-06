@@ -22,11 +22,11 @@ pub enum KeyCheck {
     Matches,
 }
 
-fn secret_aad(name: &str) -> Vec<u8> {
+pub(crate) fn secret_aad(name: &str) -> Vec<u8> {
     format!("secret:{name}").into_bytes()
 }
 
-fn signing_key_aad(did: &str) -> Vec<u8> {
+pub(crate) fn signing_key_aad(did: &str) -> Vec<u8> {
     format!("signing_key:{did}").into_bytes()
 }
 

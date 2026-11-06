@@ -1099,6 +1099,41 @@ async fn review_checks(s: &AppState, plan: &SetupPlan, cf_token: Option<&str>) -
 
 /// `POST /setup/{step}`: saves the step's answers, then goes on to the
 /// next step (or shows what's wrong).
+/// `POST /setup/keys/backup`: the key backup, as a download (the Keys
+/// step's form; its passphrase is typed twice).
+pub async fn key_backup(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
+    if s.store.setup_completed().await.unwrap_or(false) {
+        return complete_page(&s);
+    }
+    let Some(id) = session(&s, &headers).await else {
+        return web::redirect("/setup");
+    };
+    let form = web::parse_form(&body);
+    if !web::same_site(&headers) || !web::ct_eq(web::field(&form, "csrf"), &csrf_for(&id)) {
+        return (
+            StatusCode::FORBIDDEN,
+            "Request refused: the form expired. Go back and try again.",
+        )
+            .into_response();
+    }
+    let pass = web::field(&form, "passphrase");
+    if pass != web::field(&form, "passphrase2") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The two passphrases differ. Go back and try again.",
+        )
+            .into_response();
+    }
+    match crate::keys::backup_stream(Arc::clone(&s), pass, "setup".into()).await {
+        Ok(body) => crate::keys::backup_response(&s, body),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("{} Go back and try again.", e.message),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn save_step(
     State(s): St,
     headers: HeaderMap,
@@ -1310,7 +1345,7 @@ pub async fn save_step(
                 errors.push("A recovery key is a did:key.".into());
             }
             if !plan.keys_backup_acknowledged {
-                errors.push("Confirm you have a copy of the master key: without it, every stored key is lost.".into());
+                errors.push("Confirm you have a key backup (or a copy of the master key): without one, every stored key is lost.".into());
             }
         }
         Step::Review => {

@@ -52,6 +52,22 @@ impl Client {
         query: &[(String, String)],
         body: Option<Value>,
     ) -> Result<Value, String> {
+        let (status, bytes) = self.call_raw(nsid, query, body).await?;
+        let v = answer_json(&bytes);
+        if (200..300).contains(&status) {
+            Ok(v)
+        } else {
+            Err(answer_error(status, &v))
+        }
+    }
+
+    /// Calls `nsid` and returns the answer's status and bytes as they are.
+    pub async fn call_raw(
+        &self,
+        nsid: &str,
+        query: &[(String, String)],
+        body: Option<Value>,
+    ) -> Result<(u16, Vec<u8>), String> {
         let path = if query.is_empty() {
             format!("/xrpc/{nsid}")
         } else {
@@ -118,21 +134,24 @@ impl Client {
                 (status, body)
             }
         };
-        let v: Value = if bytes.is_empty() {
-            json!({})
-        } else {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-        };
-        if (200..300).contains(&status) {
-            Ok(v)
-        } else {
-            Err(match (v["error"].as_str(), v["message"].as_str()) {
-                (Some(e), Some(m)) => format!("{e}: {m}"),
-                (_, Some(m)) => m.to_owned(),
-                _ => format!("HTTP {status}: {v}"),
-            })
-        }
+        Ok((status, bytes))
+    }
+}
+
+fn answer_json(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(bytes).into_owned()))
+    }
+}
+
+fn answer_error(status: u16, v: &Value) -> String {
+    match (v["error"].as_str(), v["message"].as_str()) {
+        (Some(e), Some(m)) => format!("{e}: {m}"),
+        (_, Some(m)) => m.to_owned(),
+        _ => format!("HTTP {status}: {v}"),
     }
 }
 
@@ -298,6 +317,56 @@ pub enum JobsCmd {
 }
 
 #[derive(Subcommand)]
+pub enum KeysCmd {
+    /// The held keys, the last key backup, and how accounts' documents
+    /// list the PLC rotation keys.
+    Show,
+    /// An encrypted backup of every key (the passphrase is asked for).
+    Backup {
+        /// Where to write it (created, mode 0600; never overwritten).
+        #[arg(long)]
+        out: PathBuf,
+        /// Read the passphrase from this file (or `-` for stdin) instead of
+        /// asking, e.g. for scheduled backups.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
+    #[command(subcommand)]
+    Set(KeysSetCmd),
+    /// Forgets a secondary PLC rotation key no account's document still
+    /// needs (each document that may list it is checked first).
+    DropPlcKey {
+        did_key: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeysSetCmd {
+    /// A new PLC rotation key for the PDS. It's stored pending and becomes
+    /// current once a key backup holds it (or with
+    /// --acknowledge-no-backup); the previous key keeps signing for the
+    /// accounts whose documents list it.
+    PlcRotationKey {
+        /// Generate the new key here.
+        #[arg(long)]
+        generate: bool,
+        /// Read the private key (hex) from this file, or `-` for stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Make the pending key current without a key backup.
+        #[arg(long)]
+        acknowledge_no_backup: bool,
+        /// Remove the pending key.
+        #[arg(long)]
+        discard_pending: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum KryphocronCmd {
     RotateNow,
     Status,
@@ -328,6 +397,8 @@ pub enum AdminCmd {
     Jobs(JobsCmd),
     #[command(subcommand)]
     Kryphocron(KryphocronCmd),
+    #[command(subcommand)]
+    Keys(KeysCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -420,10 +491,205 @@ fn setting_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
 }
 
+/// Re-auth for a key change: over the socket, a typed confirmation; over
+/// HTTP, the operator's password and code.
+fn reauth(c: &Client, what: &str, yes: bool) -> Result<Value, String> {
+    match c {
+        Client::Socket(_) => {
+            confirm(what, yes)?;
+            Ok(json!({}))
+        }
+        Client::Http { .. } => {
+            let password = rpassword::prompt_password("Your operator password: ")
+                .map_err(|e| e.to_string())?;
+            print!("Your code (empty without a code app): ");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut code = String::new();
+            std::io::stdin()
+                .read_line(&mut code)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"password": password, "code": code.trim()}))
+        }
+    }
+}
+
+fn merge(mut a: Value, b: Value) -> Value {
+    if let (Some(a), Value::Object(b)) = (a.as_object_mut(), b) {
+        a.extend(b);
+    }
+    a
+}
+
+/// A private key from a file or stdin (`-`), never the command line.
+fn read_key(path: &std::path::Path) -> Result<zeroize::Zeroizing<String>, String> {
+    let text = if path.as_os_str() == "-" {
+        let mut t = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut t).map_err(|e| e.to_string())?;
+        t
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
+    };
+    Ok(zeroize::Zeroizing::new(text.trim().to_owned()))
+}
+
+/// Writes a new file only the owner can read; an existing one is refused.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How long ago a time (ms since the epoch) was, roughly.
+fn ago(at_ms: i64) -> String {
+    let secs = (locus_core::time::now_ms() - at_ms).max(0) / 1000;
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} minutes ago", secs / 60),
+        3_600..86_400 => format!("{} hours ago", secs / 3_600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
+    let lx = |m: &str| format!("{NS}.{m}");
+    match k {
+        KeysCmd::Show => {
+            let v = c.call(&lx("owner.keys.show"), &[], None).await?;
+            println!(
+                "master key   {} ({})",
+                v["masterKey"]["id"].as_str().unwrap_or(""),
+                v["masterKey"]["source"].as_str().unwrap_or("")
+            );
+            println!("service key  {}", v["serviceKey"].as_str().unwrap_or(""));
+            for r in v["plcRotationKeys"].as_array().cloned().unwrap_or_default() {
+                let note = if r["inLastBackup"] == json!(false) {
+                    "  (not in a key backup yet)"
+                } else {
+                    ""
+                };
+                println!(
+                    "PLC key      {} {}{note}",
+                    r["didKey"].as_str().unwrap_or(""),
+                    r["role"].as_str().unwrap_or("")
+                );
+            }
+            match v["lastBackup"]["at"].as_i64() {
+                Some(at) => println!(
+                    "last backup  {} by {}",
+                    ago(at),
+                    v["lastBackup"]["by"].as_str().unwrap_or("?")
+                ),
+                None => println!("last backup  never: run `aurora-locus keys backup --out <file>`"),
+            }
+            let a = &v["accounts"];
+            println!(
+                "accounts     {} list the current key, {} only a secondary one, {} no held key, {} not checked yet",
+                a["listingCurrent"],
+                a["listingOnlySecondary"],
+                a["listingNoHeldKey"],
+                a["notChecked"]
+            );
+            Ok(())
+        }
+        KeysCmd::Backup {
+            out,
+            passphrase_file,
+        } => {
+            if out.exists() {
+                return Err(format!("{} exists; choose a new file", out.display()));
+            }
+            let pass = match &passphrase_file {
+                Some(f) => read_key(f)?,
+                None => zeroize::Zeroizing::new(secret(
+                    "A passphrase for the backup (at least 12 characters)",
+                )?),
+            };
+            let (status, bytes) = c
+                .call_raw(
+                    &lx("owner.keys.backup"),
+                    &[],
+                    Some(json!({"passphrase": *pass})),
+                )
+                .await?;
+            if !(200..300).contains(&status) {
+                return Err(answer_error(status, &answer_json(&bytes)));
+            }
+            // Read it back before keeping it: a cut-off or damaged backup
+            // fails here, not on the day it's needed.
+            let (_, entries) = locus_core::key_backup::open(&bytes, &pass)
+                .map_err(|e| format!("the backup didn't check out, nothing was written: {e}"))?;
+            write_private(&out, &bytes)?;
+            println!(
+                "Wrote {} ({} keys and secrets). Keep it, and its passphrase, away from this server.",
+                out.display(),
+                entries.len()
+            );
+            Ok(())
+        }
+        KeysCmd::Set(KeysSetCmd::PlcRotationKey {
+            generate,
+            file,
+            acknowledge_no_backup,
+            discard_pending,
+            yes,
+        }) => {
+            let mut body = json!({
+                "generate": generate,
+                "acknowledgeNoBackup": acknowledge_no_backup,
+                "discardPending": discard_pending,
+            });
+            if let Some(f) = &file {
+                body["privateKeyHex"] = json!(*read_key(f)?);
+            }
+            let what = if discard_pending {
+                "Remove the pending PLC rotation key"
+            } else if acknowledge_no_backup {
+                "Make the pending PLC rotation key current without a key backup that holds it"
+            } else {
+                "Store a new pending PLC rotation key for this PDS"
+            };
+            let body = merge(body, reauth(c, what, yes)?);
+            let v = c
+                .call(&lx("owner.keys.setPlcRotationKey"), &[], Some(body))
+                .await?;
+            println!(
+                "{} is {}.",
+                v["didKey"].as_str().unwrap_or(""),
+                v["role"].as_str().unwrap_or("")
+            );
+            if let Some(next) = v["next"].as_str() {
+                println!("{next}");
+            }
+            Ok(())
+        }
+        KeysCmd::DropPlcKey { did_key, yes } => {
+            let body = merge(
+                json!({"didKey": did_key}),
+                reauth(c, &format!("Forget the PLC rotation key {did_key}"), yes)?,
+            );
+            c.call(&lx("owner.keys.dropPlcKey"), &[], Some(body))
+                .await?;
+            println!("{did_key} is no longer held.");
+            Ok(())
+        }
+    }
+}
+
 /// Runs an online command.
 pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match cmd {
+        AdminCmd::Keys(k) => keys(c, k).await,
         AdminCmd::Status => {
             let caps = c.call(&lx("describeCapabilities"), &[], None).await?;
             println!("aurora-locus {}", caps["version"].as_str().unwrap_or("?"));

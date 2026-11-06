@@ -247,6 +247,7 @@ async fn harness_build(
         logs: Arc::new(locus_core::logs::LogRing::new(100)),
         branding: crate::branding::Cache::default(),
         socket_secret: crate::socket::new_secret(),
+        reload: tokio_util::sync::CancellationToken::new(),
     });
     crate::kryphocron::refresh_oracle(&state).await.unwrap();
     Harness {
@@ -5199,7 +5200,7 @@ impl Browser {
             .raw("GET", path, None, vec![], &[("cookie", &cookie)])
             .await;
         self.keep(&headers);
-        (st, headers, String::from_utf8(body).unwrap())
+        (st, headers, String::from_utf8_lossy(&body).into_owned())
     }
 
     async fn post(
@@ -5226,7 +5227,7 @@ impl Browser {
             )
             .await;
         self.keep(&headers);
-        (st, headers, String::from_utf8(body).unwrap())
+        (st, headers, String::from_utf8_lossy(&body).into_owned())
     }
 }
 
@@ -8977,6 +8978,42 @@ async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
         page.contains(&h.state.secrets.plc_keys.current().did()),
         "the rotation key is shown"
     );
+    // The key backup downloads from this step.
+    let r = step(
+        "/setup/keys/backup",
+        vec![
+            ("passphrase", "a setup passphrase".into()),
+            ("passphrase2", "a different one!".into()),
+        ],
+    )
+    .await;
+    assert_eq!(r.0, StatusCode::BAD_REQUEST, "the two must match");
+    let r = step(
+        "/setup/keys/backup",
+        vec![
+            ("passphrase", "a setup passphrase".into()),
+            ("passphrase2", "a setup passphrase".into()),
+        ],
+    )
+    .await;
+    assert_eq!(r.0, StatusCode::OK);
+    assert!(
+        r.1["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment; filename=\"aurora-locus-keys-")
+    );
+    assert!(r.2.starts_with("{\"format\":\"aurora-locus-key-backup\""));
+    assert_eq!(
+        h.state
+            .store
+            .key_state()
+            .await
+            .unwrap()
+            .last_backup_by
+            .as_deref(),
+        Some("setup")
+    );
     let r = step("/setup/keys", vec![]).await;
     assert!(
         r.0 == StatusCode::BAD_REQUEST && r.2.contains("master key"),
@@ -11372,5 +11409,350 @@ async fn behind_cloudflare_the_client_ip_comes_from_cloudflare_only() {
     assert_eq!(
         crate::ratelimit::real_ip(&h.state, Some(ip("192.0.2.50")), &headers),
         Some(ip("192.0.2.50"))
+    );
+}
+
+// ---------------------------------------------------------------- keys
+
+impl Harness {
+    /// An owner with a real password, for calls that re-authenticate.
+    async fn owner_with_password(&self, name: &str, password: &str) -> String {
+        let hash = locus_auth::password::hash(password).unwrap();
+        assert!(
+            self.state
+                .store
+                .create_operator(name, &hash, "owner")
+                .await
+                .unwrap()
+        );
+        let token = crate::admin_auth::new_token();
+        self.state
+            .store
+            .create_operator_token(
+                &format!("t-{name}"),
+                &crate::admin_auth::token_hash(&token),
+                name,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+        format!("Bearer {token}")
+    }
+
+    async fn backup_bytes(&self, auth: &str, passphrase: &str) -> (StatusCode, Vec<u8>) {
+        let path = format!("/xrpc/{}.owner.keys.backup", locus_core::LOCUS_NS);
+        let (st, _, out) = self
+            .raw(
+                "POST",
+                &path,
+                None,
+                serde_json::to_vec(&json!({"passphrase": passphrase})).unwrap(),
+                &[
+                    ("authorization", auth),
+                    ("content-type", "application/json"),
+                ],
+            )
+            .await;
+        (st, out)
+    }
+}
+
+#[tokio::test]
+async fn key_backups_hold_every_key_and_make_a_pending_plc_key_current() {
+    use locus_core::key_backup::Entry;
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (did, _) = h.user("kim.pds.example.com").await;
+    let owner = h.owner_with_password("olga", "olga-password-123").await;
+    let admin = format!("Bearer {}", h.operator("adam", "admin").await);
+    let first = h.state.secrets.plc_keys.current().did();
+
+    // Owners only.
+    assert_eq!(
+        h.admin_call("GET", &ns("owner.keys.show"), &admin, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (st, v) = h
+        .admin_call("GET", &ns("owner.keys.show"), &owner, None)
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["plcRotationKeys"][0]["didKey"], json!(first));
+    assert_eq!(v["plcRotationKeys"][0]["inLastBackup"], json!(false));
+    assert!(v["lastBackup"].is_null());
+
+    // A backup: every secret, every account key and the PLC keys' roles.
+    let (st, bytes) = h.backup_bytes(&owner, "short").await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "passphrases are at least 12 characters"
+    );
+    assert!(bytes.starts_with(b"{\"error\""));
+    let (st, bytes) = h.backup_bytes(&owner, "backup passphrase 1").await;
+    assert_eq!(st, StatusCode::OK);
+    let (header, entries) = locus_core::key_backup::open(&bytes, "backup passphrase 1").unwrap();
+    assert_eq!(header.service_did, h.state.service_did);
+    assert_eq!(header.master_key_id, h.state.master_key.key_id());
+    let has = |f: &dyn Fn(&Entry) -> bool| entries.iter().any(f);
+    assert!(has(
+        &|e| matches!(e, Entry::PlcKey { did_key, role } if *did_key == first && role == "current")
+    ));
+    assert!(has(
+        &|e| matches!(e, Entry::Secret { name, .. } if *name == format!("plc_rotation_key/{first}"))
+    ));
+    assert!(has(
+        &|e| matches!(e, Entry::Secret { name, .. } if name == "service_signing_key")
+    ));
+    let stored = h
+        .state
+        .store
+        .get_signing_key(&did, &h.state.master_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(has(
+        &|e| matches!(e, Entry::SigningKey { did: d, value, .. } if *d == did && **value == *stored.1)
+    ));
+    assert!(locus_core::key_backup::open(&bytes, "backup passphrase 2").is_err());
+    let state = h.state.store.key_state().await.unwrap();
+    assert_eq!(state.last_backup_by.as_deref(), Some("operator:olga"));
+
+    // A new PLC rotation key needs re-authentication, and is pending.
+    let set = ns("owner.keys.setPlcRotationKey");
+    let (st, v) = h
+        .admin_call("POST", &set, &owner, Some(json!({"generate": true})))
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("ReauthRequired"))
+    );
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(json!({"generate": true, "password": "wrong password 1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+    let reauth = json!({"password": "olga-password-123"});
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(json!({"generate": true, "password": "olga-password-123"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let pending = v["didKey"].as_str().unwrap().to_owned();
+    assert_eq!(v["role"], "pending");
+    let generation = h.state.store.key_state().await.unwrap().generation;
+    assert!(generation > state.generation, "nodes reload");
+    // Neither or two actions at once are refused.
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(
+                json!({"generate": true, "discardPending": true}),
+                &reauth,
+            )),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // A backup made after it makes it current; the old key stays secondary.
+    let (st, bytes) = h.backup_bytes(&owner, "backup passphrase 1").await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, entries) = locus_core::key_backup::open(&bytes, "backup passphrase 1").unwrap();
+    assert!(entries.iter().any(|e| matches!(e, Entry::Secret { name, .. } if *name == format!("plc_rotation_key/{pending}"))));
+    let rows = h.state.store.plc_key_rows().await.unwrap();
+    let role = |k: &str| rows.iter().find(|r| r.did_key == k).map(|r| r.role.clone());
+    assert_eq!(role(&pending).as_deref(), Some("current"));
+    assert_eq!(role(&first).as_deref(), Some("secondary"));
+
+    // The old key can't be dropped while an account's document lists only it.
+    let drop = ns("owner.keys.dropPlcKey");
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &drop,
+            &owner,
+            Some(merge(json!({"didKey": first}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["message"].as_str().unwrap().contains(&did), "{v}");
+    assert_eq!(
+        h.state.store.plc_key_listing(&did).await.unwrap(),
+        Some(vec![first.clone()]),
+        "the guard recorded what it saw"
+    );
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &drop,
+            &owner,
+            Some(merge(json!({"didKey": pending}), &reauth)),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "the current key can't be dropped"
+    );
+
+    // A pending key nobody lists can be discarded; another can be made
+    // current without a backup, explicitly.
+    for _ in 0..2 {
+        let (st, _) = h
+            .admin_call(
+                "POST",
+                &set,
+                &owner,
+                Some(merge(json!({"generate": true}), &reauth)),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"discardPending": true}), &reauth)),
+        )
+        .await;
+    assert_eq!(
+        (st, v["role"].as_str()),
+        (StatusCode::OK, Some("discarded")),
+        "{v}"
+    );
+    let (st, _) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"discardPending": true}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "nothing pending");
+    let hex_key = {
+        use proto_blue_crypto::ExportableKeypair as _;
+        hex::encode(proto_blue_crypto::K256Keypair::generate().export_private_key())
+    };
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"privateKeyHex": hex_key}), &reauth)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let third = v["didKey"].as_str().unwrap().to_owned();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &set,
+            &owner,
+            Some(merge(json!({"acknowledgeNoBackup": true}), &reauth)),
+        )
+        .await;
+    assert_eq!(
+        (st, v["role"].as_str()),
+        (StatusCode::OK, Some("current")),
+        "{v}"
+    );
+    let (_, v) = h
+        .admin_call("GET", &ns("owner.keys.show"), &owner, None)
+        .await;
+    let shown: Vec<(String, String)> = v["plcRotationKeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["didKey"].as_str().unwrap().to_owned(),
+                r["role"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(shown.contains(&(third.clone(), "current".into())), "{v}");
+    assert_eq!(shown.len(), 3, "first and second stay secondary: {v}");
+    assert!(
+        h.state
+            .store
+            .audit_entries(None, 50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.action == "keys.plcRotationKey.current"),
+        "audited"
+    );
+}
+
+fn merge(mut a: Value, b: &Value) -> Value {
+    if let (Some(a), Some(b)) = (a.as_object_mut(), b.as_object()) {
+        a.extend(b.clone());
+    }
+    a
+}
+
+#[tokio::test]
+async fn a_changed_env_plc_key_becomes_pending_once() {
+    let h = harness(false).await;
+    let first = h.state.secrets.plc_keys.current().did();
+    let env_key = proto_blue_crypto::K256Keypair::generate();
+    let rows = |h: &Harness| {
+        let s = h.state.store.clone();
+        async move {
+            s.plc_key_rows()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.did_key, r.role))
+                .collect::<Vec<_>>()
+        }
+    };
+    crate::state::apply_env_plc_key(&h.state.store, &h.state.master_key, &env_key)
+        .await
+        .unwrap();
+    let after = rows(&h).await;
+    assert!(
+        after.contains(&(env_key.did(), "pending".into())),
+        "{after:?}"
+    );
+    assert!(after.contains(&(first.clone(), "current".into())));
+    // Applied once: a later boot with the same value changes nothing, even
+    // after the key moved on.
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.promote_pending_plc_key().await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = h.state.store.begin().await.unwrap();
+    let other = proto_blue_crypto::K256Keypair::generate();
+    use proto_blue_crypto::ExportableKeypair as _;
+    tx.store_pending_plc_key(
+        &other.did(),
+        &other.export_private_key(),
+        &h.state.master_key,
+    )
+    .await
+    .unwrap();
+    tx.promote_pending_plc_key().await.unwrap();
+    tx.commit().await.unwrap();
+    let before = rows(&h).await;
+    crate::state::apply_env_plc_key(&h.state.store, &h.state.master_key, &env_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&h).await,
+        before,
+        "an unchanged env value never overrides a later change"
     );
 }

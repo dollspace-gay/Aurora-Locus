@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod error;
+pub mod key_backup;
 pub mod keys;
 pub mod lease;
 pub mod logs;

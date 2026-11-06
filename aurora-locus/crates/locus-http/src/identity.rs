@@ -281,7 +281,10 @@ fn upstream(m: impl Into<String>) -> XrpcError {
 }
 
 /// The DID's current PLC document and the CID its next op must name.
-async fn plc_state(s: &AppState, did: &str) -> Result<(Option<Operation>, String), PlcStep> {
+pub(crate) async fn plc_state(
+    s: &AppState,
+    did: &str,
+) -> Result<(Option<Operation>, String), PlcStep> {
     let plc = s.plc().map_err(PlcStep::Ambiguous)?;
     let raw = match plc.last_op_json(did).await {
         Ok(Some(v)) => v,

@@ -69,6 +69,16 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("owner.updateOperator"), post(update_operator))
         .route(at!("owner.createApiToken"), post(create_api_token))
         .route(at!("owner.revokeApiToken"), post(revoke_api_token))
+        .route(at!("owner.keys.show"), get(crate::keys::show))
+        .route(at!("owner.keys.backup"), post(crate::keys::backup))
+        .route(
+            at!("owner.keys.setPlcRotationKey"),
+            post(crate::keys::set_plc_rotation_key),
+        )
+        .route(
+            at!("owner.keys.dropPlcKey"),
+            post(crate::keys::drop_plc_key),
+        )
 }
 
 // ---------------------------------------------------------------- ungated

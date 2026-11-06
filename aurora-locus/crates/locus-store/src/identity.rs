@@ -26,7 +26,7 @@ impl PlcKeyRole {
         }
     }
 
-    fn parse(s: &str) -> CoreResult<Self> {
+    pub fn parse(s: &str) -> CoreResult<Self> {
         match s {
             "pending" => Ok(Self::Pending),
             "current" => Ok(Self::Current),

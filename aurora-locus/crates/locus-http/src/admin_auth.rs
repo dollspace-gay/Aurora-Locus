@@ -72,6 +72,9 @@ pub struct Caller {
     pub actor: String,
     pub role: Role,
     pub via: Via,
+    /// For a console sign-in, when the operator last confirmed their
+    /// identity (password and code).
+    pub confirmed_at: Option<i64>,
 }
 
 /// Which credentials a method takes.
@@ -143,6 +146,7 @@ pub async fn require(
             actor: "socket".into(),
             role: Role::Owner,
             via: Via::Socket,
+            confirmed_at: None,
         }
     } else if auth.starts_with("Basic ") {
         if !matches!(surface, Surface::Reference { .. }) || !basic_admin(s, headers) {
@@ -152,6 +156,7 @@ pub async fn require(
             actor: "admin".into(),
             role: Role::Admin,
             via: Via::Basic,
+            confirmed_at: None,
         }
     } else if let Some(token) = auth
         .strip_prefix("Bearer ")
@@ -166,6 +171,7 @@ pub async fn require(
             actor: format!("operator:{}", op.username),
             role: Role::parse(&op.role).unwrap_or(Role::Viewer),
             via: Via::Token,
+            confirmed_at: None,
         }
     } else if let Some(id) = auth.strip_prefix("Console ") {
         let idle = s.snapshot().int("admin.session_idle_minutes") * 60_000;
@@ -181,6 +187,7 @@ pub async fn require(
             actor: format!("operator:{}", op.username),
             role: Role::parse(&op.role).unwrap_or(Role::Viewer),
             via: Via::Console,
+            confirmed_at: Some(session.confirmed_at),
         }
     } else if auth.starts_with("Bearer ") {
         let Surface::Reference { mod_service: true } = surface else {
@@ -206,6 +213,7 @@ pub async fn require(
             actor: did,
             role: Role::Moderator,
             via: Via::ModService,
+            confirmed_at: None,
         }
     } else {
         return Err(unauthorized());
@@ -234,5 +242,57 @@ pub async fn audit(
         .await
     {
         tracing::error!(action, "audit log write failed: {e}");
+    }
+}
+
+/// Proof of identity a key change asks for over HTTP: the operator's
+/// password and, if they have a code app, a current code.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct Reauth {
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// Checks a caller made a key change knowingly. The socket CLI is the
+/// owner already and confirms on its TTY; a console sign-in must have
+/// confirmed its identity in the last few minutes; an API token must send
+/// its operator's password (and code).
+pub async fn reauth(s: &AppState, caller: &Caller, proof: &Reauth) -> XrpcResult<()> {
+    let refused = || {
+        XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "ReauthRequired",
+            "Confirm it's you: send the operator's password (and code)",
+        )
+    };
+    match caller.via {
+        Via::Socket => Ok(()),
+        Via::Console => match caller.confirmed_at {
+            Some(t) if locus_core::time::now_ms() - t < crate::console::CONFIRM_WINDOW_MS => Ok(()),
+            _ => Err(refused()),
+        },
+        Via::Token => {
+            let name = caller.actor.strip_prefix("operator:").ok_or_else(refused)?;
+            let op = s.store.operator(name).await?.ok_or_else(refused)?;
+            let pw = proof.password.as_deref().unwrap_or_default();
+            if op.disabled || !locus_auth::password::verify(pw, &op.password_hash) {
+                return Err(refused());
+            }
+            if op.totp_secret.is_some()
+                && !crate::console::code_ok(
+                    s,
+                    name,
+                    &crate::console::totp_secret_name(name),
+                    proof.code.as_deref().unwrap_or_default(),
+                )
+                .await
+            {
+                return Err(refused());
+            }
+            Ok(())
+        }
+        Via::Basic | Via::ModService => Err(refused()),
     }
 }

@@ -428,7 +428,7 @@ pub async fn code_page(State(s): St, headers: HeaderMap) -> Response {
     }
 }
 
-fn totp_secret_name(operator: &str) -> String {
+pub(crate) fn totp_secret_name(operator: &str) -> String {
     format!("operator/{operator}/totp")
 }
 
@@ -438,7 +438,7 @@ fn totp_pending_name(operator: &str) -> String {
 
 /// Whether `code` is a current, unused code of the operator's code app
 /// (or of `secret_name`'s secret); each code works once.
-async fn code_ok(s: &AppState, operator: &str, secret_name: &str, code: &str) -> bool {
+pub(crate) async fn code_ok(s: &AppState, operator: &str, secret_name: &str, code: &str) -> bool {
     let Ok(Some(secret)) = s.store.get_secret(secret_name, &s.master_key).await else {
         return false;
     };

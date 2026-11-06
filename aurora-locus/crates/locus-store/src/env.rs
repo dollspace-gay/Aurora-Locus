@@ -159,7 +159,7 @@ impl Store {
         Ok(rows.into_iter().map(|(n, k, h)| ((n, k), h)).collect())
     }
 
-    async fn env_applied_hashes(&self) -> CoreResult<BTreeMap<String, String>> {
+    pub async fn env_applied_hashes(&self) -> CoreResult<BTreeMap<String, String>> {
         let sql = "SELECT key, hash FROM env_applied";
         let rows: Vec<(String, String)> = match self {
             Self::Sqlite(p) => sqlx::query_as(sql).fetch_all(p).await,
@@ -239,7 +239,7 @@ impl Tx {
 
     /// Compare-and-set of `env_applied`: succeeds only if the stored hash is
     /// still `expected` (or absent when `expected` is None).
-    async fn cas_env_applied(
+    pub async fn cas_env_applied(
         &mut self,
         key: &str,
         expected: Option<&str>,

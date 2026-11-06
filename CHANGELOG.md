@@ -470,6 +470,27 @@ kryphocron built in.
   public record uses it), and taken-down or scanner-matched blobs move to
   quarantine (and back when the takedown is reversed or the match cleared).
   A background job catches any move a crash or a gate switch left.
+- Key backups (`aurora-locus keys backup --out <file>`, and a download in
+  setup): every stored secret, every account signing key and the PLC
+  rotation keys' roles, encrypted under a passphrase (Argon2id,
+  XChaCha20-Poly1305), streamed in frames that can't be reordered, cut
+  short or mixed between backups unnoticed. The CLI reads each backup back
+  before keeping it; `--passphrase-file` serves scheduled backups.
+- `aurora-locus keys show`: the master key, service key and PLC rotation
+  keys, the last key backup, and how many accounts' documents list the
+  current key, only an older one, or none.
+- Changing the PDS's PLC rotation key (`keys set plc-rotation-key
+  --generate | --file`, or a changed `PDS_PLC_ROTATION_KEY_*` value): the
+  new key is pending until a key backup holds it (or
+  `--acknowledge-no-backup`); the previous key stays as a secondary
+  signer for accounts whose documents list it. `--discard-pending` and
+  `keys drop-plc-key` remove a key only after checking no account's
+  document still needs it. Key changes need the operator's password and
+  code over HTTP, or a typed confirmation over the socket, and are
+  audited. Every node reloads its keys within seconds of a change.
+- A background scan records which held PLC rotation keys each account's
+  document lists, after a key becomes current and daily while an older
+  key is held.
 
 ### Changed
 

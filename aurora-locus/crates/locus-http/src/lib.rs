@@ -19,6 +19,7 @@ pub mod error;
 pub mod health;
 pub mod identity;
 pub mod import;
+pub mod keys;
 pub mod kryphocron;
 pub mod lexicon;
 pub mod locus_admin;
@@ -364,6 +365,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/static/{*path}", get(web::asset))
         .route("/setup", get(setup::index))
         .route("/setup/token", post(setup::enter_token))
+        .route("/setup/keys/backup", post(setup::key_backup))
         .route("/setup/probe", get(setup::probe_answer))
         .route(
             "/setup/{step}",

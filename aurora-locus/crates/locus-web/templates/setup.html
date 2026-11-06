@@ -194,13 +194,22 @@
 <p>This PDS's keys are made and stored encrypted under its master key.</p>
 <div class="fact"><span class="l">PLC rotation key</span><span class="v"><code>{{ f.rotation_key }}</code></span></div>
 <div class="fact"><span class="l">Master key</span><span class="v">{{ f.master_key_source }}{% if !f.master_key_path.is_empty() %}, at <code>{{ f.master_key_path }}</code>{% endif %} <span class="muted">(id {{ f.master_key_id }})</span></span></div>
-<div class="banner bad">If the master key is lost, every stored key is lost with it, and this PDS can't sign for its accounts again. Keep a copy somewhere other than this server. <code>aurora-locus keys backup</code> writes an encrypted backup of the keys.</div>
+<div class="banner bad">If the master key is lost, every stored key is lost with it, and this PDS can't sign for its accounts again. Download a key backup and keep it somewhere other than this server (later, <code>aurora-locus keys backup</code> makes another).</div>
+<form class="stack" method="post" action="/setup/keys/backup">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="passphrase">Backup passphrase <span class="muted">(at least 12 characters)</span></label>
+<input type="password" id="passphrase" name="passphrase" autocomplete="new-password" minlength="12" required>
+<label for="passphrase2">The passphrase again</label>
+<input type="password" id="passphrase2" name="passphrase2" autocomplete="new-password" minlength="12" required>
+<div class="hint">The backup is encrypted with this passphrase. Without it the backup can't be read, so keep it as safely as the file.</div>
+<div class="row"><button type="submit" class="secondary">Download the key backup</button></div>
+</form>
 <form class="stack" method="post" action="/setup/keys">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="recovery_did_key">Your recovery key <span class="muted">(optional)</span></label>
 <input type="text" id="recovery_did_key" name="recovery_did_key" value="{{ f.recovery_did_key }}" placeholder="did:key:z…" spellcheck="false">
 <div class="hint">A did:key you hold offline, added to every new account's identity, so you can recover accounts even without this server's keys.</div>
-<label class="check"><input type="checkbox" name="keys_ack" value="1"{% if f.keys_ack %} checked{% endif %}> I have a copy of the master key</label>
+<label class="check"><input type="checkbox" name="keys_ack" value="1"{% if f.keys_ack %} checked{% endif %}> I have a key backup (or a copy of the master key)</label>
 <div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
 </form>
 </div>

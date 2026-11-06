@@ -184,7 +184,7 @@ async fn main() {
                 match node::Node::start(bootstrap.clone(), log.clone(), cancel.clone()).await {
                     Ok(n) => match n.run_until_stopped().await {
                         node::Ended::Restart => {
-                            tracing::info!("starting again after setup");
+                            tracing::info!("starting again");
                         }
                         node::Ended::Stopped => break,
                     },
