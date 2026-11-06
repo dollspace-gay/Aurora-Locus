@@ -242,6 +242,17 @@ impl Node {
         for key in store.report_and_apply_env(&node_id, &env_values).await? {
             tracing::info!(key, "applied env value");
         }
+        let role = format!("{:?}", bootstrap.role);
+        let redis = bootstrap.redis_url.clone().unwrap_or_default();
+        for name in store
+            .report_bootstrap(&node_id, &[("role", &role), ("redis_url", &redis)])
+            .await?
+        {
+            tracing::warn!(
+                setting = name,
+                "another live node has a different {name}: every node must use the same one"
+            );
+        }
 
         let settings = Settings::load(store.clone()).await?;
         log.apply(settings.current().text("log.level"));
@@ -412,6 +423,18 @@ impl Node {
         )
         .await?;
         tracing::info!(backend = blobs.name(), "blob store opened");
+        let kv = match &self.bootstrap.redis_url {
+            Some(url) => {
+                let url = locus_http::scratch::redis_url(
+                    url,
+                    env.get("PDS_REDIS_SCRATCH_PASSWORD").map(String::as_str),
+                );
+                let kv = locus_http::scratch::Scratch::connect(&url).await?;
+                tracing::info!("rate limits and replay windows in Redis");
+                kv
+            }
+            None => locus_http::scratch::Scratch::default(),
+        };
         let gate_settings = self.settings.clone();
         let state = Arc::new(AppState {
             repo: RepoEngine::new(self.store.clone(), Arc::new(TidClock::new(clock_id)))
@@ -434,6 +457,7 @@ impl Node {
             ssrf_protection: !self.bootstrap.ssrf_protection_disabled(),
             resolvers: ResolverCache::default(),
             limits: locus_http::ratelimit::Limiter::default(),
+            kv,
             oauth_clients: locus_http::oauth::ClientCache::default(),
             kr,
             setup: Arc::new(if self.setup_mode {

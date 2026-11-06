@@ -117,6 +117,40 @@ impl Store {
         Ok(done)
     }
 
+    /// Records hashes of this node's bootstrap values that must agree
+    /// install-wide (role, Redis URL) and returns the names of those another
+    /// live node reports differently. Bootstrap values can't be changed
+    /// live, so a disagreement is only warned about.
+    pub async fn report_bootstrap(
+        &self,
+        node_id: &str,
+        values: &[(&str, &str)],
+    ) -> CoreResult<Vec<String>> {
+        let mut tx = self.begin().await?;
+        for (name, value) in values {
+            let hash = value_hash(&Value::String((*value).to_owned()));
+            tx.upsert_env_report(node_id, &format!("@{name}"), &hash)
+                .await?;
+        }
+        tx.commit().await?;
+        let live = self.live_slot_holders(CLOCK_SLOT_FAMILY).await?;
+        let reports = self.env_reports().await?;
+        let mut differ = Vec::new();
+        for (name, _) in values {
+            let key = format!("@{name}");
+            let mine = reports.get(&(node_id.to_owned(), key.clone()));
+            if live
+                .iter()
+                .filter(|n| n.as_str() != node_id)
+                .filter_map(|n| reports.get(&(n.clone(), key.clone())))
+                .any(|h| Some(h) != mine)
+            {
+                differ.push((*name).to_owned());
+            }
+        }
+        Ok(differ)
+    }
+
     async fn prune_env_reports(&self, live: &[String]) -> CoreResult<()> {
         let all: Vec<String> = match self {
             Self::Sqlite(p) => {
@@ -213,7 +247,11 @@ impl Tx {
             }
         }
         .map_err(db_err)?;
-        for key in existing.iter().filter(|k| !keep.contains(&k.as_str())) {
+        // `@` keys are bootstrap reports, kept by `report_bootstrap`.
+        for key in existing
+            .iter()
+            .filter(|k| !k.starts_with('@') && !keep.contains(&k.as_str()))
+        {
             match self {
                 Tx::Sqlite(t) => {
                     sqlx::query("DELETE FROM env_report WHERE node_id = ?1 AND key = ?2")

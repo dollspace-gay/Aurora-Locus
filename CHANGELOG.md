@@ -669,6 +669,14 @@ kryphocron built in.
   are recorded, and `repair repos --from-sequencer` replays their logged
   record changes into the index and rebuilds them. `keys rotate-account
   --recovery` rotates the accounts recovery touched.
+- Redis for rate limits and replay windows: `LOCUS_REDIS_URL`, or the
+  reference's `PDS_REDIS_SCRATCH_ADDRESS` (`host:port`) and
+  `PDS_REDIS_SCRATCH_PASSWORD`. With it, rate-limit counters (backend
+  `auto` or `redis`) and every replay window (DPoP proofs, client
+  assertions, request objects, code challenges, entryway service tokens)
+  are shared through Redis; without it they stay in the database. A node
+  that can't reach its Redis doesn't start. Nodes warn at boot when
+  another live node has a different role or Redis URL.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

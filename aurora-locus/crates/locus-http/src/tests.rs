@@ -200,6 +200,8 @@ struct HarnessOpts {
     plc: Option<(String, Plc)>,
     /// Instead of `https://<hostname>`.
     public_url: Option<String>,
+    /// Rate limits and replay windows in this Redis.
+    kv: crate::scratch::Scratch,
 }
 
 impl Default for HarnessOpts {
@@ -213,6 +215,7 @@ impl Default for HarnessOpts {
             entryway_key: None,
             plc: None,
             public_url: None,
+            kv: crate::scratch::Scratch::default(),
         }
     }
 }
@@ -227,6 +230,7 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         entryway_key,
         plc,
         public_url,
+        kv,
     } = o;
     let hostname = hostname.as_str();
     let dir = tempfile::tempdir().unwrap();
@@ -304,6 +308,7 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         ssrf_protection: true,
         resolvers: crate::state::ResolverCache::default(),
         limits: crate::ratelimit::Limiter::default(),
+        kv,
         oauth_clients: crate::oauth::ClientCache::default(),
         kr,
         setup: Arc::new(if setup_mode {
@@ -14715,4 +14720,82 @@ async fn sequencer_recovery_replays_the_event_log_onto_repos() {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["results"][0]["did"], did);
+}
+
+/// With Redis (LOCUS_TEST_REDIS_URL), rate-limit counters and replay
+/// windows live there, shared by every node using it.
+#[tokio::test]
+async fn redis_holds_rate_limits_and_replay_windows() {
+    let Ok(url) = std::env::var("LOCUS_TEST_REDIS_URL") else {
+        return;
+    };
+    let kv = crate::scratch::Scratch::connect(&url).await.unwrap();
+    let h = harness_build(HarnessOpts {
+        kv: kv.clone(),
+        ..HarnessOpts::default()
+    })
+    .await;
+    let other = harness_build(HarnessOpts {
+        kv,
+        ..HarnessOpts::default()
+    })
+    .await;
+    let run = locus_core::time::now_ms().to_string();
+    // Replay windows: once, across both nodes.
+    assert!(h.state.unique("Test", &run, 60_000).await.unwrap());
+    assert!(!other.state.unique("Test", &run, 60_000).await.unwrap());
+    assert!(other.state.unique("Other", &run, 60_000).await.unwrap());
+    // A window ends.
+    let short = format!("{run}-short");
+    assert!(h.state.unique("Test", &short, 50).await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    assert!(other.state.unique("Test", &short, 60_000).await.unwrap());
+    // The database's table isn't used.
+    let locus_store::Store::Sqlite(pool) = &h.state.store else {
+        unreachable!()
+    };
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_replay")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // Rate limits: a lowered global bucket, shared. Each node's requests
+    // count against the same client IP.
+    for n in [&h, &other] {
+        n.state
+            .settings
+            .set("rate_limits.global_points", json!(3), "test")
+            .await
+            .unwrap();
+    }
+    let path = "/xrpc/com.atproto.server.describeServer".to_owned();
+    // A client address of its own each run (the counters outlive a run).
+    let now = locus_core::time::now_ms();
+    let ip: std::net::SocketAddr = format!(
+        "10.{}.{}.{}:1",
+        (now >> 16) & 255,
+        (now >> 8) & 255,
+        now & 255
+    )
+    .parse()
+    .unwrap();
+    let call = |n: &Harness| {
+        let req = Request::builder()
+            .uri(path.clone())
+            .header("host", n.state.hostname.clone())
+            .extension(axum::extract::ConnectInfo(ip))
+            .body(Body::empty())
+            .unwrap();
+        let app = n.app.clone();
+        async move { app.oneshot(req).await.unwrap() }
+    };
+    let r = call(&h).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["ratelimit-remaining"], "2");
+    assert_eq!(call(&other).await.headers()["ratelimit-remaining"], "1");
+    assert_eq!(call(&h).await.status(), StatusCode::OK);
+    let r = call(&other).await;
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.headers().contains_key("retry-after"));
 }

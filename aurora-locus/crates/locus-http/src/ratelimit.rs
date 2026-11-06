@@ -193,12 +193,24 @@ fn bypassed(s: &AppState, headers: &HeaderMap, ip: Option<IpAddr>) -> bool {
 async fn consume(s: &AppState, b: Bucket, key: &str, points: i64) -> Status {
     let now = locus_core::time::now_ms();
     let full = format!("{}:{key}", b.name);
-    let use_db = match s.snapshot().text("rate_limits.backend") {
+    let backend = s.snapshot().text("rate_limits.backend").to_owned();
+    let redis = s.kv.is_redis() && matches!(backend.as_str(), "auto" | "redis");
+    let use_db = match backend.as_str() {
         "database" => true,
         "memory" => false,
         _ => s.store.is_postgres(),
     };
-    let (consumed, window_end) = if use_db {
+    let (consumed, window_end) = if redis {
+        match s.kv.consume(&full, points, b.window_ms).await {
+            Some(Ok((c, ttl))) => (c, now + ttl),
+            Some(Err(e)) => {
+                // Fail open, as the reference.
+                tracing::warn!("rate limit store unavailable: {e}");
+                (0, now + b.window_ms)
+            }
+            None => (0, now + b.window_ms),
+        }
+    } else if use_db {
         match s.store.consume_rate_limit(&full, points, b.window_ms).await {
             Ok(v) => v,
             Err(e) => {

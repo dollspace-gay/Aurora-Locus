@@ -24,6 +24,11 @@ if running locus-test-kms; then
   export AWS_REGION=eu-west-2 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-locus}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-locus-secret}"
 fi
 
+# Redis tests run when the local Redis container is up.
+if running locus-test-redis; then
+  export LOCUS_TEST_REDIS_URL=redis://127.0.0.1:56379
+fi
+
 cargo fmt --all
 cargo clippy --workspace --all-targets --quiet --message-format short -- -D warnings
 set +o pipefail

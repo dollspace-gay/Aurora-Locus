@@ -516,10 +516,10 @@ pub static REGISTRY: &[Def] = &[
     },
     Def {
         key: "rate_limits.backend",
-        kind: Kind::Choice(&["auto", "memory", "database"]),
+        kind: Kind::Choice(&["auto", "memory", "database", "redis"]),
         default: r#""auto""#,
         env: None,
-        description: "Where counters live: in each node, or in the database (shared). Auto: the database on Postgres.",
+        description: "Where counters live: in each node, in the database or in Redis (shared). Auto: Redis when the install has one, else the database on Postgres.",
     },
     Def {
         key: "rate_limits.global_points",

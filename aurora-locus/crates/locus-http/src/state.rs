@@ -562,6 +562,8 @@ pub struct AppState {
     pub resolvers: ResolverCache,
     /// Rate-limit counters (in-process backend) and firehose subscriber counts.
     pub limits: crate::ratelimit::Limiter,
+    /// Redis, when the install has one (rate limits and replay windows).
+    pub kv: crate::scratch::Scratch,
     /// Fetched OAuth client metadata and keys.
     pub oauth_clients: crate::oauth::ClientCache,
     /// The kryphocron codec, rotation oracle and audit sinks.

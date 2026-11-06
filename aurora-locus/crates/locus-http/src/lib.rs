@@ -39,6 +39,7 @@ pub mod repair;
 pub mod repo;
 pub mod routing;
 pub mod scanner;
+pub mod scratch;
 pub mod server;
 pub mod setup;
 pub mod shard;

@@ -1227,8 +1227,7 @@ pub async fn set_callback_token(
     let jti = jwt.jti.as_deref().ok_or_else(|| refuse("jwt has no jti"))?;
     let ttl = (jwt.exp - now + 60).max(1) * 1000;
     if !s
-        .store
-        .oauth_unique(&format!("ServiceAuth@{}", jwt.iss), jti, ttl)
+        .unique(&format!("ServiceAuth@{}", jwt.iss), jti, ttl)
         .await?
     {
         return Err(refuse("jwt replayed"));

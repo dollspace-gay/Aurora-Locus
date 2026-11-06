@@ -132,8 +132,7 @@ pub async fn dpop_proof(
     )?;
     if let Some(p) = &proof {
         let unique = s
-            .store
-            .oauth_unique("DPoP", &p.jti, locus_auth::oauth::dpop::JTI_WINDOW_MS)
+            .unique("DPoP", &p.jti, locus_auth::oauth::dpop::JTI_WINDOW_MS)
             .await
             .map_err(|e| OAuthError::server_error(e.to_string()))?;
         if !unique {
@@ -325,8 +324,7 @@ async fn authenticate_client(
         }
         let ttl = exp.map_or(66_000, |e| (e * 1000 - locus_core::time::now_ms()).max(1));
         let unique = s
-            .store
-            .oauth_unique(&format!("Auth@{}", client.id), jti, ttl)
+            .unique(&format!("Auth@{}", client.id), jti, ttl)
             .await
             .map_err(store_err)?;
         if !unique {
@@ -356,8 +354,7 @@ async fn request_parameters(
             OAuthError::invalid_request("Request object payload must contain a \"jti\" claim")
         })?;
         if !s
-            .store
-            .oauth_unique(&format!("JAR@{}", client.id), jti, 59_000 * 11 / 10)
+            .unique(&format!("JAR@{}", client.id), jti, 59_000 * 11 / 10)
             .await
             .map_err(store_err)?
         {
@@ -880,8 +877,7 @@ async fn code_grant(
     oreq::check_code_grant(&p, redirect_uri, verifier)?;
     if let Some(challenge) = &p.code_challenge
         && !s
-            .store
-            .oauth_unique("CodeChallenge", challenge, oreq::CODE_CHALLENGE_REPLAY_MS)
+            .unique("CodeChallenge", challenge, oreq::CODE_CHALLENGE_REPLAY_MS)
             .await
             .map_err(store_err)?
     {

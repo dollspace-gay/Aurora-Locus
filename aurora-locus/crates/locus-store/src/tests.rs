@@ -2693,3 +2693,42 @@ async fn jobs_pause_and_run_now() {
         handle.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn bootstrap_disagreements_between_live_nodes_are_named() {
+    for b in backends().await {
+        let s = &b.store;
+        let ttl = Duration::from_secs(30);
+        for n in ["node-a", "node-b"] {
+            s.claim_slot(CLOCK_SLOT_FAMILY, 8, n, ttl)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let a = [("role", "Pds"), ("redis_url", "redis://r1")];
+        assert!(
+            s.report_bootstrap("node-a", &a).await.unwrap().is_empty(),
+            "{}",
+            b.name
+        );
+        assert!(
+            s.report_bootstrap("node-b", &a).await.unwrap().is_empty(),
+            "{}: agree",
+            b.name
+        );
+        let other = [("role", "Pds"), ("redis_url", "")];
+        assert_eq!(
+            s.report_bootstrap("node-b", &other).await.unwrap(),
+            vec!["redis_url"],
+            "{}",
+            b.name
+        );
+        // The env report of a node keeps its bootstrap rows.
+        let (v, _) = collect_env(&env_of(&[("PDS_SERVICE_NAME", "X")]));
+        s.report_and_apply_env("node-a", &v).await.unwrap();
+        assert_eq!(
+            s.report_bootstrap("node-b", &other).await.unwrap(),
+            vec!["redis_url"]
+        );
+    }
+}
