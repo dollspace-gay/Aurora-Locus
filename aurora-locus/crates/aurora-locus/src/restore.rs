@@ -43,6 +43,92 @@ impl BackendKind {
 pub struct Finish {
     pub seq_floor: Option<i64>,
     pub emit_sync: bool,
+    /// Shard role: the entryway's current token verify key (a file, or
+    /// `-` for stdin; hex or did:key). Required there, refused elsewhere.
+    pub entryway_verify_key: Option<PathBuf>,
+    /// Shard role: the entryway's current PLC rotation key, likewise.
+    pub entryway_plc_rotation_key: Option<PathBuf>,
+}
+
+/// A shard restore's entryway keys: (verify key, PLC rotation key).
+type ShardKeys = (String, String);
+
+fn read_key_arg(path: &Path) -> Result<String, String> {
+    let text = if path == Path::new("-") {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(e)?;
+        s
+    } else {
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?
+    };
+    Ok(text.trim().to_owned())
+}
+
+/// The shard restore's first step, checked before anything is written: a
+/// shard needs both entryway keys (the restored ones may be old or revoked,
+/// and nothing pushes them again); other roles refuse them.
+fn shard_keys(bootstrap: &Bootstrap, f: &Finish) -> Result<Option<ShardKeys>, String> {
+    let shard = bootstrap.role == locus_core::bootstrap::Role::Shard;
+    match (&f.entryway_verify_key, &f.entryway_plc_rotation_key) {
+        (None, None) if !shard => Ok(None),
+        (Some(_), _) | (_, Some(_)) if !shard => Err(
+            "--entryway-verify-key and --entryway-plc-rotation-key are for the shard role".into(),
+        ),
+        (Some(v), Some(p)) => {
+            let verify = locus_http::shard::parse_k256_key(&read_key_arg(v)?)
+                .map_err(|err| format!("--entryway-verify-key: {err}"))?;
+            let plc = locus_http::shard::parse_k256_key(&read_key_arg(p)?)
+                .map_err(|err| format!("--entryway-plc-rotation-key: {err}"))?;
+            Ok(Some((verify, plc)))
+        }
+        _ => Err(
+            "a shard restore needs --entryway-verify-key and --entryway-plc-rotation-key (the keys the entryway signs with now: `keys show` on the entryway)"
+                .into(),
+        ),
+    }
+}
+
+/// The shard restore's database steps: the entryway keys given replace
+/// the restored ones, and every hosted account's earlier tokens are
+/// refused (revocations acknowledged after the restore point are lost).
+async fn shard_finish(store: &Store, keys: &ShardKeys, report: &mut Report) -> Result<(), String> {
+    let (verify, plc) = keys;
+    let mut tx = store.begin().await.map_err(e)?;
+    tx.replace_shard_verify_keys(std::slice::from_ref(verify))
+        .await
+        .map_err(e)?;
+    tx.set_setting(
+        "entryway.plc_rotation_keys",
+        serde_json::json!([plc]),
+        "restore",
+    )
+    .await
+    .map_err(e)?;
+    tx.commit().await.map_err(e)?;
+    let now = locus_core::time::now_ms();
+    let mut after = String::new();
+    let mut n = 0;
+    loop {
+        let page = store.accounts_after(&after, 500).await.map_err(e)?;
+        let Some(last) = page.last().map(|a| a.did.clone()) else {
+            break;
+        };
+        for a in &page {
+            store
+                .revoke_shard_account(&a.did, now, locus_http::shard::REVOCATION_KEEP_MS)
+                .await
+                .map_err(e)?;
+            n += 1;
+        }
+        after = last;
+    }
+    report.say(format!(
+        "Shard: the entryway keys given replace the restored ones; tokens issued before now are refused for {n} accounts (they sign in again through the entryway)."
+    ));
+    report.say(
+        "Shard: run `shard add` for this shard again on a locus entryway (it re-issues the callback token and re-pushes keys and blocks); re-set `entryway-admin-token` and `dpop-secret` with `keys set` if they changed since the backup.",
+    );
+    Ok(())
 }
 
 /// What a run reports, line by line.
@@ -168,8 +254,12 @@ async fn finish(
     snap: &Snapshot,
     floor: &Floor,
     opts: &Finish,
+    shard: Option<&ShardKeys>,
     report: &mut Report,
 ) -> Result<(), String> {
+    if let Some(k) = shard {
+        shard_finish(store, k, report).await?;
+    }
     // The seq floor: the next event's seq is above it.
     let mut tx = store.begin().await.map_err(e)?;
     let last = tx.raise_seq_floor(floor.value).await.map_err(e)?;
@@ -378,6 +468,7 @@ pub async fn restore(bootstrap: &Bootstrap, opts: RestoreOpts) -> Result<Report,
             target.display()
         ));
     }
+    let shard = shard_keys(bootstrap, &opts.finish)?;
     let manifest: locus_http::backups::Manifest = serde_json::from_slice(
         &std::fs::read(opts.dir.join("manifest.json"))
             .map_err(|err| format!("this isn't a whole backup (no manifest.json): {err}"))?,
@@ -408,7 +499,15 @@ pub async fn restore(bootstrap: &Bootstrap, opts: RestoreOpts) -> Result<Report,
         std::fs::create_dir_all(parent).map_err(e)?;
     }
     std::fs::copy(opts.dir.join("db.sqlite"), &tmp).map_err(|err| format!("db.sqlite: {err}"))?;
-    let result = restore_into(bootstrap, &opts, &manifest, &tmp, &mut report).await;
+    let result = restore_into(
+        bootstrap,
+        &opts,
+        &manifest,
+        &tmp,
+        shard.as_ref(),
+        &mut report,
+    )
+    .await;
     match result {
         Ok(()) => {
             std::fs::rename(&tmp, target).map_err(e)?;
@@ -436,6 +535,7 @@ async fn restore_into(
     opts: &RestoreOpts,
     manifest: &locus_http::backups::Manifest,
     tmp: &Path,
+    shard: Option<&ShardKeys>,
     report: &mut Report,
 ) -> Result<(), String> {
     let store = Store::connect(&DatabaseUrl::Sqlite(tmp.to_path_buf()))
@@ -529,7 +629,7 @@ async fn restore_into(
         report.say(format!("Restarted {moves} blob moves."));
     }
 
-    finish(&store, &key, &snap, &floor, &opts.finish, report).await?;
+    finish(&store, &key, &snap, &floor, &opts.finish, shard, report).await?;
     report.say(
         "Keys changed after this backup come back with `aurora-locus keys import` of a later key backup.",
     );
@@ -550,6 +650,7 @@ pub struct PostRestoreOpts {
 /// any node starts.
 pub async fn post_restore(bootstrap: &Bootstrap, opts: PostRestoreOpts) -> Result<Report, String> {
     // 1. Checks, writing nothing. (open_store checks the master key.)
+    let shard = shard_keys(bootstrap, &opts.finish)?;
     let (store, key) = crate::node::open_store(bootstrap).await.map_err(e)?;
     if store.key_store_empty().await.map_err(e)? {
         return Err("this install is empty: that's `backup restore`".into());
@@ -692,7 +793,16 @@ pub async fn post_restore(bootstrap: &Bootstrap, opts: PostRestoreOpts) -> Resul
     }
 
     // 4. The finishing steps.
-    finish(&store, &key, &snap, &floor, &opts.finish, &mut report).await?;
+    finish(
+        &store,
+        &key,
+        &snap,
+        &floor,
+        &opts.finish,
+        shard.as_ref(),
+        &mut report,
+    )
+    .await?;
     store.close().await;
     Ok(report)
 }

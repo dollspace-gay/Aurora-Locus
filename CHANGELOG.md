@@ -597,6 +597,17 @@ kryphocron built in.
   authorization server, and creates accounts from a genesis operation the
   entryway's PLC rotation key signed (submitting it to PLC itself). It
   holds no PLC rotation key of its own and runs no PLC key scan.
+- Locus shard callbacks, for a locus entryway: `.shard.setCallbackToken`
+  (only a single-use service JWT from the entryway's token key; the shard
+  keeps a hash of the token), and, with that token, `.shard.revokeSessions`
+  (a session, or every token of an account issued before a time; checked
+  on every request for 2 hours), `.shard.setVerifyKeys` and
+  `.shard.setPrivateTierBlock` (the shard's own operator API then only
+  shows the block). `describeCapabilities` gives the role.
+- Shard restore: `backup restore` and `backup post-restore` on a shard
+  require `--entryway-verify-key` and `--entryway-plc-rotation-key` (the
+  entryway's current keys replace the restored ones) and refuse every
+  hosted account's tokens issued before the restore.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 

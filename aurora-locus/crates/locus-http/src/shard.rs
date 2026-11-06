@@ -351,13 +351,16 @@ pub async fn verify_access(s: &AppState, ew: &Entryway, token: &str) -> XrpcResu
         return Err(XrpcError::named("InvalidToken", "Bad token scope"));
     }
     let account = token_account(s, sub, scope).await?;
+    let sid = claim(&jws, "sid").unwrap_or("").to_owned();
+    check_revoked(s, sub, &sid, &jws).await?;
     Ok(Authed {
         did: sub.to_owned(),
         scope: scope.to_owned(),
-        session_id: claim(&jws, "sid")
-            .or_else(|| claim(&jws, "jti"))
-            .unwrap_or("")
-            .to_owned(),
+        session_id: if sid.is_empty() {
+            claim(&jws, "jti").unwrap_or("").to_owned()
+        } else {
+            sid
+        },
         app_password_name: None,
         status: account.status,
         oauth: None,
@@ -442,6 +445,7 @@ pub async fn oauth_access(s: &AppState, ew: &Entryway, headers: &HeaderMap) -> X
         ));
     }
     let account = token_account(s, &sub, "").await?;
+    check_revoked(s, &sub, claim(&jws, "sid").unwrap_or(""), &jws).await?;
     let jti = claim(&jws, "jti").unwrap_or("").to_owned();
     let sid = claim(&jws, "sid").map_or_else(|| jti.clone(), str::to_owned);
     Ok(Authed {
@@ -1131,4 +1135,218 @@ pub async fn reserve_signing_key(
         )
         .await?;
     Ok(Json(json!({ "signingKey": did_key })))
+}
+
+// ---------------------------------------------------------------- callbacks
+
+/// How long a revocation is kept: past the longest access-token lifetime
+/// (2 h) plus clock skew.
+pub const REVOCATION_KEEP_MS: i64 = VERIFY_KEY_OVERLAP_MS + 60_000;
+
+fn callback_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+/// Refuses a token whose session the entryway revoked, or that was
+/// issued before the account's `not_before`.
+async fn check_revoked(s: &AppState, did: &str, sid: &str, jws: &Jws) -> XrpcResult<()> {
+    let iat_ms = jws.payload.get("iat").and_then(Value::as_i64).unwrap_or(0) * 1000;
+    if s.store.shard_revoked(did, sid, iat_ms).await? {
+        return Err(XrpcError::named("ExpiredToken", "Token has been revoked"));
+    }
+    Ok(())
+}
+
+fn shard_only(s: &AppState) -> XrpcResult<&Entryway> {
+    s.entryway.as_deref().ok_or_else(|| {
+        XrpcError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "MethodNotImplemented",
+            "Only a shard takes this call",
+        )
+    })
+}
+
+/// The shard-callback token, checked against the installed hash.
+async fn callback_auth<'a>(s: &'a AppState, headers: &HeaderMap) -> XrpcResult<&'a Entryway> {
+    let ew = shard_only(s)?;
+    let token = auth::bearer(headers)?;
+    let ok = match s.store.callback_token_hash().await? {
+        Some(stored) => bool::from(subtle::ConstantTimeEq::ct_eq(
+            stored.as_bytes(),
+            callback_token_hash(token).as_bytes(),
+        )),
+        None => false,
+    };
+    if !ok {
+        return Err(XrpcError::new(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "Invalid shard-callback token",
+        ));
+    }
+    Ok(ew)
+}
+
+#[derive(serde::Deserialize)]
+pub struct CallbackTokenInput {
+    token: String,
+}
+
+/// `.shard.setCallbackToken`: installs the token the entryway's locus
+/// callbacks carry, replacing any. Only a service JWT from the entryway,
+/// signed with an accepted verify key, is accepted (never the admin
+/// password): `iss` = the entryway DID, `aud` = this shard, `lxm` = this
+/// method, single-use `jti`, at most an hour's lifetime.
+pub async fn set_callback_token(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<CallbackTokenInput>,
+) -> XrpcResult<Json<Value>> {
+    use locus_auth::service_jwt;
+    const LXM: &str = locus_core::locus_nsid!("shard.setCallbackToken");
+    let ew = shard_only(&s)?;
+    let now = now_s();
+    let refuse = |m: &str| XrpcError::new(StatusCode::UNAUTHORIZED, "AuthenticationRequired", m);
+    let token = auth::bearer(&headers)?;
+    let jwt = service_jwt::parse(token, Some(LXM), now)
+        .map_err(|e| XrpcError::new(StatusCode::UNAUTHORIZED, e.name(), e.to_string()))?;
+    if jwt.iss != ew.did {
+        return Err(refuse("Untrusted issuer"));
+    }
+    if jwt.aud != s.service_did {
+        return Err(refuse("jwt audience does not match service did"));
+    }
+    if jwt.exp - now > 3600 + 60 {
+        return Err(refuse("jwt lifetime too long"));
+    }
+    if !ew.verify_key_ids().iter().any(|k| jwt.verifies_with(k)) {
+        return Err(refuse("jwt signature does not match the entryway's key"));
+    }
+    let jti = jwt.jti.as_deref().ok_or_else(|| refuse("jwt has no jti"))?;
+    let ttl = (jwt.exp - now + 60).max(1) * 1000;
+    if !s
+        .store
+        .oauth_unique(&format!("ServiceAuth@{}", jwt.iss), jti, ttl)
+        .await?
+    {
+        return Err(refuse("jwt replayed"));
+    }
+    if input.token.len() < 32 {
+        return Err(XrpcError::invalid_request(
+            "The callback token is at least 32 characters",
+        ));
+    }
+    s.store
+        .set_callback_token_hash(&callback_token_hash(&input.token))
+        .await?;
+    tracing::info!(entryway = %ew.did, "shard-callback token installed");
+    Ok(Json(json!({})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeInput {
+    did: String,
+    sid: Option<String>,
+    not_before: Option<String>,
+}
+
+/// `.shard.revokeSessions`: a session (`sid`) or every token issued before
+/// `notBefore`, refused on every request until the tokens have expired.
+pub async fn revoke_sessions(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<RevokeInput>,
+) -> XrpcResult<Json<Value>> {
+    callback_auth(&s, &headers).await?;
+    if !input.did.starts_with("did:") {
+        return Err(XrpcError::invalid_request("did must be a DID"));
+    }
+    match (
+        input.sid.as_deref().filter(|x| !x.is_empty()),
+        &input.not_before,
+    ) {
+        (Some(sid), None) => {
+            s.store
+                .revoke_shard_session(&input.did, sid, REVOCATION_KEEP_MS)
+                .await?;
+        }
+        (None, Some(t)) => {
+            let at = locus_core::time::parse_rfc3339_ms(t)
+                .ok_or_else(|| XrpcError::invalid_request("notBefore must be a datetime"))?;
+            s.store
+                .revoke_shard_account(&input.did, at, REVOCATION_KEEP_MS)
+                .await?;
+        }
+        _ => {
+            return Err(XrpcError::invalid_request("Give either sid or notBefore"));
+        }
+    }
+    if let Err(e) = s.store.prune_shard_revocations().await {
+        tracing::warn!("couldn't prune shard revocations: {e}");
+    }
+    Ok(Json(json!({})))
+}
+
+#[derive(serde::Deserialize)]
+pub struct VerifyKeysInput {
+    keys: Vec<String>,
+}
+
+/// `.shard.setVerifyKeys`: the entryway's accepted token keys, exactly
+/// (a rotation pushes `{old, new}`, then `{new}`). Every node reloads.
+pub async fn set_verify_keys(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<VerifyKeysInput>,
+) -> XrpcResult<Json<Value>> {
+    callback_auth(&s, &headers).await?;
+    if input.keys.is_empty() || input.keys.len() > 4 {
+        return Err(XrpcError::invalid_request("Give one to four keys"));
+    }
+    let keys = input
+        .keys
+        .iter()
+        .map(|k| parse_k256_key(k))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(XrpcError::invalid_request)?;
+    let mut tx = s.store.begin().await?;
+    tx.replace_shard_verify_keys(&keys).await?;
+    tx.bump_key_generation().await?;
+    tx.commit().await?;
+    crate::keys::reload_soon(&s);
+    Ok(Json(json!({ "keys": keys })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct BlockInput {
+    did: String,
+    blocked: bool,
+}
+
+/// `.shard.setPrivateTierBlock`: the entryway's local operator block for
+/// an account on this shard.
+pub async fn set_private_tier_block(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<BlockInput>,
+) -> XrpcResult<Json<Value>> {
+    callback_auth(&s, &headers).await?;
+    s.store
+        .account_by_did(&input.did)
+        .await?
+        .ok_or_else(|| XrpcError::invalid_request("Account not found"))?;
+    s.store
+        .set_private_tier_blocked(&input.did, input.blocked)
+        .await?;
+    Ok(Json(json!({})))
+}
+
+/// Whether the private-tier block is the entryway's to set (a locus
+/// entryway installed a callback token): the shard's own console and API
+/// then only show it.
+pub async fn block_is_entryways(s: &AppState) -> XrpcResult<bool> {
+    Ok(s.entryway.is_some() && s.store.callback_token_hash().await?.is_some())
 }

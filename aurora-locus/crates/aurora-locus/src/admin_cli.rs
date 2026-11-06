@@ -502,6 +502,14 @@ pub enum BackupCmd {
         /// A fresh commit and #sync per active account.
         #[arg(long)]
         emit_sync: bool,
+        /// Shard role: the entryway's current token verify key (a file,
+        /// or `-` for stdin). Required there.
+        #[arg(long)]
+        entryway_verify_key: Option<PathBuf>,
+        /// Shard role: the entryway's current PLC rotation key (a file,
+        /// or `-`). Required there.
+        #[arg(long)]
+        entryway_plc_rotation_key: Option<PathBuf>,
     },
     /// After a Postgres point-in-time recovery, before any node starts
     /// (offline).
@@ -516,6 +524,14 @@ pub enum BackupCmd {
         seq_floor: Option<i64>,
         #[arg(long)]
         emit_sync: bool,
+        /// Shard role: the entryway's current token verify key (a file,
+        /// or `-` for stdin). Required there.
+        #[arg(long)]
+        entryway_verify_key: Option<PathBuf>,
+        /// Shard role: the entryway's current PLC rotation key (a file,
+        /// or `-`). Required there.
+        #[arg(long)]
+        entryway_plc_rotation_key: Option<PathBuf>,
     },
 }
 

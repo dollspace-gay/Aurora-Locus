@@ -175,3 +175,78 @@ impl Tx {
         Ok(())
     }
 }
+
+impl Store {
+    /// Revokes one session of an account (its `sid`), for `keep_ms`.
+    pub async fn revoke_shard_session(&self, did: &str, sid: &str, keep_ms: i64) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO shard_revocation (did, sid, not_before, expires_at) \
+             VALUES ({1}, {2}, NULL, {now} + {3}) \
+             ON CONFLICT (did, sid) DO UPDATE SET expires_at = excluded.expires_at",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, sid, keep_ms)?;
+        Ok(())
+    }
+
+    /// Revokes every token of an account issued before `not_before_ms`
+    /// (a later value wins), for `keep_ms`.
+    pub async fn revoke_shard_account(
+        &self,
+        did: &str,
+        not_before_ms: i64,
+        keep_ms: i64,
+    ) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO shard_revocation (did, sid, not_before, expires_at) \
+             VALUES ({1}, '', {2}, {now} + {3}) \
+             ON CONFLICT (did, sid) DO UPDATE SET \
+             not_before = CASE WHEN shard_revocation.not_before > excluded.not_before \
+                 THEN shard_revocation.not_before ELSE excluded.not_before END, \
+             expires_at = excluded.expires_at",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, not_before_ms, keep_ms)?;
+        Ok(())
+    }
+
+    /// Whether a token of `did` for session `sid` (empty: none named),
+    /// issued at `iat_ms`, has been revoked.
+    pub async fn shard_revoked(&self, did: &str, sid: &str, iat_ms: i64) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT 1 FROM shard_revocation WHERE did = {1} AND expires_at > {now} \
+             AND ((sid = {2} AND sid <> '') OR (sid = '' AND not_before > {3})) LIMIT 1",
+            self.is_postgres(),
+        );
+        let r: Option<(i32,)> = run!(self, q, fetch_optional, did, sid, iat_ms)?;
+        Ok(r.is_some())
+    }
+
+    /// Removes revocations whose tokens have all expired.
+    pub async fn prune_shard_revocations(&self) -> CoreResult<u64> {
+        let q = sql(
+            "DELETE FROM shard_revocation WHERE expires_at <= {now}",
+            self.is_postgres(),
+        );
+        exec!(self, q,)
+    }
+
+    /// Installs the shard-callback token's hash, replacing any.
+    pub async fn set_callback_token_hash(&self, hash: &str) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO shard_callback_token (id, token_hash, installed_at) VALUES (1, {1}, {now}) \
+             ON CONFLICT (id) DO UPDATE SET token_hash = excluded.token_hash, \
+             installed_at = excluded.installed_at",
+            self.is_postgres(),
+        );
+        exec!(self, q, hash)?;
+        Ok(())
+    }
+
+    /// The installed shard-callback token's hash, if one is installed.
+    pub async fn callback_token_hash(&self) -> CoreResult<Option<String>> {
+        let q = "SELECT token_hash FROM shard_callback_token WHERE id = 1";
+        let r: Option<(String,)> = run!(self, q, fetch_optional,)?;
+        Ok(r.map(|(h,)| h))
+    }
+}

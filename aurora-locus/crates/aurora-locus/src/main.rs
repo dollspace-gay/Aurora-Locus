@@ -198,6 +198,8 @@ async fn main() {
                     accept_failed,
                     seq_floor,
                     emit_sync,
+                    entryway_verify_key,
+                    entryway_plc_rotation_key,
                 } => {
                     restore::restore(
                         &bootstrap,
@@ -209,6 +211,8 @@ async fn main() {
                             finish: restore::Finish {
                                 seq_floor,
                                 emit_sync,
+                                entryway_verify_key,
+                                entryway_plc_rotation_key,
                             },
                         },
                     )
@@ -220,6 +224,8 @@ async fn main() {
                     accept_missing_majority,
                     seq_floor,
                     emit_sync,
+                    entryway_verify_key,
+                    entryway_plc_rotation_key,
                 } => {
                     restore::post_restore(
                         &bootstrap,
@@ -230,6 +236,8 @@ async fn main() {
                             finish: restore::Finish {
                                 seq_floor,
                                 emit_sync,
+                                entryway_verify_key,
+                                entryway_plc_rotation_key,
                             },
                         },
                     )

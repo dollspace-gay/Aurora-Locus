@@ -13296,3 +13296,266 @@ async fn entryway_values_are_refused_outside_the_shard_role() {
         "one reservation per DID"
     );
 }
+
+/// An account created on a shard from an op `plc_key` signed.
+async fn shard_account(
+    h: &Harness,
+    plc_key: &proto_blue_crypto::K256Keypair,
+    handle: &str,
+) -> String {
+    let (_, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            None,
+            Some(json!({})),
+        )
+        .await;
+    let reserved = v["signingKey"].as_str().unwrap().to_owned();
+    let op = locus_identity::plc::Operation {
+        rotation_keys: vec![plc_key.did()],
+        verification_methods: [("atproto".to_owned(), reserved)].into(),
+        also_known_as: vec![format!("at://{handle}")],
+        services: [(
+            "atproto_pds".to_owned(),
+            locus_identity::plc::Service {
+                kind: "AtprotoPersonalDataServer".into(),
+                endpoint: "https://pds.example.com".into(),
+            },
+        )]
+        .into(),
+        prev: None,
+    }
+    .sign(plc_key)
+    .unwrap();
+    let did = op.genesis_did().unwrap();
+    let (st, v) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAccount",
+            None,
+            Some(json!({"handle": handle, "did": did, "plcOp": op.to_json()})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    did
+}
+
+#[tokio::test]
+async fn a_shard_takes_locus_callbacks_with_its_callback_token() {
+    use proto_blue_crypto::K256Keypair;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let token_key = K256Keypair::generate();
+    let plc_key = K256Keypair::generate();
+    let (url, _) = mock_entryway().await;
+    let ew_did = "did:web:entryway.test";
+    let h = shard_harness(crate::shard::Entryway::for_test(
+        &url,
+        ew_did,
+        &[token_key.did()],
+        &[plc_key.did()],
+    ))
+    .await;
+    let did = shard_account(&h, &plc_key, "bea.test").await;
+    let now = locus_core::time::now_ms() / 1000;
+
+    // describeCapabilities says so.
+    let (_, caps) = h.call("GET", &ns("describeCapabilities"), None, None).await;
+    assert_eq!(
+        (caps["role"].as_str(), caps["shardCallbacks"].as_bool()),
+        (Some("shard"), Some(true))
+    );
+
+    // setCallbackToken: only a service JWT from the entryway's key.
+    let set_token = ns("shard.setCallbackToken");
+    let lxm = format!("{}.shard.setCallbackToken", locus_core::LOCUS_NS);
+    let jwt = |key: &K256Keypair, iss: &str, aud: &str, lxm: &str| {
+        locus_auth::service_jwt::create(key, iss, aud, Some(now + 60), Some(lxm), now).unwrap()
+    };
+    let cb = "a-shard-callback-token-of-enough-length-0001";
+    let body = Some(json!({"token": cb}));
+    for (bad, why) in [
+        (
+            jwt(
+                &K256Keypair::generate(),
+                ew_did,
+                "did:web:pds.example.com",
+                &lxm,
+            ),
+            "another key",
+        ),
+        (
+            jwt(
+                &token_key,
+                "did:web:someone.else",
+                "did:web:pds.example.com",
+                &lxm,
+            ),
+            "another issuer",
+        ),
+        (jwt(&token_key, ew_did, ew_did, &lxm), "another audience"),
+        (
+            jwt(
+                &token_key,
+                ew_did,
+                "did:web:pds.example.com",
+                "com.atproto.server.getSession",
+            ),
+            "another method",
+        ),
+    ] {
+        let (st, v) = h.call("POST", &set_token, Some(&bad), body.clone()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{why}: {v}");
+    }
+    let (st, _) = h
+        .admin_call("POST", &set_token, &h.basic_admin(), body.clone())
+        .await;
+    assert_ne!(st, StatusCode::OK, "the admin password doesn't install it");
+    let good = jwt(&token_key, ew_did, "did:web:pds.example.com", &lxm);
+    let (st, v) = h.call("POST", &set_token, Some(&good), body.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _) = h.call("POST", &set_token, Some(&good), body.clone()).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "single use");
+
+    // Callbacks need that token.
+    let revoke = ns("shard.revokeSessions");
+    let (st, _) = h
+        .call(
+            "POST",
+            &revoke,
+            Some("wrong-token"),
+            Some(json!({"did": did, "sid": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // Revoking a session, then every token issued before a time.
+    let access = |sid: &str, iat: i64| {
+        es256k_jwt(
+            &token_key,
+            "at+jwt",
+            &json!({"scope": "com.atproto.access", "aud": "did:web:pds.example.com",
+                    "sub": did, "sid": sid, "iat": iat, "exp": iat + 600}),
+        )
+    };
+    let (hr, dr) = (&h, did.as_str());
+    let session = |t: String| async move {
+        hr.call(
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&t),
+            Some(
+                json!({"repo": dr, "collection": "app.bsky.feed.post", "record": {
+                "$type": "app.bsky.feed.post", "text": "hi", "createdAt": "2026-11-06T00:00:00Z"}}),
+            ),
+        )
+        .await
+    };
+    assert_eq!(session(access("s1", now)).await.0, StatusCode::OK);
+    let (st, _) = h
+        .call(
+            "POST",
+            &revoke,
+            Some(cb),
+            Some(json!({"did": did, "sid": "s1"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, v) = session(access("s1", now)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("ExpiredToken"))
+    );
+    assert_eq!(session(access("s2", now)).await.0, StatusCode::OK);
+    let cut = locus_core::time::iso8601((now + 2) * 1000);
+    let (st, _) = h
+        .call(
+            "POST",
+            &revoke,
+            Some(cb),
+            Some(json!({"did": did, "notBefore": cut})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(session(access("s2", now)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(session(access("s3", now + 5)).await.0, StatusCode::OK);
+    let (st, _) = h
+        .call("POST", &revoke, Some(cb), Some(json!({"did": did})))
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "sid or notBefore");
+
+    // The private-tier block comes from the entryway; the shard's own
+    // operator API only shows it then.
+    let (st, _) = h
+        .call(
+            "POST",
+            &ns("shard.setPrivateTierBlock"),
+            Some(cb),
+            Some(json!({"did": did, "blocked": true})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h.state.store.private_tier_blocked(&did).await.unwrap());
+    let owner = h.owner_with_password("tess", "tess-password-123").await;
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("moderator.account.setPrivateTierBlock"),
+            &owner,
+            Some(json!({"did": did, "blocked": false})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(h.state.store.private_tier_blocked(&did).await.unwrap());
+
+    // setVerifyKeys replaces the accepted set and reloads the nodes.
+    let generation = h.state.store.key_state().await.unwrap().generation;
+    let next = K256Keypair::generate();
+    let (st, v) = h
+        .call(
+            "POST",
+            &ns("shard.setVerifyKeys"),
+            Some(cb),
+            Some(json!({"keys": [token_key.did(), next.did()]})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let mut keys: Vec<String> = h
+        .state
+        .store
+        .shard_verify_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.did_key)
+        .collect();
+    keys.sort();
+    let mut want = vec![token_key.did(), next.did()];
+    want.sort();
+    assert_eq!(keys, want);
+    assert!(h.state.store.key_state().await.unwrap().generation > generation);
+    let (st, _) = h
+        .call(
+            "POST",
+            &ns("shard.setVerifyKeys"),
+            Some(cb),
+            Some(json!({"keys": []})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn shard_callbacks_are_refused_outside_the_shard_role() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let (st, _) = h
+        .call(
+            "POST",
+            &ns("shard.revokeSessions"),
+            Some("x"),
+            Some(json!({"did": "did:plc:a", "sid": "s"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+}

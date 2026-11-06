@@ -46,6 +46,22 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
     }
     axum::Router::new()
         .route(at!("describeCapabilities"), get(describe_capabilities))
+        .route(
+            at!("shard.setCallbackToken"),
+            post(crate::shard::set_callback_token),
+        )
+        .route(
+            at!("shard.revokeSessions"),
+            post(crate::shard::revoke_sessions),
+        )
+        .route(
+            at!("shard.setVerifyKeys"),
+            post(crate::shard::set_verify_keys),
+        )
+        .route(
+            at!("shard.setPrivateTierBlock"),
+            post(crate::shard::set_private_tier_block),
+        )
         .route(at!("viewer.getSettings"), get(get_settings))
         .route(at!("viewer.getAuditLog"), get(get_audit_log))
         .route(at!("viewer.listJobs"), get(list_jobs))
@@ -133,6 +149,12 @@ pub async fn describe_capabilities(State(s): St) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "namespace": locus_core::LOCUS_NS,
         "roles": ["owner", "admin", "moderator", "viewer"],
+        "role": match s.role {
+            locus_core::bootstrap::Role::Pds => "pds",
+            locus_core::bootstrap::Role::Shard => "shard",
+            locus_core::bootstrap::Role::Entryway => "entryway",
+        },
+        "shardCallbacks": s.entryway.is_some(),
         "kryphocron": {
             "privateTier": crate::pipethrough::appview(&s).is_some() && s.snapshot().bool("kryphocron.private_tier_enabled"),
             "mediaGate": crate::media_gate::gate_on(&s),
@@ -290,6 +312,11 @@ pub async fn set_private_tier_block(
         locus_nsid!("moderator.account.setPrivateTierBlock"),
     )
     .await?;
+    if crate::shard::block_is_entryways(&s).await? {
+        return Err(XrpcError::invalid_request(
+            "This shard's private-tier blocks are set on the entryway",
+        ));
+    }
     s.store
         .account_by_did(&input.did)
         .await?
