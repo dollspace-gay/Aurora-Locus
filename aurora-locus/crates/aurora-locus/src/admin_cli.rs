@@ -337,6 +337,22 @@ pub enum ModerationCmd {
 }
 
 #[derive(Subcommand)]
+pub enum RepoCmd {
+    /// A new tree and commit from the record index (the reference's
+    /// rebuild-repo), applied as an import.
+    Rebuild { did: String },
+}
+
+#[derive(Subcommand)]
+pub enum RepairCmd {
+    /// The record index rebuilt from the repository's tree.
+    Repo { did: String },
+    /// The PLC document set back to the handle, this PDS and the held
+    /// signing key, then `#identity`.
+    Identity { did: String },
+}
+
+#[derive(Subcommand)]
 pub enum ShardCmd {
     /// Adds (or re-adds) a shard: probes it, checks its admin password,
     /// and on a locus shard installs a fresh callback token.
@@ -726,6 +742,12 @@ pub enum AdminCmd {
     /// Entryway role: the shards behind it.
     #[command(subcommand)]
     Shard(ShardCmd),
+    /// Repository tools.
+    #[command(subcommand)]
+    Repo(RepoCmd),
+    /// Repair tools.
+    #[command(subcommand)]
+    Repair(RepairCmd),
     /// Any XRPC method: `key=value` query parameters, or `--body` JSON to
     /// call it as a procedure.
     Call {
@@ -1354,6 +1376,27 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
     let lx = |m: &str| format!("{NS}.{m}");
     match cmd {
         AdminCmd::Keys(k) => keys(c, k).await,
+        AdminCmd::Repo(RepoCmd::Rebuild { did }) => {
+            print(
+                &c.call(&lx("admin.repo.rebuild"), &[], Some(json!({"did": did})))
+                    .await?,
+            );
+            Ok(())
+        }
+        AdminCmd::Repair(RepairCmd::Repo { did }) => {
+            print(
+                &c.call(&lx("admin.repo.repair"), &[], Some(json!({"did": did})))
+                    .await?,
+            );
+            Ok(())
+        }
+        AdminCmd::Repair(RepairCmd::Identity { did }) => {
+            print(
+                &c.call(&lx("admin.identity.repair"), &[], Some(json!({"did": did})))
+                    .await?,
+            );
+            Ok(())
+        }
         AdminCmd::Shard(ShardCmd::Add {
             shard_url,
             admin_password_file,

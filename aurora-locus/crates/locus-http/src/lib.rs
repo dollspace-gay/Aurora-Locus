@@ -35,6 +35,7 @@ pub mod pipethrough;
 pub mod portal;
 pub mod ratelimit;
 pub mod raw;
+pub mod repair;
 pub mod repo;
 pub mod routing;
 pub mod scanner;
@@ -421,6 +422,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(portal::routes())
         .merge(branding::routes())
         .merge(entryway::routes())
+        .merge(repair::routes())
         // Every other XRPC method goes to another service.
         .route("/xrpc/{nsid}", axum::routing::any(pipethrough::proxy))
         // In the shard role, account management goes to the entryway; in

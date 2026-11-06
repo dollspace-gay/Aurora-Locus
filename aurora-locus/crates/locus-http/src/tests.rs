@@ -14318,3 +14318,196 @@ async fn jobs_are_paused_and_run_through_the_admin_api() {
         .await;
     assert_eq!(v["jobs"][0]["runRequested"], true);
 }
+
+#[tokio::test]
+async fn repair_tools_fix_the_index_the_tree_and_the_identity() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("ren", "ren-password-123").await;
+    let (did, access) = h.user("rep.pds.example.com").await;
+    let mut rkeys = Vec::new();
+    for i in 0..5 {
+        let (st, v) = h
+            .call(
+                "POST",
+                "/xrpc/com.atproto.repo.createRecord",
+                Some(&access),
+                Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record(&format!("post {i}"))})),
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        rkeys.push(
+            v["uri"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let locus_store::Store::Sqlite(pool) = &h.state.store else {
+        unreachable!()
+    };
+    let count = |pool: &sqlx::SqlitePool, did: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM record WHERE did = ?1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // The index loses a row and gains a bogus one: repair repo fixes both.
+    sqlx::query("DELETE FROM record WHERE did = ?1 AND rkey = ?2")
+        .bind(&did)
+        .bind(&rkeys[0])
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO record (did, collection, rkey, cid, rev, indexed_at) \
+         VALUES (?1, 'app.bsky.feed.post', 'zzzbogus', 'bafyreibogus', 'x', 0)",
+    )
+    .bind(&did)
+    .execute(pool)
+    .await
+    .unwrap();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.repair"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        (v["added"].as_u64(), v["removed"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(count(pool, did.clone()).await, 5);
+
+    // The tree's root node is lost: repair refuses, rebuild makes a new
+    // tree and commit from the index, with #sync.
+    let root = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    sqlx::query("DELETE FROM repo_block WHERE did = ?1 AND cid = ?2")
+        .bind(&did)
+        .bind(&root.data_cid)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.repair"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let before = h.outbox_kinds(&did).await.len();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.rebuild"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["records"], 5);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let rebuilt = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
+    assert_ne!(rebuilt.commit_cid, root.commit_cid);
+    assert!(rebuilt.rev > root.rev);
+    let old_refs: i64 =
+        sqlx::query_scalar("SELECT ref_count FROM repo_block WHERE did = ?1 AND cid = ?2")
+            .bind(&did)
+            .bind(&root.commit_cid)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(old_refs, 0, "the old commit is left for GC");
+    assert!(h.outbox_kinds(&did).await[before..].contains(&"sync".to_owned()));
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.repo.repair"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "the rebuilt tree is whole: {v}");
+    assert_eq!(
+        (
+            v["added"].as_u64(),
+            v["removed"].as_u64(),
+            v["updated"].as_u64()
+        ),
+        (Some(0), Some(0), Some(0))
+    );
+    let (st, car) = {
+        let (st, _, body) = h
+            .raw(
+                "GET",
+                &format!("/xrpc/com.atproto.sync.getRepo?did={did}"),
+                None,
+                vec![],
+                &[],
+            )
+            .await;
+        (st, body)
+    };
+    assert_eq!(st, StatusCode::OK);
+    let (_, blocks) = proto_blue_repo::car::read_car(&car).unwrap();
+    assert!(blocks.iter().count() >= 7, "commit, tree and 5 records");
+    // And it takes writes again.
+    let (st, _) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("after")})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // The PLC document drifted: repair identity sets it back.
+    {
+        let mut plc = h.plc.lock().unwrap();
+        let last = plc.log.get_mut(&did).unwrap().last_mut().unwrap();
+        last["alsoKnownAs"] = json!(["at://someone-else.example"]);
+        last["services"]["atproto_pds"]["endpoint"] = json!("https://elsewhere.example");
+    }
+    let before = h.outbox_kinds(&did).await.len();
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.identity.repair"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["plcUpdated"], true);
+    let op = h.plc.lock().unwrap().last(&did).unwrap();
+    assert_eq!(op["alsoKnownAs"][0], "at://rep.pds.example.com");
+    assert_eq!(
+        op["services"]["atproto_pds"]["endpoint"],
+        "https://pds.example.com"
+    );
+    assert_eq!(h.outbox_kinds(&did).await[before..], ["identity"]);
+    // Nothing to fix the second time.
+    let (_, v) = h
+        .admin_call(
+            "POST",
+            &ns("admin.identity.repair"),
+            &owner,
+            Some(json!({"did": did})),
+        )
+        .await;
+    assert_eq!(v["plcUpdated"], false);
+}

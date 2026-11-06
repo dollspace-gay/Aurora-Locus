@@ -716,3 +716,67 @@ impl Store {
         .map_err(db_err)
     }
 }
+
+impl Store {
+    /// Up to `limit` of an account's record index rows after (collection,
+    /// rkey), in order: (collection, rkey, cid).
+    pub async fn record_index_page(
+        &self,
+        did: &str,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> CoreResult<Vec<(String, String, String)>> {
+        let (c, r) = after.unwrap_or(("", ""));
+        let q = crate::blob::sql(
+            "SELECT collection, rkey, cid FROM record WHERE did = {1} \
+             AND (collection > {2} OR (collection = {2} AND rkey > {3})) \
+             ORDER BY collection, rkey LIMIT {4}",
+            self.is_postgres(),
+        );
+        match self {
+            Store::Sqlite(p) => {
+                sqlx::query_as(&q)
+                    .bind(did)
+                    .bind(c)
+                    .bind(r)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+            Store::Postgres(p) => {
+                sqlx::query_as(&q)
+                    .bind(did)
+                    .bind(c)
+                    .bind(r)
+                    .bind(limit)
+                    .fetch_all(p)
+                    .await
+            }
+        }
+        .map_err(db_err)
+    }
+}
+
+impl Tx {
+    /// Sets every block of an account to no references (a rebuild then
+    /// counts the new tree's; the rest are left for GC).
+    pub async fn zero_block_counts(&mut self, did: &str) -> CoreResult<u64> {
+        let q = crate::blob::sql(
+            "UPDATE repo_block SET ref_count = 0, zero_since = {now} WHERE did = {1} AND ref_count > 0",
+            matches!(self, Tx::Postgres(_)),
+        );
+        match self {
+            Tx::Sqlite(t) => sqlx::query(&q)
+                .bind(did)
+                .execute(&mut **t)
+                .await
+                .map(|r| r.rows_affected()),
+            Tx::Postgres(t) => sqlx::query(&q)
+                .bind(did)
+                .execute(&mut **t)
+                .await
+                .map(|r| r.rows_affected()),
+        }
+        .map_err(db_err)
+    }
+}

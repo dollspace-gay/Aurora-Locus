@@ -654,6 +654,14 @@ kryphocron built in.
   (and an import's in-place prefixes, never the rest of a disk root) and
   queues for deletion every key older than a day that no blob, branding
   asset, move or queued delete names.
+- Repair tools (admin): `repo rebuild <did>` (the reference's
+  `rebuild-repo`: a new tree and signed commit from the record index, the
+  account's blocks re-counted so the old tree's go to GC, `#sync`;
+  records whose blocks are gone are listed), `repair repo <did>` (the
+  record index made to match the tree, with blob references and
+  backlinks) and `repair identity <did>` (a did:plc document set back to
+  the account's handle, this PDS and its signing key in one operation,
+  then `#identity`).
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
 
