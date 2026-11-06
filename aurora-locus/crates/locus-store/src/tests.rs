@@ -2732,3 +2732,186 @@ async fn bootstrap_disagreements_between_live_nodes_are_named() {
         );
     }
 }
+
+// ------------------------------------------------- Postgres READ COMMITTED races
+//
+// Two transactions from one pool stand for two nodes. Each test holds the
+// first at the racy point, starts the second in a task, waits for it to
+// block (or finish, which is the bug), then lets the first commit.
+
+async fn postgres() -> Option<Backend> {
+    backends().await.into_iter().find(|b| b.name == "postgres")
+}
+
+async fn racer_account(s: &Store, did: &str) {
+    let mut tx = s.begin().await.unwrap();
+    tx.insert_account(&crate::accounts::NewAccount {
+        did,
+        handle: &format!("{}.test", &did[8..]),
+        email: None,
+        password_hash: None,
+        status: crate::accounts::Status::Active,
+        did_method: "plc",
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Blob state as (state, unreferenced_since is set), or None if gone.
+async fn blob_state(s: &Store, did: &str, cid: &str) -> Option<(String, bool)> {
+    s.blob(did, cid)
+        .await
+        .unwrap()
+        .map(|b| (b.state, b.unreferenced_since.is_some()))
+}
+
+/// An upload of a CID an imported record references, racing the delete
+/// of that last record: whichever commits first, the blob ends a temp row
+/// (temp GC takes it) or permanent with `unreferenced_since` set; never
+/// permanent and unreferenced with it NULL (kept forever).
+#[tokio::test]
+async fn an_upload_racing_the_last_reference_delete_never_leaks() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:uploadrace";
+    racer_account(s, did).await;
+    let cid = "bafkreiuploadrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.replace_record_blobs(did, "app.bsky.feed.post", "r1", &[cid.to_owned()])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // The upload's metadata transaction, held after it saw the record.
+    let mut up = s.begin().await.unwrap();
+    up.lock_repo(did).await.unwrap();
+    up.insert_temp_blob(did, cid, "image/png", 3, "tmp/k1")
+        .await
+        .unwrap();
+    assert!(up.blob_has_records(did, cid).await.unwrap());
+    // The delete of the record, from another node.
+    let s2 = s.clone();
+    let delete = tokio::spawn(async move {
+        let mut tx = s2.begin().await.unwrap();
+        tx.lock_repo(did).await.unwrap();
+        tx.replace_record_blobs(did, "app.bsky.feed.post", "r1", &[])
+            .await
+            .unwrap();
+        tx.orphan_blob_if_unreferenced(did, cid).await.unwrap();
+        tx.commit().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!delete.is_finished(), "the delete waits for the upload");
+    up.reference_blob(did, cid, "blobs/k1", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    up.commit().await.unwrap();
+    delete.await.unwrap();
+    assert_eq!(
+        blob_state(s, did, cid).await,
+        Some(("permanent".into(), true)),
+        "permanent, and unreferenced since the delete"
+    );
+}
+
+/// A GC batch that starts while a commit references an unreferenced
+/// blob past its grace: the commit's reference wins (the delete re-checks
+/// the row it waited for).
+#[tokio::test]
+async fn blob_gc_never_takes_a_blob_a_commit_is_referencing() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:gcrace";
+    racer_account(s, did).await;
+    let cid = "bafkreigcrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.insert_temp_blob(did, cid, "image/png", 3, "blobs/gc")
+        .await
+        .unwrap();
+    tx.reference_blob(did, cid, "blobs/gc2", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    let Store::Postgres(pool) = s else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE blob SET unreferenced_since = 0, pending_move = NULL WHERE did = $1")
+        .bind(did)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut commit = s.begin().await.unwrap();
+    commit.lock_repo(did).await.unwrap();
+    commit
+        .reference_blob(did, cid, "blobs/gc3", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let s2 = s.clone();
+    let gc = tokio::spawn(async move {
+        let mut tx = s2.begin().await.unwrap();
+        let n = tx.gc_blob_batch(1, 1, 100, 1).await.unwrap();
+        tx.commit().await.unwrap();
+        n
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!gc.is_finished(), "GC waits on the row the commit holds");
+    commit
+        .replace_record_blobs(did, "app.bsky.feed.post", "r1", &[cid.to_owned()])
+        .await
+        .unwrap();
+    commit.commit().await.unwrap();
+    assert_eq!(gc.await.unwrap(), 0, "nothing collected");
+    assert_eq!(
+        blob_state(s, did, cid).await,
+        Some(("permanent".into(), false))
+    );
+}
+
+/// Block GC racing a commit that re-references a zero-count block: the
+/// block survives with its new count.
+#[tokio::test]
+async fn block_gc_never_takes_a_block_a_commit_re_references() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:blockrace";
+    let cid = "bafyreiblockrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.put_unreferenced_block(did, cid, "rev1", b"block")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let Store::Postgres(pool) = s else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE repo_block SET zero_since = 0 WHERE did = $1")
+        .bind(did)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut commit = s.begin().await.unwrap();
+    commit
+        .apply_block_deltas(
+            did,
+            "rev2",
+            &[crate::repo::BlockDelta {
+                cid: cid.into(),
+                bytes: Some(b"block".to_vec()),
+                delta: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    let s2 = s.clone();
+    let gc = tokio::spawn(async move { s2.gc_zero_blocks(1, 100).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!gc.is_finished(), "GC waits on the block the commit holds");
+    commit.commit().await.unwrap();
+    assert_eq!(gc.await.unwrap(), 0);
+    assert_eq!(s.repo_block_counts(did).await.unwrap().get(cid), Some(&1));
+}
