@@ -1,7 +1,9 @@
 //! Values that legitimately differ between two servers (DIDs, TIDs, CIDs,
 //! revs, timestamps, tokens, hosts, sequence numbers) become placeholders
 //! before comparison. DIDs are numbered in order of first appearance on
-//! each side, so the same account lines up on both.
+//! each side, so the same account lines up on both. The server's own host
+//! becomes `<host>` and the other server's `<peer>` (a migrated account's
+//! document names its source).
 
 use std::collections::HashMap;
 
@@ -13,10 +15,12 @@ pub struct Normalizer {
     dids: HashMap<String, usize>,
     /// `host:port` of the server, replaced with `<host>`.
     pub host: String,
+    /// `host:port` of the other server, replaced with `<peer>`.
+    pub peer: String,
 }
 
 /// Keys whose integer values are counters that differ between servers.
-const VOLATILE_INTS: &[&str] = &["seq", "cursor", "size", "time"];
+const VOLATILE_INTS: &[&str] = &["seq", "cursor", "size", "time", "expires_in"];
 
 fn is_tid(s: &str) -> bool {
     s.len() == 13
@@ -55,6 +59,7 @@ impl Normalizer {
         Self {
             dids: HashMap::new(),
             host: host.to_owned(),
+            peer: String::new(),
         }
     }
 
@@ -77,7 +82,10 @@ impl Normalizer {
             let parts: Vec<String> = s.split('/').map(|p| self.atom(p)).collect();
             return parts.join("/");
         }
-        let s = s.replace(&self.host, "<host>");
+        let mut s = s.replace(&self.host, "<host>");
+        if !self.peer.is_empty() {
+            s = s.replace(&self.peer, "<peer>");
+        }
         self.atom(&s)
     }
 
@@ -95,6 +103,8 @@ impl Normalizer {
         }
         if s.starts_with("did:plc:") || s.starts_with("did:web:") {
             self.did(s)
+        } else if s.starts_with("urn:ietf:params:oauth:request_uri:") {
+            "<request-uri>".into()
         } else if (s.starts_with("zQ3sh") || s.starts_with("zDnae")) && s.len() > 40 {
             "<multikey>".into()
         } else if s.starts_with("did:key:") {

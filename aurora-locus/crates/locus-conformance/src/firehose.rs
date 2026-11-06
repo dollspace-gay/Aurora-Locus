@@ -60,6 +60,9 @@ fn summary(frame: Frame) -> Value {
         "#identity" => {
             out["handle"] = s(body, "handle");
         }
+        "#info" => {
+            out["name"] = s(body, "name");
+        }
         "#sync" => {
             out["blocks"] =
                 json!(matches!(body.get("blocks"), Some(LexValue::Bytes(b)) if !b.is_empty()));
@@ -67,6 +70,64 @@ fn summary(frame: Frame) -> Value {
         _ => {}
     }
     out
+}
+
+fn seq(frame: &Frame) -> Option<i64> {
+    match frame {
+        Frame::Message(m) => m
+            .body
+            .as_map()
+            .and_then(|b| b.get("seq"))
+            .and_then(|s| match s {
+                LexValue::Integer(i) => Some(*i),
+                _ => None,
+            }),
+        Frame::Error(_) => None,
+    }
+}
+
+/// Subscribes from `cursor` (empty: none) and collects frames until the
+/// stream is quiet for a second or closes, at most 10 s. Returns the
+/// summaries and the last seq seen. A closed stream ends with `{"closed":
+/// true}`.
+pub async fn backfill(base: &str, cursor: &str) -> (Vec<Value>, Option<i64>) {
+    use std::time::Duration;
+    let mut url = format!(
+        "{}/xrpc/com.atproto.sync.subscribeRepos",
+        base.replacen("http", "ws", 1)
+    );
+    if !cursor.is_empty() {
+        url = format!("{url}?cursor={cursor}");
+    }
+    let mut ws = match tokio_tungstenite::connect_async(&url).await {
+        Ok((ws, _)) => ws,
+        Err(e) => return (vec![json!({"connect": e.to_string()})], None),
+    };
+    let (mut out, mut last) = (Vec::new(), None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let wait = Duration::from_millis(1000).min(deadline - tokio::time::Instant::now());
+        match tokio::time::timeout(wait, ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b)))) => {
+                if let Ok(f) = Frame::decode(&b) {
+                    last = seq(&f).or(last);
+                    out.push(summary(f));
+                }
+            }
+            Ok(
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None | Some(Err(_)),
+            ) => {
+                out.push(json!({"closed": true}));
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    (out, last)
 }
 
 /// Subscribes and keeps collecting until the process ends.
