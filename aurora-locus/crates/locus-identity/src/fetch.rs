@@ -55,13 +55,17 @@ pub struct SafeFetcher {
 
 impl SafeFetcher {
     pub fn new(policy: FetchPolicy) -> Result<Self, FetchError> {
+        Self::build(policy, UnicastResolver { lookup: None })
+    }
+
+    fn build(policy: FetchPolicy, resolver: UnicastResolver) -> Result<Self, FetchError> {
         let mut builder = reqwest::Client::builder()
             .timeout(TIMEOUT)
             .connect_timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("aurora-locus/", env!("CARGO_PKG_VERSION")));
         if policy.ssrf_protection {
-            builder = builder.dns_resolver(Arc::new(UnicastResolver));
+            builder = builder.dns_resolver(Arc::new(resolver));
         }
         let http = builder
             .build()
@@ -91,7 +95,7 @@ pub fn streaming_client(ssrf_protection: bool, http2: bool) -> Result<reqwest::C
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("aurora-locus/", env!("CARGO_PKG_VERSION")));
     if ssrf_protection {
-        builder = builder.dns_resolver(Arc::new(UnicastResolver));
+        builder = builder.dns_resolver(Arc::new(UnicastResolver { lookup: None }));
     }
     if !http2 {
         builder = builder.http1_only();
@@ -190,19 +194,31 @@ fn is_public_v6(a: Ipv6Addr) -> bool {
     !special
 }
 
-/// Resolves with the system resolver and refuses any name that resolves to
-/// a non-public address, or that is a local-network name.
-struct UnicastResolver;
+/// A name lookup standing in for the system resolver (tests).
+type Lookup = dyn Fn(&str) -> futures::future::BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>
+    + Send
+    + Sync;
+
+/// Resolves (with the system resolver unless `lookup` is set) and refuses
+/// any name that resolves to a non-public address, or that is a
+/// local-network name. Every connection resolves anew, so a name that
+/// answered publicly once and privately later is refused then.
+struct UnicastResolver {
+    lookup: Option<Arc<Lookup>>,
+}
 
 impl Resolve for UnicastResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+        let lookup = self.lookup.clone();
         Box::pin(async move {
             if is_local_name(&host) {
                 return Err("Hostname is not a public domain".into());
             }
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let addrs: Vec<SocketAddr> = match lookup {
+                Some(f) => f(&host).await?,
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
             if addrs.is_empty() {
                 return Err(format!("{host} did not resolve").into());
             }
@@ -395,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_resolver_refuses_names_that_resolve_privately() {
-        let r = UnicastResolver;
+        let r = UnicastResolver { lookup: None };
         let err = r.resolve("localhost".parse().unwrap()).await.err().unwrap();
         assert!(err.to_string().contains("not a public domain"));
     }
@@ -420,6 +436,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.body, b"did:plc:abc");
+    }
+
+    /// A listener that only counts the connections it gets.
+    async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                h.fetch_add(1, Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        (port, hits)
+    }
+
+    #[tokio::test]
+    async fn a_name_that_rebinds_to_a_private_address_is_refused_at_connect_time() {
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering;
+        let (port, hits) = counting_listener().await;
+        // What the name answers, in turn: public first, then the loopback
+        // address of the listener, then mapped, CGNAT, unique-local and a
+        // mix of public and private.
+        let answers: Arc<Mutex<Vec<Vec<IpAddr>>>> = Arc::new(Mutex::new(
+            [
+                vec!["1.1.1.1"],
+                vec!["127.0.0.1"],
+                vec!["::ffff:127.0.0.1"],
+                vec!["100.64.0.1"],
+                vec!["fd00::1"],
+                vec!["1.1.1.1", "127.0.0.1"],
+            ]
+            .into_iter()
+            .rev()
+            .map(|a| a.iter().map(|ip| ip.parse().unwrap()).collect())
+            .collect(),
+        ));
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (a, n) = (Arc::clone(&answers), Arc::clone(&lookups));
+        let lookup: Arc<Lookup> = Arc::new(move |_host: &str| {
+            n.fetch_add(1, Ordering::SeqCst);
+            let ips = a.lock().unwrap().pop().unwrap_or_default();
+            Box::pin(async move { Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect()) })
+        });
+        let resolver = UnicastResolver {
+            lookup: Some(Arc::clone(&lookup)),
+        };
+        // The first answer is public: the check passes.
+        assert!(resolver.resolve("rebind.pds.social".parse().unwrap()).await.is_ok());
+        // The client resolves again when it connects, and refuses the
+        // private answer without connecting; so it does for every other
+        // non-public answer.
+        let f = SafeFetcher::build(ON_LOOSE, UnicastResolver { lookup: Some(lookup) }).unwrap();
+        for case in ["loopback", "mapped", "cgnat", "ula", "mixed"] {
+            let err = f
+                .fetch(HttpRequest::get(format!("https://rebind.pds.social:{port}/")))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FetchError::Network(_)), "{case}: {err}");
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 6, "every connection resolved anew");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing connected");
     }
 
     /// A tiny HTTP/1.1 server on a random port, enough for the tests above.
