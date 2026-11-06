@@ -901,13 +901,15 @@ async fn the_window_outlasts_the_job_and_stragglers_do_not_block_the_next_migrat
         !crate::hostnames::step(&h.state).await.unwrap(),
         "not rechecked yet"
     );
-    sqlx::query("UPDATE hostname_migration SET rechecked_at = NULL")
-        .execute(match &h.state.store {
-            Store::Sqlite(p) => p,
-            Store::Postgres(_) => unreachable!(),
-        })
-        .await
-        .unwrap();
+    let q = sqlx::query("UPDATE hostname_migration SET rechecked_at = NULL");
+    match &h.state.store {
+        Store::Sqlite(p) => q.execute(p).await.map(|_| ()),
+        Store::Postgres(p) => sqlx::query("UPDATE hostname_migration SET rechecked_at = NULL")
+            .execute(p)
+            .await
+            .map(|_| ()),
+    }
+    .unwrap();
     assert!(crate::hostnames::step(&h.state).await.unwrap());
     h.reload_hosts().await;
     assert_eq!(h.state.hosts().former, [old]);

@@ -746,6 +746,9 @@ kryphocron built in.
   implementations wouldn't reproduce). Found by new property tests that
   also verify every `#commit` event from its own blocks and `getRepo`
   since every earlier rev.
+- On Postgres, input text with a NUL byte (a query parameter, a body
+  field) is refused with 400 `InvalidRequest`; it answered 500, since
+  Postgres can't store it.
 - `com.atproto.admin.deleteAccount` of an account that's already deleted
   announces the deletion again (`#account` deleted), as the reference
   does, so a relay that missed it hears it.

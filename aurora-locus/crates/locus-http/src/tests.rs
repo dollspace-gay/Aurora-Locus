@@ -233,6 +233,36 @@ impl Default for HarnessOpts {
     }
 }
 
+/// The harness's database: SQLite in `dir`, or a fresh Postgres database
+/// when `LOCUS_TEST_HTTP_POSTGRES_URL` names a server (check.sh runs the
+/// suite both ways).
+async fn test_database(dir: &std::path::Path) -> DatabaseUrl {
+    let Ok(admin_url) = std::env::var("LOCUS_TEST_HTTP_POSTGRES_URL") else {
+        return DatabaseUrl::Sqlite(dir.join("t.sqlite"));
+    };
+    let admin = sqlx::PgPool::connect(&admin_url).await.unwrap();
+    let db = format!("locus_test_{}", hex::encode(rand::random::<[u8; 8]>()));
+    sqlx::query(&format!("CREATE DATABASE {db}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    let (base, _) = admin_url
+        .rsplit_once('/')
+        .expect("LOCUS_TEST_HTTP_POSTGRES_URL ends in /<database>");
+    DatabaseUrl::Postgres(format!("{base}/{db}"))
+}
+
+/// The SQLite pool, for tests that set up or inspect rows directly; None
+/// on Postgres, where such a test skips (the store tests cover those
+/// paths on both backends).
+fn sqlite_pool(store: &Store) -> Option<&sqlx::SqlitePool> {
+    match store {
+        Store::Sqlite(p) => Some(p),
+        Store::Postgres(_) => None,
+    }
+}
+
 async fn harness_build(o: HarnessOpts) -> Harness {
     let HarnessOpts {
         hostname,
@@ -248,9 +278,7 @@ async fn harness_build(o: HarnessOpts) -> Harness {
     } = o;
     let hostname = hostname.as_str();
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
-        .await
-        .unwrap();
+    let store = Store::open(&test_database(dir.path()).await).await.unwrap();
     let (plc_url, plc) = match plc {
         Some(p) => p,
         None => mock_plc().await,
@@ -9867,13 +9895,12 @@ async fn console_settings_save_through_the_admin_api_by_role() {
 
 /// Makes every console session's last confirmation old.
 async fn age_console_confirmations(h: &Harness) {
-    let locus_store::Store::Sqlite(p) = &h.state.store else {
-        panic!("tests use SQLite")
-    };
-    sqlx::query("UPDATE operator_session SET confirmed_at = 0")
-        .execute(p)
-        .await
-        .unwrap();
+    let q = "UPDATE operator_session SET confirmed_at = 0";
+    match &h.state.store {
+        Store::Sqlite(p) => sqlx::query(q).execute(p).await.map(|_| ()),
+        Store::Postgres(p) => sqlx::query(q).execute(p).await.map(|_| ()),
+    }
+    .unwrap();
 }
 
 #[tokio::test]
@@ -12286,6 +12313,9 @@ async fn a_kms_plc_rotation_key_signs_in_kms() {
 #[tokio::test]
 async fn backups_hold_the_database_every_object_it_names_and_the_keys() {
     let h = harness(false).await;
+    if sqlite_pool(&h.state.store).is_none() {
+        return; // `backup create` is for SQLite installs (Postgres has PITR)
+    }
     let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
     let (did, access) = h.user("bob.pds.example.com").await;
     let blob = h.upload(&access, b"backed up bytes", "image/png").await;
@@ -14146,8 +14176,8 @@ async fn an_entryway_pushes_revocations_blocks_and_key_changes_to_its_shards() {
         crate::entryway::token_key(&e.state).await.unwrap().did(),
         new
     );
-    let locus_store::Store::Sqlite(pool) = &e.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&e.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     sqlx::query("UPDATE entryway_key_rotation SET switched_at = switched_at - 7300000")
         .execute(pool)
@@ -14283,8 +14313,8 @@ async fn the_orphan_sweep_queues_only_untracked_keys_under_locus_prefixes() {
         .await
         .unwrap();
     assert_eq!(n, 2, "the two orphans under locus prefixes");
-    let locus_store::Store::Sqlite(pool) = &h.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&h.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     let queued: Vec<(String,)> =
         sqlx::query_as("SELECT storage_key FROM blob_delete ORDER BY storage_key")
@@ -14389,8 +14419,8 @@ async fn repair_tools_fix_the_index_the_tree_and_the_identity() {
                 .to_owned(),
         );
     }
-    let locus_store::Store::Sqlite(pool) = &h.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&h.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     let count = |pool: &sqlx::SqlitePool, did: String| {
         let pool = pool.clone();
@@ -14590,8 +14620,8 @@ async fn sequencer_recovery_replays_the_event_log_onto_repos() {
         .await
         .unwrap();
     let latest = h.state.store.repo_root_of(&did).await.unwrap().unwrap();
-    let locus_store::Store::Sqlite(pool) = &h.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&h.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
 
     // Data loss: the repo back at its first post, later blocks and index
@@ -14789,8 +14819,8 @@ async fn redis_holds_rate_limits_and_replay_windows() {
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     assert!(other.state.unique("Test", &short, 60_000).await.unwrap());
     // The database's table isn't used.
-    let locus_store::Store::Sqlite(pool) = &h.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&h.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_replay")
         .fetch_one(pool)

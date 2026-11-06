@@ -281,8 +281,8 @@ async fn a_shard_keeps_a_previous_verify_key_for_its_overlap_only() {
     let (st, r) = set_key(&h, &owner, VERIFY, &v1, false, PW).await;
     assert_eq!(st, StatusCode::OK, "{r}");
     // As if the overlap were nearly over.
-    let locus_store::Store::Sqlite(pool) = &h.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&h.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     sqlx::query("UPDATE shard_verify_key SET expires_at = ?1 WHERE did_key = ?2")
         .bind(locus_core::time::now_ms() + 1500)
@@ -397,8 +397,8 @@ async fn an_entryway_key_rotation_waits_for_an_offline_shard_and_keeps_the_old_k
     assert!(entryway_accepts(old_token.clone()).await);
 
     // s2 is offline when the rotation starts.
-    let locus_store::Store::Sqlite(pool) = &e.state.store else {
-        unreachable!()
+    let Some(pool) = sqlite_pool(&e.state.store) else {
+        return; // SQLite-only: it reads or sets rows directly
     };
     let dead = format!("http://127.0.0.1:{}", {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

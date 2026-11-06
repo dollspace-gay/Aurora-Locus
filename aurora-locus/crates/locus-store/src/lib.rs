@@ -76,6 +76,13 @@ pub enum Tx {
 }
 
 pub(crate) fn db_err(e: sqlx::Error) -> CoreError {
+    // Text Postgres can't store (a NUL byte; 22021, 22P05) came from the
+    // caller's input: a refusal, not a storage failure. SQLite takes it.
+    if let sqlx::Error::Database(d) = &e
+        && matches!(d.code().as_deref(), Some("22021" | "22P05"))
+    {
+        return CoreError::Invalid("Text can't contain a NUL character".into());
+    }
     CoreError::Storage(e.to_string())
 }
 

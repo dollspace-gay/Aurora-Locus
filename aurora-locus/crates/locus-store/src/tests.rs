@@ -2921,3 +2921,16 @@ async fn block_gc_never_takes_a_block_a_commit_re_references() {
     assert_eq!(gc.await.unwrap(), 0);
     assert_eq!(s.repo_block_counts(did).await.unwrap().get(cid), Some(&1));
 }
+
+/// A NUL byte in a lookup is the caller's input error on Postgres (which
+/// can't store it), never a storage failure; SQLite just doesn't find it.
+#[tokio::test]
+async fn text_with_a_nul_byte_is_a_refusal_not_a_failure() {
+    for b in backends().await {
+        let r = b.store.account_by_handle("a\0b.test").await;
+        match b.name {
+            "postgres" => assert!(matches!(r, Err(CoreError::Invalid(_))), "{r:?}"),
+            _ => assert!(matches!(r, Ok(None)), "{}: {r:?}", b.name),
+        }
+    }
+}

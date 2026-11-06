@@ -43,4 +43,14 @@ if [ "$status" = 0 ] && running locus-test-s3; then
     cargo test -p locus-blob --quiet 2>&1 | grep -E 'test result|FAILED|panicked|^error'
   status="${PIPESTATUS[0]}"
 fi
+# The HTTP suite again on Postgres. The blobs, audiences and keys modules
+# set up rows with SQLite SQL throughout, so they run on SQLite only (the
+# store tests cover those paths on both backends); other tests that do so
+# skip themselves.
+if [ "$status" = 0 ] && [ -n "${LOCUS_TEST_POSTGRES_URL:-}" ]; then
+  LOCUS_TEST_HTTP_POSTGRES_URL="$LOCUS_TEST_POSTGRES_URL" \
+    cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys:: \
+    2>&1 | grep -E 'test result|FAILED|panicked|^error'
+  status="${PIPESTATUS[0]}"
+fi
 exit "$status"
