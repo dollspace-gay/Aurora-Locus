@@ -18,6 +18,10 @@
 <label>Invite code
 <input name="invite" spellcheck="false" required></label>
 {% endif %}
+{% if !hcaptcha_site_key.is_empty() %}
+<div class="h-captcha" data-sitekey="{{ hcaptcha_site_key }}"></div>
+<script src="{{ hcaptcha_script }}" async defer></script>
+{% endif %}
 <button type="submit" class="primary">Create account</button>
 </form>
 <form method="post" action="/oauth/authorize/show-sign-in">

@@ -217,6 +217,14 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
         tx.commit().await.map_err(e)?;
     }
     report.add("settings from pds.env", values.len() as u64);
+    // The reference's explicit service DID, kept (tokens it minted name it).
+    locus_http::identity::apply_service_did_env(
+        &store,
+        env.get("PDS_SERVICE_DID").map(String::as_str),
+        false,
+    )
+    .await
+    .map_err(e)?;
 
     // account.sqlite
     let pepper = secrets.email_token_pepper.clone();

@@ -648,7 +648,7 @@ fn fingerprint(value: &[u8]) -> String {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSecretInput {
-    /// `jwt-secret`, `dpop-secret`, `backup-passphrase`, or in the shard
+    /// `jwt-secret`, `dpop-secret`, `hcaptcha-secret`, `backup-passphrase`, or in the shard
     /// role `entryway-verify-key`, `entryway-plc-rotation-key` and
     /// `entryway-admin-token`.
     name: String,
@@ -663,7 +663,7 @@ pub struct SetSecretInput {
 }
 
 /// `owner.keys.setSecret`: replaces a secret a changed env value can't
-/// (the JWT and DPoP secrets), applied on every node within seconds.
+/// (the JWT, DPoP and hCaptcha secrets), applied on every node within seconds.
 pub async fn set_secret(
     State(s): St,
     headers: HeaderMap,
@@ -694,6 +694,17 @@ pub async fn set_secret(
                 })?;
             (secret_names::DPOP_SECRET, Zeroizing::new(b))
         }
+        "hcaptcha-secret" => {
+            if value.is_empty() {
+                return Err(XrpcError::invalid_request(
+                    "The hCaptcha secret can't be empty",
+                ));
+            }
+            (
+                secret_names::HCAPTCHA_SECRET,
+                Zeroizing::new(value.as_bytes().to_vec()),
+            )
+        }
         "backup-passphrase" => {
             if value.chars().count() < locus_core::key_backup::MIN_PASSPHRASE {
                 return Err(XrpcError::invalid_request(
@@ -707,7 +718,7 @@ pub async fn set_secret(
         }
         other => {
             return Err(XrpcError::invalid_request(format!(
-                "{other} isn't a secret this sets (jwt-secret, dpop-secret, backup-passphrase)"
+                "{other} isn't a secret this sets (jwt-secret, dpop-secret, hcaptcha-secret, backup-passphrase)"
             )));
         }
     };

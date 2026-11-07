@@ -11,6 +11,10 @@ use thiserror::Error;
 /// Default lifetime when the caller names no `exp`, as the reference.
 pub const DEFAULT_TTL_S: i64 = 60;
 
+/// The longest inbound lifetime, and the clock skew allowed on top.
+pub const MAX_LIFETIME_S: i64 = 3600;
+pub const SKEW_S: i64 = 60;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ServiceJwtError {
     #[error("poorly formatted jwt")]
@@ -27,6 +31,12 @@ pub enum ServiceJwtError {
     BadJwtIss,
     #[error("jwt signature does not match jwt issuer")]
     BadJwtSignature,
+    #[error("jwt lifetime is longer than an hour")]
+    BadJwtLifetime,
+    #[error("jwt has no jti")]
+    NoJti,
+    #[error("jwt replayed")]
+    Replayed,
     #[error("signing failed: {0}")]
     Sign(String),
 }
@@ -36,7 +46,11 @@ impl ServiceJwtError {
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
-            Self::BadJwt | Self::Sign(_) => "BadJwt",
+            Self::BadJwt
+            | Self::Sign(_)
+            | Self::BadJwtLifetime
+            | Self::NoJti
+            | Self::Replayed => "BadJwt",
             Self::BadJwtType => "BadJwtType",
             Self::JwtExpired => "JwtExpired",
             Self::BadJwtAudience => "BadJwtAudience",
@@ -85,6 +99,7 @@ pub struct Unverified {
     pub iss: String,
     pub aud: String,
     pub exp: i64,
+    pub iat: Option<i64>,
     pub lxm: Option<String>,
     pub jti: Option<String>,
     signing_input: String,
@@ -100,6 +115,16 @@ impl Unverified {
             Some((did, "atproto_labeler")) => (did, "atproto_label"),
             Some((did, _)) => (did, "atproto"),
             None => (&self.iss, "atproto"),
+        }
+    }
+
+    /// The inbound lifetime cap: `exp - iat` at most an hour plus a
+    /// minute's skew, or without `iat`, `exp - now` at most an hour.
+    #[must_use]
+    pub fn lifetime_ok(&self, now: i64) -> bool {
+        match self.iat {
+            Some(iat) => self.exp - iat <= MAX_LIFETIME_S + SKEW_S,
+            None => self.exp - now <= MAX_LIFETIME_S,
         }
     }
 
@@ -159,6 +184,7 @@ pub fn parse(token: &str, lxm: Option<&str>, now: i64) -> Result<Unverified, Ser
         iss,
         aud: payload["aud"].as_str().unwrap_or_default().to_owned(),
         exp,
+        iat: payload["iat"].as_i64(),
         lxm: claimed,
         jti: payload["jti"].as_str().map(str::to_owned),
         signing_input: format!("{h}.{p}"),

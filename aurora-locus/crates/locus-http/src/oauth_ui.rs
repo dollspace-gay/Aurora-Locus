@@ -73,6 +73,9 @@ struct SignUpPage {
     invite_required: bool,
     handle: String,
     email: String,
+    /// The hCaptcha site key; empty when hCaptcha is off.
+    hcaptcha_site_key: String,
+    hcaptcha_script: &'static str,
 }
 
 struct ScopeLine {
@@ -126,15 +129,31 @@ fn service_name(s: &AppState) -> String {
 /// The page security headers: strict CSP (`form-action` widened only for a
 /// form-post redirect), no framing, no caching.
 fn page(html: String, status: StatusCode, form_action: Option<&str>) -> Response {
+    page_with(html, status, form_action, false)
+}
+
+/// As [`page`]; with `hcaptcha`, the CSP also lets the hCaptcha widget in.
+fn page_with(
+    html: String,
+    status: StatusCode,
+    form_action: Option<&str>,
+    hcaptcha: bool,
+) -> Response {
     let mut res = (status, html).into_response();
     let h = res.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    let (extra, frames) = if hcaptcha {
+        let o = crate::hcaptcha::ORIGINS;
+        (format!(" {o}"), format!("; frame-src {o}; connect-src {o}"))
+    } else {
+        (String::new(), String::new())
+    };
     let csp = format!(
-        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-         form-action 'self'{}; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; script-src 'self'{extra}; style-src 'self'{extra}; img-src 'self' data:; \
+         form-action 'self'{}; frame-ancestors 'none'; base-uri 'none'{frames}",
         form_action.map(|a| format!(" {a}")).unwrap_or_default()
     );
     if let Ok(v) = HeaderValue::from_str(&csp) {
@@ -600,6 +619,8 @@ fn sign_up_page(
     email: &str,
     status: StatusCode,
 ) -> Response {
+    let site_key = crate::hcaptcha::site_key(s);
+    let hcaptcha = site_key.is_some();
     let html = SignUpPage {
         service_name: service_name(s),
         brand: crate::branding::oauth_brand_cached(s, true),
@@ -612,10 +633,12 @@ fn sign_up_page(
         invite_required: s.snapshot().bool("accounts.invite_required"),
         handle: handle.to_owned(),
         email: email.to_owned(),
+        hcaptcha_site_key: site_key.unwrap_or_default(),
+        hcaptcha_script: crate::hcaptcha::SCRIPT,
     }
     .render()
     .unwrap_or_default();
-    with_cookies(page(html, status, None), &c.set)
+    with_cookies(page_with(html, status, None, hcaptcha), &c.set)
 }
 
 /// `POST /oauth/authorize/show-sign-up` and `show-sign-in`: switch between
@@ -656,6 +679,16 @@ pub async fn sign_up(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
     });
     if let Some(code) = form_value(&form, "invite").filter(|v| !v.trim().is_empty()) {
         input["inviteCode"] = serde_json::json!(code.trim());
+    }
+    if let Err(m) = crate::hcaptcha::check(
+        &s,
+        &headers,
+        form_value(&form, crate::hcaptcha::FIELD),
+        &handle,
+    )
+    .await
+    {
+        return sign_up_page(&s, &c, m, &handle, &email, StatusCode::BAD_REQUEST);
     }
     let input = match serde_json::from_value(input) {
         Ok(i) => i,

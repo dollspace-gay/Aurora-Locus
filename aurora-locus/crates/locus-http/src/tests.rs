@@ -1,6 +1,7 @@
 //! End-to-end handler tests on SQLite, with a mock PLC directory.
 
 mod audiences;
+mod auth_features;
 mod blobs;
 mod bulk;
 mod conformance;
@@ -214,6 +215,10 @@ struct HarnessOpts {
     kv: crate::scratch::Scratch,
     /// Off: user-influenced fetches may reach loopback (mock remote PDSes).
     ssrf_protection: bool,
+    /// An explicit service DID (`PDS_SERVICE_DID`), recorded as at setup.
+    service_did: Option<String>,
+    /// The env the server secrets are first loaded from (else the process's).
+    env: Option<HashMap<String, String>>,
 }
 
 impl Default for HarnessOpts {
@@ -229,6 +234,8 @@ impl Default for HarnessOpts {
             public_url: None,
             kv: crate::scratch::Scratch::default(),
             ssrf_protection: true,
+            service_did: None,
+            env: None,
         }
     }
 }
@@ -275,6 +282,8 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         public_url,
         kv,
         ssrf_protection,
+        service_did,
+        env,
     } = o;
     let hostname = hostname.as_str();
     let dir = tempfile::tempdir().unwrap();
@@ -292,13 +301,18 @@ async fn harness_build(o: HarnessOpts) -> Harness {
         .await
         .unwrap();
     let master_key = Arc::new(MasterKey::generate(SourceKind::Env));
-    let secrets = ServerSecrets::load_or_create(&store, &master_key)
+    let secrets = match &env {
+        Some(env) => ServerSecrets::load_or_create_from(&store, &master_key, env).await,
+        None => ServerSecrets::load_or_create(&store, &master_key).await,
+    }
+    .unwrap();
+    crate::identity::apply_service_did_env(&store, service_did.as_deref(), false)
         .await
         .unwrap();
     let settings = Settings::load(store.clone()).await.unwrap();
     let hostname = hostname.to_owned();
     let hostname_for_gate = hostname.clone();
-    let service_did = format!("did:web:{hostname}");
+    let service_did = crate::identity::service_did_for(&settings.current(), &hostname);
     let mut sessions = LegacySessions::new(store.clone(), secrets.jwt.clone(), service_did.clone());
     if let Some(k) = &entryway_key {
         let private = proto_blue_crypto::ExportableKeypair::export_private_key(k);

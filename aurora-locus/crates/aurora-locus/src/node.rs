@@ -287,8 +287,31 @@ impl Node {
             );
         }
 
+        // An explicit service DID is fixed once setup completes.
+        let service_did_refused = locus_http::identity::apply_service_did_env(
+            &store,
+            env.get("PDS_SERVICE_DID").map(String::as_str),
+            store.setup_completed().await?,
+        )
+        .await?;
+        let service_did_env = if service_did_refused {
+            "refused"
+        } else {
+            "ok"
+        };
+        store
+            .report_bootstrap(&node_id, &[("service_did_env", service_did_env)])
+            .await?;
+
         let settings = Settings::load(store.clone()).await?;
         log.apply(settings.current().text("log.level"));
+        if service_did_refused {
+            tracing::warn!(
+                configured = env.get("PDS_SERVICE_DID").map_or("", String::as_str),
+                serving = settings.current().text("identity.service_did"),
+                "PDS_SERVICE_DID differs from the service DID setup recorded; it's ignored (an explicit service DID can't change in 0.1)"
+            );
+        }
 
         // Setup mode until setup completes; after it, the hostname setup
         // chose is the one served.
@@ -389,7 +412,8 @@ impl Node {
         } else {
             format!("https://{hostname}")
         };
-        let service_did = format!("did:web:{hostname}");
+        let service_did =
+            locus_http::identity::service_did_for(&self.settings.current(), &hostname);
         // Read before the keys, so a change made while they load is seen.
         let key_generation = self.store.key_state().await?.generation;
         let secrets = ServerSecrets::load_or_create(&self.store, &self.master_key).await?;

@@ -29,6 +29,8 @@ pub mod secret_names {
     pub const CORRELATION_KEY: &str = "kryphocron_correlation_key";
     pub const AUDIENCE_KEY: &str = "kryphocron_audience_key";
     pub const ADMIN_PASSWORD: &str = "admin_password";
+    pub const HCAPTCHA_SECRET: &str = "hcaptcha_secret";
+    pub const HCAPTCHA_TOKEN_SALT: &str = "hcaptcha_token_salt";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -51,6 +53,12 @@ pub struct ServerSecrets {
     /// The reference's single admin credential (`admin:<password>` Basic
     /// auth): `PDS_ADMIN_PASSWORD` when set, otherwise generated and kept.
     pub admin_password: Zeroizing<Vec<u8>>,
+    /// The hCaptcha secret (`PDS_HCAPTCHA_SECRET_KEY` on first boot, then
+    /// `keys set hcaptcha-secret`); None when there is none.
+    pub hcaptcha_secret: Option<Zeroizing<Vec<u8>>>,
+    /// Salts the client tokens sent with each hCaptcha check
+    /// (`PDS_HCAPTCHA_TOKEN_SALT` on first boot, else generated).
+    pub hcaptcha_token_salt: Zeroizing<Vec<u8>>,
 }
 
 /// A PLC rotation key this PDS can sign with: in the key store, or in KMS.
@@ -468,6 +476,31 @@ impl ServerSecrets {
                 )
         })
         .await?;
+        let env_hcaptcha = var("PDS_HCAPTCHA_SECRET_KEY").filter(|v| !v.trim().is_empty());
+        // There may be none, so it's taken from env only before setup
+        // completes (the first boot), never added or changed later.
+        let setup_done = store.setup_completed().await?;
+        let hcaptcha_secret = match store.get_secret(secret_names::HCAPTCHA_SECRET, key).await? {
+            Some(v) => Some(v),
+            None => match &env_hcaptcha {
+                Some(v) if !setup_done => Some(
+                    load_or(store, key, secret_names::HCAPTCHA_SECRET, || {
+                        v.trim().as_bytes().to_vec()
+                    })
+                    .await?,
+                ),
+                _ => None,
+            },
+        };
+        let hcaptcha_token_salt = load_or(store, key, secret_names::HCAPTCHA_TOKEN_SALT, || {
+            var("PDS_HCAPTCHA_TOKEN_SALT")
+                .filter(|v| !v.is_empty())
+                .map_or_else(
+                    || hex::encode(rand::random::<[u8; 16]>()).into_bytes(),
+                    String::into_bytes,
+                )
+        })
+        .await?;
         let admin_password = match var("PDS_ADMIN_PASSWORD") {
             Some(p) if !p.is_empty() => Zeroizing::new(p.into_bytes()),
             _ => stored_admin,
@@ -493,6 +526,16 @@ impl ServerSecrets {
                  change it with `aurora-locus keys set dpop-secret`"
             );
         }
+        if let Some(v) = &env_hcaptcha
+            && hcaptcha_secret
+                .as_ref()
+                .is_none_or(|stored| v.trim().as_bytes() != stored.as_slice())
+        {
+            tracing::warn!(
+                "PDS_HCAPTCHA_SECRET_KEY differs from the stored hCaptcha secret and is ignored; \
+                 change it with `aurora-locus keys set hcaptcha-secret`"
+            );
+        }
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -506,6 +549,8 @@ impl ServerSecrets {
             correlation_key,
             audience_key: keypair(&audience, "membership assertion key")?,
             admin_password,
+            hcaptcha_secret,
+            hcaptcha_token_salt,
             jwt,
             app_password_pepper,
             email_token_pepper,
@@ -553,7 +598,7 @@ pub struct AppState {
     pub hostname: String,
     /// `https://<hostname>`, or `http://localhost:<port>` on localhost.
     pub public_url: String,
-    /// `did:web:<hostname>`.
+    /// The explicit service DID (`PDS_SERVICE_DID`), else `did:web:<hostname>`.
     pub service_did: String,
     /// This node's id (holder of the bulk jobs it runs).
     pub node_id: String,
@@ -717,6 +762,20 @@ impl AppState {
                 .old_full
                 .iter()
                 .any(|h| aud.strip_prefix("did:web:") == Some(h.as_str()))
+    }
+
+    /// `did:web:<hostname>`: the host's own identity (its `did.json`,
+    /// membership assertions), even when the service DID was set explicitly.
+    #[must_use]
+    pub fn host_did(&self) -> String {
+        format!("did:web:{}", self.hostname)
+    }
+
+    /// As [`AppState::accepts_aud`], also taking the host's own did:web
+    /// (membership assertions and the query that issues them).
+    #[must_use]
+    pub fn accepts_host_aud(&self, aud: &str) -> bool {
+        self.accepts_aud(aud) || aud == self.host_did()
     }
 
     /// Every service DID accepted as an audience.

@@ -441,7 +441,7 @@ pub async fn verify_assertion(s: &AppState, token: &str, sub: &str, audience_uri
         claims["exp"].as_i64().unwrap_or(0),
     );
     let claims_ok = claims["iss"].as_str() == Some(iss.as_str())
-        && claims["aud"].as_str().is_some_and(|a| s.accepts_aud(a))
+        && claims["aud"].as_str().is_some_and(|a| s.accepts_host_aud(a))
         && claims["sub"].as_str() == Some(sub)
         && claims["audienceUri"].as_str() == Some(audience_uri)
         && exp + 30 >= now
@@ -484,7 +484,7 @@ async fn fetch_assertion(s: &AppState, subject: &str, audience_uri: &str) -> boo
         ))
         .query(&[
             ("audienceUri", audience_uri),
-            ("aud", s.service_did.as_str()),
+            ("aud", s.host_did().as_str()),
         ])
         .bearer_auth(token)
         .timeout(Duration::from_secs(10))
@@ -529,7 +529,7 @@ pub async fn get_membership_assertion(
     let now = locus_core::time::now_ms() / 1000;
     let jwt = locus_auth::service_jwt::parse(token, Some(ASSERTION_LXM), now)
         .map_err(|e| XrpcError::named(e.name(), e.to_string()))?;
-    if !s.accepts_aud(&jwt.aud) {
+    if !s.accepts_host_aud(&jwt.aud) {
         return Err(XrpcError::named(
             "BadJwtAudience",
             "jwt audience does not match service did",

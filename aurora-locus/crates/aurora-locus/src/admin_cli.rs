@@ -665,6 +665,14 @@ pub enum KeysSetCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// The hCaptcha secret web sign-up checks tokens with (with the
+    /// `accounts.hcaptcha_site_key` setting).
+    HcaptchaSecret {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Shard role: the entryway's token verify key (K256, hex or
     /// did:key). The previous one stays accepted 2 hours unless
     /// --revoke-previous.
@@ -1234,6 +1242,16 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 &file,
                 yes,
                 "Replace the DPoP nonce secret",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::HcaptchaSecret { file, yes }) => {
+            set_secret(
+                c,
+                "hcaptcha-secret",
+                &file,
+                yes,
+                "Replace the hCaptcha secret",
             )
             .await
         }
