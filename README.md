@@ -10,9 +10,6 @@ relays, and serves apps and other services the way Bluesky's reference PDS
 existing `pds.env` boots unchanged, and it can take over a reference
 installation in place.
 
-> **Status:** pre-release. 0.1.0 hasn't been tagged yet; expect rough
-> edges, and keep backups.
-
 ## What it does
 
 - **The reference PDS's behaviour.** Accounts, repositories, blobs, the
