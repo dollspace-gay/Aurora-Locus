@@ -191,6 +191,7 @@ pub async fn create_account(State(s): St, headers: HeaderMap, body: Bytes) -> Re
         "handle": web::field(&form, "handle"),
         "email": web::field(&form, "email"),
         "password": raw("password"),
+        "locusDidMethod": if web::field(&form, "did_method") == "web" { "web" } else { "plc" },
     });
     if s.snapshot().bool("accounts.invite_required") {
         let code = api(crate::admin::create_invite_code(
@@ -394,10 +395,13 @@ async fn render_account(
 }
 
 fn invite_row(c: locus_store::invites::InviteCode) -> InviteRow {
+    // `available` is the code's total uses (as the API reports it); the
+    // page shows what's left.
+    let used = i64::try_from(c.uses.len()).unwrap_or(i64::MAX);
     InviteRow {
         uses: c.uses.len(),
         code: c.code,
-        available: c.available,
+        available: (c.available - used).max(0),
         for_account: c.for_account,
         created: when(c.created_at),
         disabled: c.disabled,

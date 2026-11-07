@@ -30,6 +30,18 @@
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="new-password" required>
 <div class="hint">Give it to its owner safely; they can change it in their app.</div>
+<fieldset class="choices column">
+<legend>Identity (DID)</legend>
+<label class="choice"><input type="radio" name="did_method" value="plc" checked> did:plc (recommended)</label>
+<div class="hint">Registered in the public PLC directory. The account can move to another PDS later, and rotation keys can recover it.</div>
+<label class="choice"><input type="radio" name="did_method" value="web"> did:web</label>
+<div class="hint">The identity is the handle's web address (<code>did:web:</code> plus the handle), and this server serves its DID document. Before choosing it:</div>
+<ul class="hint">
+<li>The DID is tied to the handle's hostname forever: the handle can change later, the DID can't.</li>
+<li>There are no rotation keys: whoever controls that hostname controls the identity.</li>
+<li>Moving to another PDS needs the new PDS, or the owner, to serve the DID document at that hostname.</li>
+</ul>
+</fieldset>
 <div class="row"><button type="submit">Create</button></div>
 </form>
 </div>

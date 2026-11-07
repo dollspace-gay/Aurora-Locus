@@ -10042,6 +10042,44 @@ async fn console_people_pages_act_through_the_admin_api() {
         .unwrap()
         .unwrap();
     assert_eq!(href, format!("/admin/accounts/{}", carol.did));
+    assert!(carol.did.starts_with("did:plc:"), "{}", carol.did);
+    // did:web on request, with its warnings shown first.
+    let (_, _, page) = b.get(&h, "/admin/accounts").await;
+    assert!(
+        page.contains(r#"name="did_method" value="web""#)
+            && page.contains("There are no rotation keys"),
+        "{page}"
+    );
+    let (st, _, body) = b
+        .post(
+            &h,
+            "/admin/accounts/create",
+            &[
+                ("csrf", &csrf),
+                ("handle", "dot.pds.example.com"),
+                ("email", "dot@example.com"),
+                ("password", "dots long password"),
+                ("did_method", "web"),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::SEE_OTHER, "{body}");
+    let dot = h
+        .state
+        .store
+        .account_by_handle("dot.pds.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dot.did, "did:web:dot.pds.example.com");
+    assert!(
+        h.state
+            .store
+            .hosted_did_web(&dot.did)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(
         h.state
             .store
@@ -10224,8 +10262,31 @@ async fn console_people_pages_act_through_the_admin_api() {
             .unwrap()
             .disabled
     );
-
-    // Operators: freshly confirmed owners only.
+    // A one-use code, used once: none left, shown used up, no Disable.
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.insert_invite_code("used-once-code", 1, "admin", "admin")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let (st, v) = h
+        .post(
+            "com.atproto.server.createAccount",
+            None,
+            json!({"handle": "uno.pds.example.com", "email": "uno@example.com",
+                "password": "long enough password", "inviteCode": "used-once-code"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, page) = b.get(&h, "/admin/invites").await;
+    let row = page
+        .split("<tr>")
+        .find(|r| r.contains("used-once-code"))
+        .expect("the code is listed");
+    assert!(
+        row.contains(r#"<td class="num">0</td><td class="num">1</td>"#),
+        "{row}"
+    );
+    assert!(row.contains("used up") && !row.contains("Disable"), "{row}");
     let (st, _, page) = b.get(&h, "/admin/operators").await;
     assert!(st == StatusCode::OK && page.contains("mo"), "{page}");
     let (st, _, page) = b

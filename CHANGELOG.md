@@ -743,6 +743,11 @@ kryphocron built in.
 
 ### Changed
 
+- The console's "Create an account" form offers did:plc or did:web, with
+  did:web's trade-offs (DID tied to the hostname, no rotation keys, moving
+  away needs the document served elsewhere) shown next to the choice.
+- The console's invite list shows the uses left (it showed the total) and
+  marks a code with none left "used up", without a Disable button.
 - The Docker image build keeps cargo's downloads and build output in
   BuildKit caches and installs the pinned toolchain in its own layer, so a
   rebuild after a small change recompiles only the workspace; link-time
