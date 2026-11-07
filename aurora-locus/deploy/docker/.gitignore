@@ -1,0 +1,5 @@
+# Written by deploy/install.sh for this server.
+.env
+locus.env
+Caddyfile
+certs/
