@@ -743,6 +743,9 @@ kryphocron built in.
 
 ### Changed
 
+- `deploy/install.sh` checks its ports before building: it stops if 80 or
+  443 is taken, and asks for another local port when 3000 is
+  (`LOCUS_LOCAL_PORT` in the compose stack's `.env`).
 - `http.internal_hosts` entries are reserved: they can't be taken as a
   handle or did:web host, and saving an entry that already is a handle,
   did:web or PDS hostname is refused.

@@ -5,8 +5,8 @@
 #   docker compose up -d --build
 #
 # Only Caddy publishes public ports. locus publishes 3000 on 127.0.0.1 only
-# (for the CLI over HTTP on this machine); never 0.0.0.0, which would let
-# clients skip Caddy.
+# (for the CLI over HTTP on this machine; LOCUS_LOCAL_PORT in .env picks
+# another host port); never 0.0.0.0, which would let clients skip Caddy.
 name: aurora-locus
 
 services:
@@ -20,7 +20,7 @@ services:
     volumes:
       - locus-data:/data
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${LOCUS_LOCAL_PORT:-3000}:3000"
     networks:
       locus: {}
     healthcheck:

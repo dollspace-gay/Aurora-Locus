@@ -45,6 +45,22 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
+# Ports, before the long build: Caddy needs 80 and 443; locus's local port
+# (3000 on 127.0.0.1, for the CLI) can move.
+in_use() { [[ -n "$(ss -Hltn "sport = :$1" 2>/dev/null)" ]]; }
+for port in 80 443; do
+  if in_use "$port"; then
+    say "Port $port is in use (sudo ss -ltnp 'sport = :$port' shows by what);"
+    say "Caddy needs it. Stop that service and run this again."
+    exit 1
+  fi
+done
+local_port=3000
+while in_use "$local_port"; do
+  say "Port $local_port on this machine is in use."
+  local_port="$(ask "Another local port for locus" $((local_port + 1)))"
+done
+
 # The questions.
 hostname="$(ask "The PDS hostname (like pds.example.com)")"
 hostname="${hostname,,}"
@@ -116,6 +132,7 @@ cat > .env <<EOF
 LOCUS_SUBNET=$subnet
 LOCUS_GATEWAY=$base.1
 LOCUS_IP_RANGE=$base.128/25
+LOCUS_LOCAL_PORT=$local_port
 CADDY_IMAGE=$caddy_image
 DNS_API_TOKEN=$dns_token
 EOF
