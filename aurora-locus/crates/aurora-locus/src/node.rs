@@ -294,11 +294,7 @@ impl Node {
             store.setup_completed().await?,
         )
         .await?;
-        let service_did_env = if service_did_refused {
-            "refused"
-        } else {
-            "ok"
-        };
+        let service_did_env = if service_did_refused { "refused" } else { "ok" };
         store
             .report_bootstrap(&node_id, &[("service_did_env", service_did_env)])
             .await?;

@@ -24,13 +24,17 @@ pub const ORIGINS: &str = "https://hcaptcha.com https://*.hcaptcha.com";
 /// The site key, when hCaptcha is on (a site key and a secret).
 #[must_use]
 pub fn site_key(s: &AppState) -> Option<String> {
-    let key = s.snapshot().text("accounts.hcaptcha_site_key").trim().to_owned();
+    let key = s
+        .snapshot()
+        .text("accounts.hcaptcha_site_key")
+        .trim()
+        .to_owned();
     (!key.is_empty() && s.secrets.hcaptcha_secret.is_some()).then_some(key)
 }
 
 /// The reference's client-token hash: scrypt (N = 1024, r = 8, p = 1,
 /// 32 bytes) of the value under the salt, in base64.
-pub(crate) fn hash_token(salt: &[u8], value: &str) -> String {
+fn hash_token(salt: &[u8], value: &str) -> String {
     let mut out = [0u8; 32];
     let params = scrypt::Params::new(10, 8, 1, 32).expect("valid scrypt parameters");
     scrypt::scrypt(value.as_bytes(), salt, &params, &mut out).expect("32-byte output");

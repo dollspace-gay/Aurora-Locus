@@ -692,6 +692,23 @@ kryphocron built in.
   `conformance/allowlist.json`.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
+- Service-auth replay protection: a service token for a procedure (any
+  `com.atproto.admin.*` procedure included) needs a `jti` and is good once,
+  per issuer, until it would expire, in Redis or the database; queries and
+  `uploadBlob` may reuse a token. Inbound service tokens live at most an
+  hour (`exp - iat` up to an hour and a minute; without `iat`, `exp - now`
+  up to an hour).
+- Optional hCaptcha for web sign-up (the account portal and the OAuth
+  sign-up page), as the reference: on with a site key
+  (`accounts.hcaptcha_site_key`, `PDS_HCAPTCHA_SITE_KEY`) and a secret
+  (`PDS_HCAPTCHA_SECRET_KEY` on first boot, then `aurora-locus keys set
+  hcaptcha-secret`), checked against `accounts.hcaptcha_verify_url`.
+  `createAccount` itself isn't gated.
+- `PDS_SERVICE_DID`: an explicit service DID, recorded at setup (and by
+  `import reference-pds`), used for `describeServer`, token audiences and
+  inbound service auth. It can't change in 0.1: a different value later is
+  ignored, logged and shown as a console warning. The host's `did.json` and
+  membership assertions keep `did:web:<host>`.
 
 ### Changed
 

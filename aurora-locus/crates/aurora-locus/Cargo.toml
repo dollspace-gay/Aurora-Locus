@@ -47,5 +47,6 @@ rustix = { version = "1", features = ["fs"] }
 workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 axum = "0.8"
 tempfile.workspace = true

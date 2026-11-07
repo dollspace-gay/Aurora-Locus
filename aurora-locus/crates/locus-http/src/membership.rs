@@ -441,7 +441,9 @@ pub async fn verify_assertion(s: &AppState, token: &str, sub: &str, audience_uri
         claims["exp"].as_i64().unwrap_or(0),
     );
     let claims_ok = claims["iss"].as_str() == Some(iss.as_str())
-        && claims["aud"].as_str().is_some_and(|a| s.accepts_host_aud(a))
+        && claims["aud"]
+            .as_str()
+            .is_some_and(|a| s.accepts_host_aud(a))
         && claims["sub"].as_str() == Some(sub)
         && claims["audienceUri"].as_str() == Some(audience_uri)
         && exp + 30 >= now

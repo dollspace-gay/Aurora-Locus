@@ -59,8 +59,15 @@ async fn mod_call(h: &Harness, lxm: &str, did: &str, token: &str) -> (StatusCode
 
 fn mod_token(key: &proto_blue_crypto::K256Keypair, lxm: &str) -> String {
     let now = now_s();
-    locus_auth::service_jwt::create(key, MOD_DID, "did:web:pds.example.com", None, Some(lxm), now)
-        .unwrap()
+    locus_auth::service_jwt::create(
+        key,
+        MOD_DID,
+        "did:web:pds.example.com",
+        None,
+        Some(lxm),
+        now,
+    )
+    .unwrap()
 }
 
 /// The refusal a replayed or `jti`-less procedure token gets.
@@ -129,7 +136,11 @@ async fn replay_rules(o: HarnessOpts) {
     // with the same token works.
     let (_, access) = h.user("ulla.pds.example.com").await;
     let (st, v) = h
-        .service_token(&access, "did:web:pds.example.com", "com.atproto.repo.uploadBlob")
+        .service_token(
+            &access,
+            "did:web:pds.example.com",
+            "com.atproto.repo.uploadBlob",
+        )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let token = v["token"].as_str().unwrap().to_owned();
@@ -211,6 +222,9 @@ async fn inbound_service_tokens_live_at_most_an_hour() {
         assert_eq!(r.0, StatusCode::OK, "{lxm} 3660 s: {}", r.1);
         let r = mod_call(&h, lxm, &did, &token(None, now + 3500, lxm)).await;
         assert_eq!(r.0, StatusCode::OK, "{lxm} no iat: {}", r.1);
+        // With `iat`, it's `exp - iat` that counts, not `exp - now`.
+        let r = mod_call(&h, lxm, &did, &token(Some(now + 50), now + 3700, lxm)).await;
+        assert_eq!(r.0, StatusCode::OK, "{lxm} iat ahead: {}", r.1);
         // Past it: refused.
         let r = mod_call(&h, lxm, &did, &token(Some(now), now + 3661, lxm)).await;
         assert!(refused(&r, too_long), "{lxm} 3661 s: {r:?}");
@@ -233,9 +247,8 @@ async fn siteverify() -> (String, Verifies) {
             "/siteverify",
             post(
                 |State(seen): State<Verifies>, body: axum::body::Bytes| async move {
-                    let form: HashMap<String, String> = url::form_urlencoded::parse(&body)
-                        .into_owned()
-                        .collect();
+                    let form: HashMap<String, String> =
+                        url::form_urlencoded::parse(&body).into_owned().collect();
                     let token = form.get("response").cloned().unwrap_or_default();
                     seen.lock().unwrap().push(form);
                     if token == "down" {
@@ -358,9 +371,10 @@ async fn web_sign_up_needs_a_valid_hcaptcha_token_when_configured() {
     assert_eq!(sent["behavior_type"], "signup");
     assert_eq!(sent["response"], "good");
     let tokens: Value = serde_json::from_str(&sent["client_tokens"]).unwrap();
+    // scrypt(handle, salt, N = 1024, r = 8, p = 1, 32 bytes), as the reference.
     assert_eq!(
         tokens["hashedHandle"],
-        crate::hcaptcha::hash_token(b"the-salt", "nia.pds.example.com")
+        "jokLkoBAmWuLXoue3kIqNbFfpHVGMAyVPAGJkmrhvhc="
     );
     assert!(tokens["hashedIp"].is_string());
 
@@ -498,7 +512,11 @@ async fn the_hcaptcha_secret_comes_from_env_once_and_changes_with_keys_set() {
         }
     };
     assert_eq!(
-        h.state.secrets.hcaptcha_secret.as_deref().map(Vec::as_slice),
+        h.state
+            .secrets
+            .hcaptcha_secret
+            .as_deref()
+            .map(Vec::as_slice),
         Some(b"the-hcaptcha-secret".as_slice()),
         "imported on the first boot"
     );
@@ -535,7 +553,12 @@ async fn the_hcaptcha_secret_comes_from_env_once_and_changes_with_keys_set() {
         .iter()
         .find(|a| a.action == "keys.setSecret")
         .expect("audited");
-    assert!(!row.detail_json.clone().unwrap_or_default().contains("new-secret"));
+    assert!(
+        !row.detail_json
+            .clone()
+            .unwrap_or_default()
+            .contains("new-secret")
+    );
 
     // An install without one doesn't take it from env after setup.
     let h2 = harness(false).await;
@@ -579,7 +602,12 @@ async fn an_explicit_service_did_is_the_service_identity() {
     let (did, access) = h.user("sid.pds.example.com").await;
     assert_eq!(claims(&access)["aud"], EXPLICIT);
     let (st, _) = h
-        .call("GET", "/xrpc/com.atproto.server.getSession", Some(&access), None)
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
         .await;
     assert_eq!(st, StatusCode::OK);
 
@@ -615,7 +643,9 @@ async fn an_explicit_service_did_is_the_service_identity() {
     // identities are always the host's): past the audience check, the
     // answer is the plain refusal; another audience is refused there.
     let lxm = crate::membership::ASSERTION_LXM;
-    let path = format!("/xrpc/{lxm}?audienceUri=at%3A%2F%2Fdid%3Aplc%3Aowner%2Fx%2Fy&aud=did:web:other.test");
+    let path = format!(
+        "/xrpc/{lxm}?audienceUri=at%3A%2F%2Fdid%3Aplc%3Aowner%2Fx%2Fy&aud=did:web:other.test"
+    );
     for (aud, want) in [
         ("did:web:pds.example.com", "Forbidden"),
         (EXPLICIT, "Forbidden"),
@@ -645,7 +675,14 @@ async fn an_explicit_service_did_is_the_service_identity() {
 async fn pds_service_did_is_recorded_before_setup_and_refused_after() {
     let h = harness(false).await;
     let store = &h.state.store;
-    let stored = || async { store.load_snapshot().await.unwrap().text("identity.service_did").to_owned() };
+    let stored = || async {
+        store
+            .load_snapshot()
+            .await
+            .unwrap()
+            .text("identity.service_did")
+            .to_owned()
+    };
     let apply = |v: Option<&'static str>, done: bool| async move {
         crate::identity::apply_service_did_env(store, v, done).await
     };
@@ -669,7 +706,12 @@ async fn pds_service_did_is_recorded_before_setup_and_refused_after() {
             .unwrap()
     );
     assert_eq!(
-        h2.state.store.load_snapshot().await.unwrap().text("identity.service_did"),
+        h2.state
+            .store
+            .load_snapshot()
+            .await
+            .unwrap()
+            .text("identity.service_did"),
         ""
     );
 }
@@ -686,7 +728,12 @@ async fn the_console_warns_about_a_refused_pds_service_did() {
     let (_, lease) = h
         .state
         .store
-        .claim_slot(CLOCK_SLOT_FAMILY, 8, "node-b", std::time::Duration::from_secs(30))
+        .claim_slot(
+            CLOCK_SLOT_FAMILY,
+            8,
+            "node-b",
+            std::time::Duration::from_secs(30),
+        )
         .await
         .unwrap()
         .unwrap();

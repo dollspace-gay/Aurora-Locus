@@ -46,11 +46,9 @@ impl ServiceJwtError {
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
-            Self::BadJwt
-            | Self::Sign(_)
-            | Self::BadJwtLifetime
-            | Self::NoJti
-            | Self::Replayed => "BadJwt",
+            Self::BadJwt | Self::Sign(_) | Self::BadJwtLifetime | Self::NoJti | Self::Replayed => {
+                "BadJwt"
+            }
             Self::BadJwtType => "BadJwtType",
             Self::JwtExpired => "JwtExpired",
             Self::BadJwtAudience => "BadJwtAudience",

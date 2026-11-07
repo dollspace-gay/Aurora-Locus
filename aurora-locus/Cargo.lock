@@ -228,6 +228,7 @@ version = "0.1.0-dev"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64 0.22.1",
  "clap",
  "hex",
  "locus-auth",
@@ -2596,9 +2597,12 @@ name = "locus-conformance"
 version = "0.1.0-dev"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures",
+ "locus-auth",
  "proto-blue-lex-data",
  "proto-blue-ws",
+ "rand 0.8.8",
  "reqwest",
  "serde_json",
  "tokio",
@@ -2665,6 +2669,7 @@ dependencies = [
  "redis",
  "reqwest",
  "rustls",
+ "scrypt",
  "serde",
  "serde_json",
  "sha2",
