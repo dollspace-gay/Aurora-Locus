@@ -20,6 +20,7 @@ members = [
 version = "0.1.0-dev"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
