@@ -15,10 +15,24 @@ pub static CSS_HREF: LazyLock<String> = LazyLock::new(|| {
     format!("/static/locus-{}.css", &hash[..12])
 });
 
+/// The one script: live refresh on the console's status pages.
+pub const JS: &str = include_str!("../static/locus.js");
+
+/// The script's path: its content hash in the name.
+pub static JS_HREF: LazyLock<String> = LazyLock::new(|| {
+    let hash = hex::encode(sha2::Sha256::digest(JS.as_bytes()));
+    format!("/static/locus-{}.js", &hash[..12])
+});
+
 /// Every page's `Content-Security-Policy`: nothing from anywhere else, no
 /// scripts, no inline anything.
 pub const CSP: &str = "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; \
      form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// A live status page's: [`CSP`] plus the one script, and its event stream
+/// and refetch, from this site only.
+pub const CSP_LIVE: &str = "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; \
+     script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// A page's `Cache-Control`.
 pub const NO_STORE: &str = "no-store, no-transform";
@@ -58,6 +72,9 @@ pub fn asset(path: &str) -> Option<(&'static str, &'static [u8])> {
     if format!("/static/{path}") == *CSS_HREF {
         return Some(("text/css; charset=utf-8", CSS.as_bytes()));
     }
+    if format!("/static/{path}") == *JS_HREF {
+        return Some(("text/javascript; charset=utf-8", JS.as_bytes()));
+    }
     let name = path.strip_prefix("fonts/")?;
     let (_, bytes) = FONTS.iter().find(|(n, _)| *n == name)?;
     let kind = if name.ends_with(".woff2") {
@@ -91,6 +108,15 @@ mod tests {
             assert!(CSS.contains(name), "{name} is bundled but unused");
         }
         assert!(asset("fonts/../../etc/passwd").is_none());
+        let js_path = JS_HREF.strip_prefix("/static/").unwrap();
+        assert_eq!(asset(js_path).unwrap().0, "text/javascript; charset=utf-8");
+        assert!(asset("locus-000000000000.js").is_none());
+        // The live CSP is the strict one plus scripts and connections from
+        // this site, nothing else.
+        assert_eq!(
+            CSP_LIVE.replace(" script-src 'self'; connect-src 'self';", ""),
+            CSP
+        );
     }
 
     #[test]

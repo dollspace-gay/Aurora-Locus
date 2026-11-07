@@ -14,6 +14,8 @@ pub mod branding;
 pub mod bsky;
 pub mod cloudflare;
 pub mod console;
+pub mod console_hostname;
+pub mod console_live;
 pub mod console_people;
 pub mod console_sections;
 pub mod email;
@@ -65,6 +67,8 @@ pub use state::{AppState, ResolverCache, ServerSecrets};
 /// Every route.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/", get(web::root))
+        .route("/robots.txt", get(web::robots))
         .route("/xrpc/_health", get(health::health))
         .route("/healthz", get(health::healthz))
         .route("/metrics", get(metrics::serve))
@@ -424,6 +428,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(console::routes())
         .merge(console_people::routes())
         .merge(console_sections::routes())
+        .merge(console_hostname::routes())
+        .route("/admin/live", get(console_live::live))
         .merge(portal::routes())
         .merge(branding::routes())
         .merge(entryway::routes())

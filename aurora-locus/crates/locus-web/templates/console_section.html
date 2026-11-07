@@ -6,7 +6,7 @@
 {% endfor %}
 {% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
 {% if !cards.is_empty() %}
-<div class="grid">
+<div class="grid" id="live-cards" data-live-part>
 {% for c in cards %}<div class="card">
 <h2>{{ c.title }}</h2>
 {% for f in c.facts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
@@ -39,6 +39,7 @@
 </div>
 {% endif %}
 {% for t in tables %}
+<div id="live-table-{{ loop.index }}" data-live-part>
 <h2>{{ t.title }}</h2>
 <div class="scroll"><table>
 <thead><tr>{% for (class, label) in t.cols %}<th class="{{ class }}">{{ label }}</th>{% endfor %}</tr></thead>
@@ -47,6 +48,7 @@
 {% else %}<tr><td class="text" colspan="{{ t.cols.len() }}"><div class="cell-text">{{ t.empty }}</div></td></tr>
 {% endfor %}</tbody>
 </table></div>
+</div>
 {% endfor %}
 {% if !frames.is_empty() %}<h2>Preview</h2>
 <div class="previews">

@@ -20,6 +20,9 @@ pub struct Shell {
     pub nav: Option<Nav>,
     /// The operator's branding, on the pages account holders see.
     pub dress: Option<Dress>,
+    /// A live status page's event stream (the page loads the one script);
+    /// empty for every other page.
+    pub live: String,
 }
 
 /// Branding on a page: its stylesheet, icons, links and text.
@@ -48,6 +51,7 @@ impl Shell {
             css: CSS_HREF.clone(),
             nav: None,
             dress: None,
+            live: String::new(),
         }
     }
 
@@ -60,7 +64,14 @@ impl Shell {
             css: CSS_HREF.clone(),
             nav: Some(nav),
             dress: None,
+            live: String::new(),
         }
+    }
+
+    /// The script's path (live pages only load it).
+    #[must_use]
+    pub fn js(&self) -> String {
+        crate::assets::JS_HREF.clone()
     }
 
     /// Whether the branding has a logo (it replaces the built-in mark).
@@ -174,6 +185,17 @@ pub struct MessagePage {
     pub shell: Shell,
     pub message: String,
     pub link: Option<Link>,
+}
+
+/// The public page at `/`, when the operator turns it on.
+#[derive(Template)]
+#[template(path = "landing.html")]
+pub struct LandingPage {
+    pub shell: Shell,
+    /// The account portal is on: link it.
+    pub portal: bool,
+    /// Sign-up is open in the portal: link it too.
+    pub sign_up: bool,
 }
 
 /// A hidden field carried through a confirm page.
@@ -323,9 +345,11 @@ mod tests {
         let mut seen = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            let text = std::fs::read_to_string(&path).unwrap();
-            // The hCaptcha widget's script is external, not inline.
-            let text = text.replace(
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            // The script tags allowed are external, by path, nothing inline:
+            // the bundled console script and the hCaptcha widget.
+            text = text.replace(r#"<script src="{{ shell.js() }}" defer></script>"#, "");
+            text = text.replace(
                 r#"<script src="{{ hcaptcha_script }}" async defer></script>"#,
                 "",
             );

@@ -52,6 +52,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/admin/limits", get(limits))
         .route("/admin/storage", get(storage))
         .route("/admin/jobs", get(jobs))
+        .route("/admin/jobs/{action}", post(job_action))
         .route("/admin/shards", get(shards))
         .route("/admin/audit", get(audit))
         .route("/admin/audit/export", get(audit_export))
@@ -85,7 +86,7 @@ fn fields_under(s: &AppState, prefix: &str, except: &[&str]) -> Vec<SettingField
         .collect()
 }
 
-async fn section(s: &AppState, op: &Op, page: PageId, intro: &str) -> SectionPage {
+pub(crate) async fn section(s: &AppState, op: &Op, page: PageId, intro: &str) -> SectionPage {
     SectionPage {
         shell: shell(s, op, page).await,
         csrf: op.csrf.clone(),
@@ -745,7 +746,7 @@ pub async fn services(State(s): St, headers: HeaderMap, Query(q): Query<PageQuer
         ],
     ));
     p.advanced = adv;
-    web::render(&p, StatusCode::OK)
+    web::render_shell(&p, &p.shell, StatusCode::OK)
 }
 
 /// `POST /admin/services/crawl` (admins).
@@ -1272,6 +1273,47 @@ pub async fn storage(State(s): St, headers: HeaderMap) -> Response {
             .collect(),
         empty: "No clean-up has run yet.".into(),
     });
+    match api(crate::backups::list(State(Arc::clone(&s)), op.api_headers()).await) {
+        Ok(v) => p.tables.push(Table {
+            title: "Backups".into(),
+            cols: cols(&[
+                ("when", "Started"),
+                ("when", "Finished"),
+                ("state", "State"),
+                ("num", "Objects"),
+                ("num", "Missing"),
+                ("name", "By"),
+                ("text", "Where"),
+                ("text", "Error"),
+            ]),
+            rows: v["backups"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|b| {
+                    let status = b["status"].as_str().unwrap_or_default().to_owned();
+                    let pill = match status.as_str() {
+                        "done" => "fine",
+                        "failed" => "red",
+                        _ => "amber",
+                    };
+                    let at = |k: &str| b[k].as_i64().map_or_else(|| "—".into(), when);
+                    vec![
+                        Cell::new("when", at("startedAt")),
+                        Cell::new("when", at("finishedAt")),
+                        Cell::new("state", status).pill(pill),
+                        Cell::new("num", b["objects"].to_string()),
+                        Cell::new("num", b["missing"].to_string()),
+                        Cell::new("name", b["by"].as_str().unwrap_or_default()),
+                        Cell::new("text", b["dir"].as_str().unwrap_or_default()).code(),
+                        Cell::new("text", b["error"].as_str().unwrap_or_default()),
+                    ]
+                })
+                .collect(),
+            empty: "No backup yet: aurora-locus backup create.".into(),
+        }),
+        Err(e) => p.errors.push(e),
+    }
     p.fields = fields_under(
         &s,
         "blobs",
@@ -1282,42 +1324,65 @@ pub async fn storage(State(s): St, headers: HeaderMap) -> Response {
             "blobs.upload_limit",
         ],
     );
-    web::render(&p, StatusCode::OK)
+    web::render_shell(&p, &p.shell, StatusCode::OK)
 }
 
 // ---------------------------------------------------------------- jobs
 
 /// `GET /admin/jobs`: every job, who runs it now, and how it went.
-pub async fn jobs(State(s): St, headers: HeaderMap) -> Response {
+pub async fn jobs(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery>) -> Response {
     let op = op_or_return!(s, headers);
+    let p = jobs_page(&s, &op, q.done, Vec::new()).await;
+    web::render_shell(&p, &p.shell, StatusCode::OK)
+}
+
+async fn jobs_page(
+    s: &AppState,
+    op: &Op,
+    notice: Option<String>,
+    errors: Vec<String>,
+) -> SectionPage {
     let mut p = section(
-        &s,
-        &op,
+        s,
+        op,
         PageId::Jobs,
-        "Background jobs each run on one node at a time; the node holding a job's lease runs it.",
+        "Background jobs each run on one node at a time; the node holding a job's lease runs it. A paused job stops within seconds and isn't taken up again until it's resumed.",
     )
     .await;
+    p.notice = notice;
+    p.errors = errors;
     let now = locus_core::time::now_ms();
     let leases = s.store.job_leases().await.unwrap_or_default();
     let states = s.store.job_states().await.unwrap_or_default();
+    let controls = s.store.job_controls().await.unwrap_or_default();
+    let can_run = op.role >= Role::Admin;
     let mut names: Vec<String> = states.iter().map(|j| j.name.clone()).collect();
     for (n, _, _) in &leases {
         if !names.contains(n) && !n.starts_with(locus_store::env::CLOCK_SLOT_FAMILY) {
             names.push(n.clone());
         }
     }
+    for (n, _) in &controls {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
     names.sort();
+    let mut job_cols = vec![
+        ("name", "Job"),
+        ("name", "Running on"),
+        ("when", "Last run"),
+        ("when", "Last success"),
+        ("num", "Runs"),
+        ("state", "State"),
+        ("text", "Last error"),
+    ];
+    if can_run {
+        job_cols.extend([("actions", ""), ("actions", "")]);
+    }
     p.tables.push(Table {
         title: "Jobs".into(),
-        cols: cols(&[
-            ("name", "Job"),
-            ("name", "Running on"),
-            ("when", "Last run"),
-            ("when", "Last success"),
-            ("num", "Runs"),
-            ("state", "State"),
-            ("text", "Last error"),
-        ]),
+        cols: cols(&job_cols),
         rows: names
             .into_iter()
             .map(|n| {
@@ -1327,7 +1392,31 @@ pub async fn jobs(State(s): St, headers: HeaderMap) -> Response {
                     .find(|(l, _, exp)| *l == n && *exp > now)
                     .map_or_else(|| "nobody".to_owned(), |(_, h, _)| h.clone());
                 let err = st.and_then(|j| j.last_error.clone());
-                vec![
+                let control = controls
+                    .iter()
+                    .find(|(c, _)| *c == n)
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_default();
+                let (state, pill) = if control.paused {
+                    (
+                        format!(
+                            "paused{}",
+                            control
+                                .paused_by
+                                .as_deref()
+                                .map(|b| format!(" by {b}"))
+                                .unwrap_or_default()
+                        ),
+                        "amber",
+                    )
+                } else if control.run_requested.is_some() {
+                    ("run asked for".to_owned(), "on")
+                } else if err.is_some() {
+                    ("failing".to_owned(), "red")
+                } else {
+                    ("ok".to_owned(), "fine")
+                };
+                let mut row = vec![
                     Cell::new("name", n.clone()),
                     Cell::new("name", holder),
                     Cell::new(
@@ -1341,10 +1430,29 @@ pub async fn jobs(State(s): St, headers: HeaderMap) -> Response {
                             .map_or_else(|| "never".into(), when),
                     ),
                     Cell::new("num", st.map_or(0, |j| j.runs).to_string()),
-                    Cell::new("state", if err.is_some() { "failing" } else { "ok" })
-                        .pill(if err.is_some() { "red" } else { "fine" }),
+                    Cell::new("state", state).pill(pill),
                     Cell::new("text", err.unwrap_or_default()),
-                ]
+                ];
+                if can_run {
+                    if control.paused {
+                        row.push(Cell::new("actions", ""));
+                        row.push(button(
+                            "/admin/jobs/pause",
+                            "Resume",
+                            &[("name", &n), ("paused", "false")],
+                            false,
+                        ));
+                    } else {
+                        row.push(button("/admin/jobs/run", "Run now", &[("name", &n)], false));
+                        row.push(button(
+                            "/admin/jobs/pause",
+                            "Pause",
+                            &[("name", &n), ("paused", "true")],
+                            true,
+                        ));
+                    }
+                }
+                row
             })
             .collect(),
         empty: "No job has run yet.".into(),
@@ -1363,7 +1471,55 @@ pub async fn jobs(State(s): St, headers: HeaderMap) -> Response {
             .collect(),
         empty: "None.".into(),
     });
-    web::render(&p, StatusCode::OK)
+    p
+}
+
+/// `POST /admin/jobs/run` and `/admin/jobs/pause` (admins): through
+/// `admin.jobs.runNow` and `admin.jobs.setPaused`.
+pub async fn job_action(
+    State(s): St,
+    headers: HeaderMap,
+    axum::extract::Path(action): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let (op, form) = match form_op(&s, &headers, &body).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = web::field(&form, "name").to_owned();
+    let paused = web::field(&form, "paused") == "true";
+    let args = Json(input(json!({"name": name, "paused": paused})));
+    let (result, done) = match action.as_str() {
+        "run" => (
+            api(
+                crate::locus_admin::run_job_now(State(Arc::clone(&s)), op.api_headers(), args)
+                    .await,
+            ),
+            format!("{name} runs now."),
+        ),
+        "pause" => (
+            api(
+                crate::locus_admin::set_job_paused(State(Arc::clone(&s)), op.api_headers(), args)
+                    .await,
+            ),
+            if paused {
+                format!("{name} is paused.")
+            } else {
+                format!("{name} is resumed.")
+            },
+        ),
+        _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+    match result {
+        Ok(_) => web::redirect(&format!(
+            "/admin/jobs?done={}",
+            url::form_urlencoded::byte_serialize(done.as_bytes()).collect::<String>()
+        )),
+        Err(e) => {
+            let p = jobs_page(&s, &op, None, vec![e]).await;
+            web::render(&p, StatusCode::BAD_REQUEST)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- shards

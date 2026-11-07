@@ -647,6 +647,7 @@ async fn editor_render(
         ("consent", "OAuth consent"),
         ("sign-up", "Sign-up"),
         ("portal", "Account portal"),
+        ("landing", "Landing page"),
     ] {
         for mode in ["light", "dark"] {
             for (width, device) in [(375, "phone"), (1100, "desktop")] {
@@ -1192,6 +1193,12 @@ pub async fn preview(
             ),
             mode == "dark",
         ),
+        "landing" => {
+            let mut dress = dress_for(&t, css(true), Blurb::None);
+            dress.html_class = format!("mode-{mode}");
+            askama::Template::render(&crate::web::landing(&name, Some(dress), true))
+                .unwrap_or_default()
+        }
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     web::page_csp(

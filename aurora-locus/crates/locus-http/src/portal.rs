@@ -223,6 +223,16 @@ async fn page(s: &AppState, u: &User, id: PageId, intro: &str) -> SectionPage {
             }),
         });
     }
+    if let Some((line, _)) = crate::console_hostname::straggler_notice(s, &u.account.did).await {
+        banners.push(locus_web::view::Banner {
+            bad: true,
+            text: line,
+            link: Some(Link {
+                href: PageId::Identity.href().into(),
+                label: "What to do".into(),
+            }),
+        });
+    }
     let nav = menu::nav(
         &format!("@{}", u.account.handle),
         &u.csrf,
@@ -1327,6 +1337,15 @@ async fn identity_render(
     p.notice = notice;
     p.errors = errors;
     let did = &u.account.did;
+    if let Some((line, fix)) = crate::console_hostname::straggler_notice(s, did).await {
+        p.cards.push(Card {
+            title: "Your PDS moved".into(),
+            facts: vec![
+                Fact::new("What happened", line).class("warn"),
+                Fact::new("What to do", fix),
+            ],
+        });
+    }
     match did_document(s, did).await {
         Some(doc) => {
             p.pre = Some((

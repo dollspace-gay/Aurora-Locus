@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ shell.title }}</h1>
+<div id="live-home" data-live-part>
 {% for a in attention %}<div class="banner{% if a.class == "bad" %} bad{% endif %}"><strong>{{ a.label }}</strong> {{ a.value }}</div>
 {% endfor %}
 <div class="grid">
@@ -23,4 +24,5 @@
 {% else %}<tr><td class="text" colspan="4"><div class="cell-text">No job has run yet.</div></td></tr>
 {% endfor %}</tbody>
 </table></div>
+</div>
 {% endblock %}
