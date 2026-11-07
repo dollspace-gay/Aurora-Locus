@@ -187,8 +187,10 @@ pub fn load_master_key(bootstrap: &Bootstrap, key_store_empty: bool) -> CoreResu
             })?;
             MasterKey::from_hex(&text, SourceKind::Env)
         }
+        // A KMS key is unwrapped through KMS with the store at hand
+        // (`kms_master_key` in the binary), never loaded here.
         MasterKeySource::Kms { .. } => Err(CoreError::Config(
-            "KMS master keys aren't available in this build yet; use a file or env key".into(),
+            "a KMS master key is unwrapped through KMS when the node starts, not loaded from a file or env".into(),
         )),
         // Several nodes share a Postgres install: a key file each node keeps
         // for itself could differ per node, so it must be declared shared.

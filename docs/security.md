@@ -473,8 +473,10 @@ HTML; the live status pages load one script from the same origin. Pages
 with hCaptcha allow hCaptcha's origins and nothing else. The branding
 editor's previews may be framed by the same origin only.
 
-Locus doesn't set `Strict-Transport-Security` itself; set HSTS at your
-proxy once HTTPS works for every name you serve.
+When its public URL is HTTPS, locus sends `Strict-Transport-Security:
+max-age=31536000` on every response (a proxy's own value is kept). It
+leaves out `includeSubDomains`: for a PDS at an apex domain that would force
+HTTPS on unrelated sites under the same domain.
 
 ### Metrics
 
@@ -589,7 +591,16 @@ suffix.
 Blobs are served with the headers in the table above, so a browser won't
 render an uploaded file as a page on your origin. No `Cache-Control` is
 sent by default, because a cached copy would outlive a takedown or account
-deletion. A taken-down blob answers 400 "Blob not found" to every caller.
+deletion. An operator can allow `public, max-age=<n>` on public blobs
+(`blobs.public_cache_max_age_s`), never on gated or private-only ones,
+accepting that copies cached before a takedown aren't purged. A taken-down
+blob answers 400 "Blob not found" to every caller.
+
+A blob response streams for at most `blobs.stream_timeout_ms` (4 minutes by
+default, and never longer than the delete grace of the copy it reads), and a
+`getRepo` CAR for at most `sync.get_repo_timeout_ms` (10 minutes), so a slow
+client can't hold a copy or a database snapshot open indefinitely. A client
+cut off resumes a blob with `Range`.
 
 ### Scanning hook
 
@@ -759,7 +770,7 @@ the lockfile yourself, and watch the repository's security advisories.
       internet.
 - [ ] Keep `strict_sni_host on` in Caddy (every generated Caddyfile has it).
       With another proxy, configure the equivalent check.
-- [ ] Set HSTS at the proxy.
+- [ ] Serve over HTTPS with an `https://` public URL, so locus sends HSTS.
 - [ ] Behind Cloudflare: use Cloudflare mode, "Full (strict)" TLS, and
       bypass the cache for `/xrpc/*`, `/oauth/*`, `/admin/*` and `/blob/*`.
 

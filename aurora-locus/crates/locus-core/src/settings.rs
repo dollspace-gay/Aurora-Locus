@@ -285,6 +285,13 @@ pub static REGISTRY: &[Def] = &[
         description: "DNS servers (IP addresses) tried for _atproto lookups when the system resolver finds nothing.",
     },
     Def {
+        key: "accounts.tombstone_plc_on_delete",
+        kind: Kind::Bool,
+        default: "false",
+        env: None,
+        description: "Tombstone a deleted account's did:plc in the PLC directory, when this PDS holds one of its rotation keys and its document still names this PDS. Off, as the reference: a tombstoned DID can never be used again, not even to migrate back.",
+    },
+    Def {
         key: "accounts.default_did_method",
         kind: Kind::Choice(&["plc", "web"]),
         default: r#""plc""#,
@@ -718,6 +725,36 @@ pub static REGISTRY: &[Def] = &[
         default: "300000",
         env: None,
         description: "How long a replaced or collected copy stays on storage before deletion, so reads in flight finish.",
+    },
+    Def {
+        key: "blobs.stream_timeout_ms",
+        kind: Kind::Int {
+            min: 10_000,
+            max: 3_600_000,
+        },
+        default: "240000",
+        env: None,
+        description: "The longest one blob response may stream, in milliseconds; a client cut off resumes with Range. Kept within blobs.delete_grace_ms (at least 10 s), so no stream outlives the copy it reads.",
+    },
+    Def {
+        key: "blobs.public_cache_max_age_s",
+        kind: Kind::Int {
+            min: 0,
+            max: 7 * 86_400,
+        },
+        default: "0",
+        env: None,
+        description: "Lets caches keep public blobs this many seconds (Cache-Control: public, max-age). 0: no cache header, as the reference. Copies cached before a takedown or deletion aren't purged.",
+    },
+    Def {
+        key: "sync.get_repo_timeout_ms",
+        kind: Kind::Int {
+            min: 10_000,
+            max: 3_600_000,
+        },
+        default: "600000",
+        env: None,
+        description: "The longest one getRepo CAR may stream, in milliseconds, so a slow reader doesn't hold a database snapshot open.",
     },
     Def {
         key: "sync.retention_hours",

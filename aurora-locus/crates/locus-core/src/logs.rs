@@ -3,6 +3,22 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether requests get a tracing span: only while spans are exported
+/// (OTLP), so log lines keep their format otherwise.
+static REQUEST_SPANS: AtomicBool = AtomicBool::new(false);
+
+/// Turns request spans on or off (set once, as logging starts).
+pub fn set_request_spans(on: bool) {
+    REQUEST_SPANS.store(on, Ordering::Relaxed);
+}
+
+/// Whether requests get a tracing span.
+#[must_use]
+pub fn request_spans() -> bool {
+    REQUEST_SPANS.load(Ordering::Relaxed)
+}
 
 pub struct LogRing {
     lines: Mutex<VecDeque<String>>,

@@ -1149,6 +1149,47 @@ async fn a_backup_that_loses_its_lease_mid_copy_is_marked_failed() {
 /// A blob store failure on upload is a 500 with the generic message, as
 /// the reference: the storage error (paths, OS errors) only goes to the log.
 #[tokio::test]
+async fn public_blobs_carry_a_cache_time_only_when_one_is_set() {
+    let h = harness(false).await;
+    let (did, access) = h.user("cal.pds.example.com").await;
+    let (st, _, body) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            b"cacheable image".to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let blob = serde_json::from_slice::<Value>(&body).unwrap()["blob"].clone();
+    h.create_post(&did, &access, post_with(&blob)).await;
+    let cid = blob["ref"]["$link"].as_str().unwrap().to_owned();
+    let path = format!("/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}");
+    // As the reference: no cache header unless the operator allows one.
+    assert_eq!(cache_control(&h, &path).await, None);
+    h.state
+        .settings
+        .set("blobs.public_cache_max_age_s", json!(60), "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        cache_control(&h, &path).await.as_deref(),
+        Some("public, max-age=60")
+    );
+}
+
+/// An unauthenticated GET's `Cache-Control`, if any.
+async fn cache_control(h: &Harness, path: &str) -> Option<String> {
+    let (st, headers, _) = h.raw("GET", path, None, Vec::new(), &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[tokio::test]
 async fn a_blob_store_failure_on_upload_answers_with_the_generic_message() {
     use std::os::unix::fs::PermissionsExt;
     let h = harness(false).await;

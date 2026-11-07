@@ -501,7 +501,12 @@ keys; a delete job removes queued keys after `blobs.delete_grace_ms`
 'none'; sandbox`, `content-disposition: attachment`). Locus adds `Range`
 support and a `/blob/<did>/<cid>` alias. There is no `Cache-Control` by
 default, as in the reference, because a cached copy would outlive a
-takedown.
+takedown; `blobs.public_cache_max_age_s` lets an operator allow a short
+public cache time on public blobs. A response streams for at most
+`blobs.stream_timeout_ms` (default 4 minutes, kept within the delete grace
+of the copy it reads); a client cut off resumes with `Range`. `getRepo`
+streams are capped the same way by `sync.get_repo_timeout_ms` (default 10
+minutes).
 
 Takedowns are checked on every request and apply at once, before the bytes
 have moved to quarantine. A taken-down blob answers "Blob not found" to
@@ -737,7 +742,14 @@ secret: `keys set metrics-token`); off
   an empty install and moves the firehose sequence past anything relays may
   already have seen. On Postgres, operators use point-in-time recovery,
   then `backup post-restore` to reconcile blobs and the firehose sequence.
-- OTLP trace export is planned, not built.
+- OTLP trace export: with `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+  `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) set, a serving node sends a span per
+  request (method, path without the query, status) over OTLP/HTTP (plain
+  HTTP, to a local collector or agent; there's no TLS client for it), named by
+  `OTEL_SERVICE_NAME` (default `aurora-locus`); the other `OTEL_EXPORTER_*`
+  variables (headers, timeout) apply. Spans follow the log level (they're
+  at `info`). Without an endpoint there are no request spans, so log lines
+  keep their format.
 
 ## 12. Differences from the reference PDS
 

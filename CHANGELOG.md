@@ -743,6 +743,28 @@ kryphocron built in.
 
 ### Changed
 
+- HTTPS installs send `Strict-Transport-Security: max-age=31536000` (not
+  including subdomains).
+- OTLP trace export: with `OTEL_EXPORTER_OTLP_ENDPOINT` set, a serving node
+  sends a span per request over OTLP/HTTP, plain HTTP to a local collector
+  or agent (`OTEL_SERVICE_NAME`, default `aurora-locus`).
+- `blobs.public_cache_max_age_s` (default 0: none, as the reference) lets
+  public blobs carry `Cache-Control: public, max-age`; never gated or
+  private-only ones.
+- Blob responses stream for at most `blobs.stream_timeout_ms` (default 4
+  min, within the delete grace), and `getRepo` CARs for at most
+  `sync.get_repo_timeout_ms` (default 10 min); a cut-off stream ends with
+  an error, not a short body.
+- `accounts.tombstone_plc_on_delete` (default off, as the reference):
+  deleting an account tombstones its did:plc, only while its document still
+  names this PDS. The identity repair job no longer counts an account being
+  deleted as live.
+- Accounts export their audiences:
+  `app.nearhorizon.locus.account.exportAudiences` and the portal's Export
+  page (full sessions only).
+- The KMS master-key message no longer says KMS isn't available.
+- CI: format, lint and tests (with Postgres and Redis), and a dependency
+  audit with the advisories that don't apply listed and explained.
 - Suspending an account suspends it: `account suspend <did> --days <n>`
   (or `--until <time>`, with `--note`), the console's Suspend card and
   `moderator.account.suspend` set the `suspended` status until a time (at

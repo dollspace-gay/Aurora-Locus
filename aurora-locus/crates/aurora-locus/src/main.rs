@@ -357,7 +357,7 @@ async fn main() {
         }
         Command::Serve => {
             let bootstrap = bootstrap_or_exit();
-            let log = logging::init(bootstrap.log_format);
+            let log = logging::init_serve(bootstrap.log_format);
             let cancel = CancellationToken::new();
             node::cancel_on_signal(cancel.clone());
             // A node in setup mode starts again once setup completes.
@@ -371,10 +371,12 @@ async fn main() {
                     },
                     Err(e) => {
                         tracing::error!("failed to start: {e}");
+                        log.shutdown();
                         std::process::exit(1);
                     }
                 }
             }
+            log.shutdown();
         }
     }
 }

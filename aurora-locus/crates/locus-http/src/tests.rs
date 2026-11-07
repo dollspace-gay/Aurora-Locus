@@ -1025,6 +1025,66 @@ async fn the_repair_job_tombstones_orphaned_dids_but_never_live_accounts() {
     );
 }
 
+/// `accounts.tombstone_plc_on_delete`: off, a deleted account's DID is left
+/// alone (as the reference); on, it's tombstoned, but never a DID whose
+/// document already names another PDS.
+#[tokio::test]
+async fn deleting_an_account_tombstones_its_did_only_when_chosen() {
+    let h = harness(false).await;
+    let did_of = |v: Value| v["did"].as_str().unwrap().to_owned();
+    let ola = did_of(
+        h.create_account("ola.pds.example.com", "ola@example.com", "pw")
+            .await,
+    );
+    let pia = did_of(
+        h.create_account("pia.pds.example.com", "pia@example.com", "pw")
+            .await,
+    );
+    let qua = did_of(
+        h.create_account("qua.pds.example.com", "qua@example.com", "pw")
+            .await,
+    );
+    let last_type = |did: &str| {
+        h.plc.lock().unwrap().last(did).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let delete = |did: String| {
+        let h = &h;
+        async move {
+            crate::account::start_deletion(&h.state, &did)
+                .await
+                .unwrap();
+            crate::identity::run_identity_repairs(&h.state)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Off (the default): untouched.
+    delete(ola.clone()).await;
+    assert_eq!(last_type(&ola), "plc_operation");
+
+    h.state
+        .settings
+        .set("accounts.tombstone_plc_on_delete", json!(true), "test")
+        .await
+        .unwrap();
+    // On, for a DID that moved to another PDS meanwhile: untouched.
+    {
+        let mut plc = h.plc.lock().unwrap();
+        let op = plc.log.get_mut(&qua).unwrap().last_mut().unwrap();
+        op["services"]["atproto_pds"]["endpoint"] = json!("https://elsewhere.example.com");
+    }
+    delete(qua.clone()).await;
+    assert_eq!(last_type(&qua), "plc_operation");
+    // On, for a DID that names this PDS: tombstoned, while the deletion is
+    // still running.
+    delete(pia.clone()).await;
+    assert_eq!(last_type(&pia), "plc_tombstone");
+}
+
 #[tokio::test]
 async fn did_web_accounts_are_served_here_and_their_hosts_stay_reserved() {
     let h = harness(false).await;
@@ -11124,6 +11184,25 @@ async fn the_account_portal_runs_on_the_account_api() {
             .contains("erin2.pds.example.com.car")
     );
     assert!(!car.is_empty());
+    // The audiences, as a file of their own.
+    let (st, headers, body) = h
+        .raw(
+            "GET",
+            "/account/export/audiences.json",
+            None,
+            vec![],
+            &[("cookie", &cookie)],
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("erin2.pds.example.com-audiences.json")
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["audiences"].is_array(), "{v}");
     let (st, _, page) = b.get(&h, "/account/apps").await;
     assert!(
         st == StatusCode::OK && page.contains("No app is signed in"),
@@ -15266,6 +15345,85 @@ async fn redis_holds_rate_limits_and_replay_windows() {
     let r = call(&other).await;
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers().contains_key("retry-after"));
+}
+
+/// An account exports its own audiences (members included) with a full
+/// session; app passwords, no auth and other accounts get nothing of it.
+#[tokio::test]
+async fn accounts_export_their_own_audiences() {
+    let h = harness(false).await;
+    let (did, access) = h.user("exa.pds.example.com").await;
+    let (_, other) = h.user("oth.pds.example.com").await;
+    let member = format!("did:plc:{}", "m".repeat(24));
+    let uri = h
+        .add_audience_with(&did, "3m6aaaaaaaaaa", "list", &[member.as_str()])
+        .await;
+    let path = format!("/xrpc/{}.account.exportAudiences", locus_core::LOCUS_NS);
+
+    let (st, v) = h.call("GET", &path, Some(&access), None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["did"], json!(did));
+    let a = &v["audiences"][0];
+    assert_eq!(a["uri"], json!(uri));
+    assert_eq!(a["value"]["mode"], "list");
+    assert_eq!(a["value"]["members"], json!([member]));
+    assert!(a["origin"].is_string());
+
+    assert_ne!(h.call("GET", &path, None, None).await.0, StatusCode::OK);
+    let (_, theirs) = h.call("GET", &path, Some(&other), None).await;
+    assert_eq!(theirs["audiences"], json!([]), "{theirs}");
+    // An app-password session can't export them.
+    let (_, ap) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createAppPassword",
+            Some(&access),
+            Some(json!({"name": "bot"})),
+        )
+        .await;
+    let (_, login) = h
+        .call(
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(json!({"identifier": "exa.pds.example.com", "password": ap["password"]})),
+        )
+        .await;
+    let app_access = login["accessJwt"].as_str().unwrap();
+    let (st, v) = h.call("GET", &path, Some(app_access), None).await;
+    assert_ne!(st, StatusCode::OK, "{v}");
+}
+
+/// HSTS on every response of an HTTPS install (not including subdomains);
+/// none when the public URL is plain HTTP.
+#[tokio::test]
+async fn https_installs_send_hsts() {
+    let h = harness(false).await;
+    for path in [
+        "/xrpc/_health",
+        "/xrpc/com.atproto.server.describeServer",
+        "/admin/sign-in",
+    ] {
+        let (_, headers, _) = h
+            .call_from("203.0.113.9", "GET", path, None, None, &[])
+            .await;
+        assert_eq!(
+            headers
+                .get("strict-transport-security")
+                .and_then(|v| v.to_str().ok()),
+            Some("max-age=31536000"),
+            "{path}"
+        );
+    }
+    let plain = harness_build(HarnessOpts {
+        public_url: Some("http://pds.example.com".into()),
+        ..HarnessOpts::default()
+    })
+    .await;
+    let (_, headers, _) = plain
+        .call_from("203.0.113.9", "GET", "/xrpc/_health", None, None, &[])
+        .await;
+    assert!(!headers.contains_key("strict-transport-security"));
 }
 
 #[tokio::test]

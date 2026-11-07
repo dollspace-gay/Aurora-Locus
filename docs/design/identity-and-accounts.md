@@ -104,10 +104,15 @@ inconsistent in that case. The operator can also run
 `aurora-locus repair identity <did>`, which sets the document back to the
 account's handle, this PDS and its signing key in one operation.
 
-**Deletion does not tombstone.** Like the reference, locus does not tombstone
-a PLC DID when its account is deleted; a tombstone would block a later
-migration back. Locus tombstones a DID only when it created the DID for a
-sign-up that then failed (see [Creation](#creation)).
+**Deletion tombstones only if you choose.** By default, like the reference,
+locus does not tombstone a PLC DID when its account is deleted; a tombstone
+would block a later migration back. With `accounts.tombstone_plc_on_delete`
+on, deleting an account queues a tombstone, which the identity repair job
+signs and submits (retrying until PLC answers). It happens only while the
+DID's document still names this PDS and lists one of its rotation keys: a
+DID that moved to another PDS is never tombstoned from here. On a shard the
+entryway decides. Locus also tombstones a DID it created for a sign-up that
+then failed (see [Creation](#creation)).
 
 ### did:web accounts
 

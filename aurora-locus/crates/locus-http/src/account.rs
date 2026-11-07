@@ -328,6 +328,19 @@ pub async fn start_deletion(s: &AppState, did: &str) -> XrpcResult<BulkJob> {
     if let Err(e) = crate::entryway::push_delete(s, did).await {
         tracing::warn!(did, "the shard didn't delete the account: {e:?}");
     }
+    // If the operator chose it, the did:plc is tombstoned too, by the
+    // identity repair job (retried until PLC answers). A shard holds no PLC
+    // rotation key: its entryway decides.
+    if s.snapshot().bool("accounts.tombstone_plc_on_delete")
+        && did.starts_with("did:plc:")
+        && s.role != locus_core::bootstrap::Role::Shard
+        && let Err(e) = s
+            .store
+            .queue_identity_repair(did, locus_store::identity::RepairKind::Tombstone, did)
+            .await
+    {
+        tracing::error!(did, "couldn't queue the DID's tombstone: {e}");
+    }
     Ok(job)
 }
 

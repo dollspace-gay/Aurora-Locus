@@ -510,6 +510,17 @@ pub(crate) async fn plc_tombstone(s: &AppState, did: &str) -> Result<(), PlcStep
     let Some(current) = state else {
         return Ok(());
     };
+    // Only a DID this PDS hosts: one that moved to another PDS (and may
+    // still list this PDS's rotation key) belongs to its new host.
+    let here = current
+        .services
+        .get("atproto_pds")
+        .is_some_and(|p| p.endpoint.trim_end_matches('/') == s.public_url.trim_end_matches('/'));
+    if !here {
+        return Err(PlcStep::Refused(XrpcError::invalid_request(
+            "The DID document names another PDS; this one doesn't tombstone it",
+        )));
+    }
     let signer = s
         .secrets
         .plc_keys
@@ -535,8 +546,13 @@ pub async fn run_identity_repairs(s: &AppState) -> locus_core::CoreResult<usize>
         let outcome = match r.kind {
             RepairKind::Handle => repair_handle(s, &r.did, &r.value).await,
             RepairKind::Tombstone => {
-                // Never tombstone a DID that has an account after all.
-                if s.store.account_by_did(&r.did).await?.is_some() {
+                // Never tombstone a DID that has an account after all (one
+                // being deleted doesn't count).
+                if s.store
+                    .account_by_did(&r.did)
+                    .await?
+                    .is_some_and(|a| a.status != locus_store::accounts::Status::Deleted)
+                {
                     Ok(())
                 } else {
                     plc_tombstone(s, &r.did).await

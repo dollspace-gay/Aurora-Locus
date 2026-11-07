@@ -1005,3 +1005,15 @@ In Docker, read the logs with `docker compose logs -f locus`; with systemd,
 `journalctl -u aurora-locus -f`. Changes made through the console, the CLI
 or env are also recorded in the audit log, which the console filters and
 exports.
+
+### Traces
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (for example
+`http://127.0.0.1:4318`) and a serving node exports a span per request
+(method, path without the query, status) over OTLP/HTTP to that collector
+or agent. `OTEL_SERVICE_NAME` names the service (default `aurora-locus`);
+`OTEL_EXPORTER_OTLP_HEADERS` and the other standard `OTEL_EXPORTER_*`
+variables apply. The endpoint is plain HTTP: run a collector next to the
+node and let it forward over TLS. Spans are at `info`, so they follow
+`log.level`. Without an endpoint there are no request spans and nothing is
+exported.

@@ -19,6 +19,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use locus_identity::handle;
+use tracing::Instrument;
 
 use crate::identity::request_host;
 use crate::state::AppState;
@@ -252,13 +253,28 @@ pub async fn headers_and_deadline(
         method: req.method().clone(),
         uri: req.uri().clone(),
     };
+    // A span per request while spans are exported (OTLP): the method, the
+    // path without its query, and the status.
+    let span = if locus_core::logs::request_spans() {
+        tracing::info_span!(
+            "request",
+            http.request.method = %req.method(),
+            url.path = %path,
+            http.response.status_code = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
     let mut res = if streaming(&path) {
-        REQUEST.scope(info, next.run(req)).await
+        REQUEST
+            .scope(info, next.run(req))
+            .instrument(span.clone())
+            .await
     } else {
         let ms = u64::try_from(s.snapshot().int("http.request_deadline_ms")).unwrap_or(60_000);
         match tokio::time::timeout(
             std::time::Duration::from_millis(ms),
-            REQUEST.scope(info, next.run(req)),
+            REQUEST.scope(info, next.run(req)).instrument(span.clone()),
         )
         .await
         {
@@ -277,6 +293,7 @@ pub async fn headers_and_deadline(
             }
         }
     };
+    span.record("http.response.status_code", res.status().as_u16());
     if dpop {
         // A fresh nonce on every OAuth-authenticated response (RFC 9449 §8.2).
         crate::oauth::add_nonce(&s, res.headers_mut());
@@ -286,6 +303,15 @@ pub async fn headers_and_deadline(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
     );
+    // Served over HTTPS (whatever the hop from the proxy): browsers stay
+    // on HTTPS for a year. Not `includeSubDomains`: a PDS at an apex
+    // domain would force it on unrelated sites under that domain.
+    if s.public_url.starts_with("https://") && !h.contains_key(header::STRICT_TRANSPORT_SECURITY) {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     if authed {
         if !h.contains_key(header::CACHE_CONTROL) {
             h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));

@@ -1055,7 +1055,16 @@ async fn serve_blob(
     if row.takedown_ref.is_some() || row.state == "quarantined" {
         return Err(not_found());
     }
-    let gated = gate && s.store.blob_private_only(did, cid).await?;
+    let snap = s.snapshot();
+    let public_max_age = snap.int("blobs.public_cache_max_age_s");
+    // Private-only: referenced only by private-tier records (asked only
+    // when the gate or a public cache time needs it).
+    let private_only = if gate || public_max_age > 0 {
+        s.store.blob_private_only(did, cid).await?
+    } else {
+        false
+    };
+    let gated = gate && private_only;
     if gated && !owner {
         let reader = crate::media_gate::reader(s, headers, "com.atproto.sync.getBlob").await;
         if !crate::media_gate::may_read(s, &reader, did, cid).await? {
@@ -1085,7 +1094,16 @@ async fn serve_blob(
             reader.len
         )));
     }
-    let mut res = Response::new(Body::from_stream(reader.body));
+    // No stream outlives the delete grace of the copy it reads (at least
+    // 10 s); a client cut off resumes with Range.
+    let limit_ms = snap
+        .int("blobs.stream_timeout_ms")
+        .min(snap.int("blobs.delete_grace_ms").max(10_000));
+    let limit = std::time::Duration::from_millis(u64::try_from(limit_ms).unwrap_or(240_000));
+    let mut res = Response::new(Body::from_stream(crate::deadline::capped(
+        reader.body,
+        limit,
+    )));
     *res.status_mut() = if partial {
         StatusCode::PARTIAL_CONTENT
     } else {
@@ -1116,6 +1134,12 @@ async fn serve_blob(
     }
     if gated {
         res.extensions_mut().insert(GatedBlob);
+    } else if public_max_age > 0 && !private_only {
+        // Only what anyone may fetch; never a blob only private posts use.
+        h.insert(
+            header::CACHE_CONTROL,
+            hv(&format!("public, max-age={public_max_age}")),
+        );
     }
     Ok(res.into_response())
 }

@@ -40,6 +40,13 @@ sqlx.workspace = true
 serde_json.workspace = true
 rpassword.workspace = true
 url.workspace = true
+# Optional OTLP trace export (when OTEL_EXPORTER_OTLP_ENDPOINT is set), over
+# plain HTTP to a local collector or agent. No TLS feature: it would bring a
+# second rustls crypto provider, and rustls then can't pick a default.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

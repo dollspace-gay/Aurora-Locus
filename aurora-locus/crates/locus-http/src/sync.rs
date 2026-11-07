@@ -269,7 +269,13 @@ fn repo_car(s: &AppState, did: String, root: Cid, since: Option<String>) -> Resp
             }
         }
     });
-    car_response(Body::from_stream(head.chain(pages)))
+    let limit = std::time::Duration::from_millis(
+        u64::try_from(s.snapshot().int("sync.get_repo_timeout_ms")).unwrap_or(600_000),
+    );
+    car_response(Body::from_stream(crate::deadline::capped(
+        head.chain(pages),
+        limit,
+    )))
 }
 
 #[derive(Deserialize)]

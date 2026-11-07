@@ -1233,6 +1233,58 @@ use axum::http::HeaderMap;
 
 type St = State<std::sync::Arc<AppState>>;
 
+/// `app.nearhorizon.locus.account.exportAudiences`: the caller's audiences
+/// from the private audience store, for moving to another host (audiences
+/// aren't in the repo CAR). `origin` is `local` for an audience made here
+/// during a private AppView outage and not yet created there: the new host
+/// has to re-create it. `aliases` maps local URIs to the ones they became,
+/// since posts may still name the old ones. A full session or an OAuth grant
+/// for this method; never an app password (it shows who is in each
+/// audience).
+pub async fn export_audiences(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    let pds = format!("{}#atproto_pds", s.service_did);
+    let authed = crate::auth::authorization(&s, &headers, crate::auth::FULL, &[], |p| {
+        Ok(p.assert_rpc(locus_core::locus_nsid!("account.exportAudiences"), &pds)?)
+    })
+    .await?;
+    let did = &authed.did;
+    let uri = |rkey: &str| format!("at://{did}/{}/{rkey}", locus_kryphocron::nsid::AUDIENCE);
+    let audiences: Vec<Value> = s
+        .store
+        .kr_audiences(did)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let members: Value =
+                serde_json::from_str(&r.members_json).unwrap_or_else(|_| json!([]));
+            let mut value = json!({
+                "$type": locus_kryphocron::nsid::AUDIENCE,
+                "mode": r.mode,
+                "members": members,
+                "createdAt": r.created_at,
+                "updatedAt": r.updated_at,
+            });
+            if let Some(name) = &r.name {
+                value["name"] = json!(name);
+            }
+            json!({"uri": uri(&r.rkey), "origin": r.origin, "value": value})
+        })
+        .collect();
+    let aliases: Vec<Value> = s
+        .store
+        .audience_aliases(did)
+        .await?
+        .into_iter()
+        .map(|(local, current)| json!({"from": uri(&local), "to": uri(&current)}))
+        .collect();
+    Ok(Json(json!({
+        "did": did,
+        "exportedAt": locus_core::time::iso8601(locus_core::time::now_ms()),
+        "audiences": audiences,
+        "aliases": aliases,
+    })))
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManageAudienceInput {

@@ -55,6 +55,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/account/apps/revoke", post(app_revoke))
         .route("/account/export", get(export_page))
         .route("/account/export/repo.car", get(export_repo))
+        .route("/account/export/audiences.json", get(export_audiences))
         .route("/account/identity", get(identity_page))
         .route("/account/identity/{action}", post(identity_action))
         .route("/account/moving", get(moving_page))
@@ -1295,7 +1296,41 @@ pub async fn export_page(State(s): St, headers: HeaderMap) -> Response {
         button: "Download".into(),
         danger: false,
     });
+    p.forms.push(Form {
+        title: "Your audiences".into(),
+        text: "Who you share private posts with. They aren't in the repository, so they don't move with it: take this file to your new server. Audiences marked local were made here while the private AppView was down, and your new server has to create them again.".into(),
+        action: "/account/export/audiences.json".into(),
+        get: true,
+        inputs: Vec::new(),
+        hidden: Vec::new(),
+        button: "Download".into(),
+        danger: false,
+    });
     web::render(&p, StatusCode::OK)
+}
+
+/// `GET /account/export/audiences.json`.
+pub async fn export_audiences(State(s): St, headers: HeaderMap) -> Response {
+    let u = match require_user(&s, &headers, "/account/export").await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match crate::audience::export_audiences(State(Arc::clone(&s)), u.bearer(&s)).await {
+        Ok(json) => {
+            let mut res = json.into_response();
+            let name = format!(
+                "attachment; filename=\"{}-audiences.json\"",
+                u.account.handle
+            );
+            if let Ok(v) = HeaderValue::from_str(&name) {
+                res.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+            }
+            res.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 /// `GET /account/export/repo.car`.

@@ -510,6 +510,16 @@ discarded. Posts naming those audiences fall back to owner only.
   migration. With the same private AppView on both hosts, nothing needs
   moving: the new host's copy fills from it. Local audiences not yet created
   on the private AppView, and local URI mappings, stay on the old host.
+- **Export.** An account downloads its audiences as JSON from the account
+  portal's Export page, or with
+  `app.nearhorizon.locus.account.exportAudiences` (a full session or an
+  OAuth grant for that method; app passwords can't, since the file shows
+  who is in each audience). Each entry has the audience's URI and value
+  (name, mode, members, dates) and its `origin`: `local` marks one made
+  during an outage and not yet on the private AppView, which the new host
+  has to create again. `aliases` lists local URIs and the ones they became,
+  since posts may still name the old ones. Importing the file on another
+  host is up to that host.
 
 ## Audit
 

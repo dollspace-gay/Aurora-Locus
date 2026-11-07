@@ -18,6 +18,7 @@ pub mod console_hostname;
 pub mod console_live;
 pub mod console_people;
 pub mod console_sections;
+pub mod deadline;
 pub mod email;
 pub mod entryway;
 pub mod error;
@@ -204,6 +205,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             concat!("/xrpc/", locus_core::locus_nsid!("account.getImportStatus")),
             get(import::get_import_status),
+        )
+        .route(
+            concat!("/xrpc/", locus_core::locus_nsid!("account.exportAudiences")),
+            get(audience::export_audiences),
         )
         .route(
             "/xrpc/tools.kryphocron.feed.createPostPrivate",
