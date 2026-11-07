@@ -1336,7 +1336,12 @@ pub async fn jobs(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery>) 
     web::render_shell(&p, &p.shell, StatusCode::OK)
 }
 
-async fn jobs_page(s: &AppState, op: &Op, notice: Option<String>, errors: Vec<String>) -> SectionPage {
+async fn jobs_page(
+    s: &AppState,
+    op: &Op,
+    notice: Option<String>,
+    errors: Vec<String>,
+) -> SectionPage {
     let mut p = section(
         s,
         op,
@@ -1486,7 +1491,10 @@ pub async fn job_action(
     let args = Json(input(json!({"name": name, "paused": paused})));
     let (result, done) = match action.as_str() {
         "run" => (
-            api(crate::locus_admin::run_job_now(State(Arc::clone(&s)), op.api_headers(), args).await),
+            api(
+                crate::locus_admin::run_job_now(State(Arc::clone(&s)), op.api_headers(), args)
+                    .await,
+            ),
             format!("{name} runs now."),
         ),
         "pause" => (

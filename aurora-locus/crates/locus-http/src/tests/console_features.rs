@@ -128,29 +128,59 @@ async fn the_hostname_wizard_prepares_checks_confirms_and_cancels() {
         .await;
     assert_eq!(st, StatusCode::SEE_OTHER);
     assert_eq!(headers["location"], "/admin/hostname?done=prepared&check=1");
-    let m = h.state.store.open_hostname_migration().await.unwrap().unwrap();
+    let m = h
+        .state
+        .store
+        .open_hostname_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((m.state.as_str(), m.new_host.as_str()), ("prepared", new));
     assert!(audited(&h, "hostname.prepare", "operator:olga").await);
     h.reload_hosts().await;
-    let (st, _, page) = owner
-        .get(&h, "/admin/hostname?done=prepared&check=1")
-        .await;
+    let (st, _, page) = owner.get(&h, "/admin/hostname?done=prepared&check=1").await;
     assert_eq!(st, StatusCode::OK, "{page}");
     // No HTTPS in tests: that pre-check fails, so no certificate yet and
     // confirming isn't offered; /tls-check approves the candidate.
-    assert!(page.contains("Pre-checks") && page.contains("fails"), "{page}");
-    assert!(page.contains("Certificate") && page.contains("not yet"), "{page}");
-    assert!(page.contains("approves it"), "{page}");
+    assert!(
+        page.contains("Pre-checks") && page.contains("fails"),
+        "{page}"
+    );
+    assert!(
+        page.contains("Certificate") && page.contains("not yet"),
+        "{page}"
+    );
+    assert!(
+        page.contains(r#"<span class="l">/tls-check</span><span class="v ok">approves it</span>"#),
+        "{page}"
+    );
     assert!(
         !page.contains("Confirm the migration") && page.contains("Confirming opens once"),
         "{page}"
     );
     assert!(page.contains("Cancel the candidate"), "{page}");
-    let stored = h.state.store.open_hostname_migration().await.unwrap().unwrap();
+    let stored = h
+        .state
+        .store
+        .open_hostname_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         stored.prechecks.unwrap().contains("tls-check"),
         "the check ran through the API and was kept"
     );
+    // A plain view shows the kept results (the HTTPS check can take
+    // seconds); "Check now" runs them again.
+    h.state
+        .store
+        .set_hostname_prechecks(&stored.id, r#"[["a kept check",true,""]]"#)
+        .await
+        .unwrap();
+    let (_, _, page) = owner.get(&h, "/admin/hostname").await;
+    assert!(page.contains("a kept check"), "{page}");
+    let (_, _, page) = owner.get(&h, "/admin/hostname?check=1").await;
+    assert!(!page.contains("a kept check"), "{page}");
     // The viewer sees the checks but no actions.
     let (_, _, page) = viewer.get(&h, "/admin/hostname").await;
     assert!(
@@ -237,7 +267,13 @@ async fn the_hostname_wizard_prepares_checks_confirms_and_cancels() {
         st == StatusCode::BAD_REQUEST && page.contains("pre-check"),
         "{page}"
     );
-    let m = h.state.store.open_hostname_migration().await.unwrap().unwrap();
+    let m = h
+        .state
+        .store
+        .open_hostname_migration()
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(m.state, "prepared");
     assert!(!audited(&h, "hostname.confirm", "operator:olga").await);
 
@@ -246,13 +282,27 @@ async fn the_hostname_wizard_prepares_checks_confirms_and_cancels() {
         .post(&h, "/admin/hostname/cancel", &[("csrf", &admin_csrf)])
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    assert!(h.state.store.open_hostname_migration().await.unwrap().is_some());
+    assert!(
+        h.state
+            .store
+            .open_hostname_migration()
+            .await
+            .unwrap()
+            .is_some()
+    );
     let (st, headers, _) = owner
         .post(&h, "/admin/hostname/cancel", &[("csrf", &csrf)])
         .await;
     assert_eq!(st, StatusCode::SEE_OTHER);
     assert_eq!(headers["location"], "/admin/hostname?done=cancelled");
-    assert!(h.state.store.open_hostname_migration().await.unwrap().is_none());
+    assert!(
+        h.state
+            .store
+            .open_hostname_migration()
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(audited(&h, "hostname.cancel", "operator:olga").await);
     let (_, _, page) = owner.get(&h, "/admin").await;
     assert!(!page.contains("is prepared"), "{page}");
@@ -298,7 +348,21 @@ async fn a_running_hostname_migration_shows_progress_stragglers_and_closes() {
         "{page}"
     );
     assert!(page.contains(&stuck) && page.contains("lists none of the keys"));
-    assert!(!page.contains(&format!(">{moved}<")), "a moved account isn't listed");
+    // The job's progress, counted by the API.
+    assert!(
+        page.contains(r#"<span class="l">Accounts moved</span><span class="v">1</span>"#),
+        "{page}"
+    );
+    assert!(
+        page.contains(
+            r#"<span class="l">Accounts it can&#x27;t move</span><span class="v warn">1</span>"#
+        ),
+        "{page}"
+    );
+    assert!(
+        !page.contains(&format!(">{moved}<")),
+        "a moved account isn't listed"
+    );
     assert!(page.contains(&format!("Accounts still pointing at {old} (1)")));
     // Running, the page is live: its script and stream, under a CSP that
     // allows only them.
@@ -486,7 +550,10 @@ async fn status_pages_refresh_over_server_sent_events() {
     ] {
         let (st, headers, page) = viewer.get(&h, path).await;
         assert_eq!(st, StatusCode::OK, "{path}: {page}");
-        assert!(page.contains(&format!(r#"data-live="{src}""#)), "{path}: {page}");
+        assert!(
+            page.contains(&format!(r#"data-live="{src}""#)),
+            "{path}: {page}"
+        );
         assert!(page.contains("data-live-part"), "{path}");
         assert_eq!(
             csp(&headers),
@@ -496,7 +563,10 @@ async fn status_pages_refresh_over_server_sent_events() {
     }
     for path in ["/admin/settings", "/admin/audit", "/admin/import"] {
         let (_, headers, page) = viewer.get(&h, path).await;
-        assert!(!page.contains("<script") && !page.contains("data-live="), "{path}");
+        assert!(
+            !page.contains("<script") && !page.contains("data-live="),
+            "{path}"
+        );
         assert_eq!(csp(&headers), locus_web::assets::CSP, "{path}");
     }
     let js = locus_web::assets::JS_HREF.clone();
@@ -540,9 +610,7 @@ async fn status_pages_refresh_over_server_sent_events() {
     // Signing out ends it.
     let (_, _, page) = viewer.get(&h, "/admin/jobs").await;
     let csrf = hidden(&page, "csrf");
-    viewer
-        .post(&h, "/admin/sign-out", &[("csrf", &csrf)])
-        .await;
+    viewer.post(&h, "/admin/sign-out", &[("csrf", &csrf)]).await;
     until(&mut body, "event: end", 3).await;
     assert_eq!(chunk(&mut body, Duration::from_secs(2)).await, Ok(None));
 
@@ -599,7 +667,11 @@ async fn jobs_run_now_and_pause_go_through_the_admin_api() {
         .post(
             &h,
             "/admin/jobs/pause",
-            &[("csrf", "forged"), ("name", "gc-blocks"), ("paused", "true")],
+            &[
+                ("csrf", "forged"),
+                ("name", "gc-blocks"),
+                ("paused", "true"),
+            ],
         )
         .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -632,7 +704,11 @@ async fn jobs_run_now_and_pause_go_through_the_admin_api() {
     );
     // A paused job can't be run now (the API says so).
     let (st, _, page) = admin
-        .post(&h, "/admin/jobs/run", &[("csrf", &csrf), ("name", "gc-blocks")])
+        .post(
+            &h,
+            "/admin/jobs/run",
+            &[("csrf", &csrf), ("name", "gc-blocks")],
+        )
         .await;
     assert!(
         st == StatusCode::BAD_REQUEST && page.contains("resume it first"),
@@ -648,7 +724,11 @@ async fn jobs_run_now_and_pause_go_through_the_admin_api() {
         .await;
     assert!(!h.state.store.job_control("gc-blocks").await.unwrap().paused);
     let (st, _, _) = admin
-        .post(&h, "/admin/jobs/run", &[("csrf", &csrf), ("name", "gc-blocks")])
+        .post(
+            &h,
+            "/admin/jobs/run",
+            &[("csrf", &csrf), ("name", "gc-blocks")],
+        )
         .await;
     assert_eq!(st, StatusCode::SEE_OTHER);
     assert!(
@@ -680,7 +760,9 @@ async fn the_console_shows_the_reference_import_report() {
 
     // An import's report: counts, and what it skipped (shown escaped, and
     // bounded).
-    let mut skipped: Vec<String> = (0..1004).map(|i| format!("did:plc:x{i}: no repo")).collect();
+    let mut skipped: Vec<String> = (0..1004)
+        .map(|i| format!("did:plc:x{i}: no repo"))
+        .collect();
     skipped.insert(0, "env value: PDS_<b>ODD</b>".into());
     let report = json!({"counts": {"repos": 2, "records": 17, "blobs": 3}, "skipped": skipped});
     let mut tx = h.state.store.begin().await.unwrap();
@@ -735,7 +817,11 @@ async fn the_landing_page_wears_the_published_theme() {
     );
     let (st, _, body) = h.raw("GET", "/robots.txt", None, vec![], &[]).await;
     assert_eq!(st, StatusCode::OK);
-    assert!(String::from_utf8(body).unwrap().contains("User-agent: *\nAllow: /"));
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("User-agent: *\nAllow: /")
+    );
 
     // On: a page, strict CSP, no theme yet.
     h.state
@@ -756,7 +842,8 @@ async fn the_landing_page_wears_the_published_theme() {
 
     // Publish a theme: the landing page gets all of it (the full stylesheet
     // with its custom CSS, the name, footer and links), as the portal does.
-    h.console_operator("ada", "admin", "an admin password").await;
+    h.console_operator("ada", "admin", "an admin password")
+        .await;
     let b = Browser::default();
     h.console_sign_in(&b, "ada", "an admin password").await;
     let (_, headers, editor) = b.get(&h, "/admin/branding").await;
@@ -809,8 +896,7 @@ async fn the_landing_page_wears_the_published_theme() {
     let (_, headers, body) = h.raw("GET", "/", None, vec![], &[]).await;
     let page = String::from_utf8(body).unwrap();
     assert!(
-        page.contains(&format!("/branding/theme/{v}/full.css"))
-            && !page.contains("vars.css"),
+        page.contains(&format!("/branding/theme/{v}/full.css")) && !page.contains("vars.css"),
         "{page}"
     );
     assert!(
@@ -822,7 +908,13 @@ async fn the_landing_page_wears_the_published_theme() {
     assert!(!page.contains("<script"), "{page}");
     assert_eq!(csp(&headers), locus_web::assets::CSP, "still strict");
     let (_, _, css) = h
-        .raw("GET", &format!("/branding/theme/{v}/full.css"), None, vec![], &[])
+        .raw(
+            "GET",
+            &format!("/branding/theme/{v}/full.css"),
+            None,
+            vec![],
+            &[],
+        )
         .await;
     assert!(String::from_utf8(css).unwrap().contains("border-width"));
 }

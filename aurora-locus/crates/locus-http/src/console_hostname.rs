@@ -268,7 +268,9 @@ fn prepared(p: &mut SectionPage, v: &Value, m: &Value, owner: bool) {
                 None => Fact::new("Certificate", "not checked yet").class("warn"),
             },
             match tls {
-                Some(c) if c["ok"] == json!(true) => Fact::new("/tls-check", "approves it").class("ok"),
+                Some(c) if c["ok"] == json!(true) => {
+                    Fact::new("/tls-check", "approves it").class("ok")
+                }
                 Some(_) => Fact::new("/tls-check", "doesn't approve it yet").class("warn"),
                 None => Fact::new("/tls-check", "not checked yet").class("warn"),
             },
@@ -283,8 +285,11 @@ fn prepared(p: &mut SectionPage, v: &Value, m: &Value, owner: bool) {
                 let ok = c["ok"] == json!(true);
                 vec![
                     Cell::new("name", c["check"].as_str().unwrap_or_default()),
-                    Cell::new("state", if ok { "passes" } else { "fails" })
-                        .pill(if ok { "fine" } else { "red" }),
+                    Cell::new("state", if ok { "passes" } else { "fails" }).pill(if ok {
+                        "fine"
+                    } else {
+                        "red"
+                    }),
                     Cell::new("text", c["why"].as_str().unwrap_or_default()),
                 ]
             })
@@ -307,7 +312,8 @@ fn prepared(p: &mut SectionPage, v: &Value, m: &Value, owner: bool) {
     if all_pass {
         p.forms.push(Form {
             title: "3. Confirm".into(),
-            text: "Every OAuth session must sign in again; the next page says what else changes.".into(),
+            text: "Every OAuth session must sign in again; the next page says what else changes."
+                .into(),
             action: CONFIRM_PATH.into(),
             get: true,
             inputs: Vec::new(),
@@ -353,8 +359,11 @@ fn running(p: &mut SectionPage, m: &Value, owner: bool, now: i64) {
             Fact::new("Accounts moved", n("moved").to_string()),
             Fact::new("Accounts it can't move", n("cannot").to_string())
                 .class(if n("cannot") > 0 { "warn" } else { "" }),
-            Fact::new("Moves that failed", n("failed").to_string())
-                .class(if n("failed") > 0 { "bad" } else { "" }),
+            Fact::new("Moves that failed", n("failed").to_string()).class(if n("failed") > 0 {
+                "bad"
+            } else {
+                ""
+            }),
             Fact::new("Window ends", at(&m["windowEndsAt"])),
         ],
     });
@@ -371,9 +380,8 @@ fn running(p: &mut SectionPage, m: &Value, owner: bool, now: i64) {
             true,
         ));
     } else {
-        p.intro.push_str(
-            " A migration can be closed once its job is done and its window has ended.",
-        );
+        p.intro
+            .push_str(" A migration can be closed once its job is done and its window has ended.");
     }
 }
 
@@ -421,14 +429,12 @@ pub async fn prepare(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
         Ok(v) => v,
         Err(r) => return r,
     };
-    let r = api(
-        crate::hostnames::prepare(
-            State(Arc::clone(&s)),
-            op.api_headers(),
-            Json(input(json!({"host": web::field(&form, "host")}))),
-        )
-        .await,
-    );
+    let r = api(crate::hostnames::prepare(
+        State(Arc::clone(&s)),
+        op.api_headers(),
+        Json(input(json!({"host": web::field(&form, "host")}))),
+    )
+    .await);
     match r {
         Ok(_) => web::redirect("/admin/hostname?done=prepared&check=1"),
         Err(e) => redirect_or(&s, &op, Err(e), "").await,
@@ -454,7 +460,8 @@ async fn confirm_render(
             what: format!(
                 "{host} becomes the hostname now, and the service DID did:web:{host}. Every OAuth session must sign in again. A job moves every did:plc account's PDS endpoint and every hosted did:web document's; accounts it can't move are listed here and in their account portal. {old} keeps full service while any DID document names it."
             ),
-            undo: "This isn't reversible in practice once tokens and PLC operations have moved.".into(),
+            undo: "This isn't reversible in practice once tokens and PLC operations have moved."
+                .into(),
             action: CONFIRM_PATH.into(),
             back: PageId::Hostname.href().into(),
             hidden: Vec::<Hidden>::new(),
@@ -519,10 +526,13 @@ pub async fn confirm(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
         )
         .await;
     }
-    match api(
-        crate::hostnames::confirm(State(Arc::clone(&s)), op.api_headers(), Json(input(json!({}))))
-            .await,
-    ) {
+    match api(crate::hostnames::confirm(
+        State(Arc::clone(&s)),
+        op.api_headers(),
+        Json(input(json!({}))),
+    )
+    .await)
+    {
         Ok(_) => web::redirect("/admin/hostname?done=confirmed"),
         Err(e) => confirm_render(&s, &op, &host, &old, Some(e), StatusCode::BAD_REQUEST).await,
     }
@@ -657,15 +667,16 @@ pub async fn import_report(State(s): St, headers: HeaderMap) -> Response {
         "What `aurora-locus import reference-pds` brought over from a reference PDS installation, and anything it skipped.",
     )
     .await;
-    let v = match api(
-        crate::locus_admin::get_reference_import(State(Arc::clone(&s)), op.api_headers()).await,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            p.errors.push(e);
-            return web::render(&p, StatusCode::OK);
-        }
-    };
+    let v =
+        match api(
+            crate::locus_admin::get_reference_import(State(Arc::clone(&s)), op.api_headers()).await,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                p.errors.push(e);
+                return web::render(&p, StatusCode::OK);
+            }
+        };
     if v["imported"] != json!(true) {
         p.cards.push(Card {
             title: "Import".into(),
@@ -691,7 +702,12 @@ pub async fn import_report(State(s): St, headers: HeaderMap) -> Response {
             .as_object()
             .into_iter()
             .flatten()
-            .map(|(k, n)| vec![Cell::new("name", k.clone()), Cell::new("num", n.to_string())])
+            .map(|(k, n)| {
+                vec![
+                    Cell::new("name", k.clone()),
+                    Cell::new("num", n.to_string()),
+                ]
+            })
             .collect(),
         empty: "Nothing was counted.".into(),
     });

@@ -692,6 +692,31 @@ kryphocron built in.
   `conformance/allowlist.json`.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
+- A hostname-migration wizard in the console (owners): prepare a
+  candidate, its pre-checks and certificate state, confirm (freshly
+  confirmed, typing the new name), the job's progress and stragglers,
+  cancel, and close after the window, through the same admin methods as
+  `aurora-locus migrate hostname`. The console warns while a migration is
+  prepared or running and while accounts still point at an old host; the
+  account portal tells such an account what to do.
+- `viewer.hostname.status` reports each migration's progress and
+  straggler count, and with `checks=false` a prepared candidate's last
+  pre-check results instead of running them; the pre-checks include
+  `/tls-check` approving the candidate.
+- The console's status pages (Home, Services, Hostname, Storage, Jobs)
+  refresh live over server-sent events (`/admin/live`): signed in like the
+  console, bounded per sign-in and per node, with keepalives and a maximum
+  lifetime. The pages still work without JavaScript; the one script is
+  served from this site and only these pages' CSP allows it.
+- Jobs "Run now", "Pause" and "Resume" buttons in the console (admins),
+  through `admin.jobs.runNow` and `admin.jobs.setPaused`; the Storage page
+  lists backups.
+- The reference-import report in the console (counts and what was
+  skipped), from the new `viewer.getReferenceImport`.
+- `/` answers with the reference's plain banner, or with
+  `server.landing_page` on a landing page in the published theme (custom
+  CSS and uploaded fonts included, as on the portal), previewed in the
+  branding editor; `/robots.txt` as the reference.
 
 ### Changed
 

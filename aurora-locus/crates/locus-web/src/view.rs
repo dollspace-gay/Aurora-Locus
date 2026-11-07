@@ -348,10 +348,7 @@ mod tests {
             let mut text = std::fs::read_to_string(&path).unwrap();
             // The one script tag allowed: the bundled script, by its path,
             // with nothing inline.
-            text = text.replace(
-                r#"<script src="{{ shell.js() }}" defer></script>"#,
-                "",
-            );
+            text = text.replace(r#"<script src="{{ shell.js() }}" defer></script>"#, "");
             for bad in [
                 "style=",
                 "<style",

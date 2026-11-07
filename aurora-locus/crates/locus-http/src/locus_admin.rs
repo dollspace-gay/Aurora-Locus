@@ -59,10 +59,7 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("viewer.getSettings"), get(get_settings))
         .route(at!("viewer.getAuditLog"), get(get_audit_log))
         .route(at!("viewer.listJobs"), get(list_jobs))
-        .route(
-            at!("viewer.getReferenceImport"),
-            get(get_reference_import),
-        )
+        .route(at!("viewer.getReferenceImport"), get(get_reference_import))
         .route(
             at!("viewer.account.getImportStatus"),
             get(get_import_status),

@@ -50,7 +50,9 @@ struct Slot(String);
 
 impl Slot {
     fn take(key: &str) -> Option<Self> {
-        let mut open = OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut open = OPEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mine = open.0.get(key).copied().unwrap_or(0);
         if mine >= PER_SESSION || open.1 >= PER_NODE {
             return None;
@@ -63,7 +65,9 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut open = OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut open = OPEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(n) = open.0.get_mut(&self.0) {
             *n -= 1;
             if *n == 0 {
@@ -92,9 +96,7 @@ async fn digest(s: &Arc<AppState>, headers: &HeaderMap, page: PageId) -> Option<
         PageId::Services => {
             crate::console_sections::services(st, h, Query(Default::default())).await
         }
-        PageId::Hostname => {
-            crate::console_hostname::page(st, h, Query(Default::default())).await
-        }
+        PageId::Hostname => crate::console_hostname::page(st, h, Query(Default::default())).await,
         _ => return None,
     };
     if res.status() != StatusCode::OK {
@@ -141,7 +143,10 @@ async fn next(mut st: Stream) -> Option<(Result<Bytes, Infallible>, Stream)> {
         }
         let Some(d) = digest(&st.s, &st.headers, st.page).await else {
             st.done = true;
-            return Some((Ok(Bytes::from_static(b"event: end\ndata: signed-out\n\n")), st));
+            return Some((
+                Ok(Bytes::from_static(b"event: end\ndata: signed-out\n\n")),
+                st,
+            ));
         };
         if d != st.last {
             st.last.clone_from(&d);

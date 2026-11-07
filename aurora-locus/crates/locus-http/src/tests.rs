@@ -10317,11 +10317,13 @@ async fn every_console_page_renders_for_each_role_under_the_csp() {
                 continue;
             }
             assert_eq!(st, StatusCode::OK, "{who} {}: {body}", page.href);
-            // The base policy; the branding editor adds frame-src 'self' for its previews.
+            // The base policy; the branding editor adds frame-src 'self' for
+            // its previews, and live status pages their one script.
             let csp = headers["content-security-policy"].to_str().unwrap();
             assert!(
                 csp == locus_web::assets::CSP
-                    || csp == format!("{}; frame-src 'self'", locus_web::assets::CSP),
+                    || csp == format!("{}; frame-src 'self'", locus_web::assets::CSP)
+                    || (page.id.live() && csp == locus_web::assets::CSP_LIVE),
                 "{}: {csp}",
                 page.href
             );
