@@ -743,6 +743,9 @@ kryphocron built in.
 
 ### Changed
 
+- kryphocron 0.4.6, with ruzstd 0.9.1: a small pre-encoded post can no
+  longer make the decoder allocate a large block before the size limit
+  applies (RUSTSEC-2026-0344).
 - HTTPS installs send `Strict-Transport-Security: max-age=31536000` (not
   including subdomains).
 - OTLP trace export: with `OTEL_EXPORTER_OTLP_ENDPOINT` set, a serving node

@@ -7,11 +7,10 @@ ignore = [
     # signing timing. Locus only verifies OAuth clients' RSA signatures with
     # their public keys; it holds no RSA private key.
     "RUSTSEC-2023-0071",
-    # crypto-bigint 0.5 (through k256 0.13, which atproto signing uses):
-    # timing variability. The fix needs k256 0.14; revisit when it's out.
+    # crypto-bigint 0.5 (through k256/p256 0.13): operations meant to be
+    # constant-time may branch on secret values. Locus signs commits and PLC
+    # operations with secret k256 keys, so this applies. The fix is the 0.14
+    # curve crates (crypto-bigint 0.7.6+), which proto-blue-crypto,
+    # kryphocron and locus must move to together.
     "RUSTSEC-2026-0387",
-    # ruzstd 0.7 (through kryphocron's codec): decompression bomb. Fixed in
-    # ruzstd 0.9.1, which needs a kryphocron release; locus bounds the
-    # decoded size of pre-encoded posts meanwhile.
-    "RUSTSEC-2026-0344",
 ]
