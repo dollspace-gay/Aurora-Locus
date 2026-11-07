@@ -616,20 +616,10 @@ async fn blocked(s: &Arc<AppState>, writer: &str, author: &str) -> XrpcResult<bo
     {
         return Ok(b);
     }
-    let query = [("actor", writer), ("others", author)];
-    let lxm = "app.bsky.graph.getRelationships";
-    // The block-source AppView if one is set, else the (public) AppView;
-    // with neither, fail closed.
-    let source = crate::pipethrough::configured(
-        s,
-        "kryphocron.block_appview_url",
-        "kryphocron.block_appview_did",
-    )
-    .or_else(|| crate::pipethrough::appview(s));
-    let Some((url, aud)) = source else {
+    // With no AppView to ask, fail closed.
+    let Some(rel) = relationships(s, writer, author).await else {
         return Ok(true);
     };
-    let rel = audience::call_service(s, &url, &aud, writer, lxm, &query).await;
     let Prism::Answer {
         status: 200, body, ..
     } = rel
@@ -697,22 +687,59 @@ async fn remote_kryphocron_block(s: &AppState, author: &str, subject: &str) -> O
     }
 }
 
+/// `app.bsky.graph.getRelationships` for `writer` about `other`, asked as
+/// the writer of the block-source AppView if one is set, else the (public)
+/// AppView, never the private one. `None`: no AppView to ask.
+async fn relationships(s: &AppState, writer: &str, other: &str) -> Option<Prism> {
+    let (url, aud) = crate::pipethrough::configured(
+        s,
+        "kryphocron.block_appview_url",
+        "kryphocron.block_appview_did",
+    )
+    .or_else(|| crate::pipethrough::appview(s))?;
+    let query = [("actor", writer), ("others", other)];
+    Some(
+        audience::call_service(
+            s,
+            &url,
+            &aud,
+            writer,
+            "app.bsky.graph.getRelationships",
+            &query,
+        )
+        .await,
+    )
+}
+
 /// A record by URI: from the index here, or `getRecord` on its PDS.
 async fn fetch_record(s: &AppState, uri: &str) -> Option<Value> {
-    let (did, collection, rkey) = locus_kryphocron::rules::split_uri(uri)?;
-    if s.store.account_by_did(did).await.ok()?.is_some() {
-        let (cid, takedown) = s.store.record_entry(did, collection, rkey).await.ok()??;
+    fetch_record_checked(s, uri).await.ok().flatten()
+}
+
+/// A record by URI, telling a record that doesn't exist (`Ok(None)`) from
+/// one that couldn't be fetched (`Err`).
+async fn fetch_record_checked(s: &AppState, uri: &str) -> Result<Option<Value>, ()> {
+    let (did, collection, rkey) = locus_kryphocron::rules::split_uri(uri).ok_or(())?;
+    if s.store.account_by_did(did).await.map_err(|_| ())?.is_some() {
+        let Some((cid, takedown)) = s
+            .store
+            .record_entry(did, collection, rkey)
+            .await
+            .map_err(|_| ())?
+        else {
+            return Ok(None);
+        };
         if takedown.is_some() {
-            return None;
+            return Ok(None);
         }
-        let bytes = s.store.block(did, &cid).await.ok()??;
-        return Some(proto_blue_lex_json::lex_to_json(
-            &proto_blue_lex_cbor::decode(&bytes).ok()?,
-        ));
+        let bytes = s.store.block(did, &cid).await.map_err(|_| ())?.ok_or(())?;
+        return Ok(Some(proto_blue_lex_json::lex_to_json(
+            &proto_blue_lex_cbor::decode(&bytes).map_err(|_| ())?,
+        )));
     }
-    let (_, endpoint) = pds_identity(s, did, false).await?;
-    let client = crate::pipethrough::client(s, true).ok()?;
-    let body: Value = client
+    let (_, endpoint) = pds_identity(s, did, false).await.ok_or(())?;
+    let client = crate::pipethrough::client(s, true).map_err(|_| ())?;
+    let res = client
         .get(format!(
             "{}/xrpc/com.atproto.repo.getRecord",
             endpoint.trim_end_matches('/')
@@ -721,11 +748,17 @@ async fn fetch_record(s: &AppState, uri: &str) -> Option<Value> {
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    body.get("value").cloned()
+        .map_err(|_| ())?;
+    let status = res.status();
+    let body: Value = res.json().await.map_err(|_| ())?;
+    if status.is_success() {
+        return Ok(body.get("value").cloned());
+    }
+    // The PDS says there's no such record (as the reference answers).
+    if status == reqwest::StatusCode::BAD_REQUEST && body["error"] == "RecordNotFound" {
+        return Ok(None);
+    }
+    Err(())
 }
 
 /// The root's threadgate, if any: whether `writer` may reply.
@@ -737,8 +770,12 @@ async fn threadgate_allows(s: &Arc<AppState>, writer: &str, root_uri: &str) -> X
         return Ok(true);
     }
     let gate_uri = format!("at://{root_author}/tools.kryphocron.feed.threadgate/{root_rkey}");
-    let Some(gate) = fetch_record(s, &gate_uri).await else {
-        return Ok(true);
+    // No threadgate: anyone may reply. One that can't be fetched fails
+    // closed.
+    let gate = match fetch_record_checked(s, &gate_uri).await {
+        Ok(Some(gate)) => gate,
+        Ok(None) => return Ok(true),
+        Err(()) => return Ok(false),
     };
     let Some(rules) = gate["allow"].as_array() else {
         return Ok(true);
@@ -760,15 +797,8 @@ async fn threadgate_allows(s: &Arc<AppState>, writer: &str, root_uri: &str) -> X
                     .has_backlink(root_author, "app.bsky.graph.follow", "subject", writer)
                     .await?
             } else {
-                let rel = audience::call(
-                    s,
-                    writer,
-                    "app.bsky.graph.getRelationships",
-                    &[("actor", writer), ("others", root_author)],
-                    None,
-                )
-                .await;
-                matches!(&rel, Prism::Answer { status: 200, body, .. }
+                let rel = relationships(s, writer, root_author).await;
+                matches!(&rel, Some(Prism::Answer { status: 200, body, .. })
                     if body["relationships"].as_array().is_some_and(|a| a.iter().any(|r| r["did"].as_str() == Some(root_author) && r.get("followedBy").is_some())))
             };
             if follows {

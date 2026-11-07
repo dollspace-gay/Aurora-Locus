@@ -781,6 +781,9 @@ async fn pds_hostnames_old_and_prepared_are_never_handles_or_did_web_hosts() {
 /// else), `listRecords` lists no kryphocron blocks, and assertions for the
 /// audience are issued (as `did:web:127.0.0.1`) to whoever asks, signed
 /// with `key`.
+/// The record key whose threadgate the mock remote PDS fails to serve.
+const BROKEN_GATE_RKEY: &str = "3m6brokengate";
+
 async fn mock_remote_pds(
     parent: Value,
     audience: String,
@@ -800,6 +803,16 @@ async fn mock_remote_pds(
                             if q.get("collection").map(String::as_str) == Some(POST_PRIVATE) =>
                         {
                             axum::Json(json!({"uri": "x", "cid": "x", "value": parent}))
+                                .into_response()
+                        }
+                        // A thread root whose threadgate can't be fetched.
+                        "com.atproto.repo.getRecord"
+                            if q.get("rkey").map(String::as_str) == Some(BROKEN_GATE_RKEY) =>
+                        {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(json!({"error": "InternalServerError"})),
+                            )
                                 .into_response()
                         }
                         "com.atproto.repo.listRecords" => {
@@ -924,6 +937,15 @@ async fn block_checks_against_a_remote_parent_fail_closed() {
     relationships(200, json!({"relationships": [{"did": author}]}));
     let (st, v) = reply(0).await;
     assert_eq!(st, StatusCode::OK, "{v}");
+    // A thread root whose threadgate can't be fetched: refused (no
+    // threadgate at all, as above, allows it).
+    let broken = json!({"uri": format!("at://{author}/{POST_PRIVATE}/{BROKEN_GATE_RKEY}"),
+        "cid": parent_ref["cid"]});
+    forbidden(
+        h.reply_as(&writers[0].0, &writers[0].1, &broken, &audience)
+            .await,
+        "threadgate unreachable",
+    );
 }
 
 /// The private tier needs the private AppView entered, even when it's the
