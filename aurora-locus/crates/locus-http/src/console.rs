@@ -217,6 +217,7 @@ async fn banners(s: &AppState, op: &Op) -> Vec<Banner> {
         });
     }
     out.extend(node_banners(s).await);
+    out.extend(crate::console_hostname::banners(s).await);
     out
 }
 
@@ -298,7 +299,11 @@ pub(crate) async fn shell(s: &AppState, op: &Op, page: PageId) -> Shell {
         page,
         banners(s, op).await,
     );
-    Shell::signed_in(page.title(), brand(s), nav)
+    let mut shell = Shell::signed_in(page.title(), brand(s), nav);
+    if page.live() {
+        shell.live = menu::live_src(page);
+    }
+    shell
 }
 
 pub(crate) fn refused(why: &str) -> Response {
@@ -868,7 +873,7 @@ pub async fn home(State(s): St, headers: HeaderMap) -> Response {
         counts: count_facts,
         jobs,
     };
-    web::render(&page, StatusCode::OK)
+    web::render_shell(&page, &page.shell, StatusCode::OK)
 }
 
 /// A byte count for people.

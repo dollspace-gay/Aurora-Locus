@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use locus_core::{CoreResult, locus_nsid};
 use serde::Deserialize;
@@ -130,6 +130,16 @@ pub async fn prechecks(s: &AppState, host: &str) -> Vec<(String, bool, String)> 
         "resolves here and serves HTTPS with a valid certificate".into(),
         ok,
         why,
+    ));
+    let approved = crate::health::approved(s, host).await;
+    out.push((
+        "/tls-check approves it".into(),
+        approved,
+        if approved {
+            String::new()
+        } else {
+            "this node hasn't loaded the candidate yet; check again in a few seconds".into()
+        },
     ));
     out
 }
@@ -298,8 +308,19 @@ pub async fn close(
     Ok(Json(json!({"id": m.id, "stragglers": left})))
 }
 
+#[derive(Deserialize, Default)]
+pub struct StatusParams {
+    /// False: a prepared candidate's last pre-check results, not fresh ones.
+    #[serde(default)]
+    checks: Option<bool>,
+}
+
 /// `viewer.hostname.status`.
-pub async fn status(State(s): State<Arc<AppState>>, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+pub async fn status(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(p): Query<StatusParams>,
+) -> XrpcResult<Json<Value>> {
     admin_auth::require(
         &s,
         &headers,
@@ -311,6 +332,13 @@ pub async fn status(State(s): State<Arc<AppState>>, headers: HeaderMap) -> XrpcR
     let mut migrations = Vec::new();
     for m in s.store.hostname_migrations().await? {
         let stragglers = s.store.hostname_stragglers(&m.id, 100).await?;
+        let progress: serde_json::Map<String, Value> = s
+            .store
+            .hostname_move_counts(&m.id)
+            .await?
+            .into_iter()
+            .map(|(state, n)| (state, json!(n)))
+            .collect();
         let prechecks: Value = m
             .prechecks
             .as_deref()
@@ -318,15 +346,21 @@ pub async fn status(State(s): State<Arc<AppState>>, headers: HeaderMap) -> XrpcR
             .unwrap_or(Value::Null);
         migrations.push(json!({
             "id": m.id, "from": m.old_host, "to": m.new_host, "state": m.state,
+            "createdAt": m.created_at, "createdBy": m.created_by,
             "confirmedAt": m.confirmed_at, "jobDoneAt": m.job_done_at,
             "windowEndsAt": m.window_ends_at, "closedAt": m.closed_at, "formerAt": m.former_at,
-            "prechecks": prechecks,
+            "prechecks": prechecks, "progress": progress,
+            "stragglerCount": s.store.hostname_straggler_count(&m.id).await?,
             "stragglers": stragglers.iter().map(|x| json!({"did": x.did, "state": x.state, "reason": x.reason})).collect::<Vec<_>>(),
         }));
     }
     // A prepared candidate's checks are run fresh, so status shows them.
     let open = s.store.open_hostname_migration().await?;
     let checks = match open.filter(|m| m.state == "prepared") {
+        Some(m) if p.checks == Some(false) => m
+            .prechecks
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<Vec<(String, bool, String)>>(c).ok()),
         Some(m) => {
             let c = prechecks(&s, &m.new_host).await;
             let json = serde_json::to_string(&c).unwrap_or_default();

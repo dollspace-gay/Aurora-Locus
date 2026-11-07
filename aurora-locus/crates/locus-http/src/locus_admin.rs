@@ -60,6 +60,10 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("viewer.getAuditLog"), get(get_audit_log))
         .route(at!("viewer.listJobs"), get(list_jobs))
         .route(
+            at!("viewer.getReferenceImport"),
+            get(get_reference_import),
+        )
+        .route(
             at!("viewer.account.getImportStatus"),
             get(get_import_status),
         )
@@ -283,6 +287,29 @@ pub async fn run_job_now(
     s.store.request_job_run(&input.name).await?;
     admin_auth::audit(&s, &who, "jobs.runNow", Some(&input.name), None).await;
     Ok(Json(json!({"name": input.name, "requested": true})))
+}
+
+/// The most skipped lines the import report returns.
+const REPORT_SKIPPED_MAX: usize = 1000;
+
+/// The report of the reference-PDS import this install came from, if it
+/// did: when, the counts, and what was skipped.
+pub async fn get_reference_import(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
+    op(&s, &headers, locus_nsid!("viewer.getReferenceImport")).await?;
+    let Some(mark) = s.store.reference_import().await? else {
+        return Ok(Json(json!({"imported": false})));
+    };
+    let skipped: Vec<Value> = mark.report["skipped"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "imported": true,
+        "importedAt": locus_core::time::iso8601(mark.imported_at),
+        "counts": mark.report.get("counts").cloned().unwrap_or_else(|| json!({})),
+        "skippedTotal": skipped.len(),
+        "skipped": skipped.into_iter().take(REPORT_SKIPPED_MAX).collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Deserialize)]

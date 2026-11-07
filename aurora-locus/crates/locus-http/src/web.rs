@@ -24,6 +24,80 @@ pub async fn asset(Path(path): Path<String>) -> Response {
     res
 }
 
+/// `GET /`: the reference's plain banner, or (when turned on) the landing
+/// page in the published theme.
+pub async fn root(
+    axum::extract::State(s): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
+) -> Response {
+    let snap = s.snapshot();
+    if !snap.bool("server.landing_page") {
+        let mut res = BANNER.into_response();
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        return res;
+    }
+    let portal = snap.bool("portal.enabled");
+    drop(snap);
+    let page = landing(
+        &crate::branding::service_name(&s).await,
+        crate::branding::dress(&s, crate::branding::Blurb::None).await,
+        portal,
+    );
+    render(&page, StatusCode::OK)
+}
+
+/// The landing page, dressed in `dress` (the published theme, or a draft
+/// for the branding editor's preview).
+pub fn landing(
+    name: &str,
+    dress: Option<locus_web::view::Dress>,
+    portal: bool,
+) -> locus_web::view::LandingPage {
+    locus_web::view::LandingPage {
+        shell: locus_web::view::Shell {
+            dress,
+            ..locus_web::view::Shell::signed_out("Welcome", name)
+        },
+        portal,
+        sign_up: portal,
+    }
+}
+
+/// `GET /robots.txt`, as the reference.
+pub async fn robots() -> Response {
+    let mut res =
+        "# Hello!\n\n# Crawling the public API is allowed\nUser-agent: *\nAllow: /".into_response();
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    res
+}
+
+/// The reference's banner at `/`.
+const BANNER: &str = r"
+         __                         __
+        /\ \__                     /\ \__
+    __  \ \ ,_\  _____   _ __   ___\ \ ,_\   ___
+  /'__'\ \ \ \/ /\ '__'\/\''__\/ __'\ \ \/  / __'\
+ /\ \L\.\_\ \ \_\ \ \L\ \ \ \//\ \L\ \ \ \_/\ \L\ \
+ \ \__/.\_\\ \__\\ \ ,__/\ \_\\ \____/\ \__\ \____/
+  \/__/\/_/ \/__/ \ \ \/  \/_/ \/___/  \/__/\/___/
+                   \ \_\
+                    \/_/
+
+
+This is an AT Protocol Personal Data Server (aka, an atproto PDS)
+
+Most API routes are under /xrpc/
+
+      Code: https://github.com/bluesky-social/atproto
+ Self-Host: https://github.com/bluesky-social/pds
+  Protocol: https://atproto.com
+";
+
 /// A rendered page with the UI's headers: the strict CSP, no framing, no
 /// caching, no referrer beyond this site.
 pub fn page(html: String, status: StatusCode) -> Response {
@@ -58,6 +132,25 @@ pub fn page(html: String, status: StatusCode) -> Response {
 pub fn render(t: &impl askama::Template, status: StatusCode) -> Response {
     match t.render() {
         Ok(html) => page(html, status),
+        Err(e) => {
+            tracing::error!(error = %e, "a page failed to render");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// [`render`] for a page whose shell may be live: a live one gets the CSP
+/// that lets its one script run and listen.
+pub fn render_shell(
+    t: &impl askama::Template,
+    shell: &locus_web::view::Shell,
+    status: StatusCode,
+) -> Response {
+    if shell.live.is_empty() {
+        return render(t, status);
+    }
+    match t.render() {
+        Ok(html) => page_csp(html, status, assets::CSP_LIVE),
         Err(e) => {
             tracing::error!(error = %e, "a page failed to render");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

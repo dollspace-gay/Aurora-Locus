@@ -4,6 +4,7 @@ mod audiences;
 mod blobs;
 mod bulk;
 mod conformance;
+mod console_features;
 mod identity;
 mod keys;
 mod keys_shard;

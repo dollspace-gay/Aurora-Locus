@@ -9,7 +9,8 @@
 <link rel="stylesheet" href="{{ shell.css }}">
 {% if let Some(d) = shell.dress %}{% if !d.css.is_empty() %}<link rel="stylesheet" href="{{ d.css }}">
 {% endif %}{% if !d.favicon.is_empty() %}<link rel="icon" href="{{ d.favicon }}">
-{% endif %}{% endif %}</head>
+{% endif %}{% endif %}{% if !shell.live.is_empty() %}<script src="{{ shell.js() }}" defer></script>
+{% endif %}</head>
 <body>
 {% if let Some(nav) = shell.nav %}
 <a class="skip" href="#main">Skip to content</a>
@@ -40,7 +41,7 @@
 </span>
 </header>
 {% endif %}
-<main id="main"{% block main_class %}{% endblock %}>
+<main id="main"{% block main_class %}{% endblock %}{% if !shell.live.is_empty() %} data-live="{{ shell.live }}"{% endif %}>
 {% if let Some(nav) = shell.nav %}
 {% for b in nav.banners %}
 <div class="banner{% if b.bad %} bad{% endif %}">{{ b.text }}{% if let Some(link) = b.link %} <a href="{{ link.href }}">{{ link.label }}</a>.{% endif %}</div>

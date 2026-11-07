@@ -44,9 +44,11 @@ pub enum PageId {
     Shards,
     Email,
     Proxy,
+    Hostname,
     Limits,
     Storage,
     Jobs,
+    Import,
     Audit,
     Logs,
     Settings,
@@ -210,6 +212,14 @@ pub const PAGES: &[Page] = &[
         Need::Viewer,
     ),
     page(
+        PageId::Hostname,
+        "/admin/hostname",
+        "Hostname",
+        None,
+        Some("network"),
+        Need::Viewer,
+    ),
+    page(
         PageId::Limits,
         "/admin/limits",
         "Limits",
@@ -229,6 +239,14 @@ pub const PAGES: &[Page] = &[
         PageId::Jobs,
         "/admin/jobs",
         "Jobs",
+        None,
+        Some("system"),
+        Need::Viewer,
+    ),
+    page(
+        PageId::Import,
+        "/admin/import",
+        "Import report",
         None,
         Some("system"),
         Need::Viewer,
@@ -291,15 +309,32 @@ pub const BUILT: &[PageId] = &[
     PageId::Shards,
     PageId::Email,
     PageId::Proxy,
+    PageId::Hostname,
     PageId::Limits,
     PageId::Storage,
     PageId::Jobs,
+    PageId::Import,
     PageId::Audit,
     PageId::Logs,
     PageId::Settings,
     PageId::Appearance,
     PageId::Security,
 ];
+
+/// The status pages that refresh themselves while open.
+pub const LIVE: &[PageId] = &[
+    PageId::Home,
+    PageId::Services,
+    PageId::Hostname,
+    PageId::Storage,
+    PageId::Jobs,
+];
+
+/// Where a live page listens for changes.
+#[must_use]
+pub fn live_src(page: PageId) -> String {
+    format!("/admin/live?page={}", page.href())
+}
 
 impl PageId {
     #[must_use]
@@ -315,6 +350,12 @@ impl PageId {
     #[must_use]
     pub fn href(self) -> &'static str {
         self.page().href
+    }
+
+    /// Whether the page refreshes itself while open (server-sent events).
+    #[must_use]
+    pub fn live(self) -> bool {
+        LIVE.contains(&self)
     }
 
     /// Its name, with its product: "Private posts · kryphocron".

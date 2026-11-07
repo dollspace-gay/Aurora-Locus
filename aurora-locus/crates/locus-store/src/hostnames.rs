@@ -229,6 +229,34 @@ impl Store {
         Ok(n)
     }
 
+    /// How many accounts the job has done for a migration, by state
+    /// (`moved`, `cannot`, `failed`).
+    pub async fn hostname_move_counts(&self, id: &str) -> CoreResult<Vec<(String, i64)>> {
+        let q = sql(
+            "SELECT state, COUNT(*) FROM hostname_move WHERE migration_id = {1} \
+             GROUP BY state ORDER BY state",
+            pg(self),
+        );
+        run!(self, q, fetch_all, id)
+    }
+
+    /// The migration an account is a straggler of, if its document may
+    /// still name an old host this PDS serves: (old host, new host, state,
+    /// reason).
+    pub async fn hostname_straggler_of(
+        &self,
+        did: &str,
+    ) -> CoreResult<Option<(String, String, String, Option<String>)>> {
+        let q = sql(
+            "SELECT m.old_host, m.new_host, v.state, v.reason FROM hostname_move v \
+             JOIN hostname_migration m ON m.id = v.migration_id \
+             WHERE v.did = {1} AND v.state <> 'moved' AND m.state IN ('running', 'done') \
+             AND m.former_at IS NULL ORDER BY m.created_at DESC LIMIT 1",
+            pg(self),
+        );
+        run!(self, q, fetch_optional, did)
+    }
+
     pub async fn set_hostname_rechecked(&self, id: &str) -> CoreResult<()> {
         let mut tx = self.begin().await?;
         let q = sql(
