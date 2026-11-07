@@ -79,6 +79,23 @@ pub fn verify(secret: &[u8], code: &str, now_s: i64) -> Option<i64> {
     })
 }
 
+/// How far off a code that `verify` refused is, in seconds (positive when
+/// the app's clock is ahead), if it matches a step within `max_s`: tells a
+/// clock difference from a wrong key.
+#[must_use]
+pub fn clock_offset_s(secret: &[u8], code: &str, now_s: i64, max_s: i64) -> Option<i64> {
+    let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    if code.len() != DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let now = now_s.div_euclid(STEP_S);
+    let max = max_s / STEP_S;
+    (1..=max)
+        .flat_map(|d| [d, -d])
+        .find(|d| code_at(secret, now + d) == code)
+        .map(|d| d * STEP_S)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +127,19 @@ mod tests {
         assert!(verify(&secret, &spaced, now).is_some());
         assert_eq!(verify(&secret, "12345", now), None);
         assert_eq!(verify(&secret, "abcdef", now), None);
+    }
+
+    #[test]
+    fn a_code_from_a_clock_minutes_off_says_how_far() {
+        let secret = new_secret();
+        let now = 1_700_000_000;
+        let ahead = code_at(&secret, now / STEP_S + 8);
+        let behind = code_at(&secret, now / STEP_S - 8);
+        assert_eq!(clock_offset_s(&secret, &ahead, now, 600), Some(240));
+        assert_eq!(clock_offset_s(&secret, &behind, now, 600), Some(-240));
+        let far = code_at(&secret, now / STEP_S + 40);
+        assert_eq!(clock_offset_s(&secret, &far, now, 600), None);
+        assert_eq!(clock_offset_s(&secret, "12345", now, 600), None);
     }
 
     #[test]

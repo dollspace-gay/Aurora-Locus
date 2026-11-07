@@ -517,6 +517,15 @@ pub(crate) fn totp_secret_name(operator: &str) -> String {
     format!("operator/{operator}/totp")
 }
 
+/// "90 seconds", "4 minutes".
+fn offset_text(s: i64) -> String {
+    if s < 120 {
+        format!("{s} seconds")
+    } else {
+        format!("{} minutes", (s + 30) / 60)
+    }
+}
+
 fn totp_pending_name(operator: &str) -> String {
     format!("operator/{operator}/totp_pending")
 }
@@ -1426,22 +1435,21 @@ pub async fn totp_confirm(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
     else {
         return web::redirect("/admin/security");
     };
-    let Some(step) = totp::verify(
-        &secret,
-        web::field(&form, "code"),
-        locus_core::time::now_ms() / 1000,
-    ) else {
-        return security_render(
-            &s,
-            &op,
-            None,
-            vec![
-                "That code isn't right. Check the app's clock, and enter the code it shows now."
-                    .into(),
-            ],
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
+    let now_s = locus_core::time::now_ms() / 1000;
+    let code = web::field(&form, "code");
+    let Some(step) = totp::verify(&secret, code, now_s) else {
+        let problem = match totp::clock_offset_s(&secret, code, now_s, 15 * 60) {
+            Some(off) => format!(
+                "That code is for a time about {} {} this server's clock: the server's clock \
+                 and your device's clock disagree. Set both to the network time and try again.",
+                offset_text(off.abs()),
+                if off > 0 { "ahead of" } else { "behind" }
+            ),
+            None => "That code isn't right. Check that the app has the key shown here (setting \
+                     up again makes a new key), and enter the code it shows now."
+                .into(),
+        };
+        return security_render(&s, &op, None, vec![problem], StatusCode::BAD_REQUEST).await;
     };
     let result = async {
         let mut tx = s.store.begin().await?;

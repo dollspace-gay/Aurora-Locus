@@ -9577,13 +9577,26 @@ async fn the_console_signs_in_with_a_password_then_a_code() {
     assert_eq!(st, StatusCode::SEE_OTHER);
     let (_, _, page) = b.get(&h, "/admin/security").await;
     assert!(page.contains("otpauth://totp/"), "{page}");
-    let secret = h
-        .state
-        .store
-        .get_secret("operator/alice/totp_pending", &h.state.master_key)
-        .await
-        .unwrap()
-        .unwrap();
+    // The key as a person types it from the page.
+    let typed = page
+        .split("<p><code>")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("the key is on the page");
+    let typed: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    let secret = data_encoding::BASE32_NOPAD
+        .decode(typed.as_bytes())
+        .expect("the key is base32");
+    assert_eq!(
+        Some(secret.clone()),
+        h.state
+            .store
+            .get_secret("operator/alice/totp_pending", &h.state.master_key)
+            .await
+            .unwrap()
+            .map(|s| s.to_vec()),
+        "the page shows the pending secret"
+    );
     let now = locus_core::time::now_ms() / 1000;
     let (st, _, page) = b
         .post(
@@ -9596,6 +9609,24 @@ async fn the_console_signs_in_with_a_password_then_a_code() {
         st == StatusCode::BAD_REQUEST || page.contains("is on"),
         "a wrong code is refused (unless it happens to be right)"
     );
+    // The page shows a QR code of the link.
+    assert!(
+        page.contains(r#"<div class="totp-qr""#) && page.contains("<svg"),
+        "{page}"
+    );
+    // A code from a clock five minutes ahead says so.
+    let (st, _, page) = b
+        .post(
+            &h,
+            "/admin/security/totp/confirm",
+            &[
+                ("csrf", &csrf),
+                ("code", &locus_auth::totp::code_at(&secret, now / 30 + 10)),
+            ],
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(page.contains("5 minutes ahead of"), "{page}");
     let code = locus_auth::totp::code_at(&secret, now / 30);
     let (st, _, page) = b
         .post(

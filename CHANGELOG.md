@@ -743,6 +743,12 @@ kryphocron built in.
 
 ### Changed
 
+- `deploy/install.sh` asks for the handle domain, defaulting to the
+  hostname as the reference's installer does; it used the parent domain,
+  which for a PDS at `example.com` made the wildcard `*.com`, so no handle
+  under the hostname was served.
+- The console's sign-in code setup shows a QR code, and a code refused
+  because the server's and the device's clocks disagree says by how much.
 - `deploy/install.sh` checks its ports before building: it stops if 80 or
   443 is taken, and asks for another local port when 3000 is
   (`LOCUS_LOCAL_PORT` in the compose stack's `.env`).

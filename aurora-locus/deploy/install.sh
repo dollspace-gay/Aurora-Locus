@@ -69,13 +69,28 @@ if [[ ! "$hostname" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0
   say "$hostname isn't a hostname."
   exit 1
 fi
-parent="${hostname#*.}"
+# Handles go under the hostname by default, as the reference's installer
+# (alice.pds.example.com, or alice.example.com for a PDS at example.com).
+domain="$(ask "The handle domain (handles are name.<domain>)" "$hostname")"
+domain="${domain,,}"
+domain="${domain#.}"
+domain="${domain#\*.}"
+domain="${domain%.}"
+if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+  say "$domain isn't a domain."
+  exit 1
+fi
+if [[ "$domain" == "$hostname" ]]; then
+  cert_names="$hostname and *.$hostname"
+else
+  cert_names="$hostname, $domain and *.$domain"
+fi
 email="$(ask "An email address for certificate notices (Let's Encrypt)")"
 
 say ""
 say "How should certificates be made?"
 say "  1) On demand, one per name (the default; fine for small and medium servers)"
-say "  2) A wildcard by DNS-01 (*.$parent; for large servers; needs a DNS provider API token)"
+say "  2) A wildcard by DNS-01 (*.$domain; for large servers; needs a DNS provider API token)"
 say "  3) Behind Cloudflare's proxy (orange cloud), with a Cloudflare Origin CA certificate"
 strategy="$(ask "1, 2 or 3" 1)"
 
@@ -94,16 +109,15 @@ case "$strategy" in
   2)
     say "DNS providers built in: cloudflare, digitalocean, hetzner, duckdns."
     provider="$(ask "Your DNS provider" cloudflare)"
-    wildcard="$(ask "The wildcard's domain (handles go under it)" "$parent")"
     read -r -s -p "Its API token (with DNS edit rights): " dns_token; echo
     say "Building Caddy with the DNS provider modules…"
     docker build -t locus-caddy "$docker_dir/caddy"
     caddy_image="locus-caddy"
-    args=(--strategy dns01 --email "$email" --hostname "$hostname" --wildcard "$wildcard" --dns-provider "$provider")
+    args=(--strategy dns01 --email "$email" --hostname "$hostname" --wildcard "$domain" --dns-provider "$provider")
     proxy_mode=caddy
     ;;
   3)
-    say "Create a Cloudflare Origin CA certificate for $parent and *.$parent"
+    say "Create a Cloudflare Origin CA certificate for $cert_names"
     say "(SSL/TLS > Origin Server > Create Certificate), and set SSL/TLS to Full (strict)."
     say "Paste the certificate (PEM), then an empty line:"
     : > certs/origin.pem
@@ -117,7 +131,7 @@ case "$strategy" in
       say "That doesn't look like a PEM certificate and key."
       exit 1
     fi
-    args=(--strategy cloudflare --hostname "$hostname" --wildcard "$parent" --cert /certs/origin.pem --key /certs/origin.key)
+    args=(--strategy cloudflare --hostname "$hostname" --wildcard "$domain" --cert /certs/origin.pem --key /certs/origin.key)
     proxy_mode=cloudflare
     ;;
   *)
@@ -138,7 +152,7 @@ DNS_API_TOKEN=$dns_token
 EOF
 cat > locus.env <<EOF
 PDS_HOSTNAME=$hostname
-PDS_SERVICE_HANDLE_DOMAINS=.$parent
+PDS_SERVICE_HANDLE_DOMAINS=.$domain
 LOCUS_TRUSTED_PROXIES=$caddy_ip/32
 LOCUS_PROXY_MODE=$proxy_mode
 # Blobs in an S3-compatible bucket instead of the data volume (set these

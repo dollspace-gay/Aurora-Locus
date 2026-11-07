@@ -103,6 +103,8 @@
   /* The sidebar: a dark panel in every mode, with the scheme's dark-form
      accent. */
   --side-bg: #0f172a;
+  /* QR codes stay black on white in both themes, so cameras read them. */
+  --qr-light: #ffffff;
   --side-fg: #f8fafc;
   --side-muted: #a0a4ac;
   --side-accent: var(--s-accent-d);
@@ -580,6 +582,8 @@ label.choice input { margin: 0; accent-color: var(--accent); }
    enough, and the rarely changed ones folded under Advanced. */
 .layout .settings-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 36rem), 1fr)); gap: 1.25rem; align-items: start; }
 .layout .settings-cards > .card { margin: 0; }
+.totp-qr { width: 12.5rem; max-width: 100%; background: var(--qr-light); border-radius: 0.5rem; line-height: 0; }
+.totp-qr svg { width: 100%; height: auto; display: block; }
 .layout details.advanced { margin: 1.25rem 0; }
 .layout details.advanced > summary { font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem; }
 

@@ -16,8 +16,10 @@
 <div class="row"><button type="submit" class="secondary">Turn off</button></div>
 </form>
 {% else if let Some(e) = enrolling %}
-<p>In your sign-in code app (any TOTP app), add an account with this key, or open the link on the device that has the app:</p>
+<p>In your sign-in code app (any TOTP app), scan this code, type in the key below it, or open the link on the device that has the app:</p>
+<div class="totp-qr" role="img" aria-label="QR code for the sign-in code app">{{ e.qr_svg()|safe }}</div>
 <p><code>{{ e.secret }}</code></p>
+<p class="hint">The key has letters and the digits 2 to 7 only: an O is always the letter, never zero.</p>
 <p><a href="{{ e.uri }}">Open in a sign-in code app</a></p>
 <form class="stack" method="post" action="/admin/security/totp/confirm">
 <input type="hidden" name="csrf" value="{{ csrf }}">

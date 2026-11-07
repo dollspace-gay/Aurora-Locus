@@ -125,6 +125,29 @@ pub struct Enrolling {
     pub uri: String,
 }
 
+impl Enrolling {
+    /// The `otpauth://` link as a QR code (inline SVG, black on white in
+    /// both themes so cameras read it); empty if it can't be encoded.
+    #[must_use]
+    pub fn qr_svg(&self) -> String {
+        let Ok(code) = qrcode::QrCode::new(self.uri.as_bytes()) else {
+            return String::new();
+        };
+        let svg = code
+            .render::<qrcode::render::svg::Color<'_>>()
+            .min_dimensions(200, 200)
+            .dark_color(qrcode::render::svg::Color("#000000"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .quiet_zone(true)
+            .build();
+        // Inline in HTML: drop the XML declaration.
+        match svg.find("<svg") {
+            Some(i) => svg[i..].to_owned(),
+            None => String::new(),
+        }
+    }
+}
+
 /// One of the operator's sign-ins.
 #[derive(Debug, Clone)]
 pub struct SessionView {

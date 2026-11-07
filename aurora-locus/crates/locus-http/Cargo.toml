@@ -62,6 +62,7 @@ http-body-util = "0.1"
 x509-parser = "0.18"
 sqlx.workspace = true
 proptest = "1"
+data-encoding.workspace = true
 
 [lints]
 workspace = true
