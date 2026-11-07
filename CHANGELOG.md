@@ -743,6 +743,11 @@ kryphocron built in.
 
 ### Changed
 
+- The Docker image build keeps cargo's downloads and build output in
+  BuildKit caches and installs the pinned toolchain in its own layer, so a
+  rebuild after a small change recompiles only the workspace; link-time
+  optimization is off by default for builds on a server (build args turn
+  it back on).
 - The private tier has its own AppView setting, `appview.private_url` and
   `appview.private_did` (`LOCUS_PRIVATE_APPVIEW_URL`/`_DID`; in the setup
   wizard's private posts step and the console's services page), for a
