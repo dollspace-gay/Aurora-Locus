@@ -746,6 +746,11 @@ kryphocron built in.
   implementations wouldn't reproduce). Found by new property tests that
   also verify every `#commit` event from its own blocks and `getRepo`
   since every earlier rev.
+- A block-source AppView for private replies to authors on other PDSes
+  (`kryphocron.block_appview_url`, `kryphocron.block_appview_did`): when
+  set, `app.bsky` blocks are checked there (for example Bluesky's AppView,
+  when prism doesn't answer `getRelationships`) instead of the configured
+  AppView; any error there still fails closed.
 - Plain `http://` URLs for operator-configured endpoints (PLC directory,
   AppView, moderation and report services, scanner, S3, entryway,
   crawlers) need to be allowed per endpoint (`http.allow_insecure_http`):

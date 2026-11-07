@@ -114,7 +114,7 @@ pub struct Target {
 }
 
 /// A configured service: (url, did), if both are set.
-fn configured(s: &AppState, url_key: &str, did_key: &str) -> Option<(String, String)> {
+pub(crate) fn configured(s: &AppState, url_key: &str, did_key: &str) -> Option<(String, String)> {
     let snap = s.snapshot();
     let (url, did) = (snap.text(url_key), snap.text(did_key));
     (!url.is_empty() && !did.is_empty()).then(|| (url.to_owned(), did.to_owned()))

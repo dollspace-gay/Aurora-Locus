@@ -145,6 +145,7 @@ pub const ENDPOINT_URL_SETTINGS: &[&str] = &[
     "blobs.scanner_url",
     "blobs.s3_endpoint",
     "sync.crawlers",
+    "kryphocron.block_appview_url",
 ];
 
 /// Whether an endpoint value (a URL, or a list of them) uses plain HTTP.
@@ -400,6 +401,20 @@ pub static REGISTRY: &[Def] = &[
         default: r#""""#,
         env: Some("PDS_BSKY_APP_VIEW_DID"),
         description: "The AppView's DID (the audience of its service tokens).",
+    },
+    Def {
+        key: "kryphocron.block_appview_url",
+        kind: Kind::Url,
+        default: r#""""#,
+        env: None,
+        description: "The AppView asked about app.bsky blocks with a parent author on another PDS (getRelationships). Empty: the configured AppView. Bluesky's answers it when prism doesn't.",
+    },
+    Def {
+        key: "kryphocron.block_appview_did",
+        kind: Kind::Text { max_len: 2048 },
+        default: r#""""#,
+        env: None,
+        description: "The block-source AppView's DID (the audience of the writer's service token).",
     },
     Def {
         key: "appview.cdn_url_pattern",

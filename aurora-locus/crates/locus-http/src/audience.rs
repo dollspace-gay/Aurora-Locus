@@ -145,6 +145,44 @@ impl Prism {
 
 /// Calls a prism method as `did` (a user service JWT, one method per
 /// token). `body` makes it a POST.
+/// A query to another service as `did` (service auth), with prism's
+/// answer kinds but none of its up/down tracking: the block-source AppView.
+pub async fn call_service(
+    s: &AppState,
+    url: &str,
+    aud: &str,
+    did: &str,
+    lxm: &str,
+    query: &[(&str, &str)],
+) -> Prism {
+    let Ok(token) = crate::pipethrough::service_token(s, did, aud, lxm).await else {
+        return Prism::Unreachable;
+    };
+    let Ok(client) = crate::pipethrough::client(s, false) else {
+        return Prism::Unreachable;
+    };
+    let res = client
+        .get(format!("{}/xrpc/{lxm}", url.trim_end_matches('/')))
+        .query(query)
+        .bearer_auth(token)
+        .timeout(call_timeout(s))
+        .send()
+        .await;
+    match res {
+        Ok(res) => {
+            let status = res.status().as_u16();
+            let body = res.json().await.unwrap_or(Value::Null);
+            Prism::Answer {
+                status,
+                body,
+                retry_after: None,
+            }
+        }
+        Err(e) if e.is_timeout() => Prism::Timeout,
+        Err(_) => Prism::Unreachable,
+    }
+}
+
 pub async fn call(
     s: &std::sync::Arc<AppState>,
     did: &str,

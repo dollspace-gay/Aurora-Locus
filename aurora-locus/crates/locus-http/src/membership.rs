@@ -614,14 +614,17 @@ async fn blocked(s: &Arc<AppState>, writer: &str, author: &str) -> XrpcResult<bo
     {
         return Ok(b);
     }
-    let rel = audience::call(
+    let query = [("actor", writer), ("others", author)];
+    let lxm = "app.bsky.graph.getRelationships";
+    // The block-source AppView if one is set, else the configured one.
+    let rel = match crate::pipethrough::configured(
         s,
-        writer,
-        "app.bsky.graph.getRelationships",
-        &[("actor", writer), ("others", author)],
-        None,
-    )
-    .await;
+        "kryphocron.block_appview_url",
+        "kryphocron.block_appview_did",
+    ) {
+        Some((url, aud)) => audience::call_service(s, &url, &aud, writer, lxm, &query).await,
+        None => audience::call(s, writer, lxm, &query, None).await,
+    };
     let Prism::Answer {
         status: 200, body, ..
     } = rel

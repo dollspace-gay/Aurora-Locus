@@ -1360,3 +1360,141 @@ async fn consent_pages_keep_their_security_block_under_every_theme() {
         );
     }
 }
+
+/// With a block-source AppView set, app.bsky block checks for a remote
+/// parent author ask it (as the writer, its DID the token's audience),
+/// not the configured AppView; it fails closed the same way; unset, the
+/// configured AppView is asked again.
+#[tokio::test]
+async fn block_checks_ask_the_block_source_appview_when_one_is_set() {
+    use base64::Engine;
+    let h = harness_build(HarnessOpts {
+        ssrf_protection: false,
+        ..HarnessOpts::default()
+    })
+    .await;
+    let (prism, prism_seen) = h.with_prism().await;
+    // Prism doesn't answer getRelationships (as it may not).
+    set_script(
+        &prism,
+        "app.bsky.graph.getRelationships",
+        501,
+        json!({"error": "MethodNotImplemented"}),
+    );
+    let (bsky_url, bsky, bsky_seen) = scripted_appview().await;
+    let author = format!("did:plc:{}", "q".repeat(24));
+    let audience = format!("at://{author}/{AUD}/3m6aaaaaaaaaa");
+    let parent_uri = format!("at://{author}/{POST_PRIVATE}/3m6parentpare");
+    let parent = json!({"$type": POST_PRIVATE, "createdAt": "2024-01-01T00:00:00.000Z",
+        "audienceList": audience, "encodedContent": {"$bytes": "AAECAwQFBgc"},
+        "encodedContentCodec": "laquna/0.2"});
+    let key = Arc::new(proto_blue_crypto::K256Keypair::generate());
+    let remote = mock_remote_pds(parent, audience.clone(), key.clone()).await;
+    h.plc.lock().unwrap().log.insert(
+        author.clone(),
+        vec![json!({"type": "plc_operation", "alsoKnownAs": ["at://far.example.net"],
+            "verificationMethods": {"atproto": key.did()},
+            "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": remote}}})],
+    );
+    h.state
+        .kr
+        .membership
+        .seed_issuer_key("127.0.0.1", &key.did());
+    let parent_ref = json!({"uri": parent_uri, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"});
+    // One writer per case: block answers are cached per pair.
+    let mut writers = Vec::new();
+    for (handle, rkey) in [
+        ("bya.pds.example.com", "3m6aaaaaaaaab"),
+        ("byb.pds.example.com", "3m6aaaaaaaaac"),
+        ("byc.pds.example.com", "3m6aaaaaaaaad"),
+        ("byd.pds.example.com", "3m6aaaaaaaaae"),
+    ] {
+        let (did, access) = h.user(handle).await;
+        let mine = h.add_audience(&did, rkey).await;
+        let (st, v) = h
+            .private_post_as(&did, &access, private_post("x", &mine))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        writers.push((did, access));
+    }
+    let reply = |w: usize| h.reply_as(&writers[w].0, &writers[w].1, &parent_ref, &audience);
+    let set = |k: &'static str, v: Value| {
+        let h = &h;
+        async move { h.state.settings.set(k, v, "test").await.unwrap() }
+    };
+    set("kryphocron.block_appview_url", json!(bsky_url)).await;
+    set(
+        "kryphocron.block_appview_did",
+        json!("did:web:api.bsky.test"),
+    )
+    .await;
+
+    // No block there: the reply goes through though prism can't answer.
+    set_script(
+        &bsky,
+        "app.bsky.graph.getRelationships",
+        200,
+        json!({"relationships": [{"did": author}]}),
+    );
+    let (st, v) = reply(0).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let asked = bsky_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.uri.contains("getRelationships"))
+        .cloned()
+        .unwrap();
+    let token = asked.headers["authorization"]
+        .to_str()
+        .unwrap()
+        .trim_start_matches("Bearer ")
+        .to_owned();
+    let claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims["aud"], "did:web:api.bsky.test");
+    assert_eq!(claims["iss"], json!(writers[0].0), "asked as the writer");
+    assert!(
+        !prism_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.uri.contains("getRelationships")),
+        "prism wasn't asked"
+    );
+    // A block there is enforced; an error there fails closed.
+    set_script(
+        &bsky,
+        "app.bsky.graph.getRelationships",
+        200,
+        json!({"relationships": [{"did": author, "blocking": "at://x/app.bsky.graph.block/1"}]}),
+    );
+    assert_eq!(reply(1).await.0, StatusCode::FORBIDDEN);
+    set_script(
+        &bsky,
+        "app.bsky.graph.getRelationships",
+        500,
+        json!({"error": "InternalServerError"}),
+    );
+    assert_eq!(reply(2).await.0, StatusCode::FORBIDDEN);
+    // Unset: the configured AppView (prism, answering 501) is asked.
+    set("kryphocron.block_appview_url", json!("")).await;
+    set_script(
+        &bsky,
+        "app.bsky.graph.getRelationships",
+        200,
+        json!({"relationships": [{"did": author}]}),
+    );
+    assert_eq!(reply(3).await.0, StatusCode::FORBIDDEN);
+    assert!(
+        prism_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.uri.contains("getRelationships"))
+    );
+}

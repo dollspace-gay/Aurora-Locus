@@ -5935,8 +5935,15 @@ async fn private_posts_are_gated_encoded_and_indexed() {
     assert_eq!(st, StatusCode::OK);
 
     // Audit: the encodes were recorded.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let audit = h.state.store.kr_audit(50).await.unwrap();
+    // The audit writer runs in the background: wait for it, briefly.
+    let mut audit = Vec::new();
+    for _ in 0..50 {
+        audit = h.state.store.kr_audit(50).await.unwrap();
+        if audit.iter().any(|r| r.event == "ContentEncoded") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(
         audit.iter().any(|r| r.event == "ContentEncoded"),
         "{audit:?}"
@@ -8098,16 +8105,23 @@ async fn gated_private_media_is_served_only_to_the_audience() {
             .0,
         StatusCode::OK
     );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        h.state
+    // The audit writer runs in the background: wait for it, briefly.
+    let mut audited = false;
+    for _ in 0..50 {
+        audited = h
+            .state
             .store
             .kr_audit(50)
             .await
             .unwrap()
             .iter()
-            .any(|r| r.event == "media.trusted_fetch")
-    );
+            .any(|r| r.event == "media.trusted_fetch");
+        if audited {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(audited, "the trusted fetch is audited");
     h.state
         .settings
         .set("kryphocron.media_trusted_services", json!([]), "test")
