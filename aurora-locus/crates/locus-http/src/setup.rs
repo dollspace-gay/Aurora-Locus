@@ -867,8 +867,10 @@ pub fn plan_from_env(seed: SetupPlan, env: &HashMap<String, String>) -> SetupPla
 
 /// Headless setup (`LOCUS_SETUP_AUTO=true`): builds the plan from env,
 /// runs the checks, and applies it unless one fails. Warnings are logged
-/// and accepted. A failure leaves the node in setup mode.
-pub async fn headless(s: &AppState, env: &HashMap<String, String>) -> Result<(), String> {
+/// and accepted. A failure leaves the node in setup mode. `Ok(false)`: another
+/// node finished setup first (several nodes starting together), which is
+/// done as well.
+pub async fn headless(s: &AppState, env: &HashMap<String, String>) -> Result<bool, String> {
     let plan = plan_from_env(
         seed_plan(&s.snapshot(), s.setup.bootstrap_hostname.as_deref()),
         env,
@@ -909,11 +911,13 @@ pub async fn headless(s: &AppState, env: &HashMap<String, String>) -> Result<(),
         .filter(|c| c.outcome == Outcome::Warn)
         .map(|c| c.id.to_owned())
         .collect();
-    apply(&s.store, &s.master_key, &plan, s.setup.dev)
-        .await
-        .map_err(|e| e.to_string())?;
+    let applied = match apply(&s.store, &s.master_key, &plan, s.setup.dev).await {
+        Ok(()) => true,
+        Err(ApplyError::AlreadyComplete) => false,
+        Err(e) => return Err(e.to_string()),
+    };
     s.setup.complete();
-    Ok(())
+    Ok(applied)
 }
 
 // ---------------------------------------------------------------- the wizard

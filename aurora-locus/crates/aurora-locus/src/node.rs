@@ -631,7 +631,8 @@ impl Node {
             self.tasks.push(tokio::spawn(async move {
                 let env: HashMap<String, String> = std::env::vars().collect();
                 match locus_http::setup::headless(&st, &env).await {
-                    Ok(()) => tracing::info!("headless setup completed"),
+                    Ok(true) => tracing::info!("headless setup completed"),
+                    Ok(false) => tracing::info!("headless setup: another node completed it"),
                     Err(e) => {
                         tracing::error!("headless setup didn't complete; still in setup mode: {e}")
                     }
