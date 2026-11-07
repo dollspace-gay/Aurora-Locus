@@ -12,6 +12,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # No debug info in test builds: the workspace's test binaries are large,
+  # and a hosted runner's disk is small.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   test:
@@ -38,7 +41,11 @@ jobs:
       LOCUS_TEST_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
       LOCUS_TEST_REDIS_URL: redis://127.0.0.1:56379
     steps:
-      - uses: actions/checkout@v4
+      # The runner's preinstalled SDKs locus doesn't use, for disk space.
+      - name: Free disk space
+        working-directory: /
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
       # rust-toolchain.toml pins the version and components.
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -65,7 +72,7 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: cargo-audit
         run: cargo install cargo-audit --locked
       # aurora-locus/.cargo/audit.toml lists the advisories ignored, and why.
