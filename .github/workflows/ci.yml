@@ -58,7 +58,8 @@ jobs:
       - name: Test the HTTP suite on Postgres
         env:
           LOCUS_TEST_HTTP_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
-        run: cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys::
+        run: |
+          cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys::
 
   audit:
     name: Dependency audit
