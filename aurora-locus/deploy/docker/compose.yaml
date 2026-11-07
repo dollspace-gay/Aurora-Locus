@@ -53,7 +53,7 @@ services:
       # (LOCUS_TRUSTED_PROXIES=172.30.53.2/32), not the bridge gateway that
       # Docker's userland proxy connects from.
       locus:
-        ipv4_address: 172.30.53.2
+        ipv4_address: ${LOCUS_CADDY_IP:-172.30.53.2}
 
   # Automatic updates, as the reference offers: off by default.
   # watchtower:

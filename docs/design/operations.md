@@ -565,16 +565,26 @@ docker build -f deploy/docker/Dockerfile -t aurora-locus \
   --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 .
 ```
 
-To set up the stack by hand instead of with the installer, write
+To set up the stack by hand instead of with the installer, see
+[Running with Docker](../docker.md). In short: write
 `deploy/docker/locus.env` (at least `PDS_HOSTNAME` and
 `LOCUS_TRUSTED_PROXIES`), then:
 
 ```sh
 cd deploy/docker
+docker compose build locus
 docker compose run --rm --no-deps --entrypoint aurora-locus locus \
   deploy caddyfile --email you@example.com > Caddyfile
-docker compose up -d --build
+docker compose up -d
 ```
+
+`deploy/docker/compose.postgres.yaml` adds Postgres on the same machine.
+
+### Kubernetes
+
+`deploy/helm/aurora-locus` is a Helm chart with two profiles: `small`
+(SQLite on one pod with a PersistentVolume) and `large` (Postgres and S3,
+any number of pods). See [Running on Kubernetes](../kubernetes.md).
 
 **Upgrading.** Pull the new source, rebuild and recreate:
 

@@ -146,6 +146,7 @@ cat > .env <<EOF
 LOCUS_SUBNET=$subnet
 LOCUS_GATEWAY=$base.1
 LOCUS_IP_RANGE=$base.128/25
+LOCUS_CADDY_IP=$caddy_ip
 LOCUS_LOCAL_PORT=$local_port
 CADDY_IMAGE=$caddy_image
 DNS_API_TOKEN=$dns_token
@@ -167,8 +168,6 @@ LOCUS_PROXY_MODE=$proxy_mode
 # LOCUS_BLOBSTORE_S3_GATED_BUCKET=
 EOF
 umask 022
-# Caddy's address on the network, to match LOCUS_TRUSTED_PROXIES.
-sed -i "s/ipv4_address: 172.30.53.2/ipv4_address: $caddy_ip/" compose.yaml
 
 say "Building aurora-locus…"
 docker compose build locus

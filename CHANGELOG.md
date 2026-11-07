@@ -743,6 +743,18 @@ kryphocron built in.
 
 ### Changed
 
+- A Helm chart (`deploy/helm/aurora-locus`): the small profile runs one pod
+  on SQLite with a PersistentVolume, the large one any number of pods on
+  Postgres and S3. Headless setup, an Ingress for the hostname and the
+  handle wildcards, and refusals for values that can't work.
+- `deploy/docker/compose.postgres.yaml`: Postgres on the same machine.
+- Several nodes starting together with headless setup: the ones another
+  node beat to it log that and serve, instead of an error saying they're
+  still in setup mode.
+- Caddy's address on the Docker network is `LOCUS_CADDY_IP` in `.env`; the
+  installer no longer edits `compose.yaml`.
+- Guides: running with Docker by hand (`docs/docker.md`) and on Kubernetes
+  (`docs/kubernetes.md`).
 - kryphocron 0.4.6, with ruzstd 0.9.1: a small pre-encoded post can no
   longer make the decoder allocate a large block before the size limit
   applies (RUSTSEC-2026-0344).

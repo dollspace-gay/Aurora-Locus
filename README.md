@@ -57,9 +57,11 @@ behind Cloudflare), builds the image and starts it. Then open
 `https://<your hostname>/setup` and finish in the wizard, using the setup
 token it tells you where to find.
 
-[docs/design/operations.md](docs/design/operations.md) covers configuration,
-other proxies, running without Docker, multi-node setups and day-to-day
-operations.
+To do the same steps by hand, see [Running with Docker](docs/docker.md); for
+a cluster, [Running on Kubernetes](docs/kubernetes.md) (a Helm chart, on one
+pod or many). [docs/design/operations.md](docs/design/operations.md) covers
+configuration, other proxies, running without Docker, multi-node setups and
+day-to-day operations.
 
 ## Building from source
 
@@ -90,6 +92,8 @@ containers and ports it expects).
 | [Identity and accounts](docs/design/identity-and-accounts.md) | did:plc and did:web, handles, sessions, OAuth, service auth, account lifecycle, migration, invites, email, the admin API |
 | [The private tier](docs/design/private-tier.md) | kryphocron support: private posts, audiences, the media gate, rotation, behaviour when the private AppView is down, and what the encoding does and doesn't protect |
 | [Operations](docs/design/operations.md) | Installing, configuring, deploying and running locus |
+| [Running with Docker](docs/docker.md) | The Docker stack set up by hand, Postgres on the same machine, your own proxy |
+| [Running on Kubernetes](docs/kubernetes.md) | The Helm chart: SQLite on one pod, or Postgres and S3 on many |
 | [Security](docs/security.md) | The security measures locus takes and their limits |
 | [Changelog](CHANGELOG.md) | Changes, in Keep a Changelog format |
 
