@@ -304,6 +304,8 @@ fn sign_in_render(
             invite_required: false,
             handle: String::new(),
             email: String::new(),
+            hcaptcha_site_key: String::new(),
+            hcaptcha_script: crate::hcaptcha::SCRIPT,
         },
         status,
     )
@@ -486,7 +488,9 @@ fn sign_up_render(
     email: &str,
     status: StatusCode,
 ) -> Response {
-    web::render(
+    let site_key = crate::hcaptcha::site_key(s);
+    let hcaptcha = site_key.is_some();
+    let mut res = web::render(
         &SignInPage {
             shell: Shell {
                 dress: crate::branding::dress_cached(s, crate::branding::Blurb::SignUp),
@@ -503,9 +507,23 @@ fn sign_up_render(
             invite_required: s.snapshot().bool("accounts.invite_required"),
             handle: handle.into(),
             email: email.into(),
+            hcaptcha_site_key: site_key.unwrap_or_default(),
+            hcaptcha_script: crate::hcaptcha::SCRIPT,
         },
         status,
-    )
+    );
+    if hcaptcha {
+        let o = crate::hcaptcha::ORIGINS;
+        let csp = format!(
+            "default-src 'none'; script-src {o}; style-src 'self' {o}; font-src 'self'; img-src 'self'; \
+             frame-src {o}; connect-src {o}; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        );
+        if let Ok(v) = axum::http::HeaderValue::from_str(&csp) {
+            res.headers_mut()
+                .insert(axum::http::header::CONTENT_SECURITY_POLICY, v);
+        }
+    }
+    res
 }
 
 /// `GET /account/sign-up`.
@@ -556,6 +574,23 @@ pub async fn sign_up(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
             &handle,
             &email,
             StatusCode::FORBIDDEN,
+        );
+    }
+    if let Err(m) = crate::hcaptcha::check(
+        &s,
+        &headers,
+        Some(web::field(&form, crate::hcaptcha::FIELD)),
+        &handle,
+    )
+    .await
+    {
+        return sign_up_render(
+            &s,
+            &pre,
+            Some(m.into()),
+            &handle,
+            &email,
+            StatusCode::BAD_REQUEST,
         );
     }
     let mut body = json!({"handle": handle, "email": email, "password": raw(&form, "password")});
@@ -1751,6 +1786,8 @@ pub fn preview_page(
             invite_required: s.snapshot().bool("accounts.invite_required"),
             handle: String::new(),
             email: String::new(),
+            hcaptcha_site_key: String::new(),
+            hcaptcha_script: crate::hcaptcha::SCRIPT,
         }
         .render()
         .unwrap_or_default();

@@ -165,6 +165,10 @@ pub struct SignInPage {
     pub email: String,
     /// The branding's sign-in heading, if it sets one.
     pub heading: String,
+    /// For sign-up: the hCaptcha site key, empty when hCaptcha is off,
+    /// and the widget's script.
+    pub hcaptcha_site_key: String,
+    pub hcaptcha_script: &'static str,
 }
 
 #[cfg(test)]

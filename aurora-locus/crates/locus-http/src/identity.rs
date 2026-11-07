@@ -889,7 +889,8 @@ pub async fn well_known_did_json(State(s): St, headers: HeaderMap) -> Response {
 
 pub(crate) fn service_document(s: &AppState) -> DidDocument {
     DidDocument {
-        id: s.service_did.clone(),
+        // The host's own did:web, whatever the configured service DID.
+        id: s.host_did(),
         also_known_as: Vec::new(),
         verification_methods: vec![
             VerificationMethod {
@@ -907,6 +908,50 @@ pub(crate) fn service_document(s: &AppState) -> DidDocument {
             kind: "AtprotoPersonalDataServer".into(),
             endpoint: s.public_url.clone(),
         }],
+    }
+}
+
+/// What a boot does with `PDS_SERVICE_DID` (`configured`): until setup
+/// completes a value is recorded as the install's service DID; after, it
+/// is fixed and a value that differs is refused. True when it was refused.
+pub async fn apply_service_did_env(
+    store: &locus_store::Store,
+    configured: Option<&str>,
+    setup_done: bool,
+) -> locus_core::CoreResult<bool> {
+    let configured = configured.map(str::trim).unwrap_or_default();
+    let snap = store.load_snapshot().await?;
+    let stored = snap.text("identity.service_did");
+    if configured == stored {
+        return Ok(false);
+    }
+    if setup_done {
+        return Ok(true);
+    }
+    // Unset before setup completes leaves what's recorded (an import).
+    if configured.is_empty() {
+        return Ok(false);
+    }
+    if proto_blue_syntax::Did::new(configured).is_err() {
+        return Err(locus_core::CoreError::Config(format!(
+            "PDS_SERVICE_DID isn't a DID: {configured}"
+        )));
+    }
+    store
+        .set_setting("identity.service_did", json!(configured), "env")
+        .await?;
+    Ok(false)
+}
+
+/// The service DID an install serves as: the explicit one, else
+/// `did:web:<hostname>`.
+#[must_use]
+pub fn service_did_for(snap: &locus_core::settings::Snapshot, hostname: &str) -> String {
+    let explicit = snap.text("identity.service_did");
+    if explicit.is_empty() {
+        format!("did:web:{hostname}")
+    } else {
+        explicit.to_owned()
     }
 }
 

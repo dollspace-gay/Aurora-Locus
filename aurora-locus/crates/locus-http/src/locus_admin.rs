@@ -486,6 +486,11 @@ pub async fn set_setting(
     let who = op(&s, &headers, locus_nsid!("admin.setSetting")).await?;
     let def = locus_core::settings::def(&input.key)
         .map_err(|e| XrpcError::invalid_request(e.to_string()))?;
+    if input.key == "identity.service_did" {
+        return Err(XrpcError::invalid_request(
+            "The service DID is fixed at setup and can't change in 0.1",
+        ));
+    }
     let value = def
         .validate(input.value)
         .map_err(|e| XrpcError::invalid_request(e.to_string()))?;

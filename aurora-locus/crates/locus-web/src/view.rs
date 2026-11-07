@@ -324,6 +324,11 @@ mod tests {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             let text = std::fs::read_to_string(&path).unwrap();
+            // The hCaptcha widget's script is external, not inline.
+            let text = text.replace(
+                r#"<script src="{{ hcaptcha_script }}" async defer></script>"#,
+                "",
+            );
             for bad in [
                 "style=",
                 "<style",

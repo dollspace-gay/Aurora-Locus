@@ -83,6 +83,13 @@ pub async fn user_service_auth(
         XrpcError::new(StatusCode::UNAUTHORIZED, e.name(), e.to_string())
     };
     let jwt = service_jwt::parse(token, Some(lxm), now).map_err(unauthorized)?;
+    if !jwt.lifetime_ok(now) {
+        return Err(unauthorized(service_jwt::ServiceJwtError::BadJwtLifetime));
+    }
+    let single_use = single_use(lxm);
+    if single_use && jwt.jti.is_none() {
+        return Err(unauthorized(service_jwt::ServiceJwtError::NoJti));
+    }
     let (did, key_id) = jwt.issuer_key_ref();
     for force in [false, true] {
         let Some(doc) = state.resolve_did_doc(did, force).await? else {
@@ -94,10 +101,35 @@ pub async fn user_service_auth(
             if !state.accepts_aud(&jwt.aud) && !crate::shard::accepts_service_aud(state, &jwt.aud) {
                 return Err(unauthorized(service_jwt::ServiceJwtError::BadJwtAudience));
             }
+            // A procedure's token is good once, until it would expire.
+            if let Some(jti) = jwt.jti.as_deref().filter(|_| single_use) {
+                let ttl = (jwt.exp - now + service_jwt::SKEW_S).max(1) * 1000;
+                if !state
+                    .unique(&format!("ServiceAuth@{}", jwt.iss), jti, ttl)
+                    .await?
+                {
+                    return Err(unauthorized(service_jwt::ServiceJwtError::Replayed));
+                }
+            }
             return Ok(did.to_owned());
         }
     }
     Err(unauthorized(service_jwt::ServiceJwtError::BadJwtSignature))
+}
+
+/// Procedures that may take the same service token again (a retry after a
+/// lost response re-sends the same bytes).
+const REUSABLE: &[&str] = &["com.atproto.repo.uploadBlob"];
+
+/// Whether a service token for `lxm` on this request is single-use:
+/// procedures (anything but GET and HEAD) are, unless idempotent. Outside
+/// a request it is, to fail closed.
+fn single_use(lxm: &str) -> bool {
+    use axum::http::Method;
+    let procedure = crate::routing::REQUEST
+        .try_with(|r| r.method != Method::GET && r.method != Method::HEAD)
+        .unwrap_or(true);
+    procedure && !REUSABLE.contains(&lxm)
 }
 
 /// A verified access token with a standard scope (full access or an app password).

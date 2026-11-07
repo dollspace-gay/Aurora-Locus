@@ -259,6 +259,18 @@ async fn node_banners(s: &AppState) -> Vec<Banner> {
             link: None,
         });
     }
+    let refused = nodes_with("service_did_env", "refused");
+    if !refused.is_empty() {
+        out.push(Banner {
+            bad: false,
+            text: format!(
+                "PDS_SERVICE_DID on {} differs from this install's service DID ({}) and is ignored: an explicit service DID can't change in 0.1.",
+                refused.join(", "),
+                s.service_did
+            ),
+            link: None,
+        });
+    }
     let snap = s.snapshot();
     for key in snap.list("http.allow_insecure_http") {
         if locus_core::settings::plain_http(snap.get(key)) {

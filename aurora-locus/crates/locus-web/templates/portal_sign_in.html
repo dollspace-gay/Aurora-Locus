@@ -20,6 +20,10 @@
 <input type="text" id="invite" name="invite" spellcheck="false" required>
 <div class="hint">Sign-ups on this server need an invite code from someone already here.</div>
 {% endif %}
+{% if !hcaptcha_site_key.is_empty() %}
+<div class="h-captcha" data-sitekey="{{ hcaptcha_site_key }}"></div>
+<script src="{{ hcaptcha_script }}" async defer></script>
+{% endif %}
 <div class="row"><button type="submit">Create account</button></div>
 </form>
 <p class="muted">Already have one? <a href="/account/sign-in">Sign in</a>.</p>

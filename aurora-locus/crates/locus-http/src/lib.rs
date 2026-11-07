@@ -20,6 +20,7 @@ pub mod email;
 pub mod entryway;
 pub mod error;
 mod faults;
+pub mod hcaptcha;
 pub mod health;
 pub mod hostnames;
 pub mod identity;

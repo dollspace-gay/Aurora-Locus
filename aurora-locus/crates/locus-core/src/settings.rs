@@ -146,6 +146,7 @@ pub const ENDPOINT_URL_SETTINGS: &[&str] = &[
     "blobs.s3_endpoint",
     "sync.crawlers",
     "kryphocron.block_appview_url",
+    "accounts.hcaptcha_verify_url",
 ];
 
 /// Whether an endpoint value (a URL, or a list of them) uses plain HTTP.
@@ -239,6 +240,13 @@ pub static REGISTRY: &[Def] = &[
         description: "Operator recovery key (a did:key) added to new did:plc accounts' rotation keys.",
     },
     Def {
+        key: "identity.service_did",
+        kind: Kind::Text { max_len: 2048 },
+        default: r#""""#,
+        env: None,
+        description: "An explicit service DID (the reference's PDS_SERVICE_DID), fixed at setup; empty means did:web:<hostname>. It has no change path in 0.1.",
+    },
+    Def {
         key: "identity.resolver_timeout_ms",
         kind: Kind::Int {
             min: 100,
@@ -288,6 +296,20 @@ pub static REGISTRY: &[Def] = &[
         default: "true",
         env: Some("PDS_INVITE_REQUIRED"),
         description: "Require an invite code to create an account.",
+    },
+    Def {
+        key: "accounts.hcaptcha_site_key",
+        kind: Kind::Text { max_len: 256 },
+        default: r#""""#,
+        env: Some("PDS_HCAPTCHA_SITE_KEY"),
+        description: "The hCaptcha site key: with the hCaptcha secret (`keys set hcaptcha-secret`), web sign-up asks for a captcha.",
+    },
+    Def {
+        key: "accounts.hcaptcha_verify_url",
+        kind: Kind::Url,
+        default: r#""https://api.hcaptcha.com/siteverify""#,
+        env: None,
+        description: "Where hCaptcha tokens are verified.",
     },
     Def {
         key: "accounts.invite_interval_ms",
