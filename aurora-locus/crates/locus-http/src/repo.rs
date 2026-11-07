@@ -37,8 +37,7 @@ fn commit_error(e: CommitError) -> XrpcError {
         CommitError::Blob { name, message } => XrpcError::named(name, message),
         CommitError::Unchanged => XrpcError::invalid_request("no changes"),
         CommitError::InvalidMst(m) => {
-            tracing::error!("commit refused by the MST check: {m}");
-            XrpcError::internal("Internal Server Error")
+            XrpcError::hidden(&format!("commit refused by the MST check: {m}"))
         }
         CommitError::Core(e) => e.into(),
     }
@@ -858,7 +857,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
                 "BlobTooLarge",
                 "This file is too large",
             ),
-            other => XrpcError::internal(other.to_string()),
+            other => XrpcError::hidden(&other),
         })?;
     let cid = written.cid.to_string_base32();
     let mime = locus_blob::mime_type(&written.head, content_type.as_deref());

@@ -35,7 +35,10 @@ impl XrpcError {
         Self::new(StatusCode::BAD_REQUEST, error, message)
     }
 
+    /// A 500, logged: the operator sees every server error in the log.
     pub fn internal(message: impl Into<String>) -> Self {
+        let message = message.into();
+        tracing::error!("{message}");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalServerError",
@@ -113,11 +116,21 @@ impl From<CoreError> for XrpcError {
         match e {
             CoreError::Invalid(m) | CoreError::Conflict(m) => Self::invalid_request(m),
             CoreError::NotFound(m) => Self::invalid_request(m),
-            other => {
-                tracing::error!("{other}");
-                Self::internal("Internal Server Error")
-            }
+            other => Self::hidden(&other),
         }
+    }
+}
+
+impl XrpcError {
+    /// A 500 whose detail goes to the log only; the client gets the
+    /// reference's generic message.
+    pub fn hidden(detail: &dyn std::fmt::Display) -> Self {
+        tracing::error!("{detail}");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "Internal Server Error",
+        )
     }
 }
 
@@ -137,10 +150,7 @@ impl From<AuthError> for XrpcError {
                 "AccountTakedown",
                 "Account has been taken down",
             ),
-            AuthError::Storage(m) => {
-                tracing::error!("{m}");
-                Self::internal("Internal Server Error")
-            }
+            AuthError::Storage(m) => Self::hidden(&m),
         }
     }
 }

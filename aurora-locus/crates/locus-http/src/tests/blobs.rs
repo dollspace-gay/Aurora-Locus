@@ -1145,3 +1145,34 @@ async fn a_backup_that_loses_its_lease_mid_copy_is_marked_failed() {
     .unwrap();
     assert_eq!(manifest.status, "failed");
 }
+
+/// A blob store failure on upload is a 500 with the generic message, as
+/// the reference: the storage error (paths, OS errors) only goes to the log.
+#[tokio::test]
+async fn a_blob_store_failure_on_upload_answers_with_the_generic_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = harness(false).await;
+    if h.state.blobs.name() != "disk" {
+        return;
+    }
+    let (_, access) = h.user("wren.pds.example.com").await;
+    let root = h._dir.path().join("blobs");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (st, _, body) = h
+        .raw(
+            "POST",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            Some(&access),
+            b"unwritable".to_vec(),
+            &[("content-type", "image/png")],
+        )
+        .await;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(
+        v,
+        json!({"error": "InternalServerError", "message": "Internal Server Error"})
+    );
+}

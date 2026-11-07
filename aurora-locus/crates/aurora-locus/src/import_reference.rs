@@ -118,6 +118,18 @@ enum Blobs {
     },
 }
 
+/// The handle domains an import keeps: pds.env's `PDS_SERVICE_HANDLE_DOMAINS`
+/// when set, else the reference's default `.<hostname>` (not the setup
+/// wizard's parent-domain suggestion, which would change the domain the
+/// reference's users had).
+fn imported_handle_domains(from_env: Vec<String>, hostname: &str) -> Vec<String> {
+    if from_env.is_empty() {
+        vec![format!(".{hostname}")]
+    } else {
+        from_env
+    }
+}
+
 /// The blobs of a reference blob dir at `location`: in place under its
 /// parent, or copied when its name is one of locus's prefixes (its keys
 /// would collide with locus's own, and the sweep would take them).
@@ -304,6 +316,7 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
     plan.trusted_proxies = REFERENCE_PROXIES.iter().map(|s| (*s).to_owned()).collect();
     plan.keys_backup_acknowledged = true;
     plan.email.skipped = true;
+    plan.handle_domains = imported_handle_domains(plan.handle_domains, &hostname);
     plan.normalize();
     locus_http::setup::apply(&store, &key, &plan, bootstrap.dev_mode_honored())
         .await
@@ -324,11 +337,33 @@ pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, Strin
     for s in &report.skipped {
         lines.push(format!("  skipped: {s}"));
     }
+    if let Some(note) = blob_root_note(root.as_deref().map(Path::new), &bootstrap.data_dir) {
+        lines.push(note);
+    }
+    lines.push(
+        "The reference has no operators: add one for the web console with \
+         `aurora-locus operator add <username>` once the node runs."
+            .to_owned(),
+    );
     lines.push(format!(
         "PLC rotation key: {} (current). Keep a copy of the master key off this server.",
         secrets.plc_keys.current_did().unwrap_or_default()
     ));
     Ok(lines)
+}
+
+/// When the blobs stay outside locus's data dir: new uploads are written
+/// there too, so the node needs write access to it.
+fn blob_root_note(root: Option<&Path>, data_dir: &Path) -> Option<String> {
+    let root = root?;
+    if root.starts_with(data_dir) {
+        return None;
+    }
+    Some(format!(
+        "Blobs stay in {0}, and new uploads go there too: the node must be able to write to it \
+         (with the systemd unit, add ReadWritePaths={0}).",
+        root.display()
+    ))
 }
 
 /// Every `actors/<2 hex>/<did>/` directory.
@@ -567,6 +602,27 @@ async fn import_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blob_root_outside_the_data_dir_is_pointed_out() {
+        let data = Path::new("/var/lib/aurora-locus");
+        let note = blob_root_note(Some(Path::new("/pds")), data).expect("a note");
+        assert!(note.contains("ReadWritePaths=/pds"), "{note}");
+        assert_eq!(blob_root_note(Some(&data.join("ref")), data), None);
+        assert_eq!(blob_root_note(None, data), None);
+    }
+
+    #[test]
+    fn an_import_keeps_the_reference_handle_domain() {
+        assert_eq!(
+            imported_handle_domains(vec![], "pds.example.com"),
+            [".pds.example.com"]
+        );
+        assert_eq!(
+            imported_handle_domains(vec![".example.net".into()], "pds.example.com"),
+            [".example.net"]
+        );
+    }
 
     #[test]
     fn env_file_lines() {

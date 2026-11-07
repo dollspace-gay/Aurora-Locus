@@ -873,6 +873,14 @@ kryphocron built in.
   delete audiences.
 - A refresh that discards an audience copy from another AppView also drops
   the account's permission rows from that AppView.
+- `import reference-pds` keeps the reference's handle domain
+  (`.<hostname>`, or `PDS_SERVICE_HANDLE_DOMAINS`); before, it took the
+  setup wizard's parent-domain suggestion.
+- `import reference-pds` says when the blobs stay outside the data dir,
+  since new uploads go there too and the node must be able to write it,
+  and that the console needs an operator (`operator add`).
+- Every 500 is logged; a blob store failure on upload answers with the
+  generic message instead of the storage error.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).

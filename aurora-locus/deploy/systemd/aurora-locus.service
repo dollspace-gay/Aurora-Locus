@@ -35,6 +35,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/aurora-locus
+# After `import reference-pds`, the blobs stay in the reference's data dir
+# and new uploads go there too; add it, e.g. ReadWritePaths=/pds.
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
