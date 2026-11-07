@@ -162,7 +162,7 @@ impl Kms {
         let key = k256::PublicKey::from_public_key_der(der.as_ref()).map_err(|_| {
             KmsError::Answer(format!("{key_id} isn't a secp256k1 key (ECC_SECG_P256K1)"))
         })?;
-        let compressed = k256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, true);
+        let compressed = k256::elliptic_curve::sec1::ToSec1Point::to_sec1_point(&key, true);
         Ok(proto_blue_crypto::format_did_key(
             "ES256K",
             compressed.as_bytes(),
@@ -187,7 +187,7 @@ impl Kms {
             .ok_or_else(|| KmsError::Answer("no signature".into()))?;
         let sig = k256::ecdsa::Signature::from_der(der.as_ref())
             .map_err(|_| KmsError::Answer("a malformed signature".into()))?;
-        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig = sig.normalize_s();
         Ok(sig.to_bytes().to_vec())
     }
 }

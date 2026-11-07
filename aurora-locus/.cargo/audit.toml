@@ -8,9 +8,8 @@ ignore = [
     # their public keys; it holds no RSA private key.
     "RUSTSEC-2023-0071",
     # crypto-bigint 0.5 (through k256/p256 0.13): operations meant to be
-    # constant-time may branch on secret values. Locus signs commits and PLC
-    # operations with secret k256 keys, so this applies. The fix is the 0.14
-    # curve crates (crypto-bigint 0.7.6+), which proto-blue-crypto,
-    # kryphocron and locus must move to together.
+    # constant-time may branch on secret values. Locus and proto-blue sign
+    # with the 0.14 curve crates (crypto-bigint 0.7); only kryphocron still
+    # pulls in 0.13, until its release on 0.14. Remove this then.
     "RUSTSEC-2026-0387",
 ]

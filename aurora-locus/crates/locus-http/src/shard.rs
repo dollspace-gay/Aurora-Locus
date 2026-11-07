@@ -73,7 +73,7 @@ pub fn hex_to_did_key(hex_key: &str) -> Result<String, String> {
     let bytes = hex::decode(hex_key.trim()).map_err(|e| format!("not hex: {e}"))?;
     let key = k256::PublicKey::from_sec1_bytes(&bytes)
         .map_err(|_| "not a secp256k1 public key".to_owned())?;
-    let compressed = k256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, true);
+    let compressed = k256::elliptic_curve::sec1::ToSec1Point::to_sec1_point(&key, true);
     Ok(proto_blue_crypto::format_did_key(
         "ES256K",
         compressed.as_bytes(),

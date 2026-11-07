@@ -755,6 +755,10 @@ kryphocron built in.
   installer no longer edits `compose.yaml`.
 - Guides: running with Docker by hand (`docs/docker.md`) and on Kubernetes
   (`docs/kubernetes.md`).
+- Signing moves to the k256/p256/p384/p521 0.14 crates (with proto-blue
+  on them too), off crypto-bigint 0.5 and its timing advisory
+  (RUSTSEC-2026-0387): repo commits, PLC operations and OAuth tokens are
+  signed with the fixed constant-time code.
 - kryphocron 0.4.6, with ruzstd 0.9.1: a small pre-encoded post can no
   longer make the decoder allocate a large block before the size limit
   applies (RUSTSEC-2026-0344).

@@ -136,50 +136,46 @@ impl PublicJwk {
                 match crv {
                     "P-256" => {
                         let (x, y) = (coord(jwk, "x", 32)?, coord(jwk, "y", 32)?);
-                        let pt = p256::EncodedPoint::from_affine_coordinates(
-                            x.as_slice().into(),
-                            y.as_slice().into(),
+                        let pt = p256::Sec1Point::from_affine_coordinates(
+                            x.as_slice().try_into().map_err(|_| bad())?,
+                            y.as_slice().try_into().map_err(|_| bad())?,
                             false,
                         );
                         Ok(Self::P256(
-                            p256::ecdsa::VerifyingKey::from_encoded_point(&pt)
-                                .map_err(|_| bad())?,
+                            p256::ecdsa::VerifyingKey::from_sec1_point(&pt).map_err(|_| bad())?,
                         ))
                     }
                     "secp256k1" => {
                         let (x, y) = (coord(jwk, "x", 32)?, coord(jwk, "y", 32)?);
-                        let pt = k256::EncodedPoint::from_affine_coordinates(
-                            x.as_slice().into(),
-                            y.as_slice().into(),
+                        let pt = k256::Sec1Point::from_affine_coordinates(
+                            x.as_slice().try_into().map_err(|_| bad())?,
+                            y.as_slice().try_into().map_err(|_| bad())?,
                             false,
                         );
                         Ok(Self::K256(
-                            k256::ecdsa::VerifyingKey::from_encoded_point(&pt)
-                                .map_err(|_| bad())?,
+                            k256::ecdsa::VerifyingKey::from_sec1_point(&pt).map_err(|_| bad())?,
                         ))
                     }
                     "P-384" => {
                         let (x, y) = (coord(jwk, "x", 48)?, coord(jwk, "y", 48)?);
-                        let pt = p384::EncodedPoint::from_affine_coordinates(
-                            x.as_slice().into(),
-                            y.as_slice().into(),
+                        let pt = p384::Sec1Point::from_affine_coordinates(
+                            x.as_slice().try_into().map_err(|_| bad())?,
+                            y.as_slice().try_into().map_err(|_| bad())?,
                             false,
                         );
                         Ok(Self::P384(
-                            p384::ecdsa::VerifyingKey::from_encoded_point(&pt)
-                                .map_err(|_| bad())?,
+                            p384::ecdsa::VerifyingKey::from_sec1_point(&pt).map_err(|_| bad())?,
                         ))
                     }
                     "P-521" => {
                         let (x, y) = (coord(jwk, "x", 66)?, coord(jwk, "y", 66)?);
-                        let pt = p521::EncodedPoint::from_affine_coordinates(
-                            x.as_slice().into(),
-                            y.as_slice().into(),
+                        let pt = p521::Sec1Point::from_affine_coordinates(
+                            x.as_slice().try_into().map_err(|_| bad())?,
+                            y.as_slice().try_into().map_err(|_| bad())?,
                             false,
                         );
                         Ok(Self::P521(Box::new(
-                            p521::ecdsa::VerifyingKey::from_encoded_point(&pt)
-                                .map_err(|_| bad())?,
+                            p521::ecdsa::VerifyingKey::from_sec1_point(&pt).map_err(|_| bad())?,
                         )))
                     }
                     _ => Err(err(format!("Unsupported curve: {crv}"))),
@@ -212,6 +208,8 @@ impl PublicJwk {
 
     /// Checks `sig` over `input` with `alg`; the algorithm must fit the key.
     pub fn verify(&self, alg: &str, input: &[u8], sig: &[u8]) -> Result<(), JoseError> {
+        // The curve crates and rsa use different versions of `signature`.
+        use p256::ecdsa::signature::Verifier as _;
         use rsa::signature::Verifier;
         let failed = || err("signature verification failed");
         let mismatch = || err(format!("\"alg\" ({alg}) doesn't fit the key"));
@@ -223,7 +221,7 @@ impl PublicJwk {
             (Self::K256(k), "ES256K") => {
                 let s = k256::ecdsa::Signature::from_slice(sig).map_err(|_| failed())?;
                 // Accept high-S signatures, as jose does.
-                let s = s.normalize_s().unwrap_or(s);
+                let s = s.normalize_s();
                 k.verify(input, &s).map_err(|_| failed())
             }
             (Self::P384(k), "ES384") => {
@@ -315,7 +313,7 @@ impl std::fmt::Debug for Es256Key {
 impl Es256Key {
     #[must_use]
     pub fn generate() -> Self {
-        Self::from_signing(p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng))
+        Self::from_signing(<p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate())
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, JoseError> {
@@ -349,7 +347,7 @@ impl Es256Key {
 
     /// The public JWK (without `kid`, `use` and `alg`).
     fn public_jwk(&self) -> Value {
-        let pt = self.key.verifying_key().to_encoded_point(false);
+        let pt = self.key.verifying_key().to_sec1_point(false);
         json!({
             "kty": "EC",
             "crv": "P-256",
@@ -471,11 +469,12 @@ mod tests {
 
     #[test]
     fn other_algorithms_verify() {
+        use p256::ecdsa::signature::Signer as _;
         use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
         let input = b"header.payload";
         // ES256K, including a high-S signature.
-        let k = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let pt = k.verifying_key().to_encoded_point(false);
+        let k = <k256::ecdsa::SigningKey as k256::elliptic_curve::Generate>::generate();
+        let pt = k.verifying_key().to_sec1_point(false);
         let jwk = json!({"kty": "EC", "crv": "secp256k1", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap())});
         let sig: k256::ecdsa::Signature = k.sign(input);
         let public = PublicJwk::from_jwk(jwk.as_object().unwrap()).unwrap();
@@ -484,8 +483,8 @@ mod tests {
         let high = k256::ecdsa::Signature::from_scalars(r, -*s_).unwrap();
         public.verify("ES256K", input, &high.to_bytes()).unwrap();
         // ES384.
-        let k = p384::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-        let pt = k.verifying_key().to_encoded_point(false);
+        let k = <p384::ecdsa::SigningKey as p384::elliptic_curve::Generate>::generate();
+        let pt = k.verifying_key().to_sec1_point(false);
         let jwk = json!({"kty": "EC", "crv": "P-384", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap())});
         let sig: p384::ecdsa::Signature = k.sign(input);
         PublicJwk::from_jwk(jwk.as_object().unwrap())

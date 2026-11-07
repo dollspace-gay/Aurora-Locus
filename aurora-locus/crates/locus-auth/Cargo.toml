@@ -27,10 +27,10 @@ proto-blue-crypto.workspace = true
 proto-blue-syntax.workspace = true
 argon2 = "0.5"
 scrypt = { version = "0.11", default-features = false }
-p256 = { version = "0.13", features = ["ecdsa"] }
-k256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-p521 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
+p521 = { version = "0.14", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["sha2"] }
 
 [dev-dependencies]

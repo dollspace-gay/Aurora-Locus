@@ -79,8 +79,7 @@ pub async fn show(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
             .and_then(|p| k256::PublicKey::from_sec1_bytes(&p.key_bytes).ok())
             .map(|p| {
                 hex::encode(
-                    k256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&p, true)
-                        .as_bytes(),
+                    k256::elliptic_curve::sec1::ToSec1Point::to_sec1_point(&p, true).as_bytes(),
                 )
             });
         Some(json!({"didKey": did, "hex": hex}))
