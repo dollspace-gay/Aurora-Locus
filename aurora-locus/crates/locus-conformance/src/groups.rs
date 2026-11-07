@@ -172,6 +172,10 @@ pub fn migration() -> Vec<Step> {
         Step::post("migration.createAccount.noAuth", "com.atproto.server.createAccount", account("migrant.test", "{{peer.dave.did}}")),
         Step::post("migration.createAccount.wrongDid", "com.atproto.server.createAccount", account("migrant.test", "{{alice.did}}"))
             .auth(svc),
+        // A service token is single-use on locus (design §1.3; the reference
+        // takes reuse): one per call, as migration tools do.
+        Step::get("migration.peer.getServiceAuth.second", "com.atproto.server.getServiceAuth").on_peer().auth(dave)
+            .q("aud", "did:web:localhost").q("lxm", "com.atproto.server.createAccount").keep("svc.jwt", "/token"),
         Step::post("migration.createAccount", "com.atproto.server.createAccount", account("migrant.test", "{{peer.dave.did}}"))
             .auth(svc).keep("mig.access", "/accessJwt").keep("mig.refresh", "/refreshJwt"),
         Step::get("migration.checkAccountStatus.new", "com.atproto.server.checkAccountStatus").auth(mig),
@@ -217,7 +221,13 @@ pub fn migration() -> Vec<Step> {
         Step::get("migration.source.getRepoStatus", "com.atproto.sync.getRepoStatus").q("did", "{{dave.did}}"),
         Step::get("migration.source.checkAccountStatus", "com.atproto.server.checkAccountStatus").auth(dave),
         // A DID that already has an account here.
+        Step::get("migration.peer.getServiceAuth.third", "com.atproto.server.getServiceAuth").on_peer().auth(dave)
+            .q("aud", "did:web:localhost").q("lxm", "com.atproto.server.createAccount").keep("svc.jwt", "/token"),
         Step::post("migration.createAccount.again", "com.atproto.server.createAccount", account("migrant2.test", "{{peer.dave.did}}"))
+            .auth(svc),
+        // The same token again: locus refuses a reused service token on a
+        // procedure; the reference takes it (allowlisted).
+        Step::post("migration.createAccount.replayed", "com.atproto.server.createAccount", account("migrant3.test", "{{peer.dave.did}}"))
             .auth(svc),
     ]
 }

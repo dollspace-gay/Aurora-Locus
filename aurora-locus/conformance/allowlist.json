@@ -2,108 +2,114 @@
   {
     "step": "repo.applyWrites.deleteMissing",
     "path": "status",
-    "section": "§1.3, §6",
+    "section": "\u00a71.3, \u00a76",
     "why": "The reference answers 500 for a delete of a missing record (an MST conflict); locus answers 400 with the reason."
   },
   {
     "step": "repo.applyWrites.deleteMissing",
     "path": "/error",
-    "section": "§1.3, §6",
+    "section": "\u00a71.3, \u00a76",
     "why": "As above: InvalidRequest instead of InternalServerError."
   },
   {
     "step": "server.createAppPassword.again",
     "path": "status",
-    "section": "§1.3",
+    "section": "\u00a71.3",
     "why": "The reference answers 500 when an app-password name is already used (a database constraint); locus answers 400 InvalidRequest."
   },
   {
     "step": "server.createAppPassword.again",
     "path": "/error",
-    "section": "§1.3",
+    "section": "\u00a71.3",
     "why": "As above: InvalidRequest instead of InternalServerError."
   },
   {
     "step": "migration.importRepo.garbage",
     "path": "status",
-    "section": "§1.3",
-    "why": "The reference answers 500 for a body that isn't a CAR; locus answers 400 InvalidRequest with the reason. (Reference bug; §1.3 has no row for it.)"
+    "section": "\u00a71.3",
+    "why": "The reference answers 500 for a body that isn't a CAR; locus answers 400 InvalidRequest with the reason. (Reference bug; \u00a71.3 has no row for it.)"
   },
   {
     "step": "migration.importRepo.garbage",
     "path": "/error",
-    "section": "§1.3",
+    "section": "\u00a71.3",
     "why": "As above: InvalidRequest instead of InternalServerError."
   },
   {
     "step": "proxy.header.badDid",
     "path": "status",
-    "section": "§1.3",
-    "why": "The reference answers 500 for an atproto-proxy header whose DID isn't a DID; locus answers 400 InvalidRequest. (Reference bug; §1.3 has no row for it.)"
+    "section": "\u00a71.3",
+    "why": "The reference answers 500 for an atproto-proxy header whose DID isn't a DID; locus answers 400 InvalidRequest. (Reference bug; \u00a71.3 has no row for it.)"
   },
   {
     "step": "proxy.header.badDid",
     "path": "/error",
-    "section": "§1.3",
+    "section": "\u00a71.3",
     "why": "As above: InvalidRequest instead of InternalServerError."
   },
   {
     "step": "admin.updateAccountEmail.taken",
     "path": "status",
-    "section": "§1.3",
-    "why": "The reference answers 500 when an operator sets an email another account uses (a database constraint); locus answers 400 InvalidRequest. (Reference bug; §1.3 has no row for it.)"
+    "section": "\u00a71.3",
+    "why": "The reference answers 500 when an operator sets an email another account uses (a database constraint); locus answers 400 InvalidRequest. (Reference bug; \u00a71.3 has no row for it.)"
   },
   {
     "step": "admin.updateAccountEmail.taken",
     "path": "/error",
-    "section": "§1.3",
+    "section": "\u00a71.3",
     "why": "As above: InvalidRequest instead of InternalServerError."
   },
   {
     "step": "oauth.jwks",
     "path": "/keys",
-    "section": "§10.4",
+    "section": "\u00a710.4",
     "why": "Locus signs OAuth access tokens with a dedicated ES256 key and publishes it; the reference signs with its HS256 secret and publishes none."
   },
   {
     "step": "admin.searchAccounts",
     "path": "*",
-    "section": "§15.2",
+    "section": "\u00a715.2",
     "why": "admin.searchAccounts is a locus addition; the reference doesn't serve it (it tries to proxy it and refuses Basic auth)."
   },
   {
     "step": "email.requestEmailConfirmation",
     "path": "*",
-    "section": "§1.3, §11.6",
+    "section": "\u00a71.3, \u00a711.6",
     "when": "no-mail",
     "why": "With no SMTP, the reference silently 'sends'; locus answers InvalidRequest 'Email is not configured on this server'."
   },
   {
     "step": "email.requestPasswordReset",
     "path": "*",
-    "section": "§1.3, §11.6",
+    "section": "\u00a71.3, \u00a711.6",
     "when": "no-mail",
     "why": "As above."
   },
   {
     "step": "email.requestAccountDelete",
     "path": "*",
-    "section": "§1.3, §11.6",
+    "section": "\u00a71.3, \u00a711.6",
     "when": "no-mail",
     "why": "As above."
   },
   {
     "step": "email.requestPasswordReset.unknown",
     "path": "*",
-    "section": "§11.6",
+    "section": "\u00a711.6",
     "when": "mail",
     "why": "Locus answers a password reset for an unknown email the same as for a known one; the reference reveals that no account has it."
   },
   {
     "step": "admin.sendEmail",
     "path": "*",
-    "section": "§1.3, §11.6",
+    "section": "\u00a71.3, \u00a711.6",
     "when": "no-mail",
     "why": "With no SMTP, the reference answers {sent: true}; locus refuses: the moderation sender isn't configured."
+  },
+  {
+    "step": "migration.createAccount.replayed",
+    "path": "*",
+    "section": "\u00a71.3, \u00a710.5",
+    "why": "A service-auth token on a procedure is single-use on locus (jti replay cache); the reference has no replay check and answers the reused token as a fresh one."
   }
 ]
