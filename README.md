@@ -63,27 +63,6 @@ pod or many). [docs/design/operations.md](docs/design/operations.md) covers
 configuration, other proxies, running without Docker, multi-node setups and
 day-to-day operations.
 
-## Building from source
-
-Locus needs Rust 1.88 (pinned in `aurora-locus/rust-toolchain.toml`) and
-`proto-blue-codegen` 0.3.3, which generates the kryphocron lexicon code at
-build time:
-
-```sh
-cargo install proto-blue-codegen --version 0.3.3 --locked
-cd aurora-locus
-cargo build --release -p aurora-locus
-```
-
-The binary is `target/release/aurora-locus`. `aurora-locus serve` starts a
-node, and `aurora-locus --help` lists the operator commands. The Docker image
-is built from `aurora-locus/deploy/docker/Dockerfile`.
-
-Tests run with `cargo test`. `aurora-locus/scripts/check.sh` formats, lints
-and runs the whole suite; it also runs the Postgres, Redis, S3 and KMS tests
-when the matching local test containers are running (the script names the
-containers and ports it expects).
-
 ## Documentation
 
 | Document | What it covers |
