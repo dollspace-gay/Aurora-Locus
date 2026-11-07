@@ -140,6 +140,7 @@ pub const ENDPOINT_URL_SETTINGS: &[&str] = &[
     "identity.plc_url",
     "entryway.url",
     "appview.url",
+    "appview.private_url",
     "moderation.service_url",
     "moderation.report_service_url",
     "blobs.scanner_url",
@@ -423,6 +424,20 @@ pub static REGISTRY: &[Def] = &[
         default: r#""""#,
         env: Some("PDS_BSKY_APP_VIEW_DID"),
         description: "The AppView's DID (the audience of its service tokens).",
+    },
+    Def {
+        key: "appview.private_url",
+        kind: Kind::Url,
+        default: r#""""#,
+        env: Some("LOCUS_PRIVATE_APPVIEW_URL"),
+        description: "The private AppView (prism): membership, audiences and private media for the private tier. It may be the same as the AppView. Empty: no private tier.",
+    },
+    Def {
+        key: "appview.private_did",
+        kind: Kind::Text { max_len: 2048 },
+        default: r#""""#,
+        env: Some("LOCUS_PRIVATE_APPVIEW_DID"),
+        description: "The private AppView's DID (the audience of its service tokens).",
     },
     Def {
         key: "kryphocron.block_appview_url",

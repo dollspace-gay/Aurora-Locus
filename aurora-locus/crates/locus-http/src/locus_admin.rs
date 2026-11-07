@@ -153,7 +153,7 @@ pub async fn describe_capabilities(State(s): St) -> Json<Value> {
         },
         "shardCallbacks": s.entryway.is_some(),
         "kryphocron": {
-            "privateTier": crate::pipethrough::appview(&s).is_some() && s.snapshot().bool("kryphocron.private_tier_enabled"),
+            "privateTier": crate::pipethrough::private_appview(&s).is_some() && s.snapshot().bool("kryphocron.private_tier_enabled"),
             "mediaGate": crate::media_gate::gate_on(&s),
         },
     }))
@@ -333,6 +333,7 @@ pub async fn kryphocron_status(State(s): St, headers: HeaderMap) -> XrpcResult<J
     let flagged = s.store.flagged_private_records(100).await?;
     Ok(Json(json!({
         "appview": crate::pipethrough::appview(&s).map(|(_, d)| d),
+        "privateAppview": crate::pipethrough::private_appview(&s).map(|(_, d)| d),
         "privateTierEnabled": snap.bool("kryphocron.private_tier_enabled"),
         "mediaGate": {"setting": snap.bool("kryphocron.private_media_gated"), "effective": crate::media_gate::gate_on(&s)},
         "prism": {"down": s.kr.prism.is_down(), "changedAt": match s.kr.prism.changed_at() {

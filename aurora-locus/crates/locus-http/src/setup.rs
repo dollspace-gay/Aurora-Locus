@@ -204,6 +204,8 @@ pub fn seed_plan(snap: &Snapshot, bootstrap_hostname: Option<&str>) -> SetupPlan
         services.appview_url = appview_url;
         services.appview_did = appview_did;
     }
+    services.private_appview_url = text("appview.private_url");
+    services.private_appview_did = text("appview.private_did");
     let crawlers: Vec<String> = snap
         .list("sync.crawlers")
         .into_iter()
@@ -295,6 +297,7 @@ pub async fn apply(
     let allowed: Vec<&str> = allowed.list("http.allow_insecure_http");
     for (key, value) in [
         ("appview.url", json!(s.appview_url)),
+        ("appview.private_url", json!(s.private_appview_url)),
         ("sync.crawlers", json!(s.crawlers)),
         ("moderation.service_url", json!(s.moderation_url)),
         ("moderation.report_service_url", json!(s.report_url)),
@@ -311,6 +314,8 @@ pub async fn apply(
         ("deploy.proxy_mode", json!(plan.proxy.as_str())),
         ("appview.url", json!(s.appview_url)),
         ("appview.did", json!(s.appview_did)),
+        ("appview.private_url", json!(s.private_appview_url)),
+        ("appview.private_did", json!(s.private_appview_did)),
         ("sync.crawlers", json!(s.crawlers)),
         ("moderation.service_url", json!(s.moderation_url)),
         ("moderation.service_did", json!(s.moderation_did)),
@@ -608,12 +613,12 @@ pub async fn run_checks(env: &CheckEnv<'_>, plan: &SetupPlan) -> Vec<Check> {
         }
     });
 
-    if plan.private_tier && plan.services.appview_url.is_empty() {
+    if plan.private_tier && plan.services.private_appview_url.is_empty() {
         out.push(check(
             "private",
             "Private posts",
             Outcome::Warn,
-            "Private posts are on, but no AppView is set, so they won't work until one is.",
+            "Private posts are on, but no private AppView is set, so they won't work until one is (it can be the same as the AppView).",
         ));
     }
     out
@@ -1354,6 +1359,13 @@ pub async fn save_step(
         }
         Step::Private => {
             plan.private_tier = f("private_tier") == "1";
+            plan.services.private_appview_url = f("private_appview_url");
+            plan.services.private_appview_did = f("private_appview_did");
+            errors = plan
+                .services_problems()
+                .into_iter()
+                .map(|p| p.message)
+                .collect();
         }
         Step::Keys => {
             plan.recovery_did_key = f("recovery_did_key");
@@ -1604,7 +1616,8 @@ async fn form_for(
         }
         Step::Private => {
             f.private_tier = p.private_tier;
-            f.appview_set = !p.services.appview_url.is_empty();
+            f.private_appview_url = p.services.private_appview_url.clone();
+            f.private_appview_did = p.services.private_appview_did.clone();
         }
         Step::Keys => {
             f.rotation_key = s.accepted_plc_keys().into_iter().next().unwrap_or_default();
@@ -1665,6 +1678,10 @@ async fn form_for(
                     },
                 ),
                 ("AppView".into(), or_none(&p.services.appview_url)),
+                (
+                    "Private AppView".into(),
+                    or_none(&p.services.private_appview_url),
+                ),
                 ("Moderation".into(), or_none(&p.services.moderation_url)),
                 ("Reports".into(), or_none(&p.services.report_url)),
                 (

@@ -5663,12 +5663,13 @@ impl Harness {
         format!("at://{did}/tools.kryphocron.policy.audience/{rkey}")
     }
 
-    /// A configured prism that admits every caller to the private tier.
+    /// A configured prism (the private AppView) that admits every caller to
+    /// the private tier.
     async fn with_prism(&self) -> (Script, SeenLog) {
         let (url, script, seen) = scripted_appview().await;
         for (k, v) in [
-            ("appview.url", url.as_str()),
-            ("appview.did", "did:web:prism.test"),
+            ("appview.private_url", url.as_str()),
+            ("appview.private_did", "did:web:prism.test"),
         ] {
             self.state.settings.set(k, json!(v), "test").await.unwrap();
         }
@@ -6074,7 +6075,7 @@ async fn the_appview_decides_who_may_write_private_posts() {
     };
     h.state
         .settings
-        .set("appview.url", json!(dead), "test")
+        .set("appview.private_url", json!(dead), "test")
         .await
         .unwrap();
     assert_eq!(
@@ -6555,10 +6556,10 @@ async fn an_unreachable_prism_is_marked_down_and_probed_back_up() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         format!("http://{}", l.local_addr().unwrap())
     };
-    let live = h.state.snapshot().text("appview.url").to_owned();
+    let live = h.state.snapshot().text("appview.private_url").to_owned();
     h.state
         .settings
-        .set("appview.url", json!(dead), "test")
+        .set("appview.private_url", json!(dead), "test")
         .await
         .unwrap();
     let answer = crate::audience::call(
@@ -6596,7 +6597,7 @@ async fn an_unreachable_prism_is_marked_down_and_probed_back_up() {
     // Any HTTP answer brings it back (the mock answers did.json with 404).
     h.state
         .settings
-        .set("appview.url", json!(live), "test")
+        .set("appview.private_url", json!(live), "test")
         .await
         .unwrap();
     for _ in 0..700 {
@@ -6886,7 +6887,7 @@ async fn during_a_prism_outage_the_copy_is_the_authority() {
     };
     h.state
         .settings
-        .set("appview.url", json!(dead), "test")
+        .set("appview.private_url", json!(dead), "test")
         .await
         .unwrap();
 
@@ -9163,8 +9164,32 @@ async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
         ("report_did", "did:plc:ar7c4by46qjdydhdevvrndac".into()),
     ];
     assert_eq!(next(&step("/setup/services", svc).await), "/setup/private");
+    // A private AppView needs its DID too.
+    let (st, _, page) = step(
+        "/setup/private",
+        vec![
+            ("private_tier", "1".into()),
+            ("private_appview_url", "https://prism.example.com".into()),
+        ],
+    )
+    .await;
+    assert_ne!(st, StatusCode::SEE_OTHER);
+    assert!(
+        page.contains("The private AppView needs both its URL and its DID."),
+        "{page}"
+    );
     assert_eq!(
-        next(&step("/setup/private", vec![("private_tier", "1".into())]).await),
+        next(
+            &step(
+                "/setup/private",
+                vec![
+                    ("private_tier", "1".into()),
+                    ("private_appview_url", "https://prism.example.com".into()),
+                    ("private_appview_did", "did:web:prism.example.com".into()),
+                ]
+            )
+            .await
+        ),
         "/setup/keys"
     );
     let (_, _, page) = b.get(&h, "/setup/keys").await;
@@ -9266,6 +9291,14 @@ async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
     assert_eq!(snap.text("server.service_name"), "Example PDS");
     assert_eq!(snap.text("email.from_address"), "PDS <pds@example.com>");
     assert!(snap.bool("kryphocron.private_tier_enabled"));
+    assert_eq!(
+        snap.text("appview.private_url"),
+        "https://prism.example.com"
+    );
+    assert_eq!(
+        snap.text("appview.private_did"),
+        "did:web:prism.example.com"
+    );
     let op = h.state.store.operator("alice").await.unwrap().unwrap();
     assert_eq!(op.role, "owner");
     assert!(locus_auth::password::verify(

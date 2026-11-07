@@ -93,7 +93,7 @@ async fn probe_after_failure(s: &std::sync::Arc<AppState>, url: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let Some((url, _)) = crate::pipethrough::appview(&st) else {
+            let Some((url, _)) = crate::pipethrough::private_appview(&st) else {
                 break;
             };
             if probe_once(&st, &url).await {
@@ -190,7 +190,7 @@ pub async fn call(
     query: &[(&str, &str)],
     body: Option<Value>,
 ) -> Prism {
-    let Some((url, aud)) = crate::pipethrough::appview(s) else {
+    let Some((url, aud)) = crate::pipethrough::private_appview(s) else {
         return Prism::Unreachable;
     };
     if s.kr.prism.is_down() {
@@ -388,7 +388,7 @@ pub async fn owner_taken_down(s: &AppState, did: &str) -> XrpcResult<bool> {
 /// `NotEnrolled` purges the copy and both permission rows; `AccountTakedown`
 /// writes `takedown` to both; `NotReady`/`Reindexing` write the probe row.
 pub async fn apply_error_answer(s: &AppState, did: &str, answer: &Prism) -> XrpcResult<()> {
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return Ok(());
     };
     let now = locus_core::time::now_ms();
@@ -489,7 +489,7 @@ pub async fn refresh(
     want: Option<&str>,
     deadline: Instant,
 ) -> XrpcResult<Refreshed> {
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return Ok(Refreshed::stopped("no AppView"));
     };
     if owner_taken_down(s, owner).await? {
@@ -867,7 +867,7 @@ fn now_iso() -> String {
 }
 
 fn prism_did(s: &AppState) -> XrpcResult<String> {
-    crate::pipethrough::appview(s)
+    crate::pipethrough::private_appview(s)
         .map(|(_, d)| d)
         .ok_or_else(|| {
             XrpcError::named(
@@ -1138,7 +1138,7 @@ pub async fn update(
 /// Deletes an audience. Never gated: with the tier off or the AppView
 /// removed, or during an outage, a prism audience's delete is queued.
 pub async fn delete(s: &std::sync::Arc<AppState>, owner: &str, rkey: &str) -> XrpcResult<()> {
-    let tier_off = crate::pipethrough::appview(s).is_none()
+    let tier_off = crate::pipethrough::private_appview(s).is_none()
         || !s.snapshot().bool("kryphocron.private_tier_enabled");
     let found = if tier_off {
         lookup(s, owner, rkey).await?
@@ -1398,7 +1398,7 @@ pub fn is_prism_audience_call(s: &AppState, headers: &HeaderMap, lxm: &str) -> b
     if !PRISM_AUDIENCE_METHODS.contains(&lxm) {
         return false;
     }
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return false;
     };
     match headers.get("atproto-proxy").and_then(|v| v.to_str().ok()) {

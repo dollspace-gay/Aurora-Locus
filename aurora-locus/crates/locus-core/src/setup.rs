@@ -98,6 +98,10 @@ pub struct EmailPlan {
 pub struct ServicesPlan {
     pub appview_url: String,
     pub appview_did: String,
+    /// The private AppView (prism) for the private tier; may be the same
+    /// as the AppView. Empty: no private tier.
+    pub private_appview_url: String,
+    pub private_appview_did: String,
     pub crawlers: Vec<String>,
     pub moderation_url: String,
     pub moderation_did: String,
@@ -110,6 +114,8 @@ impl Default for ServicesPlan {
         Self {
             appview_url: DEFAULT_APPVIEW_URL.into(),
             appview_did: DEFAULT_APPVIEW_DID.into(),
+            private_appview_url: String::new(),
+            private_appview_did: String::new(),
             crawlers: vec![DEFAULT_CRAWLER.into()],
             moderation_url: String::new(),
             moderation_did: String::new(),
@@ -468,6 +474,22 @@ impl SetupPlan {
             out.push(problem(
                 "services.appview_did",
                 "An AppView needs both its URL and its DID.",
+            ));
+        }
+        url(
+            "services.private_appview_url",
+            &s.private_appview_url,
+            &mut out,
+        );
+        did(
+            "services.private_appview_did",
+            &s.private_appview_did,
+            &mut out,
+        );
+        if s.private_appview_url.is_empty() != s.private_appview_did.is_empty() {
+            out.push(problem(
+                "services.private_appview_did",
+                "The private AppView needs both its URL and its DID.",
             ));
         }
         for c in &s.crawlers {

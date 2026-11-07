@@ -468,13 +468,26 @@ pub async fn private(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery
             p.cards.push(card(
                 "Private tier",
                 vec![
+                    {
+                        let enabled = v["privateTierEnabled"].as_bool().unwrap_or(false);
+                        let has_private = v["privateAppview"].is_string();
+                        let f = Fact::new(
+                            "Private posts",
+                            match (enabled, has_private) {
+                                (true, true) => "on",
+                                (true, false) => "off: no private AppView is set",
+                                (false, _) => "off",
+                            },
+                        );
+                        if enabled && !has_private {
+                            f.class("bad")
+                        } else {
+                            f
+                        }
+                    },
                     Fact::new(
-                        "Private posts",
-                        on_off(v["privateTierEnabled"].as_bool().unwrap_or(false)),
-                    ),
-                    Fact::new(
-                        "AppView",
-                        v["appview"]
+                        "Private AppView",
+                        v["privateAppview"]
                             .as_str()
                             .map_or_else(|| "none".into(), str::to_owned),
                     ),
@@ -710,6 +723,13 @@ pub async fn services(State(s): St, headers: HeaderMap, Query(q): Query<PageQuer
         ],
     ));
     p.cards.push(card(
+        "Private AppView",
+        vec![
+            Fact::new("URL", or_none(snap.text("appview.private_url"))),
+            Fact::new("DID", or_none(snap.text("appview.private_did"))),
+        ],
+    ));
+    p.cards.push(card(
         "Firehose",
         vec![
             Fact::new("Sequence", seq.to_string()),
@@ -732,7 +752,16 @@ pub async fn services(State(s): St, headers: HeaderMap, Query(q): Query<PageQuer
             danger: false,
         });
     }
-    p.fields = fields(&s, &["appview.url", "appview.did", "sync.crawlers"]);
+    p.fields = fields(
+        &s,
+        &[
+            "appview.url",
+            "appview.did",
+            "appview.private_url",
+            "appview.private_did",
+            "sync.crawlers",
+        ],
+    );
     let mut adv = fields(&s, &["appview.cdn_url_pattern"]);
     adv.extend(fields_under(&s, "proxy", &[]));
     adv.extend(fields_under(&s, "oauth", &[]));

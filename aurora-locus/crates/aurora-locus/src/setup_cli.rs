@@ -358,10 +358,22 @@ async fn interactive(
     }
 
     println!("\n7. Private posts");
-    plan.private_tier = confirm(
-        "  Allow private posts (they need an AppView that supports them)?",
-        plan.private_tier,
-    )?;
+    plan.private_tier = confirm("  Allow private posts?", plan.private_tier)?;
+    if plan.private_tier {
+        println!(
+            "  Private posts need a private AppView (prism); it can be the same as the AppView above."
+        );
+        loop {
+            let s = &mut plan.services;
+            s.private_appview_url = ask("  Private AppView URL", &s.private_appview_url)?;
+            if !s.private_appview_url.is_empty() {
+                s.private_appview_did = ask("  Private AppView DID", &s.private_appview_did)?;
+            }
+            if say_problems(plan.services_problems()) {
+                break;
+            }
+        }
+    }
 
     println!("\n8. Keys");
     println!("  PLC rotation key: {rotation_key}");

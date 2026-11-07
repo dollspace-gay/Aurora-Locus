@@ -77,7 +77,7 @@ fn take(
 /// the newer row, expired or not. `None`: no fresh row while prism is up
 /// (the probe decides).
 async fn ready(s: &AppState, did: &str) -> XrpcResult<Option<bool>> {
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return Ok(Some(false));
     };
     let now = locus_core::time::now_ms();
@@ -151,7 +151,7 @@ async fn probe(s: &Arc<AppState>, subject: &str, posts: &[String]) -> XrpcResult
     }
     let query: Vec<(&str, &str)> = posts.iter().map(|p| ("uris", p.as_str())).collect();
     let answer = audience::call(s, subject, "app.nearhorizon.private.getPosts", &query, None).await;
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return Ok(Probe::Nothing);
     };
     let now = locus_core::time::now_ms();
@@ -618,15 +618,18 @@ async fn blocked(s: &Arc<AppState>, writer: &str, author: &str) -> XrpcResult<bo
     }
     let query = [("actor", writer), ("others", author)];
     let lxm = "app.bsky.graph.getRelationships";
-    // The block-source AppView if one is set, else the configured one.
-    let rel = match crate::pipethrough::configured(
+    // The block-source AppView if one is set, else the (public) AppView;
+    // with neither, fail closed.
+    let source = crate::pipethrough::configured(
         s,
         "kryphocron.block_appview_url",
         "kryphocron.block_appview_did",
-    ) {
-        Some((url, aud)) => audience::call_service(s, &url, &aud, writer, lxm, &query).await,
-        None => audience::call(s, writer, lxm, &query, None).await,
+    )
+    .or_else(|| crate::pipethrough::appview(s));
+    let Some((url, aud)) = source else {
+        return Ok(true);
     };
+    let rel = audience::call_service(s, &url, &aud, writer, lxm, &query).await;
     let Prism::Answer {
         status: 200, body, ..
     } = rel

@@ -64,7 +64,7 @@ fn sync_rule(row: &AudienceRow, prism_cid: &Option<String>, prism: &Audience) ->
 /// Settles an account's queued edits and creates its local audiences in
 /// prism, after a complete listing. Returns how many prism writes it made.
 pub async fn sync_account(s: &Arc<AppState>, owner: &str, listing: &Refreshed) -> XrpcResult<u32> {
-    let Some((_, prism_did)) = crate::pipethrough::appview(s) else {
+    let Some((_, prism_did)) = crate::pipethrough::private_appview(s) else {
         return Ok(0);
     };
     let mut writes = 0;
@@ -302,7 +302,7 @@ pub async fn run(s: Arc<AppState>, cancel: CancellationToken) -> locus_core::Cor
 
 /// One pass over the accounts due a poll.
 pub async fn poll_once(s: &Arc<AppState>, cancel: &CancellationToken) -> XrpcResult<u32> {
-    if crate::pipethrough::appview(s).is_none() || s.kr.prism.is_down() {
+    if crate::pipethrough::private_appview(s).is_none() || s.kr.prism.is_down() {
         return Ok(0);
     }
     let snap = s.snapshot();

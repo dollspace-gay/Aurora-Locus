@@ -743,6 +743,13 @@ kryphocron built in.
 
 ### Changed
 
+- The private tier has its own AppView setting, `appview.private_url` and
+  `appview.private_did` (`LOCUS_PRIVATE_APPVIEW_URL`/`_DID`; in the setup
+  wizard's private posts step and the console's services page), for a
+  prism that doesn't serve public reads. It may name the same service as
+  `appview.*`, but must be entered: with it empty the private tier is off.
+  The block check for a remote parent author falls back to the public
+  AppView, never prism, and fails closed with neither.
 - `deploy/install.sh` asks for the handle domain, defaulting to the
   hostname as the reference's installer does; it used the parent domain,
   which for a PDS at `example.com` made the wildcard `*.com`, so no handle

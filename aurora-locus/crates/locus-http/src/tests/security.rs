@@ -848,6 +848,15 @@ async fn block_checks_against_a_remote_parent_fail_closed() {
     })
     .await;
     let (script, _) = h.with_prism().await;
+    // One AppView for both: prism is also the public AppView, so it's the
+    // block source.
+    let prism_url = h.state.snapshot().text("appview.private_url").to_owned();
+    for (k, v) in [
+        ("appview.url", prism_url.as_str()),
+        ("appview.did", "did:web:prism.test"),
+    ] {
+        h.state.settings.set(k, json!(v), "test").await.unwrap();
+    }
     // The parent's author is on another PDS.
     let author = format!("did:plc:{}", "r".repeat(24));
     let audience = format!("at://{author}/{AUD}/3m6aaaaaaaaaa");
@@ -914,6 +923,48 @@ async fn block_checks_against_a_remote_parent_fail_closed() {
     // block check's).
     relationships(200, json!({"relationships": [{"did": author}]}));
     let (st, v) = reply(0).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+/// The private tier needs the private AppView entered, even when it's the
+/// same service as the AppView: the AppView alone never stands in.
+#[tokio::test]
+async fn the_private_tier_needs_its_own_private_appview_entry() {
+    let h = harness(false).await;
+    let (_, seen) = h.with_prism().await;
+    let prism_url = h.state.snapshot().text("appview.private_url").to_owned();
+    let set = |k: &'static str, v: Value| {
+        let h = &h;
+        async move { h.state.settings.set(k, v, "test").await.unwrap() }
+    };
+    set("appview.url", json!(prism_url)).await;
+    set("appview.did", json!("did:web:prism.test")).await;
+    set("appview.private_url", json!("")).await;
+    set("appview.private_did", json!("")).await;
+    let (did, access) = h.user("pat.pds.example.com").await;
+    let mine = h.add_audience(&did, "3m6aaaaaaaaaa").await;
+    let (st, v) = h
+        .private_post_as(&did, &access, private_post("x", &mine))
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("UnsupportedNamespace")),
+        "{v}"
+    );
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.uri.contains("getMembership")),
+        "the AppView wasn't asked as prism"
+    );
+    // Entered as the private AppView too (the same service): it works.
+    set("appview.private_url", json!(prism_url)).await;
+    set("appview.private_did", json!("did:web:prism.test")).await;
+    let (st, v) = h
+        .private_post_as(&did, &access, private_post("x", &mine))
+        .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
 
@@ -1363,8 +1414,8 @@ async fn consent_pages_keep_their_security_block_under_every_theme() {
 
 /// With a block-source AppView set, app.bsky block checks for a remote
 /// parent author ask it (as the writer, its DID the token's audience),
-/// not the configured AppView; it fails closed the same way; unset, the
-/// configured AppView is asked again.
+/// not prism; it fails closed the same way; unset, the (public) AppView is
+/// asked, never prism; with no AppView either, it fails closed.
 #[tokio::test]
 async fn block_checks_ask_the_block_source_appview_when_one_is_set() {
     use base64::Engine;
@@ -1408,6 +1459,7 @@ async fn block_checks_ask_the_block_source_appview_when_one_is_set() {
         ("byb.pds.example.com", "3m6aaaaaaaaac"),
         ("byc.pds.example.com", "3m6aaaaaaaaad"),
         ("byd.pds.example.com", "3m6aaaaaaaaae"),
+        ("bye.pds.example.com", "3m6aaaaaaaaaf"),
     ] {
         let (did, access) = h.user(handle).await;
         let mine = h.add_audience(&did, rkey).await;
@@ -1481,20 +1533,35 @@ async fn block_checks_ask_the_block_source_appview_when_one_is_set() {
         json!({"error": "InternalServerError"}),
     );
     assert_eq!(reply(2).await.0, StatusCode::FORBIDDEN);
-    // Unset: the configured AppView (prism, answering 501) is asked.
+    // Unset: the public AppView is asked, not prism.
     set("kryphocron.block_appview_url", json!("")).await;
+    let (pub_url, public, pub_seen) = scripted_appview().await;
     set_script(
-        &bsky,
+        &public,
         "app.bsky.graph.getRelationships",
         200,
         json!({"relationships": [{"did": author}]}),
     );
-    assert_eq!(reply(3).await.0, StatusCode::FORBIDDEN);
+    set("appview.url", json!(pub_url)).await;
+    set("appview.did", json!("did:web:appview.test")).await;
+    let (st, v) = reply(3).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
     assert!(
-        prism_seen
+        pub_seen
             .lock()
             .unwrap()
             .iter()
             .any(|s| s.uri.contains("getRelationships"))
     );
+    assert!(
+        !prism_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.uri.contains("getRelationships")),
+        "prism is never the block source"
+    );
+    // No AppView at all: fails closed.
+    set("appview.url", json!("")).await;
+    assert_eq!(reply(4).await.0, StatusCode::FORBIDDEN);
 }

@@ -151,8 +151,8 @@ impl Harness {
     async fn with_stub(&self) -> Stub {
         let stub = stub_prism().await;
         for (k, v) in [
-            ("appview.url", stub.url.as_str()),
-            ("appview.did", "did:web:prism.test"),
+            ("appview.private_url", stub.url.as_str()),
+            ("appview.private_did", "did:web:prism.test"),
         ] {
             self.state.settings.set(k, json!(v), "test").await.unwrap();
         }
@@ -1136,7 +1136,8 @@ async fn another_prism_did_discards_the_copy_aliases_and_both_rows() {
         .unwrap();
 
     // The same stub under another DID.
-    h.set("appview.did", json!("did:web:prism2.test")).await;
+    h.set("appview.private_did", json!("did:web:prism2.test"))
+        .await;
     stub.set(LIST, 200, json!({"audiences": []}));
     refresh(&h.state, &did, Trigger::Background, None, far())
         .await
@@ -1239,8 +1240,8 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
 
         let (refusal, status) = match condition {
             "no AppView" => {
-                h.set("appview.url", json!("")).await;
-                h.set("appview.did", json!("")).await;
+                h.set("appview.private_url", json!("")).await;
+                h.set("appview.private_did", json!("")).await;
                 ("UnsupportedNamespace", StatusCode::BAD_REQUEST)
             }
             "tier off" => {
@@ -1398,8 +1399,9 @@ async fn deletes_succeed_with_the_tier_off_while_writes_are_refused() {
         }
 
         // Back on.
-        h.set("appview.url", json!(stub.url)).await;
-        h.set("appview.did", json!("did:web:prism.test")).await;
+        h.set("appview.private_url", json!(stub.url)).await;
+        h.set("appview.private_did", json!("did:web:prism.test"))
+            .await;
         h.set("kryphocron.private_tier_enabled", json!(true)).await;
         h.state
             .store
@@ -1459,7 +1461,7 @@ async fn a_hung_prism_is_an_outage_and_errors_are_not() {
             held.push(s);
         }
     });
-    h.set("appview.url", json!(hung_url)).await;
+    h.set("appview.private_url", json!(hung_url)).await;
     assert!(matches!(list().await, Prism::Timeout));
     assert!(
         wait_for(true, 3000).await,
@@ -1526,7 +1528,7 @@ async fn a_hung_prism_is_an_outage_and_errors_are_not() {
     );
 
     // The next answered probe marks it up.
-    h.set("appview.url", json!(stub.url)).await;
+    h.set("appview.private_url", json!(stub.url)).await;
     assert!(wait_for(false, 12_000).await, "probed back up");
 }
 

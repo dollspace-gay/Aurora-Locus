@@ -183,7 +183,11 @@
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <p>Private posts are shared only with an audience their author picks. They're stored encoded here and shown only to that audience.</p>
 <label class="check"><input type="checkbox" name="private_tier" value="1"{% if f.private_tier %} checked{% endif %}> Allow private posts</label>
-<div class="hint">They work only with an AppView that supports them{% if !f.appview_set %}, and none is set, so this has no effect until one is{% endif %}.</div>
+<label for="private_appview_url">Private AppView URL</label>
+<input type="url" id="private_appview_url" name="private_appview_url" value="{{ f.private_appview_url }}">
+<label for="private_appview_did">Private AppView DID</label>
+<input type="text" id="private_appview_did" name="private_appview_did" value="{{ f.private_appview_did }}" spellcheck="false">
+<div class="hint">The AppView that serves private posts (prism). It can be the same as the AppView on the previous step, if that one serves both; enter it here either way. Private posts work only once it's set.</div>
 <div class="row">{% if let Some(b) = self.back() %}<a class="button secondary" href="{{ b }}">Back</a>{% endif %}<button type="submit">Save and continue</button></div>
 </form>
 </div>

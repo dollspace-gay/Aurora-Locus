@@ -120,10 +120,18 @@ pub(crate) fn configured(s: &AppState, url_key: &str, did_key: &str) -> Option<(
     (!url.is_empty() && !did.is_empty()).then(|| (url.to_owned(), did.to_owned()))
 }
 
-/// The configured AppView (url, did).
+/// The configured AppView (url, did): public reads are proxied here.
 #[must_use]
 pub fn appview(s: &AppState) -> Option<(String, String)> {
     configured(s, "appview.url", "appview.did")
+}
+
+/// The private AppView (prism; url, did): the private tier's authority.
+/// It has its own entry, even when it's the same service as the AppView;
+/// with none, the private tier is off.
+#[must_use]
+pub fn private_appview(s: &AppState) -> Option<(String, String)> {
+    configured(s, "appview.private_url", "appview.private_did")
 }
 
 /// The reference's default service for a method.

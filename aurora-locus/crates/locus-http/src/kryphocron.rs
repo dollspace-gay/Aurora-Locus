@@ -162,7 +162,7 @@ pub(crate) async fn record_takedown(s: &AppState, did: &str, prism_did: &str) ->
 /// and the host switch on (else `UnsupportedNamespace`), no local block,
 /// and the AppView's permission (`privateIndexed`), else `Forbidden`.
 pub(crate) async fn gate(s: &Arc<AppState>, did: &str) -> XrpcResult<()> {
-    let Some(appview) = crate::pipethrough::appview(s) else {
+    let Some(appview) = crate::pipethrough::private_appview(s) else {
         return Err(unsupported());
     };
     if !s.snapshot().bool("kryphocron.private_tier_enabled") {

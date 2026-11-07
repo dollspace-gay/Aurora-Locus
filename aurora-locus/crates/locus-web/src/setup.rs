@@ -202,7 +202,8 @@ pub struct SetupForm {
     pub report_did: String,
     // Private posts.
     pub private_tier: bool,
-    pub appview_set: bool,
+    pub private_appview_url: String,
+    pub private_appview_did: String,
     // Keys.
     pub rotation_key: String,
     pub master_key_source: String,
