@@ -25,6 +25,11 @@ if running locus-test-kms; then
   export AWS_REGION=eu-west-2 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-locus}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-locus-secret}"
 fi
 
+# Direct TLS tests start Pebble (an ACME test server) when its image is here.
+if command -v docker >/dev/null && docker image inspect ghcr.io/letsencrypt/pebble:latest >/dev/null 2>&1; then
+  export LOCUS_TEST_PEBBLE_IMAGE="${LOCUS_TEST_PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble:latest}"
+fi
+
 # Redis tests run when the local Redis container is up.
 if running locus-test-redis; then
   export LOCUS_TEST_REDIS_URL=redis://127.0.0.1:56379

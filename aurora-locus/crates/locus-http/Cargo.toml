@@ -58,6 +58,7 @@ proto-blue-ws.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+x509-parser = "0.18"
 sqlx.workspace = true
 proptest = "1"
 

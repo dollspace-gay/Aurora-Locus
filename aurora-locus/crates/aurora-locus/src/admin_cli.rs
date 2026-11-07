@@ -497,6 +497,9 @@ pub enum KeysCmd {
         /// The KMS key (`--to kms`).
         #[arg(long)]
         kms_key_id: Option<String>,
+        /// Refused: this command can never be forced.
+        #[arg(long, hide = true)]
+        force: bool,
     },
     /// Forgets a secondary PLC rotation key no account's document still
     /// needs (each document that may list it is checked first).
@@ -559,6 +562,10 @@ pub enum MigrateCmd {
         to: String,
         #[arg(long)]
         url: String,
+        /// Run even while a node is running on this install (it keeps
+        /// writing, so the copy may miss its latest writes).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -605,6 +612,9 @@ pub enum BackupCmd {
         /// or `-`). Required there.
         #[arg(long)]
         entryway_plc_rotation_key: Option<PathBuf>,
+        /// Refused: this command can never be forced.
+        #[arg(long, hide = true)]
+        force: bool,
     },
     /// After a Postgres point-in-time recovery, before any node starts
     /// (offline).
@@ -627,6 +637,9 @@ pub enum BackupCmd {
         /// or `-`). Required there.
         #[arg(long)]
         entryway_plc_rotation_key: Option<PathBuf>,
+        /// Refused: this command can never be forced.
+        #[arg(long, hide = true)]
+        force: bool,
     },
 }
 

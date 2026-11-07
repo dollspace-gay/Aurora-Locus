@@ -542,24 +542,24 @@ impl Node {
             .await
             .map_err(|e| CoreError::Config(format!("can't listen on {addr}: {e}")))?;
         tracing::info!(%addr, public_url = %state.public_url, setup_mode = self.setup_mode, "listening");
-        // Direct TLS: HTTPS with ACME certificates, and port 80 for the
-        // challenges and redirects.
+        // Direct TLS: HTTPS with ACME certificates, and (unless off) port 80
+        // for the HTTP-01 challenges and redirects.
         if let Some(tls) = self.bootstrap.tls.clone() {
             let acme = locus_http::acme::Acme::new(Arc::clone(&state), tls.clone());
             self.tasks.push(tokio::spawn(
                 Arc::clone(&acme).maintain(self.cancel.clone()),
             ));
-            let http = tokio::net::TcpListener::bind(tls.http_listen)
-                .await
-                .map_err(|e| {
-                    CoreError::Config(format!("can't listen on {} for ACME: {e}", tls.http_listen))
+            if let Some(at) = tls.http_listen {
+                let http = tokio::net::TcpListener::bind(at).await.map_err(|e| {
+                    CoreError::Config(format!("can't listen on {at} for ACME: {e}"))
                 })?;
-            let (a, c) = (Arc::clone(&acme), self.cancel.clone());
-            self.tasks.push(tokio::spawn(async move {
-                if let Err(e) = locus_http::acme::serve_http(a, http, c).await {
-                    tracing::error!("the HTTP-01 listener failed: {e}");
-                }
-            }));
+                let (a, c) = (Arc::clone(&acme), self.cancel.clone());
+                self.tasks.push(tokio::spawn(async move {
+                    if let Err(e) = locus_http::acme::serve_http(a, http, c).await {
+                        tracing::error!("the HTTP-01 listener failed: {e}");
+                    }
+                }));
+            }
             let (st, c, outer) = (Arc::clone(&state), self.cancel.clone(), self.outer.clone());
             self.tasks.push(tokio::spawn(async move {
                 if let Err(e) = locus_http::acme::serve(st, acme, tls.listen, c).await {
@@ -567,7 +567,10 @@ impl Node {
                     outer.cancel();
                 }
             }));
-            tracing::info!(https = %tls.listen, http = %tls.http_listen, directory = %tls.directory, "direct TLS on");
+            let http = tls
+                .http_listen
+                .map_or_else(|| "off".to_owned(), |a| a.to_string());
+            tracing::info!(https = %tls.listen, %http, directory = %tls.directory, "direct TLS on");
         }
         // Cloudflare's IP ranges, daily, while in Cloudflare mode.
         {

@@ -245,6 +245,7 @@ dependencies = [
  "proto-blue-lex-cbor",
  "proto-blue-lex-data",
  "proto-blue-repo",
+ "rcgen",
  "reqwest",
  "rpassword",
  "rustix",
@@ -2596,9 +2597,12 @@ name = "locus-conformance"
 version = "0.1.0-dev"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures",
+ "locus-auth",
  "proto-blue-lex-data",
  "proto-blue-ws",
+ "rand 0.8.8",
  "reqwest",
  "serde_json",
  "tokio",
@@ -2680,6 +2684,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "url",
+ "x509-parser",
  "zeroize",
 ]
 

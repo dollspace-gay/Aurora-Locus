@@ -97,3 +97,37 @@ pub async fn acquire(bootstrap: &Bootstrap, who: Holder) -> CoreResult<NodeLock>
         }
     }
 }
+
+/// An offline command's lock. With `force`, a running node is warned
+/// about instead of refused, and the command runs without the lock.
+pub async fn acquire_offline(
+    bootstrap: &Bootstrap,
+    command: &str,
+    force: bool,
+) -> CoreResult<NodeLock> {
+    match acquire(bootstrap, Holder::Offline).await {
+        Err(CoreError::Conflict(why)) if force => {
+            eprintln!(
+                "Warning: a node is running on this install; `{command}` runs anyway (--force), \
+                 on data the node is using."
+            );
+            tracing::warn!(command, "forced past a running node: {why}");
+            Ok(NodeLock {
+                #[cfg(unix)]
+                _file: None,
+                _pg: None,
+            })
+        }
+        r => r,
+    }
+}
+
+/// Refuses `--force` on the commands that can never be forced.
+pub fn never_forced(command: &str, force: bool) -> Result<(), String> {
+    if force {
+        return Err(format!(
+            "`{command}` can never be forced: stop every node first"
+        ));
+    }
+    Ok(())
+}

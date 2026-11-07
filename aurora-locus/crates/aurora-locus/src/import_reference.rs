@@ -44,6 +44,8 @@ const LOCUS_PREFIXES: &[&str] = &["blobs", "gated", "quarantine", "branding", "t
 pub struct Opts {
     pub dir: PathBuf,
     pub env_file: PathBuf,
+    /// Runs even while a node holds the install.
+    pub force: bool,
 }
 
 fn e(x: impl std::fmt::Display) -> String {
@@ -137,7 +139,7 @@ fn disk_blobs(location: PathBuf, dir: &Path) -> Blobs {
 
 /// Runs the import; the report's lines.
 pub async fn run(bootstrap: &Bootstrap, opts: Opts) -> Result<Vec<String>, String> {
-    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+    let _lock = crate::node_lock::acquire_offline(bootstrap, "import reference-pds", opts.force)
         .await
         .map_err(|e| e.to_string())?;
     if matches!(bootstrap.database, DatabaseUrl::Postgres(_)) {

@@ -692,6 +692,12 @@ kryphocron built in.
   `conformance/allowlist.json`.
 - `com.atproto.server.reserveSigningKey`, in every role (rate-limited per
   IP; unused keys expire after a day).
+- Direct TLS proves certificates by TLS-ALPN-01 on the HTTPS port when
+  HTTP-01 fails, or alone with `LOCUS_TLS_HTTP_LISTEN=off`, so port 80 no
+  longer has to reach the node.
+- `--force` for `migrate storage` and `import reference-pds`: they run
+  while a node holds the install, with a warning. `keys rewrap`,
+  `backup restore` and `backup post-restore` refuse `--force`.
 
 ### Changed
 

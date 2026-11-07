@@ -11,8 +11,8 @@ fn e(x: impl std::fmt::Display) -> String {
     x.to_string()
 }
 
-pub async fn run(bootstrap: &Bootstrap, url: &str) -> Result<Vec<String>, String> {
-    let _lock = crate::node_lock::acquire(bootstrap, crate::node_lock::Holder::Offline)
+pub async fn run(bootstrap: &Bootstrap, url: &str, force: bool) -> Result<Vec<String>, String> {
+    let _lock = crate::node_lock::acquire_offline(bootstrap, "migrate storage", force)
         .await
         .map_err(|e| e.to_string())?;
     if !matches!(bootstrap.database, DatabaseUrl::Sqlite(_)) {
@@ -33,7 +33,7 @@ pub async fn run(bootstrap: &Bootstrap, url: &str) -> Result<Vec<String>, String
     }
     let (src, key) = crate::node::open_store(bootstrap).await.map_err(e)?;
     let live = src.live_slot_holders(CLOCK_SLOT_FAMILY).await.map_err(e)?;
-    if !live.is_empty() {
+    if !live.is_empty() && !force {
         return Err(format!(
             "{} node(s) are running; stop every node first (migrate storage runs offline)",
             live.len()

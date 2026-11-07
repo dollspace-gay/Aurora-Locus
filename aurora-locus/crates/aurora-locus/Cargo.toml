@@ -49,3 +49,4 @@ workspace = true
 [dev-dependencies]
 axum = "0.8"
 tempfile.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }

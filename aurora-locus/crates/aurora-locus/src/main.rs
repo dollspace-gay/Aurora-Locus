@@ -80,6 +80,9 @@ enum ImportCmd {
         /// Its pds.env.
         #[arg(long)]
         env: PathBuf,
+        /// Run even while a node is running on this install.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -166,12 +169,15 @@ async fn main() {
                 }
             }
         }
-        Command::Import(ImportCmd::ReferencePds { dir, env }) => {
+        Command::Import(ImportCmd::ReferencePds { dir, env, force }) => {
             let bootstrap = bootstrap_or_exit();
             let _log = logging::init(LogFormat::Pretty);
-            match import_reference::run(&bootstrap, import_reference::Opts { dir, env_file: env })
-                .await
-            {
+            let opts = import_reference::Opts {
+                dir,
+                env_file: env,
+                force,
+            };
+            match import_reference::run(&bootstrap, opts).await {
                 Ok(lines) => {
                     for l in lines {
                         println!("{l}");
@@ -189,6 +195,15 @@ async fn main() {
         Command::Admin(admin_cli::AdminCmd::Backup(
             cmd @ (admin_cli::BackupCmd::Restore { .. } | admin_cli::BackupCmd::PostRestore { .. }),
         )) => {
+            let (name, force) = match &cmd {
+                admin_cli::BackupCmd::Restore { force, .. } => ("backup restore", *force),
+                admin_cli::BackupCmd::PostRestore { force, .. } => ("backup post-restore", *force),
+                _ => unreachable!("matched above"),
+            };
+            if let Err(e) = node_lock::never_forced(name, force) {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
             let bootstrap = bootstrap_or_exit();
             let _log = logging::init(LogFormat::Pretty);
             let result = match cmd {
@@ -201,6 +216,7 @@ async fn main() {
                     emit_sync,
                     entryway_verify_key,
                     entryway_plc_rotation_key,
+                    ..
                 } => {
                     restore::restore(
                         &bootstrap,
@@ -227,6 +243,7 @@ async fn main() {
                     emit_sync,
                     entryway_verify_key,
                     entryway_plc_rotation_key,
+                    ..
                 } => {
                     restore::post_restore(
                         &bootstrap,
@@ -260,11 +277,12 @@ async fn main() {
         }
         Command::Admin(admin_cli::AdminCmd::Migrate(admin_cli::MigrateCmd::Storage {
             url,
+            force,
             ..
         })) => {
             let bootstrap = bootstrap_or_exit();
             let _log = logging::init(LogFormat::Pretty);
-            match migrate_storage::run(&bootstrap, &url).await {
+            match migrate_storage::run(&bootstrap, &url, force).await {
                 Ok(lines) => {
                     for l in lines {
                         println!("{l}");
@@ -281,7 +299,12 @@ async fn main() {
             path,
             out,
             kms_key_id,
+            force,
         })) => {
+            if let Err(e) = node_lock::never_forced("keys rewrap", force) {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
             let bootstrap = bootstrap_or_exit();
             let _log = logging::init(LogFormat::Pretty);
             let target = match (to, path, out, kms_key_id) {

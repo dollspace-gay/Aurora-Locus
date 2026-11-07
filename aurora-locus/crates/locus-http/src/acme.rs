@@ -1,11 +1,13 @@
 //! Direct TLS: locus terminates TLS itself, for operators who run no proxy
 //! (`LOCUS_TLS=true`). Certificates come from ACME (Let's Encrypt by
-//! default) by HTTP-01, on demand: a TLS handshake for a name with no
-//! certificate yet starts an order, if `/tls-check`'s rule approves the
-//! name, and fails meanwhile (the client retries). The PDS hostname's is
-//! ordered at start. Certificates and the ACME account live in the cache
-//! directory; each is renewed 60 days after it was issued.
+//! default), on demand: a TLS handshake for a name with no certificate yet
+//! starts an order, if `/tls-check`'s rule approves the name, and fails
+//! meanwhile (the client retries). The PDS hostname's is ordered at start.
+//! Certificates and the ACME account live in the cache directory; each is
+//! renewed 60 days after it was issued.
 //!
+//! An order is proved by HTTP-01 while port 80 is served, and by
+//! TLS-ALPN-01 (on the HTTPS port itself) if that fails or port 80 is off.
 //! Port 80 serves the HTTP-01 challenges and sends everything else to
 //! HTTPS.
 
@@ -38,6 +40,8 @@ use crate::state::AppState;
 const RENEW_AFTER_MS: i64 = 60 * 86_400_000;
 /// A name refused by the rule isn't asked about again for this long.
 const REFUSED_FOR: Duration = Duration::from_secs(300);
+/// The ALPN protocol of TLS-ALPN-01 validation handshakes.
+pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
 /// The certificates and the ACME state.
 pub struct Acme {
@@ -48,6 +52,8 @@ pub struct Acme {
     refused: Mutex<HashMap<String, Instant>>,
     /// HTTP-01: token → key authorization.
     challenges: RwLock<HashMap<String, String>>,
+    /// TLS-ALPN-01: name → challenge certificate.
+    alpn_challenges: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     account: tokio::sync::Mutex<Option<Account>>,
 }
 
@@ -94,6 +100,7 @@ impl Acme {
             pending: Mutex::default(),
             refused: Mutex::default(),
             challenges: RwLock::default(),
+            alpn_challenges: RwLock::default(),
             account: tokio::sync::Mutex::new(None),
         });
         me.load_cache();
@@ -241,8 +248,27 @@ impl Acme {
         Ok(account)
     }
 
-    /// Orders, proves and stores a certificate for `name`.
+    /// Orders, proves and stores a certificate for `name`: by HTTP-01
+    /// while port 80 is served, then by TLS-ALPN-01.
     async fn issue(&self, name: &str) -> Result<(), String> {
+        let mut kinds = vec![ChallengeType::TlsAlpn01];
+        if self.cfg.http_listen.is_some() {
+            kinds.insert(0, ChallengeType::Http01);
+        }
+        let mut last = String::new();
+        for kind in kinds {
+            match self.issue_by(name, kind.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::info!(name, "{kind:?} failed: {e}");
+                    last = format!("{kind:?}: {e}");
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn issue_by(&self, name: &str, kind: ChallengeType) -> Result<(), String> {
         let (pem_path, key_path, issued_path) = self.cert_paths(name).ok_or("not a hostname")?;
         let account = self.account().await?;
         let ids = [Identifier::Dns(name.to_owned())];
@@ -258,15 +284,23 @@ impl Acme {
                 continue;
             }
             let mut challenge = authz
-                .challenge(ChallengeType::Http01)
-                .ok_or("no http-01 challenge offered")?;
-            let token = challenge.token.clone();
+                .challenge(kind.clone())
+                .ok_or_else(|| format!("no {kind:?} challenge offered"))?;
             let auth = challenge.key_authorization().as_str().to_owned();
-            self.challenges
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(token.clone(), auth);
-            tokens.push(token);
+            if kind == ChallengeType::TlsAlpn01 {
+                let cert = challenge_cert(name, &auth)?;
+                self.alpn_challenges
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(name.to_owned(), Arc::new(cert));
+            } else {
+                let token = challenge.token.clone();
+                self.challenges
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(token.clone(), auth);
+                tokens.push(token);
+            }
             challenge.set_ready().await.map_err(|e| e.to_string())?;
         }
         let result = async {
@@ -294,6 +328,10 @@ impl Acme {
                 c.remove(t);
             }
         }
+        self.alpn_challenges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
         let (key_pem, chain_pem) = result?;
         let ck = certified_key(chain_pem.as_bytes(), key_pem.as_bytes())?;
         let now = locus_core::time::now_ms();
@@ -357,6 +395,20 @@ pub struct Resolver(pub Arc<Acme>);
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello.server_name()?.to_ascii_lowercase();
+        // A TLS-ALPN-01 validation offers only `acme-tls/1`; it gets the
+        // challenge certificate while one is pending, and nothing else.
+        if hello
+            .alpn()
+            .is_some_and(|mut p| p.next() == Some(ACME_TLS_ALPN) && p.next().is_none())
+        {
+            return self
+                .0
+                .alpn_challenges
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&name)
+                .cloned();
+        }
         let found = self
             .0
             .certs
@@ -369,6 +421,22 @@ impl ResolvesServerCert for Resolver {
         }
         found
     }
+}
+
+/// The TLS-ALPN-01 challenge certificate for `name` (RFC 8737):
+/// self-signed, `name` its only SAN, and a critical `acmeIdentifier`
+/// extension holding the SHA-256 of the key authorization.
+pub fn challenge_cert(name: &str, key_authorization: &str) -> Result<CertifiedKey, String> {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key_authorization.as_bytes());
+    let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+    let mut params =
+        rcgen::CertificateParams::new(vec![name.to_owned()]).map_err(|e| e.to_string())?;
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::new_acme_identifier(&digest));
+    let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
+    certified_key(cert.pem().as_bytes(), key.serialize_pem().as_bytes())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -470,6 +538,10 @@ impl TlsListener {
                     match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
                         .await
                     {
+                        // A TLS-ALPN-01 validation ends with the handshake.
+                        Ok(Ok(tls)) if tls.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) => {
+                            tracing::debug!(%addr, "TLS-ALPN-01 validation handshake");
+                        }
                         Ok(Ok(tls)) => {
                             let _ = tx.send((tls, addr)).await;
                         }
@@ -528,7 +600,9 @@ pub async fn serve(
     .map_err(std::io::Error::other)?
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(Resolver(Arc::clone(&acme))));
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // `acme-tls/1` last: rustls picks by this order, and a validation
+    // offers nothing else.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
     let tcp = tokio::net::TcpListener::bind(listen).await?;
     let listener = TlsListener::new(tcp, Arc::new(config), cancel.clone())?;
     // The rate limiter reads the usual connect info.
@@ -565,6 +639,41 @@ mod tests {
         for bad in ["", "../etc/passwd", "a/b", ".hidden", "a..b", "x y"] {
             assert!(file_name(bad).is_none(), "{bad}");
         }
+    }
+
+    /// RFC 8737: the name as the only SAN, and a critical acmeIdentifier
+    /// (1.3.6.1.5.5.7.1.31) holding a DER OCTET STRING of SHA-256(key
+    /// authorization).
+    #[test]
+    fn the_tls_alpn_challenge_certificate() {
+        use sha2::Digest;
+        use x509_parser::extensions::GeneralName;
+        let auth = "token-abc.thumbprint-xyz";
+        let ck = challenge_cert("pds.example.com", auth).unwrap();
+        assert_eq!(ck.cert.len(), 1);
+        let (_, cert) = x509_parser::parse_x509_certificate(&ck.cert[0]).unwrap();
+        // Self-signed.
+        assert_eq!(cert.issuer(), cert.subject());
+        let san = cert.subject_alternative_name().unwrap().unwrap();
+        assert_eq!(
+            san.value.general_names,
+            vec![GeneralName::DNSName("pds.example.com")]
+        );
+        let oid = x509_parser::der_parser::oid!(1.3.6.1.5.5.7.1.31);
+        let ext = cert
+            .extensions()
+            .iter()
+            .find(|e| e.oid == oid)
+            .expect("acmeIdentifier");
+        assert!(ext.critical);
+        let mut want = vec![0x04, 32];
+        want.extend_from_slice(&sha2::Sha256::digest(auth.as_bytes()));
+        assert_eq!(ext.value, want.as_slice());
+        // Another key authorization, another digest.
+        let other = challenge_cert("pds.example.com", "token-abc.other").unwrap();
+        let (_, other) = x509_parser::parse_x509_certificate(&other.cert[0]).unwrap();
+        let other = other.extensions().iter().find(|e| e.oid == oid).unwrap();
+        assert_ne!(other.value, ext.value);
     }
 
     #[test]

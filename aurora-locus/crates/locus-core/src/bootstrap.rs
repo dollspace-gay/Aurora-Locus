@@ -98,8 +98,9 @@ pub struct DirectTls {
     /// HTTPS (`LOCUS_TLS_LISTEN`, default `0.0.0.0:443`).
     pub listen: SocketAddr,
     /// Plain HTTP for ACME's HTTP-01 challenges and redirects
-    /// (`LOCUS_TLS_HTTP_LISTEN`, default `0.0.0.0:80`).
-    pub http_listen: SocketAddr,
+    /// (`LOCUS_TLS_HTTP_LISTEN`, default `0.0.0.0:80`; `off` for none, and
+    /// certificates are then proved by TLS-ALPN-01 only).
+    pub http_listen: Option<SocketAddr>,
     /// The ACME directory (`LOCUS_ACME_DIRECTORY`, default Let's Encrypt).
     pub directory: String,
     /// The ACME account contact (`LOCUS_ACME_EMAIL`).
@@ -234,11 +235,10 @@ impl Bootstrap {
                     get("LOCUS_TLS_LISTEN", None).or(file.tls_listen),
                     443,
                 )?,
-                http_listen: addr(
-                    "LOCUS_TLS_HTTP_LISTEN",
-                    get("LOCUS_TLS_HTTP_LISTEN", None).or(file.tls_http_listen),
-                    80,
-                )?,
+                http_listen: match get("LOCUS_TLS_HTTP_LISTEN", None).or(file.tls_http_listen) {
+                    Some(v) if v.eq_ignore_ascii_case("off") => None,
+                    v => Some(addr("LOCUS_TLS_HTTP_LISTEN", v, 80)?),
+                },
                 directory: get("LOCUS_ACME_DIRECTORY", None)
                     .or(file.acme_directory)
                     .unwrap_or_else(|| LETS_ENCRYPT.to_owned()),
@@ -424,6 +424,21 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).into(), (*v).into()))
             .collect()
+    }
+
+    #[test]
+    fn direct_tls_port_80_can_be_off() {
+        let tls = |extra: &[(&str, &str)]| {
+            let mut e = env(&[("LOCUS_TLS", "true")]);
+            e.extend(env(extra));
+            Bootstrap::load(None, &e).unwrap().tls.unwrap()
+        };
+        assert_eq!(tls(&[]).http_listen, Some("0.0.0.0:80".parse().unwrap()));
+        assert_eq!(
+            tls(&[("LOCUS_TLS_HTTP_LISTEN", "127.0.0.1:8080")]).http_listen,
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(tls(&[("LOCUS_TLS_HTTP_LISTEN", "off")]).http_listen, None);
     }
 
     #[test]
