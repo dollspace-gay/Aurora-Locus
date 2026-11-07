@@ -243,6 +243,8 @@ fn done_text(key: &str) -> &'static str {
         "created" => "Account created.",
         "takedown" => "Takedown changed.",
         "deactivate" => "Deactivation changed.",
+        "suspend" => "Suspended.",
+        "unsuspend" => "Suspension lifted.",
         "private-block" => "Private-post block changed.",
         "invites" => "Invite codes changed.",
         "handle" => "Handle changed.",
@@ -301,7 +303,15 @@ async fn render_account(
         Fact::new("DID method", a.did_method.clone()),
     ];
     if let Some(r) = &a.status_ref {
-        facts.push(Fact::new("Takedown reference", r.clone()));
+        let label = if a.status == Status::Suspended {
+            "Suspension note"
+        } else {
+            "Takedown reference"
+        };
+        facts.push(Fact::new(label, r.clone()));
+    }
+    if let (Status::Suspended, Some(t)) = (a.status, a.suspended_until) {
+        facts.push(Fact::new("Suspended until", when(t)).class("warn"));
     }
     if let Some(t) = a.deactivated_at {
         facts.push(Fact::new("Deactivated", when(t)));
@@ -383,6 +393,8 @@ async fn render_account(
         invites,
         taken_down: a.status == Status::Takendown,
         deactivated: a.status == Status::Deactivated,
+        suspended: a.status == Status::Suspended,
+        active: a.status == Status::Active,
         blocked,
         invites_disabled: a.invites_disabled,
         email: a.email.unwrap_or_default(),
@@ -445,6 +457,23 @@ pub async fn account_action(
             )),
         )
         .await),
+        "suspend" => {
+            let days = web::field(&form, "days").trim().parse::<i64>().unwrap_or(0);
+            api(crate::locus_admin::suspend_account(
+                st(),
+                h,
+                Json(input(
+                    json!({"did": did, "days": days, "note": web::field(&form, "note")}),
+                )),
+            )
+            .await)
+        }
+        "unsuspend" => {
+            api(
+                crate::locus_admin::unsuspend_account(st(), h, Json(input(json!({"did": did}))))
+                    .await,
+            )
+        }
         "private-block" => api(crate::locus_admin::set_private_tier_block(
             st(),
             h,

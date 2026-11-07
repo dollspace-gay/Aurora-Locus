@@ -743,6 +743,30 @@ kryphocron built in.
 
 ### Changed
 
+- Suspending an account suspends it: `account suspend <did> --days <n>`
+  (or `--until <time>`, with `--note`), the console's Suspend card and
+  `moderator.account.suspend` set the `suspended` status until a time (at
+  most ten years). No sign-in, writes or public reads (`RepoSuspended`)
+  meanwhile; `#account` says `suspended`; a job lifts it when the time comes,
+  or `account unsuspend` earlier. Only an active account can be suspended.
+  The command deactivated the account before; the console's deactivation
+  card is now called Deactivate.
+- The rate-limit bypass key and the metrics token are secrets in the key
+  store, no longer settings any operator could read: `keys set
+  rate-limit-bypass-key` / `keys set metrics-token` (`--remove` removes
+  them), `PDS_RATE_LIMIT_BYPASS_KEY` / `LOCUS_METRICS_TOKEN` on first boot.
+  A value an earlier version kept as a setting moves into the key store on
+  start, and the values its audit entries recorded are removed.
+- Console sign-in limits (passwords and codes, per address and per
+  operator) apply even with rate limits off or bypassed.
+- The console and account portal no longer show a storage error's text:
+  it goes to the log, and the page shows a generic message.
+- The rate-limit bypass header is compared in constant time.
+- A private reply whose thread root's threadgate can't be fetched is
+  refused (a root with no threadgate still allows it); it was allowed. The
+  threadgate's following rule for a root author on another PDS asks the
+  block-source or public AppView, as the block check does, not the private
+  AppView.
 - The console's "Create an account" form offers did:plc or did:web, with
   did:web's trade-offs (DID tied to the hostname, no rotation keys, moving
   away needs the document served elsewhere) shown next to the choice.

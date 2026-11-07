@@ -59,6 +59,8 @@ pub struct Account {
     pub status_ref: Option<String>,
     pub deactivated_at: Option<i64>,
     pub delete_after: Option<i64>,
+    /// When a suspension lifts (ms), while `status` is `Suspended`.
+    pub suspended_until: Option<i64>,
     pub invites_disabled: bool,
     pub did_method: String,
     /// When email sign-in codes were turned on, if they are.
@@ -77,6 +79,7 @@ struct AccountRow {
     status_ref: Option<String>,
     deactivated_at: Option<i64>,
     delete_after: Option<i64>,
+    suspended_until: Option<i64>,
     invites_disabled: bool,
     did_method: String,
     email_auth_factor_at: Option<i64>,
@@ -96,6 +99,7 @@ impl TryFrom<AccountRow> for Account {
             status_ref: r.status_ref,
             deactivated_at: r.deactivated_at,
             delete_after: r.delete_after,
+            suspended_until: r.suspended_until,
             invites_disabled: r.invites_disabled,
             did_method: r.did_method,
             email_auth_factor_at: r.email_auth_factor_at,
@@ -104,7 +108,7 @@ impl TryFrom<AccountRow> for Account {
 }
 
 const ACCOUNT_COLS: &str = "did, handle, email, email_confirmed_at, password_hash, created_at, status, \
-     status_ref, deactivated_at, delete_after, invites_disabled, did_method, email_auth_factor_at";
+     status_ref, deactivated_at, delete_after, suspended_until, invites_disabled, did_method, email_auth_factor_at";
 
 /// A new account row.
 #[derive(Debug, Clone)]
@@ -219,11 +223,11 @@ impl Tx {
         status_ref: Option<&str>,
     ) -> CoreResult<()> {
         let sqlite = format!(
-            "UPDATE account SET status = ?2, status_ref = ?3, \
+            "UPDATE account SET status = ?2, status_ref = ?3, suspended_until = NULL, \
              deactivated_at = CASE WHEN ?2 = 'deactivated' THEN {SQLITE_NOW_MS} ELSE NULL END WHERE did = ?1"
         );
         let pg = format!(
-            "UPDATE account SET status = $2, status_ref = $3, \
+            "UPDATE account SET status = $2, status_ref = $3, suspended_until = NULL, \
              deactivated_at = CASE WHEN $2 = 'deactivated' THEN {PG_NOW_MS} ELSE NULL END WHERE did = $1"
         );
         let rows = by_backend!(self, sqlite, pg, |q, ex| sqlx::query(&q)
@@ -239,6 +243,46 @@ impl Tx {
         } else {
             Err(CoreError::NotFound(format!("account {did}")))
         }
+    }
+
+    /// Suspends an active (or already suspended) account until `until_ms`,
+    /// with an operator's note. Returns whether it changed: a taken-down,
+    /// deactivated or deleted account can't be suspended.
+    pub async fn suspend_account(
+        &mut self,
+        did: &str,
+        until_ms: i64,
+        note: Option<&str>,
+    ) -> CoreResult<bool> {
+        let sqlite = "UPDATE account SET status = 'suspended', status_ref = ?3, suspended_until = ?2, \
+                      deactivated_at = NULL WHERE did = ?1 AND status IN ('active', 'suspended')";
+        let pg = "UPDATE account SET status = 'suspended', status_ref = $3, suspended_until = $2, \
+                  deactivated_at = NULL WHERE did = $1 AND status IN ('active', 'suspended')";
+        let rows = by_backend!(self, sqlite, pg, |q, ex| sqlx::query(q)
+            .bind(did)
+            .bind(until_ms)
+            .bind(note)
+            .execute(ex)
+            .await
+            .map(|r| r.rows_affected()))
+        .map_err(db_err)?;
+        Ok(rows == 1)
+    }
+
+    /// Lifts a suspension: the account is active again. Returns whether it
+    /// changed (false unless it was suspended).
+    pub async fn unsuspend_account(&mut self, did: &str) -> CoreResult<bool> {
+        let sqlite = "UPDATE account SET status = 'active', status_ref = NULL, suspended_until = NULL \
+                      WHERE did = ?1 AND status = 'suspended'";
+        let pg = "UPDATE account SET status = 'active', status_ref = NULL, suspended_until = NULL \
+                  WHERE did = $1 AND status = 'suspended'";
+        let rows = by_backend!(self, sqlite, pg, |q, ex| sqlx::query(q)
+            .bind(did)
+            .execute(ex)
+            .await
+            .map(|r| r.rows_affected()))
+        .map_err(db_err)?;
+        Ok(rows == 1)
     }
 
     /// Changes an account's handle; a handle another account holds is a

@@ -301,6 +301,39 @@ pub(crate) async fn set_account_takedown(
     crate::entryway::push_status(s, did).await
 }
 
+/// Suspends an account until a time (`Some((until_ms, note))`) or lifts its
+/// suspension (`None`), emitting `#account` (`suspended`, or active). Sign-in,
+/// writes and public reads are refused while it lasts; sessions are kept
+/// and work again once it lifts. Returns whether the status changed: only an
+/// active or suspended account can be suspended, and only a suspended one
+/// lifted.
+pub(crate) async fn set_account_suspension(
+    s: &AppState,
+    did: &str,
+    suspend: Option<(i64, Option<&str>)>,
+) -> XrpcResult<bool> {
+    let (_lock, mut tx) = s.repo.locked_tx(did).await.map_err(internal)?;
+    let (changed, body) = match suspend {
+        Some((until, note)) => (
+            tx.suspend_account(did, until, note).await?,
+            account_body(did, false, Some("suspended")),
+        ),
+        None => (
+            tx.unsuspend_account(did).await?,
+            account_body(did, true, None),
+        ),
+    };
+    if !changed {
+        return Ok(false);
+    }
+    tx.insert_outbox(did, "account", &body.map_err(internal)?)
+        .await?;
+    tx.commit().await?;
+    // On an entryway, the account's shard applies it too.
+    crate::entryway::push_status(s, did).await?;
+    Ok(true)
+}
+
 #[derive(Deserialize)]
 pub struct UpdateSubjectInput {
     subject: Value,

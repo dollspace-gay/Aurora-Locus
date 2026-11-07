@@ -4189,7 +4189,15 @@ impl Harness {
 #[tokio::test]
 async fn rate_limits_count_by_real_client_ip_and_account() {
     for backend in ["memory", "database"] {
-        let h = harness(false).await;
+        // The bypass key is a secret, taken from env on first boot.
+        let h = harness_build(HarnessOpts {
+            env: Some(HashMap::from([(
+                "PDS_RATE_LIMIT_BYPASS_KEY".to_owned(),
+                "let-me-in".to_owned(),
+            )])),
+            ..HarnessOpts::default()
+        })
+        .await;
         let set = |k: &'static str, v: Value| {
             let h = &h;
             async move { h.state.settings.set(k, v, "test").await.unwrap() }
@@ -4287,7 +4295,6 @@ async fn rate_limits_count_by_real_client_ip_and_account() {
         );
 
         // Bypass by header or by address.
-        set("rate_limits.bypass_key", json!("let-me-in")).await;
         set("rate_limits.bypass_ips", json!(["203.0.113.0/24"])).await;
         let (st, _, _) = h
             .call_from(
@@ -8679,6 +8686,205 @@ impl Harness {
     }
 }
 
+/// A suspension: moderators set it with an end time; until then no sign-in,
+/// writes or public reads (`RepoSuspended`), with `#account` saying so; it
+/// lifts by itself when the time comes (sessions kept), or on request.
+#[tokio::test]
+async fn operators_suspend_an_account_until_a_time() {
+    use locus_store::accounts::Status;
+    let h = harness(false).await;
+    let (did, access) = h.user("sus.pds.example.com").await;
+    let viewer = format!("Bearer {}", h.operator("vee", "viewer").await);
+    let moderator = format!("Bearer {}", h.operator("mo", "moderator").await);
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let suspend = |days: i64| json!({"did": did, "days": days, "note": "spam wave"});
+    let status = || async {
+        h.get(format!("/xrpc/com.atproto.sync.getRepoStatus?did={did}"))
+            .await
+            .1
+    };
+    // The latest `#account` event's active and status.
+    let last_account_event = || async {
+        let (kind, payload) = h.state.store.outbox_for(&did).await.unwrap().pop().unwrap();
+        assert_eq!(kind, "account");
+        let ev = proto_blue_lex_json::lex_to_json(&proto_blue_lex_cbor::decode(&payload).unwrap());
+        (ev["active"].clone(), ev["status"].clone())
+    };
+
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.suspend"),
+            &viewer,
+            Some(suspend(7))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    for bad in [
+        json!({"did": did}),
+        json!({"did": did, "days": 0}),
+        json!({"did": did, "until": "2000-01-01T00:00:00Z"}),
+    ] {
+        assert_eq!(
+            h.admin_call(
+                "POST",
+                &ns("moderator.account.suspend"),
+                &moderator,
+                Some(bad)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &ns("moderator.account.suspend"),
+            &moderator,
+            Some(suspend(7)),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!(a.status, Status::Suspended);
+    let week = 7 * 86_400_000;
+    let left = a.suspended_until.unwrap() - locus_core::time::now_ms();
+    assert!(left > week - 60_000 && left <= week, "{left}");
+    assert_eq!(a.status_ref.as_deref(), Some("spam wave"));
+    let st = status().await;
+    assert_eq!(
+        (st["active"].as_bool(), st["status"].as_str()),
+        (Some(false), Some("suspended")),
+        "{st}"
+    );
+    assert_eq!(
+        last_account_event().await,
+        (json!(false), json!("suspended"))
+    );
+    // No sign-in, no session use, no public reads.
+    let (code, _) = h
+        .post(
+            "com.atproto.server.createSession",
+            None,
+            json!({"identifier": "sus.pds.example.com", "password": "pw"}),
+        )
+        .await;
+    assert_ne!(code, StatusCode::OK);
+    assert_ne!(
+        h.call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, v) = h
+        .get(format!("/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .await;
+    assert_eq!(v["error"], "RepoSuspended", "{v}");
+
+    // The time comes: the job lifts it, and the old session works again.
+    let mut tx = h.state.store.begin().await.unwrap();
+    tx.suspend_account(&did, locus_core::time::now_ms() - 1, Some("spam wave"))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        crate::account::lift_due_suspensions(&h.state)
+            .await
+            .unwrap(),
+        1
+    );
+    let st = status().await;
+    assert_eq!(st["active"].as_bool(), Some(true), "{st}");
+    assert_eq!(last_account_event().await.0, json!(true));
+    let a = h.state.store.account_by_did(&did).await.unwrap().unwrap();
+    assert_eq!((a.status, a.suspended_until), (Status::Active, None));
+    assert_eq!(
+        h.call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        crate::account::lift_due_suspensions(&h.state)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Lifted on request; an account that isn't suspended can't be lifted.
+    let unsuspend = json!({"did": did});
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.unsuspend"),
+            &moderator,
+            Some(unsuspend.clone())
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    h.admin_call(
+        "POST",
+        &ns("moderator.account.suspend"),
+        &moderator,
+        Some(suspend(3)),
+    )
+    .await;
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.unsuspend"),
+            &moderator,
+            Some(unsuspend)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(status().await["active"].as_bool(), Some(true));
+
+    // A taken-down account can't be suspended (that would lift the takedown
+    // later).
+    crate::admin::set_account_takedown(&h.state, &did, Some("case-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.admin_call(
+            "POST",
+            &ns("moderator.account.suspend"),
+            &moderator,
+            Some(suspend(1))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.state
+            .store
+            .account_by_did(&did)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        Status::Takendown
+    );
+}
+
 #[tokio::test]
 async fn the_locus_namespace_is_gated_by_role_group() {
     let h = harness(false).await;
@@ -9489,6 +9695,44 @@ fn console_session(b: &Browser) -> String {
         .find(|(k, _)| k == "locus-console")
         .map(|(_, v)| v.clone())
         .unwrap()
+}
+
+/// Console password guessing is limited even with rate limits off.
+#[tokio::test]
+async fn console_sign_in_limits_hold_with_rate_limits_off() {
+    let h = harness(false).await;
+    h.console_operator("alice", "owner", "correct horse battery")
+        .await;
+    h.state
+        .settings
+        .set("rate_limits.enabled", json!(false), "test")
+        .await
+        .unwrap();
+    let b = Browser::default();
+    let (_, _, page) = b.get(&h, "/admin/sign-in").await;
+    let csrf = hidden(&page, "csrf");
+    let mut statuses = Vec::new();
+    for _ in 0..11 {
+        let (st, _, _) = b
+            .post(
+                &h,
+                "/admin/sign-in",
+                &[
+                    ("csrf", &csrf),
+                    ("username", "alice"),
+                    ("password", "wrong guess"),
+                ],
+            )
+            .await;
+        statuses.push(st);
+    }
+    assert!(
+        statuses[..10]
+            .iter()
+            .all(|s| *s != StatusCode::TOO_MANY_REQUESTS),
+        "{statuses:?}"
+    );
+    assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
@@ -15025,8 +15269,97 @@ async fn redis_holds_rate_limits_and_replay_windows() {
 }
 
 #[tokio::test]
-async fn metrics_are_served_to_allowed_addresses_or_the_token() {
+async fn secrets_kept_as_settings_move_to_the_key_store() {
     let h = harness(false).await;
+    // As an earlier version stored them: setting rows, audited with values.
+    for (key, value) in [
+        ("rate_limits.bypass_key", "old-bypass"),
+        ("metrics.token", "old-metrics"),
+    ] {
+        let json = json!(value).to_string();
+        match &h.state.store {
+            locus_store::Store::Sqlite(p) => {
+                sqlx::query(
+                    "INSERT INTO setting (key, value_json, version, updated_at, updated_by) \
+                     VALUES (?1, ?2, 1, 0, 'test')",
+                )
+                .bind(key)
+                .bind(&json)
+                .execute(p)
+                .await
+                .unwrap();
+            }
+            locus_store::Store::Postgres(p) => {
+                sqlx::query(
+                    "INSERT INTO setting (key, value_json, version, updated_at, updated_by) \
+                     VALUES ($1, $2, 1, 0, 'test')",
+                )
+                .bind(key)
+                .bind(&json)
+                .execute(p)
+                .await
+                .unwrap();
+            }
+        }
+        h.state
+            .store
+            .audit(
+                "test",
+                "setting.change",
+                Some(key),
+                Some(&json!({"before": null, "after": value})),
+            )
+            .await
+            .unwrap();
+    }
+    let secrets = crate::state::ServerSecrets::load_or_create_from(
+        &h.state.store,
+        &h.state.master_key,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        secrets.rate_limit_bypass_key.as_deref().map(Vec::as_slice),
+        Some(&b"old-bypass"[..])
+    );
+    assert_eq!(
+        secrets.metrics_token.as_deref().map(Vec::as_slice),
+        Some(&b"old-metrics"[..])
+    );
+    let (_, rows) = h.state.store.load_settings().await.unwrap();
+    assert!(!rows.contains_key("rate_limits.bypass_key") && !rows.contains_key("metrics.token"));
+    let log = h.state.store.audit_entries(None, 100).await.unwrap();
+    let leaked = format!("{log:?}");
+    assert!(
+        !leaked.contains("old-bypass") && !leaked.contains("old-metrics"),
+        "{leaked}"
+    );
+    // Viewers can't read them: they aren't settings any more.
+    let viewer = format!("Bearer {}", h.operator("vee", "viewer").await);
+    let (_, v) = h
+        .admin_call(
+            "GET",
+            &format!("/xrpc/{}.viewer.getSettings", locus_core::LOCUS_NS),
+            &viewer,
+            None,
+        )
+        .await;
+    let all = v.to_string();
+    assert!(!all.contains("bypass_key") && !all.contains("metrics.token"));
+}
+
+#[tokio::test]
+async fn metrics_are_served_to_allowed_addresses_or_the_token() {
+    // The token is a secret, taken from env on first boot.
+    let h = harness_build(HarnessOpts {
+        env: Some(HashMap::from([(
+            "LOCUS_METRICS_TOKEN".to_owned(),
+            "metrics-token-123".to_owned(),
+        )])),
+        ..HarnessOpts::default()
+    })
+    .await;
     let get = |peer: &'static str, token: Option<&'static str>| {
         let h = &h;
         async move {
@@ -15076,11 +15409,6 @@ async fn metrics_are_served_to_allowed_addresses_or_the_token() {
 
     // Elsewhere: refused, unless with the token.
     assert_eq!(get("203.0.113.9", None).await.0, StatusCode::FORBIDDEN);
-    h.state
-        .settings
-        .set("metrics.token", json!("metrics-token-123"), "test")
-        .await
-        .unwrap();
     assert_eq!(
         get("203.0.113.9", Some("wrong")).await.0,
         StatusCode::FORBIDDEN

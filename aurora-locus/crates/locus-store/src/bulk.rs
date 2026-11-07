@@ -480,6 +480,26 @@ impl Store {
         )
     }
 
+    /// Suspended accounts whose suspension has ended.
+    pub async fn accounts_due_for_unsuspension(&self, limit: i64) -> CoreResult<Vec<String>> {
+        on_pool!(
+            self,
+            format!(
+                "SELECT did FROM account WHERE status = 'suspended' AND suspended_until IS NOT NULL \
+                 AND suspended_until <= {SQLITE_NOW_MS} LIMIT ?1"
+            ),
+            format!(
+                "SELECT did FROM account WHERE status = 'suspended' AND suspended_until IS NOT NULL \
+                 AND suspended_until <= {PG_NOW_MS} LIMIT $1"
+            ),
+            |q, p| sqlx::query_scalar(q)
+                .bind(limit)
+                .fetch_all(p)
+                .await
+                .map_err(db_err)
+        )
+    }
+
     /// Runs (or resumes) an account deletion job to the end, fencing every
     /// batch and renewing the job between batches.
     pub async fn run_delete_job(&self, job: &BulkJob, batch: i64) -> CoreResult<()> {

@@ -1030,7 +1030,7 @@ pub async fn email_action(
                         &s,
                         &op,
                         None,
-                        vec![e.to_string()],
+                        vec![crate::console::server_problem(&e)],
                         StatusCode::INTERNAL_SERVER_ERROR,
                     )
                     .await
@@ -1061,7 +1061,7 @@ pub async fn email_action(
                     &s,
                     &op,
                     None,
-                    vec![e.to_string()],
+                    vec![crate::console::server_problem(&e)],
                     StatusCode::INTERNAL_SERVER_ERROR,
                 )
                 .await;

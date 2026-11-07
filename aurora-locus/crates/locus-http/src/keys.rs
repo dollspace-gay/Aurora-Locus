@@ -648,7 +648,8 @@ fn fingerprint(value: &[u8]) -> String {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSecretInput {
-    /// `jwt-secret`, `dpop-secret`, `hcaptcha-secret`, `backup-passphrase`, or in the shard
+    /// `jwt-secret`, `dpop-secret`, `hcaptcha-secret`, `rate-limit-bypass-key`,
+    /// `metrics-token` (empty removes these two), `backup-passphrase`, or in the shard
     /// role `entryway-verify-key`, `entryway-plc-rotation-key` and
     /// `entryway-admin-token`.
     name: String,
@@ -675,6 +676,21 @@ pub async fn set_secret(
     let value = Zeroizing::new(input.value.trim().to_owned());
     if input.name.starts_with("entryway-") {
         return set_entryway_value(&s, &who, &input, &value).await;
+    }
+    // Optional secrets: an empty value removes them.
+    let optional = match input.name.as_str() {
+        "rate-limit-bypass-key" => Some(secret_names::RATE_LIMIT_BYPASS_KEY),
+        "metrics-token" => Some(secret_names::METRICS_TOKEN),
+        _ => None,
+    };
+    if let (Some(slot), true) = (optional, value.is_empty()) {
+        s.store.delete_secret(slot).await?;
+        let mut tx = s.store.begin().await?;
+        tx.bump_key_generation().await?;
+        tx.commit().await?;
+        admin_auth::audit(&s, &who, "keys.clearSecret", Some(&input.name), None).await;
+        reload_soon(&s);
+        return Ok(Json(json!({"name": input.name, "cleared": true})));
     }
     let (slot, bytes): (&str, Zeroizing<Vec<u8>>) = match input.name.as_str() {
         "jwt-secret" => {
@@ -705,6 +721,14 @@ pub async fn set_secret(
                 Zeroizing::new(value.as_bytes().to_vec()),
             )
         }
+        "rate-limit-bypass-key" => (
+            secret_names::RATE_LIMIT_BYPASS_KEY,
+            Zeroizing::new(value.as_bytes().to_vec()),
+        ),
+        "metrics-token" => (
+            secret_names::METRICS_TOKEN,
+            Zeroizing::new(value.as_bytes().to_vec()),
+        ),
         "backup-passphrase" => {
             if value.chars().count() < locus_core::key_backup::MIN_PASSPHRASE {
                 return Err(XrpcError::invalid_request(
@@ -718,7 +742,8 @@ pub async fn set_secret(
         }
         other => {
             return Err(XrpcError::invalid_request(format!(
-                "{other} isn't a secret this sets (jwt-secret, dpop-secret, hcaptcha-secret, backup-passphrase)"
+                "{other} isn't a secret this sets (jwt-secret, dpop-secret, hcaptcha-secret, \
+                 rate-limit-bypass-key, metrics-token, backup-passphrase)"
             )));
         }
     };

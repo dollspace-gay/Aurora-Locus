@@ -41,6 +41,24 @@
 </div>
 <div class="card">
 <h3>Suspend</h3>
+{% if suspended %}
+<p>The account is suspended: it can't sign in, and its repo isn't served. The suspension lifts by itself at the time shown above.</p>
+<form method="post" action="{{ base }}/unsuspend"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button type="submit" class="secondary">Lift the suspension now</button></div></form>
+{% else if active %}
+<p>A suspension works like a takedown for a set time: no sign-in, no writes, and its repo isn't served. It lifts by itself.</p>
+<form class="stack" method="post" action="{{ base }}/suspend"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="days">Days</label>
+<input type="number" id="days" name="days" value="7" min="1" max="3650" required>
+<label for="note">Note <span class="muted">(optional: why, or a report id)</span></label>
+<input type="text" id="note" name="note" maxlength="1000">
+<div class="row"><button type="submit" class="danger">Suspend</button></div></form>
+{% else %}
+<p>Only an active account can be suspended.</p>
+{% endif %}
+</div>
+<div class="card">
+<h3>Deactivate</h3>
 {% if deactivated %}
 <p>The account is deactivated.</p>
 <form method="post" action="{{ base }}/deactivate"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="false">

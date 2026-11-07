@@ -262,6 +262,8 @@ pub struct AccountPage {
     pub invites: Vec<InviteRow>,
     pub taken_down: bool,
     pub deactivated: bool,
+    pub suspended: bool,
+    pub active: bool,
     pub blocked: bool,
     pub invites_disabled: bool,
     pub email: String,

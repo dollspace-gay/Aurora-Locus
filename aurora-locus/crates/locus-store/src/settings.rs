@@ -84,6 +84,61 @@ impl Store {
         Ok(snap)
     }
 
+    /// Retires a setting that held a secret (now kept in the key store):
+    /// returns its stored value, deletes the row, and blanks the values its
+    /// audit entries recorded. Nothing when there's no row.
+    pub async fn retire_secret_setting(&self, key: &str) -> CoreResult<Option<Value>> {
+        let (select, delete, scrub) = match self {
+            Self::Sqlite(_) => (
+                "SELECT value_json FROM setting WHERE key = ?1",
+                "DELETE FROM setting WHERE key = ?1",
+                "UPDATE audit_log SET detail_json = NULL \
+                 WHERE action IN ('setting.set', 'setting.change') AND target = ?1",
+            ),
+            Self::Postgres(_) => (
+                "SELECT value_json FROM setting WHERE key = $1",
+                "DELETE FROM setting WHERE key = $1",
+                "UPDATE audit_log SET detail_json = NULL \
+                 WHERE action IN ('setting.set', 'setting.change') AND target = $1",
+            ),
+        };
+        let mut tx = self.begin().await?;
+        let old: Option<String> = match &mut tx {
+            Tx::Sqlite(t) => {
+                let old = sqlx::query_scalar(select)
+                    .bind(key)
+                    .fetch_optional(&mut **t)
+                    .await
+                    .map_err(db_err)?;
+                for q in [delete, scrub] {
+                    sqlx::query(q)
+                        .bind(key)
+                        .execute(&mut **t)
+                        .await
+                        .map_err(db_err)?;
+                }
+                old
+            }
+            Tx::Postgres(t) => {
+                let old = sqlx::query_scalar(select)
+                    .bind(key)
+                    .fetch_optional(&mut **t)
+                    .await
+                    .map_err(db_err)?;
+                for q in [delete, scrub] {
+                    sqlx::query(q)
+                        .bind(key)
+                        .execute(&mut **t)
+                        .await
+                        .map_err(db_err)?;
+                }
+                old
+            }
+        };
+        tx.commit().await?;
+        Ok(old.and_then(|o| serde_json::from_str(&o).ok()))
+    }
+
     /// Validates and stores one setting, audited as `actor`. Returns the new
     /// settings version.
     pub async fn set_setting(&self, key: &str, value: Value, actor: &str) -> CoreResult<i64> {

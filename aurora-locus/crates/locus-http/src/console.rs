@@ -400,19 +400,20 @@ pub async fn sign_in(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
         .find(|(k, _)| k == "password")
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
-    let limited = crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::CONSOLE_SIGN_IN])
-        .await
-        .is_err()
-        || crate::ratelimit::limit(
-            &s,
-            &[(
-                crate::ratelimit::buckets::CONSOLE_SIGN_IN_NAME,
-                &username,
-                1,
-            )],
-        )
-        .await
-        .is_err();
+    let limited =
+        crate::ratelimit::limit_ip_always(&s, &[crate::ratelimit::buckets::CONSOLE_SIGN_IN])
+            .await
+            .is_err()
+            || crate::ratelimit::limit_always(
+                &s,
+                &[(
+                    crate::ratelimit::buckets::CONSOLE_SIGN_IN_NAME,
+                    &username,
+                    1,
+                )],
+            )
+            .await
+            .is_err();
     if limited {
         return sign_in_render(
             &s,
@@ -469,7 +470,7 @@ pub async fn sign_in(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
         return sign_in_render(
             &s,
             &csrf,
-            Some(e.to_string()),
+            Some(server_problem(&e)),
             &username,
             false,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -517,6 +518,13 @@ pub(crate) fn totp_secret_name(operator: &str) -> String {
     format!("operator/{operator}/totp")
 }
 
+/// A server-side failure for a page: logged with its detail, shown without
+/// it (as every 500 is).
+pub(crate) fn server_problem(e: &dyn std::fmt::Display) -> String {
+    tracing::error!("{e}");
+    "Something went wrong on the server. The details are in its log.".into()
+}
+
 /// "90 seconds", "4 minutes".
 fn offset_text(s: i64) -> String {
     if s < 120 {
@@ -562,7 +570,7 @@ pub async fn sign_in_code(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
             StatusCode::FORBIDDEN,
         );
     }
-    if crate::ratelimit::limit(
+    if crate::ratelimit::limit_always(
         &s,
         &[(
             crate::ratelimit::buckets::CONSOLE_SIGN_IN_NAME,
@@ -619,7 +627,7 @@ pub async fn sign_in_code(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
         return sign_in_render(
             &s,
             &csrf,
-            Some(e.to_string()),
+            Some(server_problem(&e)),
             &op.username,
             true,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -725,7 +733,7 @@ pub async fn confirm(State(s): St, headers: HeaderMap, body: Bytes) -> Response 
         return r;
     }
     let next = web::field(&form, "next").to_owned();
-    if crate::ratelimit::limit(
+    if crate::ratelimit::limit_always(
         &s,
         &[(
             crate::ratelimit::buckets::CONSOLE_SIGN_IN_NAME,
@@ -1211,7 +1219,7 @@ pub async fn save_appearance(State(s): St, headers: HeaderMap, body: Bytes) -> R
         )
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, server_problem(&e)).into_response();
     }
     web::redirect("/admin/appearance?saved=1")
 }
@@ -1381,7 +1389,7 @@ pub async fn change_password(State(s): St, headers: HeaderMap, body: Bytes) -> R
                 &s,
                 &op,
                 None,
-                vec![e.to_string()],
+                vec![server_problem(&e)],
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
             .await
@@ -1413,7 +1421,7 @@ pub async fn totp_start(State(s): St, headers: HeaderMap, body: Bytes) -> Respon
                 &s,
                 &op,
                 None,
-                vec![e.to_string()],
+                vec![server_problem(&e)],
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
             .await
@@ -1481,7 +1489,7 @@ pub async fn totp_confirm(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
                 &s,
                 &op,
                 None,
-                vec![e.to_string()],
+                vec![server_problem(&e)],
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
             .await
@@ -1537,7 +1545,7 @@ pub async fn totp_off(State(s): St, headers: HeaderMap, body: Bytes) -> Response
                 &s,
                 &op,
                 None,
-                vec![e.to_string()],
+                vec![server_problem(&e)],
                 StatusCode::INTERNAL_SERVER_ERROR,
             )
             .await

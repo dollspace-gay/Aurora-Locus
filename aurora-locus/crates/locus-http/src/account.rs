@@ -395,6 +395,25 @@ pub async fn delete_due_accounts(s: &AppState) -> locus_core::CoreResult<usize> 
     Ok(n)
 }
 
+/// One pass of the suspension job: lifts suspensions whose time is up.
+pub async fn lift_due_suspensions(s: &AppState) -> locus_core::CoreResult<usize> {
+    let mut n = 0;
+    for did in s.store.accounts_due_for_unsuspension(100).await? {
+        match crate::admin::set_account_suspension(s, &did, None).await {
+            Ok(true) => {
+                let _ = s
+                    .store
+                    .audit("system", "account.unsuspend", Some(&did), None)
+                    .await;
+                n += 1;
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(did, "lifting a suspension failed: {}", e.message),
+        }
+    }
+    Ok(n)
+}
+
 /// Parses an RFC 3339 datetime into ms since the epoch (UTC offsets and
 /// fractional seconds accepted).
 pub(crate) fn parse_datetime_ms(s: &str) -> Option<i64> {

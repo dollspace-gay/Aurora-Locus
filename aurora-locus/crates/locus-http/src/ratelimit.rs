@@ -174,12 +174,11 @@ fn bypassed(s: &AppState, headers: &HeaderMap, ip: Option<IpAddr>) -> bool {
     if !snap.bool("rate_limits.enabled") {
         return true;
     }
-    let key = snap.text("rate_limits.bypass_key");
-    if !key.is_empty()
-        && headers
-            .get("x-ratelimit-bypass")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == key)
+    if let Some(key) = &s.secrets.rate_limit_bypass_key
+        && headers.get("x-ratelimit-bypass").is_some_and(|v| {
+            use subtle::ConstantTimeEq;
+            bool::from(v.as_bytes().ct_eq(key.as_slice()))
+        })
     {
         return true;
     }
@@ -263,6 +262,29 @@ pub async fn limit(s: &AppState, list: &[(Bucket, &str, i64)]) -> XrpcResult<()>
     if slot.lock().map(|s| s.bypass).unwrap_or(true) {
         return Ok(());
     }
+    consume_all(s, list, Some(&slot)).await
+}
+
+/// `limit` that applies even with rate limits off or bypassed: for
+/// guessing secrets (console passwords and sign-in codes), which no
+/// operator setting should leave unthrottled.
+pub async fn limit_always(s: &AppState, list: &[(Bucket, &str, i64)]) -> XrpcResult<()> {
+    let slot = SLOT.try_with(Arc::clone).ok();
+    consume_all(s, list, slot.as_ref()).await
+}
+
+/// `limit_always` keyed by the client IP.
+pub async fn limit_ip_always(s: &AppState, list: &[Bucket]) -> XrpcResult<()> {
+    let ip = client_ip().map_or_else(|| "unknown".to_owned(), |i| i.to_string());
+    let with_keys: Vec<(Bucket, &str, i64)> = list.iter().map(|b| (*b, ip.as_str(), 1)).collect();
+    limit_always(s, &with_keys).await
+}
+
+async fn consume_all(
+    s: &AppState,
+    list: &[(Bucket, &str, i64)],
+    slot: Option<&Arc<Mutex<Slot>>>,
+) -> XrpcResult<()> {
     let mut exceeded = false;
     for (b, key, points) in list {
         if *points < 1 {
@@ -273,7 +295,7 @@ pub async fn limit(s: &AppState, list: &[(Bucket, &str, i64)]) -> XrpcResult<()>
             locus_core::metrics::inc("locus_rate_limit_hits_total", &[("bucket", b.name)], 1);
         }
         exceeded |= st.exceeded;
-        if let Ok(mut sl) = slot.lock() {
+        if let Some(Ok(mut sl)) = slot.map(|sl| sl.lock()) {
             sl.statuses.push(st);
         }
     }

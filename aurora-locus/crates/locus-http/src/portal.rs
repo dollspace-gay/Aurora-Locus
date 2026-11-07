@@ -368,7 +368,11 @@ async fn start(s: &AppState, did: &str, session_id: &str, headers: &HeaderMap) -
         .create_portal_session(&id_hash(&id), did, session_id, TTL_MS)
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::console::server_problem(&e),
+        )
+            .into_response();
     }
     let all = web::cookies(headers);
     let next = web::cookie(&all, "locus-account-next")

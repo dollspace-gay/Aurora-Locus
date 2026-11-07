@@ -585,13 +585,6 @@ pub static REGISTRY: &[Def] = &[
         description: "Apply rate limits.",
     },
     Def {
-        key: "rate_limits.bypass_key",
-        kind: Kind::Text { max_len: 512 },
-        default: r#""""#,
-        env: Some("PDS_RATE_LIMIT_BYPASS_KEY"),
-        description: "Requests with this x-ratelimit-bypass header skip rate limits. Empty: none.",
-    },
-    Def {
         key: "rate_limits.bypass_ips",
         kind: Kind::TextList { max_len: 64 },
         default: "[]",
@@ -648,13 +641,6 @@ pub static REGISTRY: &[Def] = &[
         default: r#"["127.0.0.0/8", "::1/128"]"#,
         env: Some("LOCUS_METRICS_ALLOWED_IPS"),
         description: "Client IPs or CIDRs that may read /metrics without the token.",
-    },
-    Def {
-        key: "metrics.token",
-        kind: Kind::Text { max_len: 512 },
-        default: r#""""#,
-        env: Some("LOCUS_METRICS_TOKEN"),
-        description: "A bearer token that reads /metrics from anywhere. Empty: none.",
     },
     Def {
         key: "sync.max_subscribers",

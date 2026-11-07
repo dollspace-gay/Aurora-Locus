@@ -58,13 +58,12 @@ fn plausible_nsid(n: &str) -> bool {
 
 fn allowed(s: &AppState, headers: &HeaderMap) -> bool {
     let snap = s.snapshot();
-    let token = snap.text("metrics.token");
-    if !token.is_empty()
+    if let Some(token) = &s.secrets.metrics_token
         && headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|t| bool::from(t.trim().as_bytes().ct_eq(token.as_bytes())))
+            .is_some_and(|t| bool::from(t.trim().as_bytes().ct_eq(token.as_slice())))
     {
         return true;
     }

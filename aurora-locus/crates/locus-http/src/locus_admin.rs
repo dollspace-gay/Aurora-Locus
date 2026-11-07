@@ -70,6 +70,8 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
             at!("moderator.account.setPrivateTierBlock"),
             post(set_private_tier_block),
         )
+        .route(at!("moderator.account.suspend"), post(suspend_account))
+        .route(at!("moderator.account.unsuspend"), post(unsuspend_account))
         .route(at!("moderator.review.listQueue"), get(list_review_queue))
         .route(at!("moderator.review.resolve"), post(resolve_review))
         .route(at!("admin.setSetting"), post(set_setting))
@@ -411,6 +413,100 @@ pub async fn set_private_tier_block(
         Some(json!({"blocked": input.blocked})),
     )
     .await;
+    Ok(Json(json!({})))
+}
+
+/// The longest suspension: past it, take the account down instead.
+const MAX_SUSPENSION_DAYS: i64 = 3650;
+
+#[derive(Deserialize)]
+pub struct SuspendInput {
+    did: String,
+    /// When it lifts (RFC 3339); or `days` from now.
+    until: Option<String>,
+    days: Option<i64>,
+    note: Option<String>,
+}
+
+/// Suspends an account until a time: no sign-in, writes or public reads
+/// (`RepoSuspended`) until then, when it lifts by itself.
+pub async fn suspend_account(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<SuspendInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = op(&s, &headers, locus_nsid!("moderator.account.suspend")).await?;
+    let now = locus_core::time::now_ms();
+    let until = match (&input.until, input.days) {
+        (Some(t), None) => crate::account::parse_datetime_ms(t)
+            .ok_or_else(|| XrpcError::invalid_request("until isn't an RFC 3339 time"))?,
+        (None, Some(d)) if d >= 1 => now.saturating_add(d.saturating_mul(86_400_000)),
+        (None, Some(_)) => return Err(XrpcError::invalid_request("days is at least 1")),
+        _ => {
+            return Err(XrpcError::invalid_request(
+                "Give when the suspension ends: until or days",
+            ));
+        }
+    };
+    if until <= now {
+        return Err(XrpcError::invalid_request(
+            "The suspension has to end in the future",
+        ));
+    }
+    if until - now > MAX_SUSPENSION_DAYS * 86_400_000 {
+        return Err(XrpcError::invalid_request(
+            "A suspension lasts at most ten years; take the account down instead",
+        ));
+    }
+    let note = input
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    if note.is_some_and(|n| n.chars().count() > 1000) {
+        return Err(XrpcError::invalid_request(
+            "The note is at most 1000 characters",
+        ));
+    }
+    let account = s
+        .store
+        .account_by_did(&input.did)
+        .await?
+        .ok_or_else(|| XrpcError::invalid_request("Account not found"))?;
+    if !crate::admin::set_account_suspension(&s, &input.did, Some((until, note))).await? {
+        return Err(XrpcError::invalid_request(format!(
+            "A {} account can't be suspended",
+            account.status.as_str()
+        )));
+    }
+    let until_iso = locus_core::time::iso8601(until);
+    admin_auth::audit(
+        &s,
+        &who,
+        "account.suspend",
+        Some(&input.did),
+        Some(json!({"until": until_iso, "note": note})),
+    )
+    .await;
+    Ok(Json(json!({"until": until_iso})))
+}
+
+#[derive(Deserialize)]
+pub struct UnsuspendInput {
+    did: String,
+}
+
+/// Lifts a suspension now.
+pub async fn unsuspend_account(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<UnsuspendInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = op(&s, &headers, locus_nsid!("moderator.account.unsuspend")).await?;
+    if !crate::admin::set_account_suspension(&s, &input.did, None).await? {
+        return Err(XrpcError::invalid_request("That account isn't suspended"));
+    }
+    admin_auth::audit(&s, &who, "account.unsuspend", Some(&input.did), None).await;
     Ok(Json(json!({})))
 }
 

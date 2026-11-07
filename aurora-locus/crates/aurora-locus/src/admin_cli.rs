@@ -215,10 +215,21 @@ pub enum AccountCmd {
     Untakedown {
         did: String,
     },
-    /// Deactivates the account (its owner can reactivate it).
+    /// Suspends the account until a time: no sign-in, writes or public
+    /// reads until then, when it lifts by itself.
     Suspend {
         did: String,
+        /// How many days it lasts.
+        #[arg(long, conflicts_with = "until", required_unless_present = "until")]
+        days: Option<i64>,
+        /// When it lifts (RFC 3339, e.g. 2026-12-01T00:00:00Z).
+        #[arg(long)]
+        until: Option<String>,
+        /// A note for the audit log and the console.
+        #[arg(long)]
+        note: Option<String>,
     },
+    /// Lifts a suspension now.
     Unsuspend {
         did: String,
     },
@@ -686,6 +697,26 @@ pub enum KeysSetCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// The key that lets a request skip rate limits (`x-ratelimit-bypass`).
+    RateLimitBypassKey {
+        #[arg(long, required_unless_present = "remove")]
+        file: Option<PathBuf>,
+        /// Remove it: no request can skip rate limits by header.
+        #[arg(long, conflicts_with = "file")]
+        remove: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The bearer token that reads /metrics from any address.
+    MetricsToken {
+        #[arg(long, required_unless_present = "remove")]
+        file: Option<PathBuf>,
+        /// Remove it: only the allowed addresses read /metrics.
+        #[arg(long, conflicts_with = "file")]
+        remove: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Shard role: the entryway's token verify key (K256, hex or
     /// did:key). The previous one stays accepted 2 hours unless
     /// --revoke-previous.
@@ -1056,6 +1087,24 @@ async fn set_secret(
     Ok(())
 }
 
+/// A secret there may be none of: set from `file`, or removed (`None`).
+async fn set_optional_secret(
+    c: &Client,
+    name: &str,
+    file: Option<&std::path::Path>,
+    yes: bool,
+    what: &str,
+) -> Result<(), String> {
+    let Some(file) = file else {
+        let body = merge(json!({"name": name, "value": ""}), reauth(c, what, yes)?);
+        c.call(&format!("{NS}.owner.keys.setSecret"), &[], Some(body))
+            .await?;
+        println!("{name} removed. Every node picks it up within seconds.");
+        return Ok(());
+    };
+    set_secret(c, name, file, yes, what).await
+}
+
 async fn set_entryway(
     c: &Client,
     name: &str,
@@ -1255,6 +1304,26 @@ async fn keys(c: &Client, k: KeysCmd) -> Result<(), String> {
                 &file,
                 yes,
                 "Replace the DPoP nonce secret",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::RateLimitBypassKey { file, remove, yes }) => {
+            set_optional_secret(
+                c,
+                "rate-limit-bypass-key",
+                file.as_deref().filter(|_| !remove),
+                yes,
+                "Change the rate-limit bypass key",
+            )
+            .await
+        }
+        KeysCmd::Set(KeysSetCmd::MetricsToken { file, remove, yes }) => {
+            set_optional_secret(
+                c,
+                "metrics-token",
+                file.as_deref().filter(|_| !remove),
+                yes,
+                "Change the metrics token",
             )
             .await
         }
@@ -2175,23 +2244,32 @@ async fn account(c: &Client, a: AccountCmd) -> Result<(), String> {
             .await?;
             println!("Takedown reversed.");
         }
-        AccountCmd::Suspend { did } => {
-            c.call(
-                "com.atproto.admin.updateSubjectStatus",
-                &[],
-                Some(json!({"subject": repo(&did), "deactivated": {"applied": true}})),
-            )
-            .await?;
-            println!("Deactivated.");
+        AccountCmd::Suspend {
+            did,
+            days,
+            until,
+            note,
+        } => {
+            let v = c
+                .call(
+                    &lx("moderator.account.suspend"),
+                    &[],
+                    Some(json!({"did": did, "days": days, "until": until, "note": note})),
+                )
+                .await?;
+            println!(
+                "Suspended until {}.",
+                v["until"].as_str().unwrap_or("the time given")
+            );
         }
         AccountCmd::Unsuspend { did } => {
             c.call(
-                "com.atproto.admin.updateSubjectStatus",
+                &lx("moderator.account.unsuspend"),
                 &[],
-                Some(json!({"subject": repo(&did), "deactivated": {"applied": false}})),
+                Some(json!({"did": did})),
             )
             .await?;
-            println!("Reactivated.");
+            println!("Suspension lifted.");
         }
         AccountCmd::ResetPassword { did } => {
             let pw = secret("New password")?;

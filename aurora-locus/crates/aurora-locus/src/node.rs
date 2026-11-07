@@ -943,11 +943,12 @@ impl Node {
         }
     }
 
-    /// The bulk-job resumer (finishes deletions a stopped node started) and
-    /// the `deleteAfter` job, each on one node at a time.
+    /// The bulk-job resumer (finishes deletions a stopped node started), the
+    /// `deleteAfter` job and the suspension lifter, each on one node at a
+    /// time.
     fn spawn_account_jobs(&mut self, state: Arc<AppState>) {
         const EVERY: Duration = Duration::from_secs(30);
-        for name in ["bulk-resumer", "delete-after"] {
+        for name in ["bulk-resumer", "delete-after", "suspension-lift"] {
             let state = Arc::clone(&state);
             self.tasks
                 .push(tokio::spawn(locus_store::runtime::run_leased(
@@ -963,6 +964,9 @@ impl Node {
                                 let result = match name {
                                     "bulk-resumer" => {
                                         locus_http::account::resume_bulk_jobs(&state).await
+                                    }
+                                    "suspension-lift" => {
+                                        locus_http::account::lift_due_suspensions(&state).await
                                     }
                                     _ => locus_http::account::delete_due_accounts(&state).await,
                                 };

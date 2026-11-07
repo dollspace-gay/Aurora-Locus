@@ -31,6 +31,8 @@ pub mod secret_names {
     pub const ADMIN_PASSWORD: &str = "admin_password";
     pub const HCAPTCHA_SECRET: &str = "hcaptcha_secret";
     pub const HCAPTCHA_TOKEN_SALT: &str = "hcaptcha_token_salt";
+    pub const RATE_LIMIT_BYPASS_KEY: &str = "rate_limit_bypass_key";
+    pub const METRICS_TOKEN: &str = "metrics_token";
 }
 
 /// The server's secrets, decrypted for this process.
@@ -59,6 +61,12 @@ pub struct ServerSecrets {
     /// Salts the client tokens sent with each hCaptcha check
     /// (`PDS_HCAPTCHA_TOKEN_SALT` on first boot, else generated).
     pub hcaptcha_token_salt: Zeroizing<Vec<u8>>,
+    /// The `x-ratelimit-bypass` key (`PDS_RATE_LIMIT_BYPASS_KEY`, then
+    /// `keys set rate-limit-bypass-key`); None when there is none.
+    pub rate_limit_bypass_key: Option<Zeroizing<Vec<u8>>>,
+    /// The bearer token that reads `/metrics` from anywhere
+    /// (`LOCUS_METRICS_TOKEN`, then `keys set metrics-token`).
+    pub metrics_token: Option<Zeroizing<Vec<u8>>>,
 }
 
 /// A PLC rotation key this PDS can sign with: in the key store, or in KMS.
@@ -536,6 +544,24 @@ impl ServerSecrets {
                  change it with `aurora-locus keys set hcaptcha-secret`"
             );
         }
+        let rate_limit_bypass_key = optional_secret(
+            store,
+            key,
+            secret_names::RATE_LIMIT_BYPASS_KEY,
+            var("PDS_RATE_LIMIT_BYPASS_KEY"),
+            "rate_limits.bypass_key",
+            "rate-limit-bypass-key",
+        )
+        .await?;
+        let metrics_token = optional_secret(
+            store,
+            key,
+            secret_names::METRICS_TOKEN,
+            var("LOCUS_METRICS_TOKEN"),
+            "metrics.token",
+            "metrics-token",
+        )
+        .await?;
         let keypair = |bytes: &[u8], what: &str| {
             K256Keypair::from_private_key(bytes).map_err(|e| {
                 CoreError::Config(format!("stored {what} is not a valid secp256k1 key: {e}"))
@@ -551,11 +577,50 @@ impl ServerSecrets {
             admin_password,
             hcaptcha_secret,
             hcaptcha_token_salt,
+            rate_limit_bypass_key,
+            metrics_token,
             jwt,
             app_password_pepper,
             email_token_pepper,
         })
     }
+}
+
+/// A secret there may be none of. The env value is stored when there is
+/// none yet; a later, different env value is ignored with a warning (its
+/// change path is `keys set <set_name>`). A value an earlier version kept
+/// in the `retired` setting moves into the key store, and the setting's
+/// row and audited values are removed.
+async fn optional_secret(
+    store: &Store,
+    key: &MasterKey,
+    name: &str,
+    env: Option<String>,
+    retired: &str,
+    set_name: &str,
+) -> CoreResult<Option<Zeroizing<Vec<u8>>>> {
+    let old = store
+        .retire_secret_setting(retired)
+        .await?
+        .and_then(|v| v.as_str().map(|s| s.trim().to_owned()))
+        .filter(|v| !v.is_empty());
+    let env = env.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let stored = match store.get_secret(name, key).await? {
+        Some(v) => Some(v),
+        None => match old.or_else(|| env.clone()) {
+            Some(v) => Some(load_or(store, key, name, || v.into_bytes()).await?),
+            None => None,
+        },
+    };
+    if let Some(v) = &env
+        && stored.as_ref().is_none_or(|s| s.as_slice() != v.as_bytes())
+    {
+        tracing::warn!(
+            "the env value for {name} differs from the stored one and is ignored; \
+             change it with `aurora-locus keys set {set_name}`"
+        );
+    }
+    Ok(stored)
 }
 
 async fn load_or(
