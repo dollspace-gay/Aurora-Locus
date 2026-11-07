@@ -1,0 +1,17 @@
+# cargo-audit: advisories that don't apply to locus, or have no fix yet.
+# Each is ignored on purpose; any other advisory fails the audit.
+
+[advisories]
+ignore = [
+    # rsa: the Marvin attack recovers a private key from decryption or
+    # signing timing. Locus only verifies OAuth clients' RSA signatures with
+    # their public keys; it holds no RSA private key.
+    "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 (through k256 0.13, which atproto signing uses):
+    # timing variability. The fix needs k256 0.14; revisit when it's out.
+    "RUSTSEC-2026-0387",
+    # ruzstd 0.7 (through kryphocron's codec): decompression bomb. Fixed in
+    # ruzstd 0.9.1, which needs a kryphocron release; locus bounds the
+    # decoded size of pre-encoded posts meanwhile.
+    "RUSTSEC-2026-0344",
+]

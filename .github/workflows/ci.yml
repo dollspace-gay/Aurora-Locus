@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aurora-locus
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: locus
+          POSTGRES_PASSWORD: locus
+          POSTGRES_DB: locus
+        ports: ["55491:5432"]
+        options: >-
+          --health-cmd "pg_isready -U locus"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["56379:6379"]
+    env:
+      LOCUS_TEST_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
+      LOCUS_TEST_REDIS_URL: redis://127.0.0.1:56379
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version and components.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aurora-locus
+          cache-bin: true
+      - name: proto-blue-codegen
+        run: command -v proto-blue-codegen || cargo install proto-blue-codegen --version 0.3.3 --locked
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --quiet -- -D warnings
+      - name: Test
+        run: cargo test --workspace --quiet
+      # The HTTP suite again on Postgres, as scripts/check.sh runs it.
+      - name: Test the HTTP suite on Postgres
+        env:
+          LOCUS_TEST_HTTP_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
+        run: cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys::
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-audit
+        run: cargo install cargo-audit --locked
+      # aurora-locus/.cargo/audit.toml lists the advisories ignored, and why.
+      - name: Audit
+        working-directory: aurora-locus
+        run: cargo audit
