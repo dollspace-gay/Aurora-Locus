@@ -69,12 +69,25 @@ async fn plc() -> String {
 
 // ------------------------------------------------------------ the binary
 
+/// A port for a child process to listen on. A port from `bind(0)` comes from
+/// the ephemeral range, which outgoing connections draw from too, so one
+/// could be taken between here and the child's bind ("Address already in
+/// use"). These come from below that range (Linux's starts at 32768), a
+/// different one on each call, skipping any in use.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id().wrapping_mul(7919);
+    for _ in 0..SPAN {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = u16::try_from(FIRST + start.wrapping_add(n) % SPAN).unwrap();
+        if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in {FIRST}..{}", FIRST + SPAN);
 }
 
 /// The binary with a clean env, set up headlessly on first start.
