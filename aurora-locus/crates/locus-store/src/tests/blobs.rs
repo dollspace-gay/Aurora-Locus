@@ -142,6 +142,47 @@ async fn a_pass_mark_waits_for_a_key_drawn_before_it_and_committed_after() {
     }
 }
 
+/// The blob row lock is Postgres-only (`FOR UPDATE`; SQLite serializes
+/// writers), and the HTTP suite's blob tests don't run on Postgres, so this
+/// is where it's exercised: a second transaction reading the row for update
+/// waits for the first to finish.
+#[tokio::test]
+async fn a_blob_row_locked_for_update_holds_a_second_reader_until_commit() {
+    for b in backends().await {
+        if b.name != "postgres" {
+            continue; // SQLite writers are serialized
+        }
+        let s = &b.store;
+        let (did, cid) = ("did:plc:lock", "bafylocked");
+        let mut seed = s.begin().await.unwrap();
+        seed.blob_backend().await.unwrap();
+        seed.insert_temp_blob(did, cid, "image/png", 1, "tmp/locked")
+            .await
+            .unwrap();
+        seed.commit().await.unwrap();
+
+        let mut first = s.begin().await.unwrap();
+        assert!(first.blob_for_update(did, cid).await.unwrap().is_some());
+        let second = tokio::spawn({
+            let s = s.clone();
+            async move {
+                let mut tx = s.begin().await.unwrap();
+                let row = tx.blob_for_update(did, cid).await.unwrap();
+                tx.commit().await.unwrap();
+                row
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "the second reader waits for the lock"
+        );
+        first.commit().await.unwrap();
+        let row = second.await.unwrap();
+        assert_eq!(row.map(|r| r.storage_key).as_deref(), Some("tmp/locked"));
+    }
+}
+
 #[tokio::test]
 async fn migrate_storage_seeds_key_seq_above_recorded_marks() {
     let all = backends().await;

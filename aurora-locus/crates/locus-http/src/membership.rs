@@ -523,14 +523,17 @@ pub async fn get_membership_assertion(
     headers: HeaderMap,
     Query(p): Query<AssertionParams>,
 ) -> XrpcResult<Json<Value>> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| XrpcError::auth_required("Authentication Required"))?;
+    let token = crate::auth::bearer(&headers)?;
     let now = locus_core::time::now_ms() / 1000;
     let jwt = locus_auth::service_jwt::parse(token, Some(ASSERTION_LXM), now)
         .map_err(|e| XrpcError::named(e.name(), e.to_string()))?;
+    if !jwt.lifetime_ok(now) {
+        let e = locus_auth::service_jwt::ServiceJwtError::BadJwtLifetime;
+        return Err(XrpcError::named(e.name(), e.to_string()));
+    }
+    // No `jti` replay check: the answer is read-like (a membership token is
+    // issued only for a member, and the rate limits below bound the asking),
+    // so replaying a request gains nothing the original did not.
     if !s.accepts_host_aud(&jwt.aud) {
         return Err(XrpcError::named(
             "BadJwtAudience",
