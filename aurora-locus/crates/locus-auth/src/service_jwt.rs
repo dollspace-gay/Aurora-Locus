@@ -306,11 +306,7 @@ mod tests {
         // A normal minute-long token.
         assert!(lifetime_ok(Some(now), now + 60, now));
         // The cap exactly, with skew.
-        assert!(lifetime_ok(
-            Some(now),
-            now + MAX_LIFETIME_S + SKEW_S,
-            now
-        ));
+        assert!(lifetime_ok(Some(now), now + MAX_LIFETIME_S + SKEW_S, now));
         assert!(!lifetime_ok(
             Some(now),
             now + MAX_LIFETIME_S + SKEW_S + 1,
