@@ -116,12 +116,14 @@ impl Unverified {
         }
     }
 
-    /// The inbound lifetime cap: `exp - iat` at most an hour plus a
-    /// minute's skew, or without `iat`, `exp - now` at most an hour.
+    /// The inbound lifetime cap: with `iat`, `exp - iat` at most an hour plus
+    /// a minute's skew and `iat` no more than a minute ahead of `now`; the
+    /// signer picks `iat`, so without the second bound `exp` could be as far
+    /// off as it likes. Without `iat`, `exp - now` at most an hour.
     #[must_use]
     pub fn lifetime_ok(&self, now: i64) -> bool {
         match self.iat {
-            Some(iat) => self.exp - iat <= MAX_LIFETIME_S + SKEW_S,
+            Some(iat) => iat <= now + SKEW_S && self.exp - iat <= MAX_LIFETIME_S + SKEW_S,
             None => self.exp - now <= MAX_LIFETIME_S,
         }
     }
@@ -274,5 +276,51 @@ mod tests {
                 .unwrap()
                 .verifies_with(&key.did())
         );
+    }
+
+    /// A token with the given claims, unsigned (the lifetime check needs no
+    /// key).
+    fn token_with(iat: Option<i64>, exp: i64) -> String {
+        let mut payload = json!({"iss": "did:plc:abc", "aud": "did:web:x", "exp": exp});
+        if let Some(iat) = iat {
+            payload["iat"] = json!(iat);
+        }
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(r#"{"typ":"JWT","alg":"ES256K"}"#),
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        )
+    }
+
+    fn lifetime_ok(iat: Option<i64>, exp: i64, now: i64) -> bool {
+        parse(&token_with(iat, exp), None, now)
+            .unwrap()
+            .lifetime_ok(now)
+    }
+
+    /// The signer picks `iat`, so a forged one can't stretch the cap.
+    #[test]
+    fn lifetime_cap_holds_whatever_iat_says() {
+        let now = 1_000_000;
+        // A normal minute-long token.
+        assert!(lifetime_ok(Some(now), now + 60, now));
+        // The cap exactly, with skew.
+        assert!(lifetime_ok(Some(now), now + MAX_LIFETIME_S + SKEW_S, now));
+        assert!(!lifetime_ok(
+            Some(now),
+            now + MAX_LIFETIME_S + SKEW_S + 1,
+            now
+        ));
+        // A year ahead with an `iat` just before `exp`.
+        let year = 365 * 24 * 3600;
+        assert!(!lifetime_ok(Some(now + year - 10), now + year, now));
+        // An `iat` more than the skew in the future, with a short span.
+        assert!(!lifetime_ok(Some(now + SKEW_S + 1), now + SKEW_S + 11, now));
+        assert!(lifetime_ok(Some(now + SKEW_S), now + SKEW_S + 10, now));
+        // No `iat`: `exp - now` is bounded alone.
+        assert!(!lifetime_ok(None, now + MAX_LIFETIME_S + 1, now));
+        assert!(lifetime_ok(None, now + MAX_LIFETIME_S, now));
+        assert!(lifetime_ok(None, now + 60, now));
     }
 }

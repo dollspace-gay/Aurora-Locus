@@ -65,7 +65,9 @@ impl SafeFetcher {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("aurora-locus/", env!("CARGO_PKG_VERSION")));
         if policy.ssrf_protection {
-            builder = builder.dns_resolver(Arc::new(resolver));
+            // A proxy would resolve names itself, skipping the resolver
+            // below, so the environment's proxy settings are not used.
+            builder = builder.no_proxy().dns_resolver(Arc::new(resolver));
         }
         let http = builder
             .build()
@@ -95,7 +97,11 @@ pub fn streaming_client(ssrf_protection: bool, http2: bool) -> Result<reqwest::C
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("aurora-locus/", env!("CARGO_PKG_VERSION")));
     if ssrf_protection {
-        builder = builder.dns_resolver(Arc::new(UnicastResolver { lookup: None }));
+        // As in `SafeFetcher::build`: no environment proxy, which would
+        // bypass the resolver.
+        builder = builder
+            .no_proxy()
+            .dns_resolver(Arc::new(UnicastResolver { lookup: None }));
     }
     if !http2 {
         builder = builder.http1_only();
@@ -518,6 +524,34 @@ mod tests {
             "every connection resolved anew"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing connected");
+    }
+
+    /// The environment's proxy settings don't reach the safe clients: a
+    /// proxy resolves names itself, which would skip the unicast-only
+    /// resolver. The rebinding test runs again in a child process with the
+    /// proxy variables set (setting them here would need `unsafe`).
+    #[test]
+    fn proxy_environment_does_not_bypass_the_resolver() {
+        let name = format!(
+            "{}::a_name_that_rebinds_to_a_private_address_is_refused_at_connect_time",
+            module_path!().split_once("::").unwrap().1
+        );
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact"])
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("http_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A tiny HTTP/1.1 server on a random port, enough for the tests above.
