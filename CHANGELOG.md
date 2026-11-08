@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults to it at the chart's version. `deploy/docker/compose.build.yaml`
   builds from the checkout (`LOCUS_BUILD_FROM_SOURCE=1` for the installer).
   The Docker, Kubernetes and operations guides say so.
+- proto-blue is pinned to `dollspace-gay/proto-blue` `main` at the merge of
+  its lazy-MST and k256 0.14 pull request (`52d4b2b`), the same code as the
+  commit pinned before, instead of the fork's branch. The README links to it.
 
 ## [0.1.0] - 2026-11-08
 

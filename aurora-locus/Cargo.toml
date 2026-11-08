@@ -89,23 +89,22 @@ hickory-resolver = "0.26"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "migrate", "macros"] }
 
 [patch.crates-io]
-# skydeval/proto-blue `feat/k256-0.14`: upstream dollspace-gay/proto-blue
-# (including the PR #13 MST delete fix) plus the lazily loaded MST and the
-# move to the 0.14 curve crates, both meant for upstream. Moves back to an
-# upstream release once they merge.
-proto-blue-syntax = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-lex-data = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-lex-cbor = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-lex-json = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-common = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-crypto = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-lexicon = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-repo = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-ws = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-identity = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-xrpc = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-api = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
-proto-blue-oauth = { git = "https://github.com/skydeval/proto-blue", rev = "75b6cfba47ed4e34530125c8c70704bcf25447b6" }
+# dollspace-gay/proto-blue `main` at the merge of PR #15: the lazily loaded
+# MST and the move to the 0.14 curve crates, which no crates.io release has
+# yet (0.3.3 predates them). Moves to the release that carries them.
+proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-lex-json = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-common = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-crypto = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-lexicon = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-identity = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-xrpc = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
+proto-blue-oauth = { git = "https://github.com/dollspace-gay/proto-blue", rev = "52d4b2b37fc8fb137efa62040c4d5d085d522fa6" }
 
 # kryphocron-lexicons 0.3.5 release commit ("Release 0.3.5: clear fields set by the encoder").
 kryphocron-lexicons = { git = "https://github.com/skydeval/kryphocron-lexicons", rev = "5d18e445aaef18ba0a517478c2c501353cb73393" }
