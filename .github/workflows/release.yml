@@ -1,0 +1,103 @@
+name: Release images
+
+# Pushing a version tag (v0.1.0, v0.1.1-rc.1, ...) builds the image and
+# publishes it to ghcr.io/<owner>/aurora-locus.
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/aurora-locus
+
+jobs:
+  image:
+    name: Build and publish the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # Publishing a tag whose number differs from the code's is a mistake
+      # that can't be taken back (the tags on a registry get pulled).
+      - name: The tag matches the workspace version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' aurora-locus/Cargo.toml)"
+          if [ "$want" != "$have" ]; then
+            echo "tag $GITHUB_REF_NAME is for $want, but the workspace version is $have" >&2
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      # v0.1.2 -> 0.1.2, 0.1 and latest (a bare major tag only from 1.0 on);
+      # a prerelease (v0.2.0-rc.1) gets only its own tag. The labels (source
+      # repository, revision, version) are what link the package to this
+      # repository.
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref_name, 'v0.') }}
+
+      # A published image is fully optimized (see the Dockerfile).
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: aurora-locus
+          file: aurora-locus/deploy/docker/Dockerfile
+          build-args: |
+            CARGO_PROFILE_RELEASE_LTO=thin
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+          load: true
+          tags: aurora-locus:smoke
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Start the image as an operator would, and ask it whether it's up.
+      # The health endpoint answers in setup mode, so no configuration is
+      # needed.
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke aurora-locus:smoke
+          for i in $(seq 1 30); do
+            if docker exec smoke aurora-locus healthcheck; then
+              docker rm -f smoke
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs smoke
+          exit 1
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The layers are cached from the build above, so this only pushes.
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: aurora-locus
+          file: aurora-locus/deploy/docker/Dockerfile
+          build-args: |
+            CARGO_PROFILE_RELEASE_LTO=thin
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

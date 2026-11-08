@@ -741,6 +741,12 @@ kryphocron built in.
   CSS and uploaded fonts included, as on the portal), previewed in the
   branding editor; `/robots.txt` as the reference.
 
+- A release workflow: pushing a `v*` tag builds the image (fully optimized),
+  starts it and checks its health, then publishes it to
+  `ghcr.io/<owner>/aurora-locus` as `X.Y.Z`, `X.Y` and `latest` (a prerelease
+  gets only its own tag). It refuses a tag that differs from the workspace
+  version.
+
 ### Changed
 
 - A Helm chart (`deploy/helm/aurora-locus`): the small profile runs one pod
