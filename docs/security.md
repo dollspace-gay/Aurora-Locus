@@ -504,6 +504,9 @@ SSRF-safe client:
   unique-local, documentation, benchmarking and multicast ranges, and
   IPv4-mapped IPv6 addresses. Local-network names are refused.
 - Redirects are never followed.
+- The `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` environment variables are
+  ignored for these requests. A proxy resolves names itself, which would
+  skip the connect-time address check.
 - Responses are capped (512 KB for documents, as the reference) and every
   request has a timeout.
 

@@ -975,3 +975,14 @@ kryphocron built in.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).
+
+### Security
+
+- Inbound service tokens: the one-hour lifetime cap no longer trusts the
+  signer's `iat`. A token with a far-off `exp` and an `iat` just before it
+  passed the cap and left a replay record that long; now an `iat` more than
+  a minute ahead is refused, which bounds `exp` as well. The shard
+  callback-token endpoint uses the same check.
+- The SSRF-safe HTTP clients ignore the `HTTP_PROXY`, `HTTPS_PROXY` and
+  `ALL_PROXY` environment variables. A proxy resolves names itself and
+  skipped the connect-time address check.

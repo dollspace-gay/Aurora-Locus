@@ -228,6 +228,13 @@ async fn inbound_service_tokens_live_at_most_an_hour() {
         // Past it: refused.
         let r = mod_call(&h, lxm, &did, &token(Some(now), now + 3661, lxm)).await;
         assert!(refused(&r, too_long), "{lxm} 3661 s: {r:?}");
+        // The signer picks `iat`: a far-off `exp` with an `iat` just before
+        // it, or an `iat` more than a minute ahead, is refused.
+        let year = 365 * 24 * 3600;
+        let r = mod_call(&h, lxm, &did, &token(Some(now + year - 10), now + year, lxm)).await;
+        assert!(refused(&r, too_long), "{lxm} forged iat: {r:?}");
+        let r = mod_call(&h, lxm, &did, &token(Some(now + 120), now + 180, lxm)).await;
+        assert!(refused(&r, too_long), "{lxm} iat 2 min ahead: {r:?}");
         let r = mod_call(&h, lxm, &did, &token(None, now + 3700, lxm)).await;
         assert!(refused(&r, too_long), "{lxm} no iat: {r:?}");
     }

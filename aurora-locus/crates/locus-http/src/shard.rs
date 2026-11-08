@@ -1227,7 +1227,7 @@ pub async fn set_callback_token(
     if jwt.aud != s.service_did {
         return Err(refuse("jwt audience does not match service did"));
     }
-    if jwt.exp - now > 3600 + 60 {
+    if !jwt.lifetime_ok(now) {
         return Err(refuse("jwt lifetime too long"));
     }
     if !ew.verify_key_ids().iter().any(|k| jwt.verifies_with(k)) {
