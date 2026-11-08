@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Work toward 0.1: a production Rust atproto PDS built on proto-blue, with
+## [0.1.0] - 2026-11-08
+
+The first release: a production Rust atproto PDS built on proto-blue, with
 kryphocron built in.
 
 ### Added
