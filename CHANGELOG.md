@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Docker stack, the installer and the Helm chart use the published image
+  (`ghcr.io/dollspace-gay/aurora-locus`) instead of building one: compose
+  defaults to `:0.1`, the installer pulls, and the chart's `image.repository`
+  defaults to it at the chart's version. `deploy/docker/compose.build.yaml`
+  builds from the checkout (`LOCUS_BUILD_FROM_SOURCE=1` for the installer).
+  The Docker, Kubernetes and operations guides say so.
+
 ## [0.1.0] - 2026-11-08
 
 The first release: a production Rust atproto PDS built on proto-blue, with

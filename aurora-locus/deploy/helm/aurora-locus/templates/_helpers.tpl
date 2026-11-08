@@ -45,7 +45,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{/* Refuse values that can't work, before anything is created. */}}
 {{- define "locus.validate" -}}
 {{- if not .Values.image.repository -}}
-{{- fail "image.repository is required: build the image (deploy/docker/Dockerfile) and push it to a registry the cluster can pull from" -}}
+{{- fail "image.repository can't be empty (it defaults to the published image): set it to a registry the cluster can pull from" -}}
 {{- end -}}
 {{- if not .Values.hostname -}}
 {{- fail "hostname is required (the PDS hostname, like pds.example.com)" -}}

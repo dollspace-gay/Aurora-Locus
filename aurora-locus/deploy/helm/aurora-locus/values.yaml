@@ -1,11 +1,12 @@
 # aurora-locus on Kubernetes. docs/kubernetes.md walks through both
 # profiles; every value is described here.
 
-# The image. Build it from the workspace and push it to a registry your
-# cluster can pull from:
+# The image: the published one, at the chart's appVersion. To run your own
+# build, push it to a registry your cluster can pull from and set
+# repository (and tag):
 #   docker build -f deploy/docker/Dockerfile -t <registry>/aurora-locus:<tag> .
 image:
-  repository: ""
+  repository: ghcr.io/dollspace-gay/aurora-locus
   # Defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
