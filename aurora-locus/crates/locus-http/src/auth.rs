@@ -249,14 +249,19 @@ pub async fn oauth_access(state: &AppState, headers: &HeaderMap) -> XrpcResult<A
     let jws =
         locus_auth::oauth::jose::Jws::decode(&token).map_err(|_| invalid("Malformed token"))?;
     // Tokens a reference PDS issued before the install was imported from
-    // it are HS256 under its JWT secret; they're accepted until they expire.
-    let imported = jws.alg() == "HS256"
-        && state.sessions.imported_at_ms().is_some_and(|t| {
-            jws.payload
-                .get("iat")
-                .and_then(Value::as_i64)
-                .is_some_and(|iat| iat * 1000 <= t)
-        });
+    // it are HS256 under its JWT secret; they're accepted for the reference's
+    // access lifetime after the import (and until they expire).
+    let imported = jws.alg() == "HS256" && {
+        let claim = |name: &str| jws.payload.get(name).and_then(Value::as_i64);
+        match (claim("iat"), claim("exp")) {
+            (Some(iat), Some(exp)) => {
+                state
+                    .sessions
+                    .imported_token_ok(iat, exp, locus_core::time::now_ms() / 1000)
+            }
+            _ => false,
+        }
+    };
     if state.sessions.is_entryway() {
         if state.sessions.entryway_verifies(&jws) {
             Ok(())

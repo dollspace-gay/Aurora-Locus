@@ -202,7 +202,10 @@ next request, not when the token expires.
 Accounts imported from a reference PDS keep their sessions: outstanding
 reference access tokens are accepted until they expire (at most 120
 minutes), with the account-status check but without per-session
-revocation. The first refresh issues locus tokens.
+revocation. Locus enforces that window: such a token must have been issued
+before the import and lived at most 120 minutes (plus a minute of skew), and
+none is accepted once the import is older than that. The first refresh
+issues locus tokens.
 
 ### App passwords
 

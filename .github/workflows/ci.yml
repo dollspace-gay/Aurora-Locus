@@ -61,7 +61,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --quiet -- -D warnings
       - name: Test
         run: cargo test --workspace --quiet
-      # The HTTP suite again on Postgres, as scripts/check.sh runs it.
+      # The HTTP suite again on Postgres, as scripts/check.sh runs it. The
+      # skipped modules seed rows with SQLite SQL, so they run on SQLite only;
+      # the store tests (run above on both backends) cover those paths,
+      # including the Postgres blob row lock.
       - name: Test the HTTP suite on Postgres
         env:
           LOCUS_TEST_HTTP_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus

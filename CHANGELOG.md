@@ -975,6 +975,11 @@ kryphocron built in.
 
 - proto-blue is pinned to `skydeval/proto-blue` `fix/lazy-mst-trim`
   (`3e966d6`), which adds the lazily loaded MST (with the emptied-tree fix).
+- A store test now exercises the Postgres blob row lock, which the HTTP
+  suite on Postgres skips along with the SQLite-seeded blob, audience and key
+  tests; the CI and `check.sh` comments say where each path is covered.
+- `scripts/check.sh` installs `proto-blue-codegen` when it's missing, and the
+  architecture doc gives the install command.
 
 ### Security
 
@@ -986,3 +991,11 @@ kryphocron built in.
 - The SSRF-safe HTTP clients ignore the `HTTP_PROXY`, `HTTPS_PROXY` and
   `ALL_PROXY` environment variables. A proxy resolves names itself and
   skipped the connect-time address check.
+- Access tokens a reference PDS issued before an import are accepted only for
+  the reference's access lifetime: they must have lived at most two hours
+  (plus a minute of skew), and none is accepted once the import is older
+  than that. Before, one with a long `exp` stayed valid until it expired,
+  with no session to revoke. The same rule covers the OAuth (DPoP) path.
+- `getMembershipAssertion` reads the bearer token like every other endpoint
+  (the scheme is case-insensitive) and applies the one-hour service-token
+  lifetime cap, so a long-lived signed token can no longer mint assertions.

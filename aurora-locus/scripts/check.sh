@@ -5,6 +5,10 @@ set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
+
+# kryphocron-lexicons runs proto-blue-codegen from its build script.
+command -v proto-blue-codegen >/dev/null || cargo install proto-blue-codegen --version 0.3.3 --locked
+
 export LOCUS_TEST_POSTGRES_URL="${LOCUS_TEST_POSTGRES_URL:-postgres://locus:locus@127.0.0.1:55491/locus}"
 
 # Each store test makes its own database; drop the ones earlier runs left.
@@ -50,8 +54,8 @@ if [ "$status" = 0 ] && running locus-test-s3; then
 fi
 # The HTTP suite again on Postgres. The blobs, audiences and keys modules
 # set up rows with SQLite SQL throughout, so they run on SQLite only (the
-# store tests cover those paths on both backends); other tests that do so
-# skip themselves.
+# store tests cover those paths on both backends, including the Postgres
+# blob row lock); other tests that do so skip themselves.
 if [ "$status" = 0 ] && [ -n "${LOCUS_TEST_POSTGRES_URL:-}" ]; then
   LOCUS_TEST_HTTP_POSTGRES_URL="$LOCUS_TEST_POSTGRES_URL" \
     cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys:: \

@@ -166,7 +166,10 @@ its own authentication and authorization.
 
 - Rust edition 2024, toolchain 1.88 (pinned in `rust-toolchain.toml`).
 - `proto-blue-codegen` on `PATH` at build time; `kryphocron-lexicons` runs
-  it from its build script. The Dockerfile installs it.
+  it from its build script, so a fresh `cargo build` fails without it.
+  Install it with `cargo install proto-blue-codegen --version 0.3.3 --locked`.
+  The Dockerfile and CI install it, and `scripts/check.sh` does when it's
+  missing.
 - A C compiler, for the zstd library kryphocron links.
 - rustls everywhere. Every proto-blue crate is used with
   `default-features = false`, so native-tls never enters the build.

@@ -35,6 +35,24 @@ const ACCESS_SCOPES: &[&str] = &[
 /// Replaying a used refresh token within this window returns the same next token.
 pub const REFRESH_GRACE_S: i64 = 2 * 60 * 60;
 
+/// How long an access token lived in the reference PDS, and the clock skew
+/// allowed on top.
+const REFERENCE_ACCESS_S: i64 = 2 * 60 * 60;
+const IMPORTED_SKEW_S: i64 = 60;
+
+/// Whether an access token the reference PDS issued before the import (at
+/// `imported_at`, seconds) is still acceptable at `now`. It was issued
+/// before the import, it lived no longer than the reference's access
+/// lifetime, and the import is no older than that lifetime: such tokens name
+/// no session to revoke, so they are only a bridge across the switch, not a
+/// standing credential.
+#[must_use]
+pub fn imported_token_ok(imported_at: i64, iat: i64, exp: i64, now: i64) -> bool {
+    iat <= imported_at
+        && exp - iat <= REFERENCE_ACCESS_S + IMPORTED_SKEW_S
+        && now <= imported_at + REFERENCE_ACCESS_S + IMPORTED_SKEW_S
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
     /// The token is malformed, has the wrong type or audience, or its session is gone.
@@ -346,6 +364,14 @@ impl LegacySessions {
         self.imported_at_s.map(|t| t * 1000)
     }
 
+    /// Whether a token the reference PDS issued before the import is still
+    /// acceptable at `now`: see [`imported_token_ok`].
+    #[must_use]
+    pub fn imported_token_ok(&self, iat: i64, exp: i64, now: i64) -> bool {
+        self.imported_at_s
+            .is_some_and(|at| imported_token_ok(at, iat, exp, now))
+    }
+
     /// The legacy JWT secret (the reference's, after an import).
     #[must_use]
     pub fn secret(&self) -> &[u8] {
@@ -414,7 +440,7 @@ impl LegacySessions {
     /// no session): the account's status is checked, but there's no
     /// session to revoke until it expires (at most the access lifetime).
     async fn verify_imported(&self, claims: Claims) -> Result<Authed, AuthError> {
-        if self.imported_at_s.is_none_or(|t| claims.iat > t) {
+        if !self.imported_token_ok(claims.iat, claims.exp, now_s()) {
             return Err(AuthError::InvalidToken);
         }
         let account = self
@@ -541,5 +567,55 @@ impl LegacySessions {
         }
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tokens from before the import are a bridge for the reference's access
+    /// lifetime, not a standing credential.
+    #[test]
+    fn imported_tokens_are_a_bridge_not_a_standing_credential() {
+        let at = 1_000_000;
+        let hour = 3600;
+        // Issued before the import, two hours, shortly after: accepted.
+        assert!(imported_token_ok(
+            at,
+            at - hour,
+            at - hour + 2 * hour,
+            at + 10
+        ));
+        // Issued after the import: refused.
+        assert!(!imported_token_ok(at, at + 1, at + 600, at + 10));
+        // The import is older than the reference access lifetime: refused,
+        // whatever `exp` says.
+        assert!(!imported_token_ok(
+            at,
+            at - 10,
+            at + 100 * hour,
+            at + 3 * hour
+        ));
+        assert!(!imported_token_ok(
+            at,
+            at - 10,
+            at + 600,
+            at + 2 * hour + 61
+        ));
+        assert!(imported_token_ok(at, at - 10, at + 600, at + 2 * hour + 60));
+        // A lifetime longer than the reference's: refused.
+        assert!(!imported_token_ok(
+            at,
+            at - 10,
+            at - 10 + 2 * hour + 61,
+            at + 10
+        ));
+        assert!(imported_token_ok(
+            at,
+            at - 10,
+            at - 10 + 2 * hour + 60,
+            at + 10
+        ));
     }
 }

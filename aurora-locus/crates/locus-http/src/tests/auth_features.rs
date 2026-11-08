@@ -667,6 +667,18 @@ async fn an_explicit_service_did_is_the_service_identity() {
         let (_, v) = h.call("GET", &path, Some(&token(aud, lxm)), None).await;
         assert_eq!(v["error"], want, "{aud}: {v}");
     }
+    // A token that lives longer than an hour can't mint assertions.
+    let long = locus_auth::service_jwt::create(
+        &key,
+        MOD_DID,
+        "did:web:pds.example.com",
+        Some(now + 2 * 3600),
+        Some(lxm),
+        now,
+    )
+    .unwrap();
+    let (_, v) = h.call("GET", &path, Some(&long), None).await;
+    assert_eq!(v["error"], "BadJwt", "{v}");
 
     // No change path: the setting is refused through the admin API.
     let owner = format!("Bearer {}", h.operator("own", "owner").await);
