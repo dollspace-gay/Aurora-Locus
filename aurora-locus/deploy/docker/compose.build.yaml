@@ -1,0 +1,13 @@
+# Builds the image from this checkout instead of pulling the published one.
+# Add it to every compose command (or set COMPOSE_FILE in .env):
+#
+#   docker compose -f compose.yaml -f compose.build.yaml build locus
+#   docker compose -f compose.yaml -f compose.build.yaml up -d
+#
+#   COMPOSE_FILE=compose.yaml:compose.build.yaml
+services:
+  locus:
+    image: aurora-locus:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile

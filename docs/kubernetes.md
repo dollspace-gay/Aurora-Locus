@@ -16,8 +16,10 @@ within seconds.
 ## What you need
 
 - Kubernetes 1.25 or newer, and Helm 3.
-- An image the cluster can pull. Build it from `aurora-locus/` and push it
-  to your registry:
+- An image the cluster can pull. The chart uses the published one,
+  `ghcr.io/dollspace-gay/aurora-locus`, at the chart's version, so there is
+  nothing to build. To run your own build (or to mirror the image into a
+  private registry), push it and set `image.repository`:
 
   ```sh
   docker build -f deploy/docker/Dockerfile -t registry.example.com/aurora-locus:0.1.0 \
@@ -38,9 +40,7 @@ within seconds.
 `values-small.yaml`:
 
 ```yaml
-image:
-  repository: registry.example.com/aurora-locus
-  tag: "0.1.0"
+# image: the published one by default; set repository and tag for your own.
 hostname: pds.example.com
 # handleDomains: [".example.com"]     # default: handles under the hostname
 trustedProxies: [10.244.0.0/16]       # your ingress controller's pod range
@@ -101,9 +101,7 @@ same one. To use KMS instead, set `masterKeySource: kms`, put
 `values-large.yaml`:
 
 ```yaml
-image:
-  repository: registry.example.com/aurora-locus
-  tag: "0.1.0"
+# image: the published one by default; set repository and tag for your own.
 profile: large
 replicaCount: 3
 hostname: pds.example.com
@@ -222,7 +220,7 @@ set:
 
 | Value | Default | Meaning |
 |---|---|---|
-| `image.repository`, `image.tag` | — , the chart's appVersion | The image |
+| `image.repository`, `image.tag` | `ghcr.io/dollspace-gay/aurora-locus`, the chart's appVersion | The image |
 | `profile` | `small` | `small` or `large` |
 | `replicaCount` | `2` | Pods, large profile |
 | `hostname` | — | The PDS hostname |

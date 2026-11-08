@@ -1,8 +1,13 @@
 # aurora-locus with Caddy in front. deploy/install.sh writes locus.env and
 # the Caddyfile next to this file and starts it; to do it by hand:
 #
-#   aurora-locus deploy caddyfile --email you@example.com > Caddyfile
-#   docker compose up -d --build
+#   docker compose run --rm --no-deps --entrypoint aurora-locus locus \
+#     deploy caddyfile --email you@example.com > Caddyfile
+#   docker compose up -d
+#
+# The image is the published one (LOCUS_IMAGE in .env picks another). To build
+# it from this checkout instead, add compose.build.yaml to every command:
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --build
 #
 # Only Caddy publishes public ports. locus publishes 3000 on 127.0.0.1 only
 # (for the CLI over HTTP on this machine; LOCUS_LOCAL_PORT in .env picks
@@ -11,10 +16,8 @@ name: aurora-locus
 
 services:
   locus:
-    image: ${LOCUS_IMAGE:-aurora-locus:latest}
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
+    # 0.1 follows the 0.1.x patch releases; pin 0.1.0 for no updates.
+    image: ${LOCUS_IMAGE:-ghcr.io/dollspace-gay/aurora-locus:0.1}
     restart: unless-stopped
     env_file: [locus.env]
     volumes:

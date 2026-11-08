@@ -45,7 +45,7 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-# Ports, before the long build: Caddy needs 80 and 443; locus's local port
+# Ports, before the image is fetched: Caddy needs 80 and 443; locus's local port
 # (3000 on 127.0.0.1, for the CLI) can move.
 in_use() { [[ -n "$(ss -Hltn "sport = :$1" 2>/dev/null)" ]]; }
 for port in 80 443; do
@@ -151,6 +151,12 @@ LOCUS_LOCAL_PORT=$local_port
 CADDY_IMAGE=$caddy_image
 DNS_API_TOKEN=$dns_token
 EOF
+# LOCUS_BUILD_FROM_SOURCE=1 builds the image from this checkout instead of
+# pulling the published one; every later `docker compose` command in this
+# directory then builds from source too.
+if [[ "${LOCUS_BUILD_FROM_SOURCE:-}" == 1 ]]; then
+  echo "COMPOSE_FILE=compose.yaml:compose.build.yaml" >> .env
+fi
 cat > locus.env <<EOF
 PDS_HOSTNAME=$hostname
 PDS_SERVICE_HANDLE_DOMAINS=.$domain
@@ -169,8 +175,13 @@ LOCUS_PROXY_MODE=$proxy_mode
 EOF
 umask 022
 
-say "Building aurora-locus…"
-docker compose build locus
+if [[ "${LOCUS_BUILD_FROM_SOURCE:-}" == 1 ]]; then
+  say "Building aurora-locus (this takes a while)…"
+  docker compose build locus
+else
+  say "Pulling aurora-locus…"
+  docker compose pull locus
+fi
 docker compose run --rm --no-deps --entrypoint aurora-locus locus deploy caddyfile "${args[@]}" > Caddyfile
 
 say "Starting…"

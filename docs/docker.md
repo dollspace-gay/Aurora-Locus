@@ -74,6 +74,8 @@ LOCUS_SUBNET=172.31.99.0/24            # if 172.30.53.0/24 clashes with another 
 LOCUS_GATEWAY=172.31.99.1
 LOCUS_IP_RANGE=172.31.99.128/25        # the upper half: containers' dynamic addresses
 LOCUS_CADDY_IP=172.31.99.2             # Caddy's address; LOCUS_TRUSTED_PROXIES must match
+LOCUS_IMAGE=ghcr.io/dollspace-gay/aurora-locus:0.1.0   # pin an exact version
+COMPOSE_FILE=compose.yaml:compose.build.yaml           # build from source (step 3)
 CADDY_IMAGE=locus-caddy                # DNS-01 wildcards (see below)
 DNS_API_TOKEN=…                        # the DNS provider's token, for DNS-01
 ```
@@ -81,7 +83,23 @@ DNS_API_TOKEN=…                        # the DNS provider's token, for DNS-01
 If you change the network, change `LOCUS_TRUSTED_PROXIES` in `locus.env`
 to `<LOCUS_CADDY_IP>/32`.
 
-## 3. Build the image
+## 3. Get the image
+
+```sh
+docker compose pull locus
+```
+
+This pulls `ghcr.io/dollspace-gay/aurora-locus:0.1`, the published image.
+`0.1` follows the 0.1.x patch releases; set `LOCUS_IMAGE` in `.env` to pin
+an exact version (`ghcr.io/dollspace-gay/aurora-locus:0.1.0`) or to use
+another registry.
+
+**To build it from the source instead**, add `compose.build.yaml` to the
+compose commands. Set it once in `.env` so every command below uses it:
+
+```sh
+COMPOSE_FILE=compose.yaml:compose.build.yaml
+```
 
 ```sh
 docker compose build locus
@@ -178,13 +196,15 @@ The console is at `https://pds.example.com/admin`.
 container with the new environment. `docker compose restart` keeps the old
 one.
 
-**Upgrading.** Pull the new source, rebuild, recreate:
+**Upgrading.** Pull the new image and recreate:
 
 ```sh
-git pull
-docker compose build locus
+docker compose pull locus
 docker compose up -d
 ```
+
+If you pinned an exact version, change `LOCUS_IMAGE` first. Building from
+source: `git pull`, `docker compose build locus`, `docker compose up -d`.
 
 Database migrations run at start. A node refuses a database newer than it
 knows, so an accidental downgrade stops instead of damaging data.

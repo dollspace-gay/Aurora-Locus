@@ -555,9 +555,13 @@ volumes for locus's data and Caddy's state.
   commented out, as the reference offers one.
 
 The image runs as a non-root user on a slim Debian base, with the `goat`
-CLI included as in the reference's image. Builds keep cargo's caches
-between runs and turn link-time optimization off, which roughly halves a
-rebuild on a server. For a fully optimized image:
+CLI included as in the reference's image. A version tag publishes it to
+`ghcr.io/dollspace-gay/aurora-locus` as `X.Y.Z`, `X.Y` and `latest`, built
+fully optimized, and the stack pulls it by default (`0.1` follows the 0.1.x
+patches). To build from the source instead, add `compose.build.yaml` to the
+compose commands. Source builds keep cargo's caches between runs and turn
+link-time optimization off, which roughly halves a rebuild on a server. For a
+fully optimized image:
 
 ```sh
 docker build -f deploy/docker/Dockerfile -t aurora-locus \
@@ -572,7 +576,7 @@ To set up the stack by hand instead of with the installer, see
 
 ```sh
 cd deploy/docker
-docker compose build locus
+docker compose pull locus
 docker compose run --rm --no-deps --entrypoint aurora-locus locus \
   deploy caddyfile --email you@example.com > Caddyfile
 docker compose up -d
@@ -586,10 +590,11 @@ docker compose up -d
 (SQLite on one pod with a PersistentVolume) and `large` (Postgres and S3,
 any number of pods). See [Running on Kubernetes](../kubernetes.md).
 
-**Upgrading.** Pull the new source, rebuild and recreate:
+**Upgrading.** Pull the new image and recreate (building from source: pull
+the new source, `docker compose build locus`, then recreate):
 
 ```sh
-docker compose build locus
+docker compose pull locus
 docker compose up -d
 ```
 
