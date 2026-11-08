@@ -1,0 +1,85 @@
+{
+  "defs": {
+    "cancellationResults": {
+      "properties": {
+        "failed": {
+          "description": "DIDs for which cancellation failed with error details",
+          "items": {
+            "ref": "#failedCancellation",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "succeeded": {
+          "description": "DIDs for which all pending scheduled actions were successfully cancelled",
+          "items": {
+            "format": "did",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "succeeded",
+        "failed"
+      ],
+      "type": "object"
+    },
+    "failedCancellation": {
+      "properties": {
+        "did": {
+          "format": "did",
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "errorCode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "did",
+        "error"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Cancel all pending scheduled moderation actions for specified subjects",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "comment": {
+              "description": "Optional comment describing the reason for cancellation",
+              "type": "string"
+            },
+            "subjects": {
+              "description": "Array of DID subjects to cancel scheduled actions for",
+              "items": {
+                "format": "did",
+                "type": "string"
+              },
+              "maxLength": 100,
+              "type": "array"
+            }
+          },
+          "required": [
+            "subjects"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "#cancellationResults",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.moderation.cancelScheduledActions",
+  "lexicon": 1
+}

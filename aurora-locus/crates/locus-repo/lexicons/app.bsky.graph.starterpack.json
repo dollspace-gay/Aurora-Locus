@@ -1,0 +1,70 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "feedItem": {
+      "properties": {
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Record defining a starter pack of actors and feeds for new users.",
+      "key": "tid",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "description": {
+            "maxGraphemes": 300,
+            "maxLength": 3000,
+            "type": "string"
+          },
+          "descriptionFacets": {
+            "items": {
+              "ref": "app.bsky.richtext.facet",
+              "type": "ref"
+            },
+            "type": "array"
+          },
+          "feeds": {
+            "items": {
+              "ref": "#feedItem",
+              "type": "ref"
+            },
+            "maxLength": 3,
+            "type": "array"
+          },
+          "list": {
+            "description": "Reference (AT-URI) to the list record.",
+            "format": "at-uri",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name for starter pack; can not be empty.",
+            "maxGraphemes": 50,
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "list",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "app.bsky.graph.starterpack",
+  "lexicon": 1
+}

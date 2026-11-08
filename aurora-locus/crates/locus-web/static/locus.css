@@ -1,0 +1,635 @@
+/* Locus web UI: the one stylesheet, for the operator console, the account
+   portal, setup and the OAuth pages. Its design comes from Horizon-Prism's
+   admin UI. Every colour, font and size is a token in the blocks up to "Top
+   bar", so the look is changed here and nowhere else. Each operator chooses
+   light, dark or the device's choice, a colour scheme and a font; the page
+   says which with classes on <html> (mode-system|light|dark, scheme-<name>,
+   font-<name>). Without them the device decides and the scheme is sky. No
+   external files, no inline styles. */
+
+/* The colour schemes. Each names its accent in a light (-l) and a dark (-d)
+   form, as a colour and as "r, g, b" for the tints; the mode blocks below
+   pick a form. A scheme class also works on a swatch (Appearance). */
+:root, .scheme-sky {
+  --s-accent-l: #0369a1;
+  --s-hover-l: #075985;
+  --s-rgb-l: 3, 105, 161;
+  --s-tint-l: 14, 165, 233;
+  --s-tint2-l: 99, 102, 241;
+  --s-accent-d: #78a9ff;
+  --s-hover-d: #9dc0fc;
+  --s-rgb-d: 120, 169, 255;
+  --s-code-d: #a3c3fb;
+}
+.scheme-violet {
+  --s-accent-l: #6d28d9;
+  --s-hover-l: #5b21b6;
+  --s-rgb-l: 109, 40, 217;
+  --s-tint-l: 139, 92, 246;
+  --s-tint2-l: 236, 72, 153;
+  --s-accent-d: #a78bfa;
+  --s-hover-d: #c4b5fd;
+  --s-rgb-d: 167, 139, 250;
+  --s-code-d: #c4b5fd;
+}
+.scheme-teal {
+  --s-accent-l: #0f766e;
+  --s-hover-l: #115e59;
+  --s-rgb-l: 15, 118, 110;
+  --s-tint-l: 20, 184, 166;
+  --s-tint2-l: 14, 165, 233;
+  --s-accent-d: #2dd4bf;
+  --s-hover-d: #5eead4;
+  --s-rgb-d: 45, 212, 191;
+  --s-code-d: #99f6e4;
+}
+.scheme-graphite {
+  --s-accent-l: #334155;
+  --s-hover-l: #1e293b;
+  --s-rgb-l: 51, 65, 85;
+  --s-tint-l: 100, 116, 139;
+  --s-tint2-l: 148, 163, 184;
+  --s-accent-d: #cbd5e1;
+  --s-hover-d: #e2e8f0;
+  --s-rgb-d: 203, 213, 225;
+  --s-code-d: #e2e8f0;
+}
+
+/* The accent in its light form: on the page, and on each swatch in its own
+   scheme. White text on every light accent is at least 4.5:1. */
+:root, .swatch {
+  --accent: var(--s-accent-l);
+  --accent-hover: var(--s-hover-l);
+  --accent-glow: rgba(var(--s-rgb-l), 0.20);
+  --accent-subtle: rgba(var(--s-rgb-l), 0.08);
+  --accent-fg: #ffffff;
+  --code-fg: var(--s-accent-l);
+}
+
+:root {
+  color-scheme: light;
+  --bg: #f8fafc;
+  --bg-gradient: radial-gradient(circle at 50% -20%, rgba(var(--s-tint-l), 0.10) 0%, rgba(var(--s-tint2-l), 0.04) 40%, rgba(248, 250, 252, 0) 80%), #f8fafc;
+  --fg: #0f172a;
+  --fg-strong: #020617;
+  --muted: #475569;
+  --line: #e2e8f0;
+  --line-strong: #cbd5e1;
+  --card: #ffffff;
+  --card-glass: rgba(255, 255, 255, 0.88);
+  --card-border: rgba(226, 232, 240, 0.95);
+  --card-hover: #f8fafc;
+  --ok: #047857;
+  --ok-bg: #ecfdf5;
+  --ok-border: #a7f3d0;
+  --warn: #b45309;
+  --warn-bg: #fffbeb;
+  --warn-border: #fde68a;
+  --bad: #e11d48;
+  --bad-fg: #ffffff;
+  --bad-bg: #fff1f2;
+  --bad-border: #fecdd3;
+  --code: #f1f5f9;
+  --code-border: #e2e8f0;
+  --pill: #f1f5f9;
+  --nav-bg: rgba(255, 255, 255, 0.86);
+  --nav-border: rgba(226, 232, 240, 0.85);
+  --shadow: 0 4px 12px -2px rgba(15, 23, 42, 0.06), 0 2px 4px -2px rgba(15, 23, 42, 0.04);
+  --button-glow: 0 2px 8px var(--accent-glow);
+  --radius-sm: 6px;
+  --radius: 12px;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Liberation Mono", Menlo, Consolas, monospace;
+  /* The sidebar: a dark panel in every mode, with the scheme's dark-form
+     accent. */
+  --side-bg: #0f172a;
+  /* QR codes stay black on white in both themes, so cameras read them. */
+  --qr-light: #ffffff;
+  --side-fg: #f8fafc;
+  --side-muted: #a0a4ac;
+  --side-accent: var(--s-accent-d);
+  --side-line: #ffffff1a;
+  --side-hover: #ffffff12;
+  --side-current: #ffffff1c;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Dark: by the device unless the operator chose light, or by choice. CSS
+   cannot share one block between a media query and a selector, so the two
+   dark blocks below are the same; keep them in step. Every dark accent is
+   at least 4.5:1 on the cards, and dark text on it too. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.mode-light) {
+    color-scheme: dark;
+    --bg: #161616;
+    --bg-gradient: #161616;
+    --fg: #f4f4f4;
+    --fg-strong: #fafafa;
+    --muted: #a4a4a4;
+    --line: rgba(244, 244, 244, 0.12);
+    --line-strong: rgba(244, 244, 244, 0.24);
+    --card: #202020;
+    --card-glass: rgba(32, 32, 32, 0.92);
+    --card-border: rgba(244, 244, 244, 0.14);
+    --card-hover: #292929;
+    --ok: #1ebd89;
+    --ok-bg: rgba(16, 185, 129, 0.12);
+    --ok-border: rgba(16, 185, 129, 0.32);
+    --warn: #f59e0b;
+    --warn-bg: rgba(245, 158, 11, 0.12);
+    --warn-border: rgba(245, 158, 11, 0.32);
+    --bad: #f77b90;
+    --bad-fg: #161616;
+    --bad-bg: rgba(244, 63, 94, 0.12);
+    --bad-border: rgba(244, 63, 94, 0.32);
+    --code: #272727;
+    --code-border: rgba(244, 244, 244, 0.18);
+    --pill: #272727;
+    --nav-bg: rgba(22, 22, 22, 0.92);
+    --nav-border: rgba(244, 244, 244, 0.14);
+    --shadow: 0 4px 14px -2px rgba(0, 0, 0, 0.3);
+    --button-glow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    --side-bg: #0f0f0f;
+    --side-fg: #f4f4f4;
+    --side-muted: #9d9d9d;
+  }
+  :root:not(.mode-light), :root:not(.mode-light) .swatch {
+    --accent: var(--s-accent-d);
+    --accent-hover: var(--s-hover-d);
+    --accent-glow: rgba(var(--s-rgb-d), 0.40);
+    --accent-subtle: rgba(var(--s-rgb-d), 0.13);
+    --accent-fg: #161616;
+    --code-fg: var(--s-code-d);
+  }
+}
+:root.mode-dark {
+  color-scheme: dark;
+  --bg: #161616;
+  --bg-gradient: #161616;
+  --fg: #f4f4f4;
+  --fg-strong: #fafafa;
+  --muted: #a4a4a4;
+  --line: rgba(244, 244, 244, 0.12);
+  --line-strong: rgba(244, 244, 244, 0.24);
+  --card: #202020;
+  --card-glass: rgba(32, 32, 32, 0.92);
+  --card-border: rgba(244, 244, 244, 0.14);
+  --card-hover: #292929;
+  --ok: #1ebd89;
+  --ok-bg: rgba(16, 185, 129, 0.12);
+  --ok-border: rgba(16, 185, 129, 0.32);
+  --warn: #f59e0b;
+  --warn-bg: rgba(245, 158, 11, 0.12);
+  --warn-border: rgba(245, 158, 11, 0.32);
+  --bad: #f77b90;
+  --bad-fg: #161616;
+  --bad-bg: rgba(244, 63, 94, 0.12);
+  --bad-border: rgba(244, 63, 94, 0.32);
+  --code: #272727;
+  --code-border: rgba(244, 244, 244, 0.18);
+  --pill: #272727;
+  --nav-bg: rgba(22, 22, 22, 0.92);
+  --nav-border: rgba(244, 244, 244, 0.14);
+  --shadow: 0 4px 14px -2px rgba(0, 0, 0, 0.3);
+  --button-glow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --side-bg: #0f0f0f;
+  --side-fg: #f4f4f4;
+  --side-muted: #9d9d9d;
+}
+:root.mode-dark, :root.mode-dark .swatch {
+  --accent: var(--s-accent-d);
+  --accent-hover: var(--s-hover-d);
+  --accent-glow: rgba(var(--s-rgb-d), 0.40);
+  --accent-subtle: rgba(var(--s-rgb-d), 0.13);
+  --accent-fg: #161616;
+  --code-fg: var(--s-code-d);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg-gradient);
+  background-attachment: fixed;
+  color: var(--fg);
+  min-height: 100vh;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Top bar of the public page and of the pages before sign-in */
+header.top {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  padding: 0.75rem 1.75rem;
+  border-bottom: 1px solid var(--nav-border);
+  background: var(--nav-bg);
+  flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+header.top .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+  color: var(--fg-strong);
+  text-decoration: none;
+}
+header.top .brand svg { color: var(--accent); }
+
+main { max-width: 74rem; margin: 0 auto; padding: 2rem 1.5rem; }
+
+h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.025em; margin: 0.25rem 0 1.25rem; color: var(--fg-strong); overflow-wrap: anywhere; }
+h2 { font-size: 1.15rem; font-weight: 600; letter-spacing: -0.01em; margin: 1.5rem 0 0.65rem; color: var(--fg-strong); }
+h3 { font-size: 1rem; font-weight: 600; margin: 0.25rem 0 0.4rem; }
+
+/* Cards */
+.card {
+  background: var(--card-glass);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin: 0 0 1.25rem;
+  box-shadow: var(--shadow);
+}
+.card h2:first-child { margin-top: 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1.25rem; margin-bottom: 0.5rem; }
+
+/* A label and a figure */
+.stat, .fact {
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.stat:last-of-type, .fact:last-of-type { border-bottom: none; }
+.stat .l, .fact .l { color: var(--muted); font-size: 0.8rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em; }
+.stat .n { margin-left: auto; font-size: 1.15rem; font-weight: 700; color: var(--fg-strong); font-variant-numeric: tabular-nums; }
+.fact .v { min-width: 0; text-align: right; font-weight: 600; overflow-wrap: anywhere; }
+
+.muted { color: var(--muted); }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
+.tech { font-size: 0.78rem; font-family: var(--font-mono); }
+
+/* Banners */
+.banner {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-left: 4px solid var(--warn);
+  padding: 0.85rem 1.25rem;
+  margin: 0 0 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.92rem;
+}
+.banner.bad { background: var(--bad-bg); border-color: var(--bad-border); border-left-color: var(--bad); }
+.banner.ok { background: var(--ok-bg); border-color: var(--ok-border); border-left-color: var(--ok); }
+
+/* Tables */
+.scroll { overflow-x: auto; margin: 0.5rem 0 1rem; }
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  font-size: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--card-glass);
+}
+th, td { text-align: left; padding: 0.55rem 0.85rem; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+th { color: var(--muted); font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; background: var(--pill); }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background-color: var(--card-hover); }
+td.actions { white-space: nowrap; text-align: right; }
+
+/* Wide tables: a wider column for the page,
+   and nothing breaks inside a word or a token. Headers, names, dates and
+   chips stay on one line; text wraps only between them; a table too wide
+   for the screen scrolls inside its .scroll box. */
+main.wide { max-width: 110rem; }
+main.wide > p, main.wide > .banner { max-width: 74rem; }
+table.dense th, table.dense td { overflow-wrap: normal; word-break: normal; }
+table.dense th { white-space: nowrap; }
+table.dense td.actions { white-space: nowrap; }
+table.dense td.actions form.inline + form.inline, table.dense td.actions .button + form.inline { margin-left: 0.35rem; }
+.nowrap { white-space: nowrap; }
+code.chip { white-space: nowrap; overflow-wrap: normal; display: inline-block; margin: 0 0.25rem 0.25rem 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
+.chips code.chip { margin: 0; }
+.counts { display: flex; flex-wrap: wrap; gap: 0.15rem 0.6rem; }
+.counts a, .counts span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.counts .zero { color: var(--muted); }
+
+/* Code */
+code, pre { font-family: var(--font-mono); font-size: 0.86rem; }
+code { background: var(--code); color: var(--code-fg); padding: 0.1rem 0.35rem; border-radius: var(--radius-sm); border: 1px solid var(--code-border); overflow-wrap: anywhere; }
+pre { background: var(--code); border: 1px solid var(--line); padding: 0.9rem; overflow: auto; border-radius: var(--radius); }
+details summary { cursor: pointer; color: var(--accent); font-size: 0.85rem; }
+
+/* Forms */
+form.inline { display: inline; }
+form.stack label { display: block; margin: 1rem 0 0.35rem; font-weight: 600; font-size: 0.92rem; color: var(--fg-strong); }
+form.stack label:first-of-type { margin-top: 0.25rem; }
+form.stack .hint { color: var(--muted); font-size: 0.84rem; margin-top: 0.35rem; }
+form.filters { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; }
+form.filters input, form.filters select { width: auto; flex: 1 1 10rem; }
+input[type=text], select, textarea {
+  width: 100%;
+  max-width: 44rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.92rem;
+}
+input[type=text]:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-subtle); outline: none; }
+
+/* Buttons */
+button, .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.48rem 1.1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-family: inherit;
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+}
+button:hover, .button:hover { background: var(--accent-hover); border-color: var(--accent-hover); box-shadow: var(--button-glow); text-decoration: none; }
+button.secondary, .button.secondary { background: transparent; color: var(--accent); border-color: var(--line); }
+button.secondary:hover, .button.secondary:hover { background: var(--accent-subtle); border-color: var(--accent); }
+button.danger { background: var(--bad); border-color: var(--bad); color: var(--bad-fg); }
+td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
+
+.row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-top: 1.25rem; }
+
+/* A row's further actions  */
+details.more { display: inline-block; margin-left: 0.35rem; vertical-align: middle; }
+details.more .menu { display: flex; flex-direction: column; gap: 0.35rem; align-items: flex-end; margin-top: 0.45rem; }
+td.actions .button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
+
+/* Appearance: radio choices, each scheme with a swatch of its accent in the
+   mode in use. */
+fieldset.choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1rem 0.9rem;
+  margin: 0 0 1rem;
+  min-width: 0;
+}
+fieldset.choices legend { font-weight: 600; font-size: 0.92rem; color: var(--fg-strong); padding: 0 0.35rem; }
+label.choice { display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.92rem; cursor: pointer; }
+label.choice input { margin: 0; accent-color: var(--accent); }
+.swatch {
+  display: inline-block;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  background: var(--accent);
+  border: 1px solid var(--line-strong);
+  flex: none;
+}
+
+/* Fonts: compiled in and served by locus, each under the SIL Open Font
+   License 1.1, with its licence beside it in /static/fonts/. A page
+   downloads only the faces it draws. The font class on <html> sets the two
+   stacks; these rules come after :root, which has the same specificity.
+   Atkinson Hyperlegible has no 600, so 600 draws in 700. IBM Plex is
+   served as IBM's own Latin1 files, so other characters fall back to the
+   next font in the stack. */
+@font-face {
+  font-family: "Atkinson Hyperlegible";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/static/fonts/atkinson-hyperlegible-1.006-400.woff2) format("woff2");
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/static/fonts/atkinson-hyperlegible-1.006-400-italic.woff2) format("woff2");
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/static/fonts/atkinson-hyperlegible-1.006-700.woff2) format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/static/fonts/jetbrains-mono-2.304-400.woff2) format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/static/fonts/jetbrains-mono-2.304-600.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/static/fonts/ibm-plex-sans-1.1.0-400.woff2) format("woff2");
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/static/fonts/ibm-plex-sans-1.1.0-600.woff2) format("woff2");
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/static/fonts/ibm-plex-sans-1.1.0-700.woff2) format("woff2");
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/static/fonts/ibm-plex-mono-2.5.0-400.woff2) format("woff2");
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(/static/fonts/ibm-plex-mono-2.5.0-600.woff2) format("woff2");
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+}
+.font-hyperlegible {
+  --font-sans: "Atkinson Hyperlegible", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", "Liberation Mono", Menlo, Consolas, monospace;
+}
+.font-system {
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Liberation Mono", Menlo, Consolas, monospace;
+}
+.font-plex {
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Code", "Liberation Mono", Menlo, Consolas, monospace;
+}
+/* Appearance draws each font's label in that font. */
+.font-sample { font-family: var(--font-sans); }
+
+/* Phone width. */
+@media (max-width: 40rem) {
+  header.top { padding: 0.65rem 1rem; gap: 0.75rem; }
+  main { padding: 1.25rem 0.9rem; }
+  .card { padding: 1rem; }
+  td.actions { white-space: normal; }
+}
+
+/* The signed-in frame: the sidebar beside the page. Every size inside the
+   sidebar is in px, since the root here is 15px; the panel is dark in every
+   mode. Every rule below starts with .layout, .sidebar, .skip or .eyebrow,
+   which only signed-in pages draw, so none reaches the public page or the
+   pages before sign-in. */
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 28px; align-items: start; padding: 16px max(16px, env(safe-area-inset-right, 0px)) 48px max(16px, env(safe-area-inset-left, 0px)); }
+.layout > main { max-width: none; margin: 0; padding: 0; }
+.sidebar { background: var(--side-bg); color: var(--side-fg); border-radius: 12px; padding: 18px 0 14px; font-size: 15.2px; line-height: 1.55; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); max-height: calc(100vh - 32px); overflow-y: auto; }
+.sidebar .brand { padding: 0 18px 12px; font-weight: 700; letter-spacing: .02em; border-bottom: 1px solid var(--side-line); margin-bottom: 8px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px; position: relative; }
+.sidebar .who { min-width: 0; }
+.sidebar .who summary { display: block; list-style: none; cursor: pointer; color: var(--side-muted); font-weight: 400; font-size: 12.48px; letter-spacing: normal; text-align: right; overflow-wrap: anywhere; }
+.sidebar .who summary::-webkit-details-marker { display: none; }
+.sidebar .who summary:focus-visible { outline: 2px solid var(--side-accent); outline-offset: 2px; border-radius: 4px; }
+.sidebar .who-menu { position: absolute; right: 10px; top: calc(100% - 4px); z-index: 2; min-width: 180px; padding: 4px 0; background: var(--side-bg); border: 1px solid var(--side-line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .35); font-size: 15.2px; font-weight: 400; letter-spacing: normal; text-align: left; }
+.sidebar .who-menu form { margin: 0; }
+.sidebar .who-menu .item { padding: 6px 14px; }
+.sidebar .sec { margin: 0; padding: 10px 18px 2px; font-size: 11.52px; letter-spacing: .1em; text-transform: uppercase; color: var(--side-muted); }
+.sidebar ul { list-style: none; margin: 0; padding: 0; }
+.sidebar .item { all: unset; box-sizing: border-box; display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; padding: 6px 18px 6px 26px; cursor: pointer; color: var(--side-fg); text-decoration: none; }
+.sidebar .item:hover, .sidebar .item:focus-visible { background: var(--side-hover); text-decoration: none; }
+.sidebar .item:focus-visible { outline: 2px solid var(--side-accent); outline-offset: -2px; }
+.sidebar .item[aria-current="page"], .sidebar .item[aria-current="true"] { background: var(--side-current); box-shadow: inset 3px 0 0 var(--side-accent); }
+.sidebar .tag { font-family: var(--font-mono); font-size: 11.2px; color: var(--side-accent); white-space: nowrap; }
+@media (max-width: 820px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: static; max-height: none; overflow: visible; }
+}
+.skip { position: absolute; left: 16px; top: -100px; z-index: 100; padding: 8px 12px; border-radius: 6px; background: var(--card); color: var(--accent); font-weight: 600; }
+.skip:focus { top: 16px; }
+.eyebrow { margin: 0; font-size: 12.48px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
+
+/* Tabs inside a page. */
+.layout nav.tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0 0 1.25rem; border-bottom: 1px solid var(--line); }
+.layout nav.tabs a { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.45rem 0.85rem; margin-bottom: -1px; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 600; font-size: 0.92rem; }
+.layout nav.tabs a:hover { color: var(--accent); text-decoration: none; }
+.layout nav.tabs a[aria-current="page"] { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* The column beside the sidebar fills the screen; prose and label-value
+   rows keep a readable measure. Every table cell says whether it may wrap:
+   num, when, name, state and actions never do; list wraps between its
+   items; text wraps between words, and inside a long token only once the
+   cell is at its floor. A table wider than its box scrolls in the box. */
+.layout main p, .layout main .banner { max-width: 70ch; }
+.layout .stat, .layout .fact { max-width: 48rem; }
+.layout th, .layout td { overflow-wrap: normal; word-break: normal; }
+.layout th { white-space: nowrap; }
+.layout th.num, .layout td.num { white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; }
+.layout td.when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.layout td.name, .layout td.state { white-space: nowrap; }
+.layout td.actions { white-space: nowrap; text-align: right; }
+.layout td.list { min-width: 12rem; }
+.layout td.text { overflow-wrap: anywhere; }
+.layout td.text > .cell-text { min-width: 16rem; }
+.layout td .wrap { white-space: normal; }
+
+/* A page's settings: its cards side by side where the column is wide
+   enough, and the rarely changed ones folded under Advanced. */
+.layout .settings-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 36rem), 1fr)); gap: 1.25rem; align-items: start; }
+.layout .settings-cards > .card { margin: 0; }
+.totp-qr { width: 12.5rem; max-width: 100%; background: var(--qr-light); border-radius: 0.5rem; line-height: 0; }
+.totp-qr svg { width: 100%; height: auto; display: block; }
+.layout details.advanced { margin: 1.25rem 0; }
+.layout details.advanced > summary { font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem; }
+
+
+/* Locus additions: the other text inputs share the text input's look, and a
+   narrow form column for sign-in and setup. */
+input[type=password], input[type=email], input[type=number], input[type=url], input[type=search] {
+  width: 100%;
+  max-width: 44rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.92rem;
+}
+input[type=password]:focus, input[type=email]:focus, input[type=number]:focus, input[type=url]:focus, input[type=search]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+  outline: none;
+}
+input[type=checkbox] { accent-color: var(--accent); }
+label.check, form.stack label.check { display: flex; align-items: center; gap: 0.5rem; font-weight: 400; margin: 0.6rem 0; }
+form.stack label.choice { display: flex; margin: 0; font-weight: 400; }
+fieldset.column { flex-direction: column; gap: 0.6rem; }
+.warn { color: var(--warn); }
+main.narrow { max-width: 30rem; }
+.steps { list-style: none; padding: 0; margin: 0 0 1.25rem; display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; font-size: 0.85rem; color: var(--muted); }
+.steps li[aria-current="step"] { color: var(--accent); font-weight: 700; }
+.steps a { color: inherit; }
+.steps li.done { color: var(--fg); }
+
+/* Pills: a setting's or a check's state. */
+.pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; background: var(--pill); color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+.pill.on { background: var(--ok-bg); color: var(--ok); }
+.pill.off { background: var(--bad-bg); color: var(--bad); }
+.pill.red { background: var(--bad-bg); color: var(--bad); }
+.pill.amber { background: var(--warn-bg); color: var(--warn); }
+.pill.info { background: var(--accent-subtle); color: var(--accent); }
+.pill.fine { background: var(--ok-bg); color: var(--ok); }
+
+/* Branding: the operator's logo, a line under the title, and a footer. */
+.brand-logo { max-height: 28px; max-width: 160px; width: auto; height: auto; }
+.brand-blurb { margin-top: -0.5rem; }
+.brand-foot { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+.previews { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; }
+.previews figure { margin: 0; max-width: 100%; overflow-x: auto; }
+.previews iframe { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); max-width: 100%; }

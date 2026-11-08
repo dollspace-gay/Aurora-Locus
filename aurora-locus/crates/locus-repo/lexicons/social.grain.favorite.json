@@ -1,0 +1,28 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "key": "tid",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "subject": {
+            "format": "at-uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "createdAt",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "social.grain.favorite",
+  "lexicon": 1
+}

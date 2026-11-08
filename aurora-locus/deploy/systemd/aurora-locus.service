@@ -1,0 +1,63 @@
+# aurora-locus as a plain service, behind a proxy on the same machine
+# (Caddy, nginx, …; see deploy/proxies). Install the binary to
+# /usr/local/bin, put the environment in /etc/aurora-locus/locus.env
+# (PDS_HOSTNAME=…, and the database if not SQLite), then:
+#
+#   useradd --system --home-dir /var/lib/aurora-locus --shell /usr/sbin/nologin locus
+#   systemctl enable --now aurora-locus
+#
+# The CLI then talks to it over /var/lib/aurora-locus/admin.sock as the
+# locus user or root: sudo -u locus aurora-locus status
+
+[Unit]
+Description=aurora-locus, an atproto PDS
+Documentation=https://atproto.com
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=locus
+Group=locus
+EnvironmentFile=/etc/aurora-locus/locus.env
+Environment=LOCUS_DATA_DIR=/var/lib/aurora-locus
+Environment=LOCUS_DATA_PERSISTENT=true
+Environment=LOCUS_LISTEN=127.0.0.1:3000
+ExecStart=/usr/local/bin/aurora-locus serve
+Restart=on-failure
+RestartSec=5
+StateDirectory=aurora-locus
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aurora-locus
+# After `import reference-pds`, the blobs stay in the reference's data dir
+# and new uploads go there too; add it, e.g. ReadWritePaths=/pds.
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+# For direct TLS on 443 without a proxy, allow binding low ports instead:
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

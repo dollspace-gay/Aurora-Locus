@@ -1,0 +1,17 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "chat.bsky.actor.deleteAccount",
+  "lexicon": 1
+}

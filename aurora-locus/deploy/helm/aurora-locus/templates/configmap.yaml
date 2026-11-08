@@ -1,0 +1,54 @@
+{{- include "locus.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "locus.fullname" . }}
+  labels:
+    {{- include "locus.labels" . | nindent 4 }}
+data:
+  PDS_HOSTNAME: {{ .Values.hostname | quote }}
+  PDS_SERVICE_HANDLE_DOMAINS: {{ include "locus.handleDomains" . | quote }}
+  LOCUS_PROXY_MODE: {{ .Values.proxyMode | quote }}
+  {{- with .Values.trustedProxies }}
+  LOCUS_TRUSTED_PROXIES: {{ join "," . | quote }}
+  {{- end }}
+  {{- if include "locus.large" . }}
+  # Pods come and go; nothing on /data outlives one.
+  LOCUS_DATA_PERSISTENT: "false"
+  LOCUS_MASTER_KEY_SOURCE: {{ .Values.masterKeySource | quote }}
+  {{- end }}
+  {{- with .Values.redisUrl }}
+  LOCUS_REDIS_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.blobs.s3 }}
+  {{- if .bucket }}
+  PDS_BLOBSTORE_S3_BUCKET: {{ .bucket | quote }}
+  {{- with .region }}
+  PDS_BLOBSTORE_S3_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .endpoint }}
+  PDS_BLOBSTORE_S3_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- if .forcePathStyle }}
+  PDS_BLOBSTORE_S3_FORCE_PATH_STYLE: "true"
+  {{- end }}
+  {{- with .accessKeyId }}
+  PDS_BLOBSTORE_S3_ACCESS_KEY_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .gatedBucket }}
+  LOCUS_BLOBSTORE_S3_GATED_BUCKET: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if .Values.setup.auto }}
+  LOCUS_SETUP_AUTO: "true"
+  LOCUS_SETUP_PROXY: {{ .Values.proxyMode | quote }}
+  LOCUS_SETUP_OPERATOR_USERNAME: {{ .Values.setup.operatorUsername | quote }}
+  LOCUS_SETUP_KEYS_BACKUP_ACKNOWLEDGED: "true"
+  {{- with .Values.setup.existingSubdomains }}
+  LOCUS_SETUP_EXISTING_SUBDOMAINS: {{ join "," . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range $k, $v := .Values.env }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}

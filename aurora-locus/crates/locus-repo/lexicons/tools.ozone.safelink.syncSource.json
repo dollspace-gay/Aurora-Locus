@@ -1,0 +1,86 @@
+{
+  "defs": {
+    "main": {
+      "description": "Replace stored rules for one source from a complete snapshot. Existing rules owned by another source remain unchanged.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "rules": {
+              "items": {
+                "ref": "#sourceRule",
+                "type": "ref"
+              },
+              "type": "array"
+            },
+            "source": {
+              "description": "Source whose rules are being synchronized",
+              "maxLength": 128,
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "rules"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "added": {
+              "type": "integer"
+            },
+            "events": {
+              "type": "integer"
+            },
+            "removed": {
+              "type": "integer"
+            },
+            "updated": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "added",
+            "updated",
+            "removed",
+            "events"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    },
+    "sourceRule": {
+      "properties": {
+        "action": {
+          "ref": "tools.ozone.safelink.defs#actionType",
+          "type": "ref"
+        },
+        "pattern": {
+          "ref": "tools.ozone.safelink.defs#patternType",
+          "type": "ref"
+        },
+        "reason": {
+          "ref": "tools.ozone.safelink.defs#reasonType",
+          "type": "ref"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "pattern",
+        "action",
+        "reason"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.safelink.syncSource",
+  "lexicon": 1
+}

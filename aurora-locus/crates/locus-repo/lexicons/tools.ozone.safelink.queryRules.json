@@ -1,0 +1,92 @@
+{
+  "defs": {
+    "main": {
+      "description": "Query URL safety rules",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "actions": {
+              "description": "Filter by action types",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "createdBy": {
+              "description": "Filter by rule creator",
+              "format": "did",
+              "type": "string"
+            },
+            "cursor": {
+              "description": "Cursor for pagination",
+              "type": "string"
+            },
+            "limit": {
+              "default": 50,
+              "description": "Maximum number of results to return",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "patternType": {
+              "description": "Filter by pattern type",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Filter by reason type",
+              "type": "string"
+            },
+            "sortDirection": {
+              "default": "desc",
+              "description": "Sort direction",
+              "knownValues": [
+                "asc",
+                "desc"
+              ],
+              "type": "string"
+            },
+            "source": {
+              "description": "Filter by exact rule source. Omit to include all sources.",
+              "maxLength": 128,
+              "type": "string"
+            },
+            "urls": {
+              "description": "Filter by specific URLs or domains",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "description": "Next cursor for pagination. Only present if there are more results.",
+              "type": "string"
+            },
+            "rules": {
+              "items": {
+                "ref": "tools.ozone.safelink.defs#urlRule",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "rules"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.safelink.queryRules",
+  "lexicon": 1
+}

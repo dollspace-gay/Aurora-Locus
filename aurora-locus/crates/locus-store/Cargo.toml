@@ -1,0 +1,26 @@
+[package]
+name = "locus-store"
+description = "Storage backends (SQLite, Postgres) and migrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+{
+  "defs": {
+    "main": {
+      "description": "Initiate a user account deletion via email.",
+      "type": "procedure"
+    }
+  },
+  "id": "com.atproto.server.requestAccountDelete",
+  "lexicon": 1
+}

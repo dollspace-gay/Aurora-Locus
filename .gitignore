@@ -1,43 +1,5 @@
-.env
-# install.sh backs up an overwritten .env to .env.bak (real secrets); ignore the
-# whole .env* family but keep the tracked template.
-.env*
-!.env.example
-admin_login.bat
-build.log
-create_admin_account.bat
-grant_admin_final.bat
-/bluesky-pds
-
-# Rust build artifacts
-/target/
-**/target/
-*.log
-Cargo.lock
-
-# Test and temporary files
-*.tmp
-*.swp
-*~
-# Beads database
-.beads/
-.chainlink/
-
-# Runtime data
-data/
-data.backup/
-data.bak/
-
-# Local tooling
-.claude/
-
-# Python
-__pycache__/
-*.pyc
-
 docs/internal
-phase-b/*
-!phase-b/mock-plc.py
-
-# runtime artifacts
-*.pid
+aurora-locus/target
+.chainlink/
+.claude/
+docs/sleepwork

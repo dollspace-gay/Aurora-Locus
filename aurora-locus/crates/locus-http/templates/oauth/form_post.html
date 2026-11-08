@@ -1,0 +1,10 @@
+{% extends "oauth/base.html" %}
+{% block title %}Continue · {{ service_name }}{% endblock %}
+{% block content %}
+<h1>Returning to the app…</h1>
+<form method="post" action="{{ action }}" id="form-post">
+{% for f in fields %}<input type="hidden" name="{{ f.0 }}" value="{{ f.1 }}">
+{% endfor %}<button type="submit" class="primary">Continue</button>
+</form>
+<script src="/oauth/assets/form-post.js"></script>
+{% endblock %}

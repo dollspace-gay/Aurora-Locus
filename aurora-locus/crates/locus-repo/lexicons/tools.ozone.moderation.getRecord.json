@@ -1,0 +1,38 @@
+{
+  "defs": {
+    "main": {
+      "description": "Get details about a record.",
+      "errors": [
+        {
+          "name": "RecordNotFound"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.moderation.defs#recordViewDetail",
+          "type": "ref"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "cid": {
+            "format": "cid",
+            "type": "string"
+          },
+          "uri": {
+            "format": "at-uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.moderation.getRecord",
+  "lexicon": 1
+}

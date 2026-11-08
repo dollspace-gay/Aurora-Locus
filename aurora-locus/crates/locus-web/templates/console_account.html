@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>@{{ handle }}</h1>
+<p class="muted"><code>{{ did }}</code> · <a href="/admin/accounts">All accounts</a></p>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<div class="grid">
+<div class="card">
+<h2>Account</h2>
+{% for f in facts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h2>Data</h2>
+{% for f in stats %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h2>Private posts</h2>
+{% for f in private %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+</div>
+
+{% if can_moderate %}
+<h2>Moderation</h2>
+<div class="settings-cards">
+<div class="card">
+<h3>Takedown</h3>
+{% if taken_down %}
+<p>The account is taken down: it can't sign in, and its repo isn't served.</p>
+<form method="post" action="{{ base }}/takedown"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="false">
+<div class="row"><button type="submit" class="secondary">Reverse the takedown</button></div></form>
+{% else %}
+<form class="stack" method="post" action="{{ base }}/takedown"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
+<label for="ref">Reference <span class="muted">(optional: a report or case id)</span></label>
+<input type="text" id="ref" name="ref">
+<div class="row"><button type="submit" class="danger">Take down</button></div></form>
+{% endif %}
+</div>
+<div class="card">
+<h3>Suspend</h3>
+{% if suspended %}
+<p>The account is suspended: it can't sign in, and its repo isn't served. The suspension lifts by itself at the time shown above.</p>
+<form method="post" action="{{ base }}/unsuspend"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button type="submit" class="secondary">Lift the suspension now</button></div></form>
+{% else if active %}
+<p>A suspension works like a takedown for a set time: no sign-in, no writes, and its repo isn't served. It lifts by itself.</p>
+<form class="stack" method="post" action="{{ base }}/suspend"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="days">Days</label>
+<input type="number" id="days" name="days" value="7" min="1" max="3650" required>
+<label for="note">Note <span class="muted">(optional: why, or a report id)</span></label>
+<input type="text" id="note" name="note" maxlength="1000">
+<div class="row"><button type="submit" class="danger">Suspend</button></div></form>
+{% else %}
+<p>Only an active account can be suspended.</p>
+{% endif %}
+</div>
+<div class="card">
+<h3>Deactivate</h3>
+{% if deactivated %}
+<p>The account is deactivated.</p>
+<form method="post" action="{{ base }}/deactivate"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="false">
+<div class="row"><button type="submit" class="secondary">Reactivate</button></div></form>
+{% else %}
+<p>Deactivating stops the account's repo being served, as if its owner had deactivated it. Its owner can reactivate it by signing in; to keep it off, take it down instead.</p>
+<form method="post" action="{{ base }}/deactivate"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
+<div class="row"><button type="submit" class="secondary">Deactivate</button></div></form>
+{% endif %}
+</div>
+<div class="card">
+<h3>Private posts and invites</h3>
+<form method="post" action="{{ base }}/private-block"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="blocked" value="{% if blocked %}false{% else %}true{% endif %}">
+<div class="row"><button type="submit" class="secondary">{% if blocked %}Allow private posts again{% else %}Block private posts here{% endif %}</button></div></form>
+<form method="post" action="{{ base }}/invites"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="disabled" value="{% if invites_disabled %}false{% else %}true{% endif %}">
+<div class="row"><button type="submit" class="secondary">{% if invites_disabled %}Let it make invite codes again{% else %}Stop its invite codes{% endif %}</button></div></form>
+</div>
+</div>
+{% endif %}
+
+{% if can_admin %}
+<h2>Credentials</h2>
+<div class="settings-cards">
+<div class="card">
+<form class="stack" method="post" action="{{ base }}/handle"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="handle">Handle</label>
+<input type="text" id="handle" name="handle" value="{{ handle }}" spellcheck="false">
+<div class="row"><button type="submit" class="secondary">Change handle</button></div></form>
+</div>
+<div class="card">
+<form class="stack" method="post" action="{{ base }}/email"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="email">Email</label>
+<input type="email" id="email" name="email" value="{{ email }}">
+<div class="row"><button type="submit" class="secondary">Change email</button></div></form>
+</div>
+<div class="card">
+<form class="stack" method="post" action="{{ base }}/password"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="password">New password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<div class="hint">Every sign-in and connected app of the account ends.</div>
+<div class="row"><button type="submit" class="secondary">Reset password</button></div></form>
+</div>
+<div class="card">
+<h3>Delete</h3>
+<p>Deletes the account, its repo and its blobs. It can't be undone.</p>
+<div class="row"><a class="button secondary" href="{{ base }}/delete">Delete the account…</a></div>
+</div>
+</div>
+{% endif %}
+
+<h2>App passwords</h2>
+<div class="scroll"><table>
+<thead><tr><th class="name">Name</th><th class="when">Created</th><th class="state">Kind</th></tr></thead>
+<tbody>
+{% for p in app_passwords %}<tr><td class="name">{{ p.name }}</td><td class="when">{{ p.created }}</td><td class="state">{% if p.privileged %}<span class="pill amber">privileged</span>{% else %}<span class="pill">normal</span>{% endif %}</td></tr>
+{% else %}<tr><td class="text" colspan="3"><div class="cell-text">None.</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+
+<h2>Its invite codes</h2>
+<div class="scroll"><table>
+<thead><tr><th class="name">Code</th><th class="num">Left</th><th class="num">Used</th><th class="when">Created</th><th class="state">State</th></tr></thead>
+<tbody>
+{% for c in invites %}<tr><td class="name"><code>{{ c.code }}</code></td><td class="num">{{ c.available }}</td><td class="num">{{ c.uses }}</td><td class="when">{{ c.created }}</td><td class="state">{% if c.disabled %}<span class="pill off">disabled</span>{% else %}<span class="pill on">usable</span>{% endif %}</td></tr>
+{% else %}<tr><td class="text" colspan="5"><div class="cell-text">None.</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% endblock %}

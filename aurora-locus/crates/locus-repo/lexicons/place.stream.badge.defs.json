@@ -1,0 +1,146 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "badgeIssuanceView": {
+      "description": "A resolved view of a badge issuance, including def fields for display.",
+      "properties": {
+        "badgeType": {
+          "knownValues": [
+            "place.stream.badge.defs#vip",
+            "place.stream.badge.defs#event"
+          ],
+          "type": "string"
+        },
+        "description": {
+          "description": "Description from the badge definition.",
+          "type": "string"
+        },
+        "imageUrl": {
+          "description": "Resolved image URL for the badge icon.",
+          "format": "uri",
+          "type": "string"
+        },
+        "issuanceCid": {
+          "description": "CID of the place.stream.badge.issuance record.",
+          "type": "string"
+        },
+        "issuanceUri": {
+          "description": "AT URI of the place.stream.badge.issuance record.",
+          "format": "at-uri",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "DID of the badge issuer.",
+          "format": "did",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name from the badge definition.",
+          "type": "string"
+        },
+        "selected": {
+          "description": "Whether this badge is currently in the user's chat profile selection.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "issuanceUri",
+        "badgeType",
+        "issuer"
+      ],
+      "type": "object"
+    },
+    "badgeSlot": {
+      "description": "A display slot containing available issuance-based badges and which one (if any) is currently selected.",
+      "properties": {
+        "available": {
+          "description": "All badges available for this slot.",
+          "items": {
+            "ref": "#badgeIssuanceView",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "selected": {
+          "description": "The currently selected badge in this slot, if any.",
+          "ref": "#badgeIssuanceView",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "available"
+      ],
+      "type": "object"
+    },
+    "badgeView": {
+      "description": "View of a badge record, with fields resolved for display. If the DID in issuer is not the current streamplace node, the signature field shall be required.",
+      "properties": {
+        "badgeType": {
+          "knownValues": [
+            "place.stream.badge.defs#mod",
+            "place.stream.badge.defs#streamer",
+            "place.stream.badge.defs#vip",
+            "place.stream.badge.defs#event",
+            "place.stream.badge.defs#bot"
+          ],
+          "type": "string"
+        },
+        "description": {
+          "description": "Description from the badge definition.",
+          "type": "string"
+        },
+        "imageUrl": {
+          "description": "Resolved image URL for the badge icon.",
+          "format": "uri",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "DID of the badge issuer.",
+          "format": "did",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name from the badge definition.",
+          "type": "string"
+        },
+        "recipient": {
+          "description": "DID of the badge recipient.",
+          "format": "did",
+          "type": "string"
+        },
+        "signature": {
+          "description": "TODO: Cryptographic signature of the badge (of a place.stream.key).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "badgeType",
+        "issuer",
+        "recipient"
+      ],
+      "type": "object"
+    },
+    "bot": {
+      "description": "This user is a bot. Self-applied via place.stream.chat.profile selfLabels.",
+      "type": "token"
+    },
+    "event": {
+      "description": "This user has won or earned a special event or contest badge.",
+      "type": "token"
+    },
+    "mod": {
+      "description": "This user is a moderator. Displayed with a sword icon.",
+      "type": "token"
+    },
+    "streamer": {
+      "description": "This user is the streamer. Displayed with a star icon.",
+      "type": "token"
+    },
+    "vip": {
+      "description": "This user is a very important person.",
+      "type": "token"
+    }
+  },
+  "id": "place.stream.badge.defs",
+  "lexicon": 1
+}

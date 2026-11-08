@@ -1,0 +1,24 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "A declaration of an account's preferences for appearing in content discovery surfaces.",
+      "key": "literal:self",
+      "record": {
+        "properties": {
+          "hideFromAlgorithmicRecommendations": {
+            "description": "Whether the account requests that its posts be hidden from algorithmic recommendations. Consumers must treat a missing record as false.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "hideFromAlgorithmicRecommendations"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "app.bsky.actor.contentVisibilityDeclaration",
+  "lexicon": 1
+}

@@ -1,0 +1,77 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Get a view of an actor's 'author feed' (post and reposts by the author). Does not require auth.",
+      "errors": [
+        {
+          "name": "BlockedActor"
+        },
+        {
+          "name": "BlockedByActor"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "feed": {
+              "items": {
+                "ref": "app.bsky.feed.defs#feedViewPost",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "feed"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "actor": {
+            "format": "at-identifier",
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "filter": {
+            "default": "posts_with_replies",
+            "description": "Combinations of post/repost types to include in response.",
+            "knownValues": [
+              "posts_with_replies",
+              "posts_no_replies",
+              "posts_with_media",
+              "posts_and_author_threads",
+              "posts_with_video"
+            ],
+            "type": "string"
+          },
+          "includePins": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "actor"
+        ],
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "app.bsky.feed.getAuthorFeed",
+  "lexicon": 1
+}

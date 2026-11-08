@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.brand }}</h1>
+<div class="card">
+<p>This is an AT Protocol Personal Data Server (a PDS): it hosts accounts for the atproto network, and apps reach them through it.</p>
+<p class="muted">Most API routes are under <code>/xrpc/</code>.</p>
+{% if portal %}<div class="row"><a class="button" href="/account">Your account</a>{% if sign_up %}<a class="button secondary" href="/account/sign-up">Create an account</a>{% endif %}</div>{% endif %}
+</div>
+{% endblock %}

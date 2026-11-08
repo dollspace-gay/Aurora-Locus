@@ -1,0 +1,30 @@
+[package]
+name = "locus-sync"
+description = "Sequencer, outbox, firehose server, crawler notification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+locus-store.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-lex-cbor.workspace = true
+proto-blue-ws.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tempfile.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,107 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "activityGame": {
+      "description": "A game from the gamesgamesgamesgames catalog, identified by its AT URI.",
+      "properties": {
+        "name": {
+          "description": "Cached display name of the game.",
+          "type": "string"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "activityLabel": {
+      "description": "A non-game activity with a well-known label.",
+      "properties": {
+        "label": {
+          "knownValues": [
+            "events",
+            "just_chatting",
+            "podcasting",
+            "music",
+            "art",
+            "software_dev",
+            "cooking",
+            "miniatures",
+            "makers_crafting",
+            "fitness",
+            "sports"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    },
+    "blockView": {
+      "properties": {
+        "blocker": {
+          "ref": "app.bsky.actor.defs#profileViewBasic",
+          "type": "ref"
+        },
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "record": {
+          "ref": "app.bsky.graph.block",
+          "type": "ref"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "blocker",
+        "record",
+        "indexedAt"
+      ],
+      "type": "object"
+    },
+    "rendition": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "renditions": {
+      "properties": {
+        "renditions": {
+          "items": {
+            "ref": "#rendition",
+            "type": "ref"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "renditions"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "place.stream.defs",
+  "lexicon": 1
+}

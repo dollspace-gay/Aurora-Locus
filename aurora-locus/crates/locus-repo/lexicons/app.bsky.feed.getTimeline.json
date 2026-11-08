@@ -1,0 +1,58 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Get a view of the requesting account's home timeline. This is expected to be some form of reverse-chronological feed.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "feed": {
+              "items": {
+                "ref": "app.bsky.feed.defs#feedViewPost",
+                "type": "ref"
+              },
+              "type": "array"
+            },
+            "startCursor": {
+              "description": "Cursor identifying the newest item in this page. Pass it as since on a later request to fetch only newer content.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "feed"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "algorithm": {
+            "description": "Variant 'algorithm' for timeline. Implementation-specific. NOTE: most feed flexibility has been moved to feed generator mechanism.",
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "since": {
+            "description": "Return only items newer than the position identified by this cursor value, newest first. Use the startCursor from a previous response. The item at that position is not returned because the caller already holds it. When the bounded range is exhausted, the returned cursor equals this value so that pagination continues below the boundary.",
+            "type": "string"
+          }
+        },
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "app.bsky.feed.getTimeline",
+  "lexicon": 1
+}

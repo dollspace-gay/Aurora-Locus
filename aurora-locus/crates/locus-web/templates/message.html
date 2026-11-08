@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<div class="card">
+<p>{{ message }}</p>
+{% if let Some(link) = link %}<p><a class="button secondary" href="{{ link.href }}">{{ link.label }}</a></p>{% endif %}
+</div>
+{% endblock %}

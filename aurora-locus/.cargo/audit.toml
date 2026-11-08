@@ -1,0 +1,10 @@
+# cargo-audit: advisories that don't apply to locus, or have no fix yet.
+# Each is ignored on purpose; any other advisory fails the audit.
+
+[advisories]
+ignore = [
+    # rsa: the Marvin attack recovers a private key from decryption or
+    # signing timing. Locus only verifies OAuth clients' RSA signatures with
+    # their public keys; it holds no RSA private key.
+    "RUSTSEC-2023-0071",
+]

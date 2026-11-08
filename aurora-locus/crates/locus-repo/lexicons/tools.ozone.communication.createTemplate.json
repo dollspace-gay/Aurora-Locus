@@ -1,0 +1,57 @@
+{
+  "defs": {
+    "main": {
+      "description": "Administrative action to create a new, re-usable communication (email for now) template.",
+      "errors": [
+        {
+          "name": "DuplicateTemplateName"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "contentMarkdown": {
+              "description": "Content of the template, markdown supported, can contain variable placeholders.",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "DID of the user who is creating the template.",
+              "format": "did",
+              "type": "string"
+            },
+            "lang": {
+              "description": "Message language.",
+              "format": "language",
+              "type": "string"
+            },
+            "name": {
+              "description": "Name of the template.",
+              "type": "string"
+            },
+            "subject": {
+              "description": "Subject of the message, used in emails.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subject",
+            "contentMarkdown",
+            "name"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.communication.defs#templateView",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.communication.createTemplate",
+  "lexicon": 1
+}

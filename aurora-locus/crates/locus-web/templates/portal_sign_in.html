@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block main_class %} class="narrow"{% endblock %}
+{% block content %}
+<h1>{% if sign_up %}Create an account{% else if code_stage %}Check your email{% else if !heading.is_empty() %}{{ heading }}{% else %}Sign in to your account{% endif %}</h1>
+{% if let Some(e) = error %}<div class="banner bad" role="alert">{{ e }}</div>{% endif %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<div class="card">
+{% if sign_up %}
+<form class="stack" method="post" action="/account/sign-up">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="handle">Handle</label>
+<input type="text" id="handle" name="handle" value="{{ handle }}" spellcheck="false" autocomplete="username" required autofocus>
+<div class="hint">Your name on the network, ending in {% for d in domains %}{% if !loop.first %} or {% endif %}<code>{{ d }}</code>{% endfor %}. You can change it later, or use a domain you own.</div>
+<label for="email">Email</label>
+<input type="email" id="email" name="email" value="{{ email }}" autocomplete="email" required>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+{% if invite_required %}
+<label for="invite">Invite code</label>
+<input type="text" id="invite" name="invite" spellcheck="false" required>
+<div class="hint">Sign-ups on this server need an invite code from someone already here.</div>
+{% endif %}
+{% if !hcaptcha_site_key.is_empty() %}
+<div class="h-captcha" data-sitekey="{{ hcaptcha_site_key }}"></div>
+<script src="{{ hcaptcha_script }}" async defer></script>
+{% endif %}
+<div class="row"><button type="submit">Create account</button></div>
+</form>
+<p class="muted">Already have one? <a href="/account/sign-in">Sign in</a>.</p>
+{% else %}
+<form class="stack" method="post" action="/account/sign-in">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="identifier">Handle or email</label>
+<input type="text" id="identifier" name="identifier" value="{{ identifier }}" autocomplete="username" spellcheck="false" required{% if !code_stage %} autofocus{% endif %}>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required>
+<div class="hint">Your account password, not an app password.</div>
+{% if code_stage %}
+<label for="code">The sign-in code we just emailed you</label>
+<input type="text" id="code" name="code" autocomplete="one-time-code" spellcheck="false" placeholder="XXXXX-XXXXX" required autofocus>
+{% endif %}
+<div class="row"><button type="submit">Sign in</button></div>
+</form>
+<p class="muted">New here? <a href="/account/sign-up">Create an account</a>.</p>
+{% endif %}
+</div>
+{% endblock %}

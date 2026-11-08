@@ -1,0 +1,153 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "labelerPolicies": {
+      "properties": {
+        "labelValueDefinitions": {
+          "description": "Label values created by this labeler and scoped exclusively to it. Labels defined here will override global label definitions for this labeler.",
+          "items": {
+            "ref": "com.atproto.label.defs#labelValueDefinition",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "labelValues": {
+          "description": "The label values which this labeler publishes. May include global or custom labels.",
+          "items": {
+            "ref": "com.atproto.label.defs#labelValue",
+            "type": "ref"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "labelValues"
+      ],
+      "type": "object"
+    },
+    "labelerView": {
+      "properties": {
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "creator": {
+          "ref": "app.bsky.actor.defs#profileView",
+          "type": "ref"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "ref": "com.atproto.label.defs#label",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "likeCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        },
+        "viewer": {
+          "ref": "#labelerViewerState",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "creator",
+        "indexedAt"
+      ],
+      "type": "object"
+    },
+    "labelerViewDetailed": {
+      "properties": {
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "creator": {
+          "ref": "app.bsky.actor.defs#profileView",
+          "type": "ref"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "ref": "com.atproto.label.defs#label",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "likeCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "policies": {
+          "ref": "app.bsky.labeler.defs#labelerPolicies",
+          "type": "ref"
+        },
+        "reasonTypes": {
+          "description": "The set of report reason 'codes' which are in-scope for this service to review and action. These usually align to policy categories. If not defined (distinct from empty array), all reason types are allowed.",
+          "items": {
+            "ref": "com.atproto.moderation.defs#reasonType",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "subjectCollections": {
+          "description": "Set of record types (collection NSIDs) which can be reported to this service. If not defined (distinct from empty array), default is any record type.",
+          "items": {
+            "format": "nsid",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subjectTypes": {
+          "description": "The set of subject types (account, record, etc) this service accepts reports on.",
+          "items": {
+            "ref": "com.atproto.moderation.defs#subjectType",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        },
+        "viewer": {
+          "ref": "#labelerViewerState",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "creator",
+        "policies",
+        "indexedAt"
+      ],
+      "type": "object"
+    },
+    "labelerViewerState": {
+      "properties": {
+        "like": {
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "id": "app.bsky.labeler.defs",
+  "lexicon": 1
+}

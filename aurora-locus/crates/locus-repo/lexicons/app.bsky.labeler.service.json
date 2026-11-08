@@ -1,0 +1,59 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "A declaration of the existence of labeler service.",
+      "key": "literal:self",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "labels": {
+            "refs": [
+              "com.atproto.label.defs#selfLabels"
+            ],
+            "type": "union"
+          },
+          "policies": {
+            "ref": "app.bsky.labeler.defs#labelerPolicies",
+            "type": "ref"
+          },
+          "reasonTypes": {
+            "description": "The set of report reason 'codes' which are in-scope for this service to review and action. These usually align to policy categories. If not defined (distinct from empty array), all reason types are allowed.",
+            "items": {
+              "ref": "com.atproto.moderation.defs#reasonType",
+              "type": "ref"
+            },
+            "type": "array"
+          },
+          "subjectCollections": {
+            "description": "Set of record types (collection NSIDs) which can be reported to this service. If not defined (distinct from empty array), default is any record type.",
+            "items": {
+              "format": "nsid",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "subjectTypes": {
+            "description": "The set of subject types (account, record, etc) this service accepts reports on.",
+            "items": {
+              "ref": "com.atproto.moderation.defs#subjectType",
+              "type": "ref"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "policies",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "app.bsky.labeler.service",
+  "lexicon": 1
+}

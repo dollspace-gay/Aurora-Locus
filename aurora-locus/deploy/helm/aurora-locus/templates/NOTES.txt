@@ -1,0 +1,31 @@
+aurora-locus ({{ .Values.profile }} profile, {{ include "locus.replicas" . }} pod{{ if ne (include "locus.replicas" .) "1" }}s{{ end }}) for {{ .Values.hostname }}.
+{{- if not .Values.trustedProxies }}
+
+WARNING: trustedProxies is empty, so locus trusts only loopback and sees
+every request as coming from the ingress. Set it to the ingress
+controller's pod range, or rate limits apply to everyone at once.
+{{- end }}
+{{- if .Values.setup.auto }}
+
+Headless setup runs at the first start. Watch it:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "locus.fullname" . }} -f
+A failed check is logged and leaves the node in setup mode.
+{{- else }}
+
+Finish setup at https://{{ .Values.hostname }}/setup with the one-time setup
+token.
+{{- if include "locus.large" . }} It is in the log of the first pod that started; or make a
+new one (the old one stops working):
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "locus.fullname" . }} -- aurora-locus setup --new-token
+{{- else }} It is in the log:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "locus.fullname" . }} | grep -i "setup token"
+{{- end }}
+{{- end }}
+
+The CLI runs inside a pod:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "locus.fullname" . }} -- aurora-locus status
+{{- if not (include "locus.large" .) }}
+
+The master key was generated on the volume at first start. Back it up:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "locus.fullname" . }} -- aurora-locus keys show
+{{- end }}

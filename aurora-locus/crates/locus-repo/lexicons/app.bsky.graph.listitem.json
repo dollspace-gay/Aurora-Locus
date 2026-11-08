@@ -1,0 +1,36 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Record representing an account's inclusion on a specific list. The AppView will ignore duplicate listitem records.",
+      "key": "tid",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "list": {
+            "description": "Reference (AT-URI) to the list record (app.bsky.graph.list).",
+            "format": "at-uri",
+            "type": "string"
+          },
+          "subject": {
+            "description": "The account which is included on the list.",
+            "format": "did",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "list",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "app.bsky.graph.listitem",
+  "lexicon": 1
+}

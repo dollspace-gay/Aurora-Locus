@@ -1,0 +1,32 @@
+{% extends "oauth/base.html" %}
+{% block title %}Create an account · {{ service_name }}{% endblock %}
+{% block content %}
+<h1>Create an account for {{ client_name }}</h1>
+<p class="muted">{{ client_host }} wants you to sign in with an account on {{ service_name }}. Make one here.</p>
+{% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/oauth/authorize/sign-up" class="stack">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<label>Handle
+<input name="handle" value="{{ handle }}" autocomplete="username" spellcheck="false" required autofocus></label>
+<p class="muted">Ending in {{ domains }}.</p>
+<label>Email
+<input name="email" type="email" value="{{ email }}" autocomplete="email" required></label>
+<label>Password
+<input name="password" type="password" autocomplete="new-password" required></label>
+{% if invite_required %}
+<label>Invite code
+<input name="invite" spellcheck="false" required></label>
+{% endif %}
+{% if !hcaptcha_site_key.is_empty() %}
+<div class="h-captcha" data-sitekey="{{ hcaptcha_site_key }}"></div>
+<script src="{{ hcaptcha_script }}" async defer></script>
+{% endif %}
+<button type="submit" class="primary">Create account</button>
+</form>
+<form method="post" action="/oauth/authorize/show-sign-in">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<button type="submit" class="link">I already have an account</button>
+</form>
+{% endblock %}

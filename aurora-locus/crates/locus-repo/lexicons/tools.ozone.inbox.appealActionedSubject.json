@@ -1,0 +1,104 @@
+{
+  "defs": {
+    "actionRef": {
+      "properties": {
+        "id": {
+          "description": "ID of the moderation action being appealed, available via actions in mod inbox.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "labelRef": {
+      "properties": {
+        "val": {
+          "description": "Label being appealed.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "val"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Appeal a moderation action affecting the user's account or content.",
+      "errors": [
+        {
+          "description": "Invalid appeal subject input.",
+          "name": "InvalidAppealSubject"
+        },
+        {
+          "description": "An active appeal already exists for this action.",
+          "name": "AlreadyAppealed"
+        },
+        {
+          "description": "The subject cannot be appealed.",
+          "name": "NotAppealable"
+        },
+        {
+          "description": "The appeal window for this action has closed.",
+          "name": "AppealWindowExpired"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "action": {
+              "closed": true,
+              "description": "Moderation action being appealed.",
+              "refs": [
+                "#actionRef",
+                "#labelRef",
+                "#takedownRef"
+              ],
+              "type": "union"
+            },
+            "modTool": {
+              "ref": "com.atproto.moderation.createReport#modTool",
+              "type": "ref"
+            },
+            "reason": {
+              "description": "Optional explanation supplied by the user.",
+              "maxGraphemes": 2000,
+              "maxLength": 20000,
+              "type": "string"
+            },
+            "subject": {
+              "description": "Subject being appealed.",
+              "refs": [
+                "com.atproto.admin.defs#repoRef",
+                "com.atproto.repo.strongRef"
+              ],
+              "type": "union"
+            }
+          },
+          "required": [
+            "subject"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.inbox.defs#subjectView",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    },
+    "takedownRef": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.inbox.appealActionedSubject",
+  "lexicon": 1
+}

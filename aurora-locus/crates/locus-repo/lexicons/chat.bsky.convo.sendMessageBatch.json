@@ -1,0 +1,75 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "batchItem": {
+      "properties": {
+        "convoId": {
+          "type": "string"
+        },
+        "message": {
+          "ref": "chat.bsky.convo.defs#messageInput",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "convoId",
+        "message"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Sends a batch of messages to a conversation.",
+      "errors": [
+        {
+          "name": "ConvoLocked"
+        },
+        {
+          "name": "InvalidConvo"
+        },
+        {
+          "name": "ReplyTargetNotFound"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "items": {
+              "items": {
+                "ref": "#batchItem",
+                "type": "ref"
+              },
+              "maxLength": 100,
+              "type": "array"
+            }
+          },
+          "required": [
+            "items"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "items": {
+              "items": {
+                "ref": "chat.bsky.convo.defs#messageView",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "items"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "chat.bsky.convo.sendMessageBatch",
+  "lexicon": 1
+}

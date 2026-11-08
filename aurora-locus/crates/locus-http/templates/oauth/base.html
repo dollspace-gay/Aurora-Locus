@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>{% block title %}{{ service_name }}{% endblock %}</title>
+<link rel="stylesheet" href="/oauth/assets/style.css">
+{% if !brand.css.is_empty() %}<link rel="stylesheet" href="{{ brand.css }}">
+{% endif %}</head>
+<body>
+<main class="card">
+<header>{% if !brand.logo.is_empty() %}<img class="logo" src="{{ brand.logo }}" alt="">{% endif %}<p class="service">{{ service_name }}</p></header>
+{% block content %}{% endblock %}
+{% if !brand.links.is_empty() %}<footer class="links">{% for l in brand.links %}{% if !loop.first %} · {% endif %}<a href="{{ l.href }}">{{ l.label }}</a>{% endfor %}</footer>{% endif %}
+</main>
+</body>
+</html>

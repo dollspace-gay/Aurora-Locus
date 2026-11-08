@@ -1,0 +1,2936 @@
+//! Store tests, run against SQLite always and against Postgres when
+//! `LOCUS_TEST_POSTGRES_URL` points at a server (each test gets its own
+//! throwaway database).
+
+mod keys;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use locus_core::CoreError;
+use locus_core::bootstrap::DatabaseUrl;
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
+
+use crate::env::{CLOCK_SLOT_FAMILY, collect_env};
+use crate::runtime::{Settings, run_leased};
+use crate::{Store, Tx};
+
+mod blobs;
+
+struct Backend {
+    name: &'static str,
+    store: Store,
+    _dir: Option<tempfile::TempDir>,
+}
+
+async fn backends() -> Vec<Backend> {
+    let mut out = Vec::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&DatabaseUrl::Sqlite(dir.path().join("t.sqlite")))
+        .await
+        .unwrap();
+    out.push(Backend {
+        name: "sqlite",
+        store,
+        _dir: Some(dir),
+    });
+
+    if let Ok(admin_url) = std::env::var("LOCUS_TEST_POSTGRES_URL") {
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect to test postgres");
+        let db = format!("locus_test_{}", hex::encode(rand::random::<[u8; 8]>()));
+        sqlx::query(&format!("CREATE DATABASE {db}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+        let url = match admin_url.rsplit_once('/') {
+            Some((base, _)) => format!("{base}/{db}"),
+            None => panic!("LOCUS_TEST_POSTGRES_URL must end in /<database>"),
+        };
+        let store = Store::open(&DatabaseUrl::Postgres(url)).await.unwrap();
+        out.push(Backend {
+            name: "postgres",
+            store,
+            _dir: None,
+        });
+    }
+    out
+}
+
+#[tokio::test]
+async fn migrations_are_idempotent_and_newer_schema_is_refused() {
+    for b in backends().await {
+        let s = &b.store;
+        s.migrate()
+            .await
+            .unwrap_or_else(|e| panic!("{}: re-migrate: {e}", b.name));
+        assert_eq!(
+            s.applied_schema_version().await.unwrap(),
+            s.known_schema_version(),
+            "{}",
+            b.name
+        );
+
+        // Pretend a newer build migrated this database.
+        let sql = "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                   VALUES (99999999999999, 'future', true, x'00', 0)";
+        let pg_sql = "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                      VALUES (99999999999999, 'future', true, '\\x00'::bytea, 0)";
+        match s {
+            Store::Sqlite(p) => {
+                sqlx::query(sql).execute(p).await.unwrap();
+            }
+            Store::Postgres(p) => {
+                sqlx::query(pg_sql).execute(p).await.unwrap();
+            }
+        }
+        match s.migrate().await {
+            Err(CoreError::Config(msg)) => assert!(msg.contains("newer"), "{}: {msg}", b.name),
+            other => panic!("{}: expected refusal, got {other:?}", b.name),
+        }
+    }
+}
+
+#[tokio::test]
+async fn settings_store_validate_version_and_audit() {
+    for b in backends().await {
+        let s = &b.store;
+        assert_eq!(s.settings_version().await.unwrap(), 0);
+        let v1 = s
+            .set_setting("log.level", json!("debug"), "op:alice")
+            .await
+            .unwrap();
+        let v2 = s
+            .set_setting(
+                "sync.deleted_history_preservation_days",
+                json!(30),
+                "op:alice",
+            )
+            .await
+            .unwrap();
+        assert_eq!((v1, v2), (1, 2), "{}", b.name);
+
+        let snap = s.load_snapshot().await.unwrap();
+        assert_eq!(snap.version(), 2);
+        assert_eq!(snap.text("log.level"), "debug");
+        assert_eq!(snap.int("sync.deleted_history_preservation_days"), 30);
+
+        // Invalid values and unknown keys are refused and change nothing.
+        assert!(matches!(
+            s.set_setting("sync.deleted_history_preservation_days", json!(91), "op")
+                .await,
+            Err(CoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_setting("no.such.key", json!(1), "op").await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert_eq!(s.settings_version().await.unwrap(), 2, "{}", b.name);
+
+        let audits: i64 = match s {
+            Store::Sqlite(p) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'setting.set'")
+                    .fetch_one(p)
+                    .await
+                    .unwrap()
+            }
+            Store::Postgres(p) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'setting.set'")
+                    .fetch_one(p)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(audits, 2, "{}", b.name);
+    }
+}
+
+#[tokio::test]
+async fn settings_propagate_to_other_handles() {
+    for b in backends().await {
+        let a = Settings::load(b.store.clone()).await.unwrap();
+        let other = Settings::load(b.store.clone()).await.unwrap();
+        let cancel = CancellationToken::new();
+        let watcher = other.spawn_watcher(cancel.clone());
+        let mut rx = other.subscribe();
+
+        a.set("server.landing_page", json!(true), "op")
+            .await
+            .unwrap();
+        assert!(
+            a.current().bool("server.landing_page"),
+            "{}: own node applies at once",
+            b.name
+        );
+
+        // Postgres: NOTIFY delivers well under the poll interval. SQLite: the poll.
+        let limit = if b.store.is_postgres() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(7)
+        };
+        tokio::time::timeout(limit, async {
+            while !rx.borrow_and_update().bool("server.landing_page") {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{}: other node never saw the change", b.name));
+
+        cancel.cancel();
+        watcher.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn leases_are_exclusive_fenced_and_taken_over_after_expiry() {
+    for b in backends().await {
+        let s = &b.store;
+        // Long enough that two queries on a loaded host fit inside it.
+        let ttl = Duration::from_secs(3);
+        let a = s
+            .try_acquire_lease("sequencer", "node-a", ttl)
+            .await
+            .unwrap()
+            .expect("a acquires");
+        assert!(
+            s.try_acquire_lease("sequencer", "node-b", ttl)
+                .await
+                .unwrap()
+                .is_none(),
+            "{}",
+            b.name
+        );
+        assert!(s.renew_lease(&a).await.unwrap());
+
+        let mut tx = s.begin().await.unwrap();
+        tx.fence(&a).await.expect("holder passes the fence");
+        tx.rollback().await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(3300)).await;
+        let bt = s
+            .try_acquire_lease("sequencer", "node-b", ttl)
+            .await
+            .unwrap()
+            .expect("b takes over");
+        assert_eq!(bt.epoch, a.epoch + 1, "{}", b.name);
+
+        // The old holder can neither renew nor commit.
+        assert!(!s.renew_lease(&a).await.unwrap(), "{}", b.name);
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            matches!(tx.fence(&a).await, Err(CoreError::LeaseLost(_))),
+            "{}",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+
+        // Release frees it at once.
+        s.release_lease(&bt).await.unwrap();
+        assert!(
+            s.try_acquire_lease("sequencer", "node-a", ttl)
+                .await
+                .unwrap()
+                .is_some(),
+            "{}",
+            b.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn fencing_rolls_back_a_stale_holders_write() {
+    for b in backends().await {
+        let s = &b.store;
+        let ttl = Duration::from_millis(400);
+        let a = s
+            .try_acquire_lease("gc", "node-a", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _b = s
+            .try_acquire_lease("gc", "node-b", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The stale holder writes, then fences before committing (as every
+        // leased job's transaction does); the fence fails, so it rolls back.
+        let mut tx: Tx = s.begin().await.unwrap();
+        tx.set_setting("log.level", json!("trace"), "job:gc")
+            .await
+            .unwrap();
+        assert!(
+            matches!(tx.fence(&a).await, Err(CoreError::LeaseLost(_))),
+            "{}",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(s.settings_version().await.unwrap(), 0, "{}", b.name);
+        assert_eq!(
+            s.load_snapshot().await.unwrap().text("log.level"),
+            "info",
+            "{}",
+            b.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn slots_go_to_different_nodes() {
+    for b in backends().await {
+        let s = &b.store;
+        let ttl = Duration::from_secs(30);
+        let (na, _) = s
+            .claim_slot(CLOCK_SLOT_FAMILY, 4, "node-a", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        let (nb, _) = s
+            .claim_slot(CLOCK_SLOT_FAMILY, 4, "node-b", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(na, nb, "{}", b.name);
+        let mut live = s.live_slot_holders(CLOCK_SLOT_FAMILY).await.unwrap();
+        live.sort();
+        assert_eq!(live, vec!["node-a", "node-b"], "{}", b.name);
+    }
+}
+
+fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn env_values_apply_once_every_live_node_agrees() {
+    for b in backends().await {
+        let s = &b.store;
+        let ttl = Duration::from_secs(30);
+        s.claim_slot(CLOCK_SLOT_FAMILY, 8, "node-a", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        s.claim_slot(CLOCK_SLOT_FAMILY, 8, "node-b", ttl)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (v1, errs) = collect_env(&env_of(&[("PDS_SERVICE_NAME", "Example PDS")]));
+        assert!(errs.is_empty());
+
+        // Only node A reports it so far: nothing applies.
+        assert!(
+            s.report_and_apply_env("node-a", &v1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{}",
+            b.name
+        );
+        // Node B agrees: it applies, once.
+        assert_eq!(
+            s.report_and_apply_env("node-b", &v1).await.unwrap(),
+            vec!["server.service_name"]
+        );
+        assert!(
+            s.report_and_apply_env("node-a", &v1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{}: applied once",
+            b.name
+        );
+        assert_eq!(
+            s.load_snapshot().await.unwrap().text("server.service_name"),
+            "Example PDS"
+        );
+
+        // A console change isn't overridden by the unchanged env value.
+        s.set_setting("server.service_name", json!("Console Name"), "op")
+            .await
+            .unwrap();
+        assert!(
+            s.report_and_apply_env("node-a", &v1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.load_snapshot().await.unwrap().text("server.service_name"),
+            "Console Name"
+        );
+
+        // A changed env value applies again once both nodes run with it.
+        let (v2, _) = collect_env(&env_of(&[("PDS_SERVICE_NAME", "Renamed PDS")]));
+        assert!(
+            s.report_and_apply_env("node-a", &v2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{}: rolling restart",
+            b.name
+        );
+        assert_eq!(
+            s.report_and_apply_env("node-b", &v2).await.unwrap(),
+            vec!["server.service_name"]
+        );
+        assert_eq!(
+            s.load_snapshot().await.unwrap().text("server.service_name"),
+            "Renamed PDS"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bad_env_values_are_reported_not_applied() {
+    let (vals, errs) = collect_env(&env_of(&[("LOG_LEVEL", "loud")]));
+    assert!(vals.is_empty());
+    assert_eq!(errs.len(), 1);
+}
+
+#[tokio::test]
+async fn run_leased_runs_the_job_on_one_node_at_a_time() {
+    for b in backends().await {
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let mut handles = Vec::new();
+        for node in ["node-a", "node-b", "node-c"] {
+            let (running, max_seen, ran) = (running.clone(), max_seen.clone(), ran.clone());
+            let store = b.store.clone();
+            handles.push(tokio::spawn(run_leased(
+                store,
+                "singleton".into(),
+                node.into(),
+                Duration::from_millis(600),
+                cancel.clone(),
+                move |_token, job_cancel| {
+                    let (running, max_seen, ran) = (running.clone(), max_seen.clone(), ran.clone());
+                    async move {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(now, Ordering::SeqCst);
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        tokio::select! {
+                            () = job_cancel.cancelled() => {}
+                            () = tokio::time::sleep(Duration::from_millis(300)) => {}
+                        }
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        cancel.cancel();
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "{}: two nodes ran it at once",
+            b.name
+        );
+        assert!(
+            ran.load(Ordering::SeqCst) >= 2,
+            "{}: job should run repeatedly",
+            b.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn secrets_are_sealed_and_a_different_master_key_is_refused() {
+    use crate::secrets::KeyCheck;
+    use locus_core::keys::{MasterKey, SourceKind};
+    for b in backends().await {
+        let s = &b.store;
+        let key = MasterKey::generate(SourceKind::File);
+        let other = MasterKey::generate(SourceKind::Env);
+
+        assert!(s.key_store_empty().await.unwrap(), "{}", b.name);
+        assert_eq!(s.check_master_key(&key).await.unwrap(), KeyCheck::Empty);
+
+        let mut tx = s.begin().await.unwrap();
+        tx.put_secret("jwt", b"hmac secret", &key).await.unwrap();
+        tx.put_signing_key("did:plc:abc", "k256", b"private bytes", &key)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(s.check_master_key(&key).await.unwrap(), KeyCheck::Matches);
+        assert_eq!(
+            s.get_secret("jwt", &key).await.unwrap().unwrap().as_slice(),
+            b"hmac secret"
+        );
+        let (kind, sk) = s
+            .get_signing_key("did:plc:abc", &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), sk.as_slice()),
+            ("k256", &b"private bytes"[..])
+        );
+
+        // The database never holds the secret in the clear.
+        let raw: Vec<u8> = match s {
+            Store::Sqlite(p) => sqlx::query_scalar("SELECT sealed FROM secret WHERE name = 'jwt'")
+                .fetch_one(p)
+                .await
+                .unwrap(),
+            Store::Postgres(p) => {
+                sqlx::query_scalar("SELECT sealed FROM secret WHERE name = 'jwt'")
+                    .fetch_one(p)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!raw.windows(11).any(|w| w == b"hmac secret"), "{}", b.name);
+
+        // A node with another key: refused at boot and on any secret write.
+        assert!(matches!(
+            s.check_master_key(&other).await,
+            Err(CoreError::Config(_))
+        ));
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.put_secret("smtp", b"x", &other).await.is_err(),
+            "{}",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+        assert!(s.get_secret("smtp", &key).await.unwrap().is_none());
+        // And it can't read the secrets either.
+        assert!(s.get_secret("jwt", &other).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn job_runs_are_recorded() {
+    for b in backends().await {
+        let s = &b.store;
+        s.record_job_run("gc", None, Some(123)).await.unwrap();
+        s.record_job_run("gc", Some("disk full"), Some(456))
+            .await
+            .unwrap();
+        let states = s.job_states().await.unwrap();
+        assert_eq!(states.len(), 1, "{}", b.name);
+        let gc = &states[0];
+        assert_eq!(gc.runs, 2, "{}", b.name);
+        assert_eq!(gc.last_error.as_deref(), Some("disk full"), "{}", b.name);
+        assert_eq!(gc.next_run_at, Some(456), "{}", b.name);
+        // The failed run doesn't erase when it last succeeded.
+        assert!(gc.last_ok_at.is_some(), "{}", b.name);
+        assert!(gc.last_run_at >= gc.last_ok_at, "{}", b.name);
+    }
+}
+
+#[tokio::test]
+async fn identity_tables_on_both_backends() {
+    use crate::identity::{PlcKeyRole, RepairKind};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+
+        // One current PLC key at most; a second is a conflict.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_plc_rotation_key("did:key:zA", PlcKeyRole::Current)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        match tx
+            .insert_plc_rotation_key("did:key:zB", PlcKeyRole::Current)
+            .await
+        {
+            Err(CoreError::Conflict(_)) => {}
+            other => panic!("{n}: second current key: {other:?}"),
+        }
+        // A failed statement ends a Postgres transaction; start another.
+        tx.rollback().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_plc_rotation_key("did:key:zB", PlcKeyRole::Secondary)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let keys = s.plc_rotation_keys().await.unwrap();
+        assert_eq!(keys.len(), 2, "{n}");
+        assert_eq!(keys[0].role, PlcKeyRole::Current, "{n}");
+
+        s.set_plc_key_listing("did:plc:x", &["did:key:zB".into()])
+            .await
+            .unwrap();
+        s.set_plc_key_listing("did:plc:x", &["did:key:zA".into(), "did:key:zB".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.plc_key_listing("did:plc:x").await.unwrap(),
+            Some(vec!["did:key:zA".to_owned(), "did:key:zB".to_owned()]),
+            "{n}"
+        );
+
+        // Caches report their age on the database clock.
+        s.cache_did_doc("did:plc:x", "{}").await.unwrap();
+        let c = s.cached_did_doc("did:plc:x").await.unwrap().unwrap();
+        assert!((0..5_000).contains(&c.age_ms), "{n}: age {}", c.age_ms);
+        s.clear_did_doc("did:plc:x").await.unwrap();
+        assert!(
+            s.cached_did_doc("did:plc:x").await.unwrap().is_none(),
+            "{n}"
+        );
+        s.cache_handle("a.test", None).await.unwrap();
+        assert_eq!(
+            s.cached_handle("a.test").await.unwrap().unwrap().value,
+            None,
+            "{n}"
+        );
+        s.cache_handle("a.test", Some("did:plc:x")).await.unwrap();
+        assert_eq!(
+            s.cached_handle("a.test")
+                .await
+                .unwrap()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("did:plc:x"),
+            "{n}"
+        );
+
+        // A did:web host is tied to one DID; the row outlives the document.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_hosted_did_web("did:web:w.test", "w.test", "{}")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        match tx
+            .insert_hosted_did_web("did:web:other", "w.test", "{}")
+            .await
+        {
+            Err(CoreError::Conflict(_)) => {}
+            other => panic!("{n}: second DID on a host: {other:?}"),
+        }
+        tx.rollback().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.set_hosted_did_web_doc("did:web:w.test", None)
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        let row = s.hosted_did_web_by_host("w.test").await.unwrap().unwrap();
+        assert_eq!((row.did.as_str(), row.doc), ("did:web:w.test", None), "{n}");
+
+        // Repairs: due at once, retried with a backoff, finished only for
+        // the value they hold.
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h1.test")
+            .await
+            .unwrap();
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        let due = s.due_identity_repairs(10).await.unwrap();
+        assert_eq!(due.len(), 1, "{n}: replaced, not added");
+        assert_eq!(due[0].value, "h2.test", "{n}");
+        s.retry_identity_repair("did:plc:x", RepairKind::Handle, "timeout", 60_000)
+            .await
+            .unwrap();
+        assert!(
+            s.due_identity_repairs(10).await.unwrap().is_empty(),
+            "{n}: backing off"
+        );
+        s.finish_identity_repair("did:plc:x", RepairKind::Handle, "h1.test")
+            .await
+            .unwrap();
+        s.queue_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.due_identity_repairs(10).await.unwrap().len(),
+            1,
+            "{n}: stale finish kept it"
+        );
+        s.finish_identity_repair("did:plc:x", RepairKind::Handle, "h2.test")
+            .await
+            .unwrap();
+        assert!(s.due_identity_repairs(10).await.unwrap().is_empty(), "{n}");
+    }
+}
+
+#[tokio::test]
+async fn bulk_jobs_block_writes_fence_batches_and_are_taken_over() {
+    use crate::accounts::{NewAccount, Status};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let did = "did:plc:bulktest";
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_account(&NewAccount {
+            did,
+            handle: "bulk.test",
+            email: Some("bulk@example.com"),
+            password_hash: None,
+            status: Status::Active,
+            did_method: "plc",
+        })
+        .await
+        .unwrap();
+        tx.put_signing_key(did, "k256", b"key", &test_master_key())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = s.begin().await.unwrap();
+        let job = tx
+            .start_bulk_job("job-1", did, "delete", "deleting", "node-a")
+            .await
+            .unwrap();
+        assert!(tx.write_blocked(did).await.unwrap(), "{n}");
+        tx.commit().await.unwrap();
+        // A second job for the account is refused.
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            matches!(
+                tx.start_bulk_job("job-2", did, "import", "staging", "node-b")
+                    .await,
+                Err(CoreError::Conflict(_))
+            ),
+            "{n}"
+        );
+        tx.rollback().await.unwrap();
+
+        // Nothing to take over while the holder's lease runs.
+        assert!(
+            s.take_over_bulk_job("node-b").await.unwrap().is_none(),
+            "{n}"
+        );
+        // The holder stops; its lease runs out.
+        let expire = "UPDATE bulk_job SET expires_at = 0 WHERE id = 'job-1'";
+        match s {
+            Store::Sqlite(p) => sqlx::query(expire).execute(p).await.map(|_| ()),
+            Store::Postgres(p) => sqlx::query(expire).execute(p).await.map(|_| ()),
+        }
+        .unwrap();
+        let taken = s
+            .take_over_bulk_job("node-b")
+            .await
+            .unwrap()
+            .expect("taken over");
+        assert_eq!((taken.holder.as_str(), taken.epoch), ("node-b", 2), "{n}");
+        // The old holder can't commit a batch any more.
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            matches!(tx.fence_bulk_job(&job).await, Err(CoreError::LeaseLost(_))),
+            "{n}"
+        );
+        tx.rollback().await.unwrap();
+
+        s.run_delete_job(&taken, 1).await.unwrap();
+        assert!(s.account_by_did(did).await.unwrap().is_none(), "{n}");
+        assert!(
+            s.get_signing_key(did, &test_master_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert_eq!(
+            s.bulk_job("job-1").await.unwrap().unwrap().phase,
+            "done",
+            "{n}"
+        );
+        // The handle and email are free again.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_account(&NewAccount {
+            did: "did:plc:bulktest2",
+            handle: "bulk.test",
+            email: Some("bulk@example.com"),
+            password_hash: None,
+            status: Status::Active,
+            did_method: "plc",
+        })
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+}
+
+fn test_master_key() -> locus_core::keys::MasterKey {
+    use std::sync::OnceLock;
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let bytes = KEY.get_or_init(rand::random);
+    locus_core::keys::MasterKey::from_bytes(*bytes, locus_core::keys::SourceKind::Env)
+}
+
+#[tokio::test]
+async fn rate_limit_counters_use_fixed_windows_and_prune() {
+    for b in backends().await {
+        let s = &b.store;
+        let (n, end) = s.consume_rate_limit("k", 2, 60_000).await.unwrap();
+        assert_eq!(n, 2, "{}", b.name);
+        let (n, end2) = s.consume_rate_limit("k", 3, 60_000).await.unwrap();
+        assert_eq!((n, end2), (5, end), "{}: same window", b.name);
+        assert_eq!(s.consume_rate_limit("other", 1, 60_000).await.unwrap().0, 1);
+        // A window that has ended starts over.
+        let (_, short_end) = s.consume_rate_limit("short", 4, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (n, end3) = s.consume_rate_limit("short", 1, 60_000).await.unwrap();
+        assert_eq!(n, 1, "{}: new window", b.name);
+        assert!(end3 > short_end);
+        // Only ended windows are pruned.
+        s.consume_rate_limit("gone", 1, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(s.prune_rate_limits(100).await.unwrap(), 1, "{}", b.name);
+        assert_eq!(s.consume_rate_limit("k", 1, 60_000).await.unwrap().0, 6);
+    }
+}
+
+#[tokio::test]
+async fn oauth_replay_windows() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(
+            s.oauth_unique("DPoP", "j1", 60_000).await.unwrap(),
+            "{}",
+            b.name
+        );
+        assert!(
+            !s.oauth_unique("DPoP", "j1", 60_000).await.unwrap(),
+            "{}: replay",
+            b.name
+        );
+        assert!(
+            s.oauth_unique("Other", "j1", 60_000).await.unwrap(),
+            "namespaces are separate"
+        );
+        assert!(s.oauth_unique("DPoP", "short", 1).await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            s.oauth_unique("DPoP", "short", 60_000).await.unwrap(),
+            "{}: window ended",
+            b.name
+        );
+        assert!(!s.oauth_unique("DPoP", "short", 60_000).await.unwrap());
+        s.oauth_unique("DPoP", "gone", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(s.prune_oauth(100).await.unwrap(), 1, "{}", b.name);
+    }
+}
+
+#[tokio::test]
+async fn oauth_requests_tokens_and_refresh_rotation() {
+    use crate::oauth::{RequestRow, TokenRow};
+    for b in backends().await {
+        let s = &b.store;
+        let mut r = RequestRow {
+            id: "req-1".into(),
+            did: None,
+            device_id: None,
+            client_id: "c".into(),
+            client_auth: None,
+            parameters: "{}".into(),
+            expires_at: 1,
+            code: None,
+        };
+        s.oauth_create_request(&r).await.unwrap();
+        r.did = Some("did:plc:a".into());
+        r.code = Some("cod-1".into());
+        s.oauth_update_request(&r).await.unwrap();
+        assert_eq!(
+            s.oauth_read_request("req-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("cod-1")
+        );
+        assert_eq!(
+            s.oauth_consume_code("cod-1").await.unwrap().unwrap().id,
+            "req-1",
+            "{}",
+            b.name
+        );
+        assert!(
+            s.oauth_consume_code("cod-1").await.unwrap().is_none(),
+            "{}: a code works once",
+            b.name
+        );
+
+        let t = TokenRow {
+            id: 0,
+            did: "did:plc:a".into(),
+            token_id: "tok-1".into(),
+            created_at: 10,
+            updated_at: 10,
+            expires_at: 20,
+            client_id: "c".into(),
+            client_auth: "{\"method\":\"none\"}".into(),
+            device_id: None,
+            parameters: "{}".into(),
+            details: None,
+            code: Some("cod-1".into()),
+            current_refresh_token: Some("ref-1".into()),
+            scope: Some("atproto".into()),
+        };
+        s.oauth_create_token(&t).await.unwrap();
+        let row = s.oauth_token("tok-1").await.unwrap().unwrap();
+        assert_eq!(
+            s.oauth_token_by_code("cod-1").await.unwrap().unwrap().id,
+            row.id
+        );
+        s.oauth_rotate_token(
+            row.id,
+            "tok-2",
+            "ref-2",
+            30,
+            40,
+            "{\"method\":\"none\"}",
+            Some("atproto"),
+        )
+        .await
+        .unwrap();
+        assert!(s.oauth_token("tok-1").await.unwrap().is_none());
+        let now = s.oauth_token("tok-2").await.unwrap().unwrap();
+        assert_eq!(
+            (now.current_refresh_token.as_deref(), now.expires_at),
+            (Some("ref-2"), 40)
+        );
+        // The spent refresh token still finds the grant (a replay).
+        let spent = s.oauth_token_by_refresh("ref-1").await.unwrap().unwrap();
+        assert_eq!(
+            (spent.id, spent.current_refresh_token.as_deref()),
+            (now.id, Some("ref-2")),
+            "{}",
+            b.name
+        );
+        s.oauth_delete_token(now.id).await.unwrap();
+        assert!(s.oauth_token_by_refresh("ref-1").await.unwrap().is_none());
+        assert!(s.oauth_token_by_refresh("ref-2").await.unwrap().is_none());
+
+        s.oauth_upsert_device("dev-1", "ses-1", Some("ua"), "1.2.3.4")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.oauth_device_session("dev-1").await.unwrap().as_deref(),
+            Some("ses-1")
+        );
+        s.oauth_touch_account_device("did:plc:a", "dev-1")
+            .await
+            .unwrap();
+        assert_eq!(s.oauth_device_accounts("dev-1").await.unwrap().len(), 1);
+        s.oauth_set_authorized_client("did:plc:a", "c", "{\"authorizedScopes\":[\"atproto\"]}")
+            .await
+            .unwrap();
+        assert!(
+            s.oauth_authorized_client("did:plc:a", "c")
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("atproto")
+        );
+    }
+}
+
+#[tokio::test]
+async fn kryphocron_tables_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, AuditRow, PermissionRow, PrivateRecord};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+
+        // Permission rows, one per source.
+        let row = PermissionRow {
+            did: "did:plc:a".into(),
+            source: "membership".into(),
+            prism_did: "did:web:prism".into(),
+            status: "member".into(),
+            private_indexed: true,
+            private_read: false,
+            expires_at: 10,
+            checked_at: 1,
+        };
+        s.put_kr_permission(&row).await.unwrap();
+        s.put_kr_permission(&PermissionRow {
+            status: "indexing".into(),
+            ..row.clone()
+        })
+        .await
+        .unwrap();
+        let got = s
+            .kr_permission("did:plc:a", "membership")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (got.status.as_str(), got.private_indexed, got.private_read),
+            ("indexing", true, false),
+            "{n}"
+        );
+        assert!(
+            s.kr_permission("did:plc:a", "probe")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert_eq!(
+            s.delete_kr_permissions_not_from("did:web:prism")
+                .await
+                .unwrap(),
+            0,
+            "{n}"
+        );
+        assert_eq!(
+            s.delete_kr_permissions_not_from("did:web:other")
+                .await
+                .unwrap(),
+            1,
+            "{n}"
+        );
+        assert!(
+            !s.private_tier_blocked("did:plc:nobody").await.unwrap(),
+            "{n}"
+        );
+
+        // Audiences: a pending delete counts as missing.
+        let aud = AudienceRow {
+            did: "did:plc:a".into(),
+            rkey: "3m6aaaaaaaaaa".into(),
+            name: Some("friends".into()),
+            mode: "list".into(),
+            members_json: "[]".into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-01T00:00:00.000Z".into(),
+            origin: "prism".into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: None,
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: "none".into(),
+            row_version: 1,
+        };
+        s.put_kr_audience(&aud).await.unwrap();
+        s.put_kr_audience(&aud).await.unwrap();
+        let got = s
+            .kr_audience("did:plc:a", "3m6aaaaaaaaaa")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.row_version, 2, "{n}: bumped on every write");
+        s.put_kr_audience(&AudienceRow {
+            pending: "delete".into(),
+            ..aud.clone()
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.kr_audience("did:plc:a", "3m6aaaaaaaaaa")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+
+        // The private-record index and rotation selection.
+        let entry = |rkey: &str, generation: Option<&str>, legacy: bool| PrivateRecord {
+            did: "did:plc:a".into(),
+            collection: "tools.kryphocron.feed.postPrivate".into(),
+            rkey: rkey.into(),
+            generation: generation.map(str::to_owned),
+            legacy_text: legacy,
+            flagged: None,
+            audience_did: Some("did:plc:a".into()),
+            audience_rkey: Some("3m6aaaaaaaaaa".into()),
+        };
+        let mut tx = s.begin().await.unwrap();
+        for e in [
+            entry(
+                "3m6aaaaaaaaa2",
+                Some("laquna/00000000000000000001/aa"),
+                false,
+            ),
+            entry(
+                "3m6aaaaaaaaa3",
+                Some("laquna/00000000000000000003/aa"),
+                false,
+            ),
+            entry("3m6aaaaaaaaa4", None, true),
+            entry(
+                "3m6aaaaaaaaa5",
+                Some("laquna/00000000000000000009/aa"),
+                false,
+            ),
+        ] {
+            tx.replace_private_record("did:plc:a", &e.collection, &e.rkey, Some(&e))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let current = "laquna/00000000000000000002/aa";
+        let due = |urgent: bool| async move {
+            s.rotation_due_records("did:plc:a", current, urgent, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.rkey)
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            due(false).await,
+            ["3m6aaaaaaaaa2", "3m6aaaaaaaaa4"],
+            "{n}: older, or legacy text"
+        );
+        assert_eq!(due(true).await, ["3m6aaaaaaaaa4"], "{n}: legacy text only");
+        let far = "laquna/00000000000000000099/ff";
+        assert_eq!(
+            s.rotation_due_accounts(current, far, "", 10).await.unwrap(),
+            ["did:plc:a"],
+            "{n}"
+        );
+        assert!(
+            s.rotation_due_accounts(current, far, "did:plc:a", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{n}: paged by DID"
+        );
+        let future = s
+            .rotation_future_dated("did:plc:a", "laquna/00000000000000000005/ff", 10)
+            .await
+            .unwrap();
+        assert_eq!(future.len(), 1, "{n}");
+        s.flag_private_record(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa2",
+            "undecodable",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.rotation_due_records("did:plc:a", current, false, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{n}: flagged skipped"
+        );
+        assert_eq!(s.flagged_private_records(10).await.unwrap().len(), 1, "{n}");
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_private_record(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa4",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            s.private_record(
+                "did:plc:a",
+                "tools.kryphocron.feed.postPrivate",
+                "3m6aaaaaaaaa4"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // Generations: the newest is current.
+        assert!(s.current_generation().await.unwrap().is_none(), "{n}");
+        s.add_generation("laquna/00000000000000000001/aa", 1)
+            .await
+            .unwrap();
+        s.add_generation("laquna/00000000000000000002/bb", 2)
+            .await
+            .unwrap();
+        s.add_generation("laquna/00000000000000000002/bb", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.current_generation().await.unwrap(),
+            Some(("laquna/00000000000000000002/bb".to_owned(), 2)),
+            "{n}"
+        );
+
+        // Audit rows, appended and pruned by age.
+        let ev = |at: i64| AuditRow {
+            at,
+            sink: "user".into(),
+            event: "ContentEncoded".into(),
+            correlation_id: Some("abc".into()),
+            detail_json: "\"x\"".into(),
+        };
+        s.append_kr_audit(&[ev(1), ev(100)]).await.unwrap();
+        assert_eq!(
+            s.kr_audit(10).await.unwrap()[0].at,
+            100,
+            "{n}: newest first"
+        );
+        assert_eq!(s.prune_kr_audit(50, 100).await.unwrap(), 1, "{n}");
+        assert_eq!(s.kr_audit(10).await.unwrap().len(), 1, "{n}");
+    }
+}
+
+#[tokio::test]
+async fn the_audience_copy_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, RefreshLimiter};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let row = |rkey: &str, origin: &str, pending: &str| AudienceRow {
+            did: "did:plc:o".into(),
+            rkey: rkey.into(),
+            name: None,
+            mode: "list".into(),
+            members_json: "[]".into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-01T00:00:00.000Z".into(),
+            origin: origin.into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: Some("v1".into()),
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: pending.into(),
+            row_version: 1,
+        };
+        assert!(s.db_now().await.unwrap() > 1_600_000_000_000, "{n}");
+        assert!(
+            s.adopt_audience(&row("a", "prism", "none")).await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.adopt_audience(&row("a", "prism", "none")).await.unwrap(),
+            "{n}: already there"
+        );
+        let v = s.audience_versions("did:plc:o").await.unwrap();
+        assert_eq!((v.len(), v[0].row_version), (1, 1), "{n}");
+        // Conditional on the version the listing saw.
+        let newer = AudienceRow {
+            prism_cid: Some("v2".into()),
+            ..row("a", "prism", "none")
+        };
+        assert!(
+            !s.replace_audience_if(&newer, 7).await.unwrap(),
+            "{n}: stale version"
+        );
+        assert!(s.replace_audience_if(&newer, 1).await.unwrap(), "{n}");
+        assert_eq!(
+            s.kr_audience("did:plc:o", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .row_version,
+            2
+        );
+        assert!(
+            !s.delete_audience("did:plc:o", "a", Some(1)).await.unwrap(),
+            "{n}: changed since"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.delete_audience("did:plc:o", "a", Some(2)).await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "a")
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}: tombstoned"
+        );
+        assert_eq!(s.prune_audience_tombstones(0).await.unwrap(), 0);
+        assert_eq!(
+            s.prune_audience_tombstones(i64::MAX).await.unwrap(),
+            1,
+            "{n}"
+        );
+
+        // Limiters.
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::Owner, 60_000)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.take_refresh("did:plc:o", RefreshLimiter::Owner, 60_000)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::ThirdParty, 60_000)
+                .await
+                .unwrap(),
+            "{n}: separate"
+        );
+        assert!(
+            s.take_refresh("did:plc:o", RefreshLimiter::Owner, 0)
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        s.note_listing("did:plc:o", 5, true, None).await.unwrap();
+        s.note_listing("did:plc:o", 6, false, Some("timeout"))
+            .await
+            .unwrap();
+        let sync = s.audience_sync("did:plc:o").await.unwrap();
+        assert_eq!(sync.last_listing_started_at, Some(6), "{n}");
+        assert!(
+            sync.last_complete_at.is_some(),
+            "{n}: kept from the complete one"
+        );
+        assert_eq!(sync.last_error.as_deref(), Some("timeout"));
+
+        // Aliases, polling and purging.
+        s.put_audience_alias("did:plc:o", "local1", "prism1")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.audience_alias("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("prism1")
+        );
+        s.adopt_audience(&row("b", "local", "none")).await.unwrap();
+        s.set_next_poll("did:plc:o", i64::MAX).await.unwrap();
+        assert!(
+            s.audience_polls_due(1_000, 10).await.unwrap().is_empty(),
+            "{n}"
+        );
+        assert_eq!(s.poll_queued_audiences_now().await.unwrap(), 1, "{n}");
+        assert_eq!(
+            s.audience_polls_due(1_000, 10).await.unwrap(),
+            ["did:plc:o"]
+        );
+        s.purge_audience_copy("did:plc:o").await.unwrap();
+        assert!(s.kr_audiences("did:plc:o").await.unwrap().is_empty(), "{n}");
+        assert!(
+            s.audience_alias("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_mapping_transaction_on_both_backends() {
+    use crate::kryphocron::{AudienceRow, PrivateRecord};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let row = |rkey: &str, origin: &str, members: &str| AudienceRow {
+            did: "did:plc:o".into(),
+            rkey: rkey.into(),
+            name: None,
+            mode: "list".into(),
+            members_json: members.into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            updated_at: "2024-01-02T00:00:00.000Z".into(),
+            origin: origin.into(),
+            prism_did: "did:web:prism".into(),
+            prism_cid: None,
+            local_cid: "bafy".into(),
+            value_cbor: vec![0xa0],
+            pending: "none".into(),
+            row_version: 1,
+        };
+        // Edited after its value was sent (version 1 sent, now 2).
+        s.put_kr_audience(&row("local1", "local", "[]"))
+            .await
+            .unwrap();
+        s.put_kr_audience(&row("local1", "local", "[\"did:plc:late\"]"))
+            .await
+            .unwrap();
+        let prism = AudienceRow {
+            prism_cid: Some("c1".into()),
+            ..row("p1", "prism", "[]")
+        };
+        assert!(
+            s.map_local_audience("did:plc:o", "local1", Some(1), "p1", Some(&prism))
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        let p = s.kr_audience("did:plc:o", "p1").await.unwrap().unwrap();
+        assert_eq!(
+            (p.pending.as_str(), p.members_json.as_str()),
+            ("update", "[\"did:plc:late\"]"),
+            "{n}: the late edit queued"
+        );
+        assert!(
+            s.kr_audience("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_none(),
+            "{n}"
+        );
+        assert!(
+            s.audience_tombstone("did:plc:o", "local1")
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}"
+        );
+        assert!(
+            !s.map_local_audience("did:plc:o", "local1", Some(1), "p1", Some(&prism))
+                .await
+                .unwrap(),
+            "{n}: twice is a no-op"
+        );
+
+        // Deleted meanwhile: prism's row becomes a pending delete.
+        let prism2 = AudienceRow {
+            prism_cid: Some("c2".into()),
+            ..row("p2", "prism", "[]")
+        };
+        assert!(
+            s.map_local_audience("did:plc:o", "gone", Some(1), "p2", Some(&prism2))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.audience_versions("did:plc:o")
+                .await
+                .unwrap()
+                .iter()
+                .find(|v| v.rkey == "p2")
+                .unwrap()
+                .pending,
+            "delete",
+            "{n}"
+        );
+
+        // Re-point candidates: private records naming a mapped local URI.
+        let mut tx = s.begin().await.unwrap();
+        for (rkey, aud) in [("3m6aaaaaaaaa2", "local1"), ("3m6aaaaaaaaa3", "p1")] {
+            let e = PrivateRecord {
+                did: "did:plc:writer".into(),
+                collection: "tools.kryphocron.feed.postPrivate".into(),
+                rkey: rkey.into(),
+                generation: None,
+                legacy_text: false,
+                flagged: None,
+                audience_did: Some("did:plc:o".into()),
+                audience_rkey: Some(aud.into()),
+            };
+            tx.replace_private_record("did:plc:writer", &e.collection, rkey, Some(&e))
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let c = s.repoint_candidates(10).await.unwrap();
+        assert_eq!(c.len(), 1, "{n}");
+        assert_eq!(
+            (
+                c[0].did.as_str(),
+                c[0].rkey.as_str(),
+                c[0].prism_rkey.as_str()
+            ),
+            ("did:plc:writer", "3m6aaaaaaaaa2", "p1")
+        );
+        assert_eq!(
+            s.pending_audiences("did:plc:o").await.unwrap().len(),
+            2,
+            "{n}"
+        );
+        assert!(
+            s.local_audiences("did:plc:o").await.unwrap().is_empty(),
+            "{n}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_review_queue_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let id = s
+            .add_review("did:plc:a", "bafy", "upload", "quarantine", Some("hash"))
+            .await
+            .unwrap();
+        s.add_review("did:plc:a", "bafz", "rescan", "reject", None)
+            .await
+            .unwrap();
+        let open = s.reviews("open", 10).await.unwrap();
+        assert_eq!(open.len(), 2, "{n}");
+        assert_eq!(open[0].reason.as_deref(), Some("hash"));
+        assert!(
+            s.resolve_review(id, "reported", "admin", Some("sent"))
+                .await
+                .unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.resolve_review(id, "cleared", "admin", None)
+                .await
+                .unwrap(),
+            "{n}: once"
+        );
+        assert_eq!(
+            s.reviews("reported", 10).await.unwrap()[0].note.as_deref(),
+            Some("sent")
+        );
+        assert!(s.unscanned_blobs(10).await.unwrap().is_empty(), "{n}");
+        assert!(s.scan_status("did:plc:a", "bafy").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn private_only_blobs_on_both_backends() {
+    use crate::kryphocron::PrivateRecord;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob("did:plc:a", "bafyimg", "image/png", 10, "tmp/x")
+            .await
+            .unwrap();
+        tx.replace_record_blobs(
+            "did:plc:a",
+            "tools.kryphocron.feed.postPrivate",
+            "3m6aaaaaaaaa2",
+            &["bafyimg".into()],
+        )
+        .await
+        .unwrap();
+        let e = PrivateRecord {
+            did: "did:plc:a".into(),
+            collection: "tools.kryphocron.feed.postPrivate".into(),
+            rkey: "3m6aaaaaaaaa2".into(),
+            generation: None,
+            legacy_text: false,
+            flagged: None,
+            audience_did: Some("did:plc:a".into()),
+            audience_rkey: Some("3m6aud".into()),
+        };
+        tx.replace_private_record("did:plc:a", &e.collection, &e.rkey, Some(&e))
+            .await
+            .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            s.blob_private_only("did:plc:a", "bafyimg").await.unwrap(),
+            "{n}"
+        );
+        let refs = s.blob_private_posts("did:plc:a", "bafyimg").await.unwrap();
+        assert_eq!(
+            (refs.len(), refs[0].audience_rkey.as_deref()),
+            (1, Some("3m6aud")),
+            "{n}"
+        );
+        // A public reference makes it public.
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_record_blobs(
+            "did:plc:a",
+            "app.bsky.feed.post",
+            "3m6aaaaaaaaa3",
+            &["bafyimg".into()],
+        )
+        .await
+        .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !s.blob_private_only("did:plc:a", "bafyimg").await.unwrap(),
+            "{n}"
+        );
+        // Never-scanned private-only blobs are picked up by the rescan.
+        let mut tx = s.begin().await.unwrap();
+        tx.replace_record_blobs("did:plc:a", "app.bsky.feed.post", "3m6aaaaaaaaa3", &[])
+            .await
+            .unwrap();
+        tx.recompute_private_only("did:plc:a", "bafyimg")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(s.unscanned_blobs(10).await.unwrap().len(), 1, "{n}");
+    }
+}
+
+#[tokio::test]
+async fn blob_placement_on_both_backends() {
+    use crate::blob::Place;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        // An install that has stored nothing can adopt another backend.
+        assert!(s.adopt_blob_backend_if_empty("s3").await.unwrap(), "{n}");
+        assert_eq!(s.blob_backend().await.unwrap().active, "s3", "{n}");
+        assert!(s.adopt_blob_backend_if_empty("disk").await.unwrap(), "{n}");
+
+        let (did, cid) = ("did:plc:a", "bafyimg");
+        let finish = |to: String| async move {
+            let mut tx = s.begin().await.unwrap();
+            assert!(tx.finish_blob_move(did, cid, &to, 1).await.unwrap());
+            tx.commit().await.unwrap();
+        };
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob(did, cid, "image/png", 10, "tmp/x")
+            .await
+            .unwrap();
+        let promoted = crate::blob::permanent_key(did, cid);
+        tx.reference_blob(did, cid, &promoted, 1).await.unwrap();
+        tx.replace_record_blobs(
+            did,
+            "tools.kryphocron.feed.postPrivate",
+            "3m6p",
+            &[cid.into()],
+        )
+        .await
+        .unwrap();
+        tx.recompute_private_only(did, cid).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !s.adopt_blob_backend_if_empty("s3").await.unwrap(),
+            "{n}: not empty"
+        );
+        // The promotion is in flight: not picked up by the pass.
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        finish(promoted).await;
+
+        // Private-only and in the normal store: misplaced only with the gate on.
+        assert!(
+            s.misplaced_blobs(false, 10).await.unwrap().is_empty(),
+            "{n}"
+        );
+        assert_eq!(
+            s.misplaced_blobs(true, 10).await.unwrap(),
+            [(did.to_owned(), cid.to_owned())],
+            "{n}"
+        );
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            tx.place_blob(did, cid, false, 1).await.unwrap().is_none(),
+            "{n}"
+        );
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(
+            m.from.starts_with("blobs/") && m.to.starts_with("gated/did:plc:a/bafyimg."),
+            "{n}"
+        );
+        assert!(
+            tx.place_blob(did, cid, true, 1).await.unwrap().is_none(),
+            "{n}: already heading there"
+        );
+        tx.commit().await.unwrap();
+        let old = m.from.clone();
+        finish(m.to).await;
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        assert!(!s.blob_key_in_use(&old).await.unwrap(), "{n}");
+        // The gate off: out of the gated store again.
+        assert_eq!(s.misplaced_blobs(false, 10).await.unwrap().len(), 1, "{n}");
+
+        // A takedown wins over the gate: quarantine, and back on reversal.
+        assert!(s.set_blob_takedown(did, cid, Some("t1")).await.unwrap());
+        assert_eq!(s.misplaced_blobs(true, 10).await.unwrap().len(), 1, "{n}");
+        let mut tx = s.begin().await.unwrap();
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(m.to.starts_with("quarantine/did:plc:a/bafyimg."), "{n}");
+        tx.commit().await.unwrap();
+        finish(m.to).await;
+        assert!(s.misplaced_blobs(true, 10).await.unwrap().is_empty(), "{n}");
+        assert!(s.set_blob_takedown(did, cid, None).await.unwrap());
+        let mut tx = s.begin().await.unwrap();
+        let m = tx.place_blob(did, cid, true, 1).await.unwrap().unwrap();
+        assert!(
+            m.from.starts_with("quarantine/") && m.to.starts_with("gated/"),
+            "{n}"
+        );
+        tx.commit().await.unwrap();
+
+        // Branding uploads draw a key sequence value, and their keys count
+        // as in use.
+        s.put_branding_asset(
+            &crate::branding::AssetRow {
+                id: "a1".into(),
+                kind: "logo".into(),
+                name: "logo.png".into(),
+                mime: "image/png".into(),
+                size: 3,
+                storage_key: "branding/a1.0".into(),
+                created_at: 0,
+                unused_since: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(s.blob_key_in_use("branding/a1.0").await.unwrap(), "{n}");
+        assert!(!s.blob_key_in_use("branding/a2.0").await.unwrap(), "{n}");
+    }
+    // The rules themselves.
+    assert_eq!(Place::of("permanent", true, true, true), Place::Quarantine);
+    assert_eq!(
+        Place::of("quarantined", false, false, false),
+        Place::Quarantine
+    );
+    assert_eq!(Place::of("temp", false, true, true), Place::Temp);
+    assert_eq!(Place::of("permanent", false, true, true), Place::Gated);
+    assert_eq!(Place::of("permanent", false, true, false), Place::Normal);
+    assert!(
+        Place::Normal.holds("blocks/did:plc:a/bafy"),
+        "imported in place"
+    );
+    assert!(!Place::Normal.holds("tmp/x") && Place::Temp.holds("tmp/x"));
+    assert!(!Place::Temp.holds("quarantine/x") && !Place::Gated.holds("blobs/x"));
+}
+
+#[tokio::test]
+async fn operators_and_admin_queries_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        assert!(
+            s.create_operator("ana", "hash", "owner").await.unwrap(),
+            "{n}"
+        );
+        assert!(
+            !s.create_operator("ana", "hash", "viewer").await.unwrap(),
+            "{n}: taken"
+        );
+        assert_eq!(s.count_owners().await.unwrap(), 1);
+        s.create_operator_token("t1", "h1", "ana", "cli", None)
+            .await
+            .unwrap();
+        s.create_operator_token("t2", "h2", "ana", "old", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.operator_by_token("h1").await.unwrap().unwrap().role,
+            "owner",
+            "{n}"
+        );
+        assert!(
+            s.operator_by_token("h2").await.unwrap().is_none(),
+            "{n}: expired"
+        );
+        assert!(
+            s.update_operator("ana", Some("admin"), None, Some(true))
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.operator_by_token("h1").await.unwrap().is_none(),
+            "{n}: disabled"
+        );
+        assert_eq!(s.operator("ana").await.unwrap().unwrap().role, "admin");
+        assert_eq!(s.operator_tokens("ana").await.unwrap().len(), 2);
+        assert!(s.revoke_operator_token("t1").await.unwrap());
+        s.audit("operator:ana", "x.one", Some("t"), None)
+            .await
+            .unwrap();
+        s.audit(
+            "operator:ana",
+            "x.two",
+            None,
+            Some(&serde_json::json!({"a": 1})),
+        )
+        .await
+        .unwrap();
+        let entries = s.audit_entries(None, 10).await.unwrap();
+        assert_eq!(entries[0].action, "x.two", "{n}: newest first");
+        assert_eq!(
+            s.audit_entries(Some(entries[0].id), 10).await.unwrap()[0].action,
+            "x.one"
+        );
+
+        // Invites, paged by recency and usage.
+        let mut tx = s.begin().await.unwrap();
+        for (i, code) in ["c1", "c2", "c3"].iter().enumerate() {
+            tx.insert_invite_code(code, 2, "admin", "admin")
+                .await
+                .unwrap();
+            let _ = i;
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        tx.commit().await.unwrap();
+        let page: Vec<String> = s
+            .all_invite_codes(false, None, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.code)
+            .collect();
+        assert_eq!(page.len(), 2, "{n}");
+        let rest = s.all_invite_codes(false, Some(&page[1]), 10).await.unwrap();
+        assert_eq!(rest.len(), 1, "{n}");
+        assert_eq!(s.all_invite_codes(true, None, 10).await.unwrap().len(), 3);
+        s.disable_invite_codes(&["c1".into()], &[]).await.unwrap();
+        assert!(s.invite_code("c1").await.unwrap().unwrap().disabled, "{n}");
+        assert_eq!(s.invite_code("c2").await.unwrap().unwrap().available, 2);
+        assert!(
+            s.search_accounts("nobody", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !s.set_record_takedown("did:plc:x", "c", "r", Some("t"))
+                .await
+                .unwrap()
+        );
+        assert!(!s.set_blob_takedown("did:plc:x", "c", None).await.unwrap());
+        assert!(s.invited_by("did:plc:x").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn setup_state_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.setup_state().await.unwrap().is_none(), "{}", b.name);
+        assert!(!s.setup_completed().await.unwrap());
+        assert!(s.create_setup_token("h1").await.unwrap());
+        assert!(
+            !s.create_setup_token("h2").await.unwrap(),
+            "{}: first wins",
+            b.name
+        );
+        assert!(s.setup_token_matches("h1").await.unwrap());
+        assert!(!s.setup_token_matches("h2").await.unwrap());
+
+        s.add_setup_session("live", 60_000).await.unwrap();
+        s.add_setup_session("old", -1).await.unwrap();
+        assert!(s.setup_session_valid("live").await.unwrap(), "{}", b.name);
+        assert!(
+            !s.setup_session_valid("old").await.unwrap(),
+            "{}: expired",
+            b.name
+        );
+        assert!(s.save_setup_draft(r#"{"seeded":true}"#).await.unwrap());
+        s.set_setup_probe("nonce").await.unwrap();
+        s.record_setup_probe("https").await.unwrap();
+        let row = s.setup_state().await.unwrap().unwrap();
+        assert_eq!(
+            (
+                row.probe_nonce.as_deref(),
+                row.probe_seen.as_deref(),
+                row.draft_json.as_str()
+            ),
+            (Some("nonce"), Some("https"), r#"{"seeded":true}"#)
+        );
+
+        // A new token ends the old one's sessions.
+        assert!(s.replace_setup_token("h3").await.unwrap());
+        assert!(!s.setup_session_valid("live").await.unwrap(), "{}", b.name);
+        s.add_setup_session("live2", 60_000).await.unwrap();
+
+        // Completion is one conditional write, with the operator beside it.
+        let mut tx = s.begin().await.unwrap();
+        assert!(tx.complete_setup("pds.example.com", "setup").await.unwrap());
+        assert!(tx.create_operator("alice", "hash", "owner").await.unwrap());
+        assert!(!tx.create_operator("alice", "hash", "owner").await.unwrap());
+        tx.commit().await.unwrap();
+        let mut tx = s.begin().await.unwrap();
+        assert!(
+            !tx.complete_setup("other.example.com", "setup")
+                .await
+                .unwrap(),
+            "{}: once",
+            b.name
+        );
+        tx.rollback().await.unwrap();
+        let row = s.setup_state().await.unwrap().unwrap();
+        assert!(row.completed_at.is_some());
+        assert_eq!(
+            (row.hostname.as_deref(), row.draft_json.as_str()),
+            (Some("pds.example.com"), "{}")
+        );
+        assert!(
+            !s.setup_session_valid("live2").await.unwrap(),
+            "{}: sessions end",
+            b.name
+        );
+        assert!(!s.setup_token_matches("h3").await.unwrap());
+        assert!(!s.save_setup_draft("{}").await.unwrap());
+        assert!(!s.replace_setup_token("h4").await.unwrap());
+        assert_eq!(s.operator("alice").await.unwrap().unwrap().role, "owner");
+    }
+}
+
+#[tokio::test]
+async fn console_sessions_on_both_backends() {
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.create_operator("alice", "h", "owner").await.unwrap());
+        s.create_operator_session(
+            "live",
+            "alice",
+            "full",
+            60_000,
+            Some("10.0.0.1"),
+            Some("ua"),
+        )
+        .await
+        .unwrap();
+        s.create_operator_session("code", "alice", "code", 60_000, None, None)
+            .await
+            .unwrap();
+        s.create_operator_session("expired", "alice", "full", -1, None, None)
+            .await
+            .unwrap();
+        let (row, op) = s.operator_session("live", 60_000).await.unwrap().unwrap();
+        assert_eq!(
+            (row.stage.as_str(), op.username.as_str(), row.ip.as_deref()),
+            ("full", "alice", Some("10.0.0.1")),
+            "{}",
+            b.name
+        );
+        assert!(
+            s.operator_session("expired", 60_000)
+                .await
+                .unwrap()
+                .is_none(),
+            "{}",
+            b.name
+        );
+        // Idle: used longer ago than the idle limit.
+        assert!(
+            s.operator_session("live", -1).await.unwrap().is_none(),
+            "{}: idle",
+            b.name
+        );
+        assert!(s.upgrade_operator_session("code").await.unwrap());
+        assert!(
+            !s.upgrade_operator_session("code").await.unwrap(),
+            "{}: once",
+            b.name
+        );
+        assert_eq!(
+            s.operator_session("code", 60_000)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .stage,
+            "full"
+        );
+        s.confirm_operator_session("live").await.unwrap();
+        assert_eq!(s.operator_sessions("alice").await.unwrap().len(), 2);
+        assert_eq!(
+            s.delete_operator_sessions("alice", Some("live"))
+                .await
+                .unwrap(),
+            2,
+            "{}",
+            b.name
+        );
+        assert!(s.operator_session("code", 60_000).await.unwrap().is_none());
+        assert!(s.operator_session("live", 60_000).await.unwrap().is_some());
+        // A disabled operator's sessions stop working.
+        s.update_operator("alice", None, None, Some(true))
+            .await
+            .unwrap();
+        assert!(
+            s.operator_session("live", 60_000).await.unwrap().is_none(),
+            "{}",
+            b.name
+        );
+        s.update_operator("alice", None, None, Some(false))
+            .await
+            .unwrap();
+        s.delete_operator_session("live").await.unwrap();
+        assert!(s.operator_session("live", 60_000).await.unwrap().is_none());
+        assert_eq!(
+            s.prune_operator_sessions().await.unwrap(),
+            0,
+            "the expired one went with delete_operator_sessions"
+        );
+
+        let t = s.operator_theme("alice").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                t.theme_mode.as_str(),
+                t.theme_scheme.as_str(),
+                t.theme_font.as_str()
+            ),
+            ("system", "sky", "hyperlegible")
+        );
+        s.set_operator_theme("alice", "dark", "teal", "plex")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.operator_theme("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .theme_scheme,
+            "teal"
+        );
+
+        s.set_operator_totp("alice", true).await.unwrap();
+        assert!(
+            s.operator("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .totp_secret
+                .is_some()
+        );
+        assert!(s.use_totp_step("alice", 100).await.unwrap());
+        assert!(
+            !s.use_totp_step("alice", 100).await.unwrap(),
+            "{}: a step works once",
+            b.name
+        );
+        assert!(
+            !s.use_totp_step("alice", 99).await.unwrap(),
+            "{}: never an older one",
+            b.name
+        );
+        assert!(s.use_totp_step("alice", 101).await.unwrap());
+        s.set_operator_totp("alice", false).await.unwrap();
+        assert!(
+            s.operator("alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .totp_secret
+                .is_none()
+        );
+
+        let c = s.console_counts().await.unwrap();
+        assert_eq!((c.blobs, c.records, c.outbox), (0, 0, 0), "{}", b.name);
+        assert!(!s.delete_secret("nothing").await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn branding_on_both_backends() {
+    use crate::branding::AssetRow;
+    for b in backends().await {
+        let s = &b.store;
+        assert!(s.branding_active().await.unwrap().is_none());
+        assert!(
+            s.publish_branding_draft("op").await.unwrap().is_none(),
+            "{}: no draft",
+            b.name
+        );
+        for id in ["logo1", "bg1"] {
+            s.put_branding_asset(
+                &AssetRow {
+                    id: id.into(),
+                    kind: if id == "logo1" { "logo" } else { "background" }.into(),
+                    name: "x.png".into(),
+                    mime: "image/png".into(),
+                    size: 10,
+                    storage_key: format!("branding/{id}"),
+                    created_at: 0,
+                    unused_since: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            s.branding_assets()
+                .await
+                .unwrap()
+                .iter()
+                .all(|a| a.unused_since.is_some()),
+            "{}: unused at upload",
+            b.name
+        );
+        let v1 = s
+            .save_branding_draft(r#"{"a":1}"#, &["logo1".into()], "op")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.save_branding_draft(r#"{"a":2}"#, &["logo1".into()], "op")
+                .await
+                .unwrap(),
+            v1,
+            "one draft"
+        );
+        let logo = s.branding_asset("logo1").await.unwrap().unwrap();
+        assert!(logo.unused_since.is_none(), "{}: used by the draft", b.name);
+        assert_eq!(s.publish_branding_draft("op").await.unwrap(), Some(v1));
+        assert_eq!(
+            s.branding_active().await.unwrap().unwrap().theme_json,
+            r#"{"a":2}"#
+        );
+        assert!(s.branding_draft().await.unwrap().is_none());
+        let v2 = s
+            .save_branding_draft(r#"{"a":3}"#, &["bg1".into()], "op")
+            .await
+            .unwrap();
+        assert!(v2 > v1);
+        s.publish_branding_draft("op").await.unwrap();
+        assert_eq!(s.branding_versions(10).await.unwrap().len(), 2);
+        // Rollback to v1; a draft can't be activated.
+        assert!(s.activate_branding(v1).await.unwrap());
+        assert_eq!(s.branding_active().await.unwrap().unwrap().version, v1);
+        let v3 = s.save_branding_draft("{}", &[], "op").await.unwrap();
+        assert!(!s.activate_branding(v3).await.unwrap(), "{}", b.name);
+        // logo1 still used by v1, bg1 by v2: nothing to collect.
+        assert_eq!(
+            s.collect_branding_assets(-1).await.unwrap(),
+            0,
+            "{}",
+            b.name
+        );
+        s.put_branding_asset(
+            &AssetRow {
+                id: "orphan".into(),
+                kind: "font".into(),
+                name: "f.woff2".into(),
+                mime: "font/woff2".into(),
+                size: 1,
+                storage_key: "branding/orphan".into(),
+                created_at: 0,
+                unused_since: None,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.collect_branding_assets(60_000).await.unwrap(),
+            0,
+            "{}: within the grace",
+            b.name
+        );
+        assert_eq!(
+            s.collect_branding_assets(-1).await.unwrap(),
+            1,
+            "{}",
+            b.name
+        );
+        assert!(s.branding_asset("orphan").await.unwrap().is_none());
+        s.deactivate_branding().await.unwrap();
+        assert!(s.branding_active().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn rewrap_moves_every_secret_to_the_new_key_on_both_backends() {
+    use crate::secrets::KeyCheck;
+    use locus_core::keys::{MasterKey, SourceKind};
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let old = MasterKey::generate(SourceKind::File);
+        let new = MasterKey::generate(SourceKind::Kms);
+        let mut tx = s.begin().await.unwrap();
+        for i in 0..1100 {
+            tx.put_secret(&format!("s{i:04}"), format!("v{i}").as_bytes(), &old)
+                .await
+                .unwrap();
+        }
+        tx.put_signing_key("did:plc:x", "k256", b"key", &old)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // The wrong current key fails and changes nothing.
+        let other = MasterKey::generate(SourceKind::Env);
+        let mut tx = s.begin().await.unwrap();
+        assert!(tx.rewrap_all(&other, &new).await.is_err(), "{n}");
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            s.check_master_key(&old).await.unwrap(),
+            KeyCheck::Matches,
+            "{n}"
+        );
+
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(
+            tx.rewrap_all(&old, &new).await.unwrap(),
+            (1100, 1),
+            "{n}: every page"
+        );
+        tx.set_master_key_wrap(Some(("kms-1", b"wrapped")))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            s.check_master_key(&new).await.unwrap(),
+            KeyCheck::Matches,
+            "{n}"
+        );
+        assert!(s.check_master_key(&old).await.is_err(), "{n}");
+        assert_eq!(
+            s.get_secret("s1099", &new)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"v1099",
+            "{n}"
+        );
+        assert!(s.get_secret("s0000", &old).await.is_err(), "{n}");
+        assert_eq!(
+            s.get_signing_key("did:plc:x", &new)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .as_slice(),
+            b"key"
+        );
+        assert_eq!(
+            s.master_key_wrap().await.unwrap(),
+            Some(("kms-1".to_owned(), b"wrapped".to_vec())),
+            "{n}"
+        );
+        // Back to a non-KMS key: the wrap goes.
+        let mut tx = s.begin().await.unwrap();
+        tx.rewrap_all(&new, &old).await.unwrap();
+        tx.set_master_key_wrap(None).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(s.master_key_wrap().await.unwrap(), None, "{n}");
+        // The first wrap recorded wins.
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(
+            tx.put_master_key_wrap("k-a", b"a").await.unwrap(),
+            ("k-a".to_owned(), b"a".to_vec())
+        );
+        assert_eq!(
+            tx.put_master_key_wrap("k-b", b"b").await.unwrap(),
+            ("k-a".to_owned(), b"a".to_vec()),
+            "{n}"
+        );
+        tx.commit().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn backups_hold_the_delete_job_and_restores_settle_blobs_on_both_backends() {
+    use std::time::Duration;
+    for b in backends().await {
+        let s = &b.store;
+        let n = b.name;
+        let queue = |key: &'static str| async move {
+            let mut tx = s.begin().await.unwrap();
+            tx.queue_blob_delete(key, 1).await.unwrap();
+            tx.commit().await.unwrap();
+        };
+        queue("tmp/a").await;
+        assert_eq!(
+            s.backup_delete_limit().await.unwrap(),
+            None,
+            "{n}: no backup"
+        );
+        // A running backup with a live lease and no mark yet: nothing.
+        let lease = s
+            .try_acquire_lease(
+                crate::backups::BACKUP_LEASE,
+                "node-1",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        s.start_backup_run("b1", "/backups/b1", "test")
+            .await
+            .unwrap();
+        assert_eq!(s.backup_delete_limit().await.unwrap(), Some(None), "{n}");
+        let mark = s.max_blob_delete_id().await.unwrap();
+        s.set_backup_mark("b1", mark).await.unwrap();
+        queue("tmp/b").await;
+        assert_eq!(
+            s.backup_delete_limit().await.unwrap(),
+            Some(Some(mark)),
+            "{n}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let due = s.due_blob_deletes(0, 10, Some(mark)).await.unwrap();
+        assert_eq!(
+            due.iter().map(|d| d.1.as_str()).collect::<Vec<_>>(),
+            ["tmp/a"],
+            "{n}: only rows up to the mark"
+        );
+        assert_eq!(
+            s.due_blob_deletes(0, 10, None).await.unwrap().len(),
+            2,
+            "{n}"
+        );
+        // A lapsed lease frees the delete job.
+        s.release_lease(&lease).await.unwrap();
+        assert_eq!(s.backup_delete_limit().await.unwrap(), None, "{n}");
+        s.finish_backup_run("b1", "done", 3, 1, true, None)
+            .await
+            .unwrap();
+        let runs = s.backup_runs(5).await.unwrap();
+        assert_eq!(
+            (runs[0].status.as_str(), runs[0].objects, runs[0].with_keys),
+            ("done", 3, true),
+            "{n}"
+        );
+
+        // Tracked keys, pending moves and the restore's settling.
+        let mut tx = s.begin().await.unwrap();
+        tx.insert_temp_blob("did:plc:a", "bafy1", "image/png", 3, "tmp/x1")
+            .await
+            .unwrap();
+        tx.reference_blob("did:plc:a", "bafy1", "blobs/did:plc:a/bafy1.g1", 1)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            s.tracked_keys_after("", 10).await.unwrap(),
+            ["tmp/x1"],
+            "{n}"
+        );
+        assert_eq!(
+            s.pending_keys_after("", 10).await.unwrap(),
+            ["blobs/did:plc:a/bafy1.g1"],
+            "{n}"
+        );
+        s.start_backup_run("b2", "/backups/b2", "test")
+            .await
+            .unwrap();
+        // A lease of the old install's node, still unexpired.
+        s.try_acquire_lease("sequencer", "old-node", Duration::from_secs(600))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tx = s.begin().await.unwrap();
+        let epoch = tx.settle_restored_blobs("s3", None, true).await.unwrap();
+        assert_eq!(tx.restart_pending_moves(epoch).await.unwrap(), 1, "{n}");
+        tx.commit().await.unwrap();
+        let backend = s.blob_backend().await.unwrap();
+        assert_eq!(
+            (backend.active.as_str(), backend.epoch),
+            ("s3", epoch),
+            "{n}"
+        );
+        assert_eq!(epoch, 2, "{n}: bumped");
+        let row = s.blob("did:plc:a", "bafy1").await.unwrap().unwrap();
+        let fresh = row.pending_move.unwrap();
+        assert!(
+            fresh.starts_with("blobs/did:plc:a/bafy1.") && fresh != "blobs/did:plc:a/bafy1.g1",
+            "{n}: a fresh key in the same store"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let queued: Vec<String> = s
+            .due_blob_deletes(0, 10, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.1)
+            .collect();
+        assert!(
+            queued.contains(&"blobs/did:plc:a/bafy1.g1".to_owned()),
+            "{n}: old target queued"
+        );
+        assert_eq!(
+            s.backup_runs(5).await.unwrap()[0].status,
+            "ended",
+            "{n}: the snapshot's running backup ends"
+        );
+        assert!(
+            s.try_acquire_lease("sequencer", "new-node", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_some(),
+            "{n}: the old install's leases are released"
+        );
+        // The seq floor only rises.
+        let mut tx = s.begin().await.unwrap();
+        assert_eq!(tx.raise_seq_floor(5000).await.unwrap(), 5000);
+        assert_eq!(tx.raise_seq_floor(10).await.unwrap(), 5000, "{n}");
+        tx.commit().await.unwrap();
+        // SQLite snapshots; Postgres installs are told about PITR.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.sqlite");
+        match s {
+            crate::Store::Sqlite(_) => {
+                s.sqlite_snapshot(&path).await.unwrap();
+                let snap = crate::Store::connect(&locus_core::bootstrap::DatabaseUrl::Sqlite(
+                    path.clone(),
+                ))
+                .await
+                .unwrap();
+                assert_eq!(snap.seq_state().await.unwrap().last_seq, 5000);
+                snap.close().await;
+            }
+            crate::Store::Postgres(_) => {
+                assert!(s.sqlite_snapshot(&path).await.is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_installs_copy_into_postgres() {
+    use locus_core::keys::{MasterKey, SourceKind};
+    let all = backends().await;
+    let Some(pg) = all.iter().find(|b| b.name == "postgres") else {
+        eprintln!("no Postgres to copy into; skipping");
+        return;
+    };
+    let src = &all.iter().find(|b| b.name == "sqlite").unwrap().store;
+    let key = MasterKey::generate(SourceKind::Env);
+    let mut tx = src.begin().await.unwrap();
+    tx.put_secret("jwt_secret", b"the secret", &key)
+        .await
+        .unwrap();
+    tx.put_signing_key("did:plc:a", "k256", b"sk", &key)
+        .await
+        .unwrap();
+    tx.insert_temp_blob("did:plc:a", "bafy1", "image/png", 3, "tmp/x1")
+        .await
+        .unwrap();
+    for k in ["tmp/d1", "tmp/d2", "tmp/d3"] {
+        tx.queue_blob_delete(k, 1).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    // The highest queued delete goes before the copy: its id must not come back.
+    let due = src.due_blob_deletes(-1_000_000, 10, None).await.unwrap();
+    let top = due.iter().map(|d| d.0).max().unwrap();
+    let mut tx = src.begin().await.unwrap();
+    tx.remove_blob_delete(top).await.unwrap();
+    tx.commit().await.unwrap();
+    // Booleans, bytes and nulls survive.
+    assert!(
+        src.set_blob_takedown("did:plc:a", "bafy1", Some("t1"))
+            .await
+            .unwrap()
+    );
+
+    let report = crate::copy::sqlite_to_postgres(src, &pg.store)
+        .await
+        .unwrap();
+    let count = |t: &str| report.tables.iter().find(|(n, _)| n == t).map(|(_, c)| *c);
+    assert_eq!(count("blob"), Some(1));
+    assert_eq!(count("blob_delete"), Some(2));
+    assert_eq!(count("secret"), Some(1));
+    let d = &pg.store;
+    assert_eq!(
+        d.get_secret("jwt_secret", &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"the secret"
+    );
+    assert_eq!(
+        d.check_master_key(&key).await.unwrap(),
+        crate::secrets::KeyCheck::Matches
+    );
+    let row = d.blob("did:plc:a", "bafy1").await.unwrap().unwrap();
+    assert_eq!(
+        (
+            row.storage_key.as_str(),
+            row.takedown_ref.as_deref(),
+            row.review_hold
+        ),
+        ("tmp/x1", Some("t1"), false)
+    );
+    // Sequences continue above what was copied, and above the deleted id.
+    let mut tx = d.begin().await.unwrap();
+    tx.queue_blob_delete("tmp/after", 1).await.unwrap();
+    let next = tx.next_key_seq().await.unwrap();
+    tx.commit().await.unwrap();
+    let after = d
+        .due_blob_deletes(-1_000_000, 10, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.1 == "tmp/after")
+        .unwrap()
+        .0;
+    assert!(
+        after > top,
+        "a new id ({after}) above every SQLite id ({top})"
+    );
+    assert_eq!(
+        (report.key_seq, next),
+        (1, 2),
+        "the sequence continues after the one value drawn"
+    );
+    // A second copy into the now-full database is refused.
+    assert!(crate::copy::sqlite_to_postgres(src, d).await.is_err());
+}
+
+/// A reference `account.sqlite` with the tables the account import reads.
+async fn reference_account_db(path: &std::path::Path) -> sqlx::SqlitePool {
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    for q in [
+        "CREATE TABLE actor (did varchar PRIMARY KEY, handle varchar, createdAt varchar NOT NULL, \
+         takedownRef varchar, deactivatedAt varchar, deleteAfter varchar)",
+        "CREATE TABLE account (did varchar PRIMARY KEY, email varchar NOT NULL, passwordScrypt varchar NOT NULL, \
+         emailConfirmedAt varchar, invitesDisabled int2 NOT NULL DEFAULT 0)",
+        "CREATE TABLE app_password (did varchar NOT NULL, name varchar NOT NULL, passwordScrypt varchar NOT NULL, \
+         createdAt varchar NOT NULL, privileged integer NOT NULL DEFAULT 0, PRIMARY KEY (did, name))",
+        "CREATE TABLE refresh_token (id varchar PRIMARY KEY, did varchar NOT NULL, expiresAt varchar NOT NULL, \
+         nextId varchar, appPasswordName varchar)",
+        "CREATE TABLE email_token (purpose varchar NOT NULL, did varchar NOT NULL, token varchar NOT NULL, \
+         requestedAt varchar NOT NULL, PRIMARY KEY (purpose, did))",
+        "CREATE TABLE invite_code (code varchar PRIMARY KEY, availableUses integer NOT NULL, disabled int2 DEFAULT 0, \
+         forAccount varchar NOT NULL, createdBy varchar NOT NULL, createdAt varchar NOT NULL)",
+        "CREATE TABLE invite_code_use (code varchar NOT NULL, usedBy varchar NOT NULL, usedAt varchar NOT NULL, \
+         PRIMARY KEY (code, usedBy))",
+        "INSERT INTO actor VALUES ('did:plc:aaa', 'Ada.Example.com', '2025-01-01T00:00:00.000Z', NULL, NULL, NULL)",
+        "INSERT INTO actor VALUES ('did:plc:bbb', 'bob.example.com', '2025-01-02T00:00:00.000Z', 'td-1', NULL, NULL)",
+        "INSERT INTO actor VALUES ('did:plc:ccc', NULL, '2025-01-03T00:00:00.000Z', NULL, NULL, NULL)",
+        "INSERT INTO account VALUES ('did:plc:aaa', 'Ada@Example.com', 'salt:key', '2025-01-01T00:00:00.000Z', 0)",
+        "INSERT INTO account VALUES ('did:plc:bbb', 'bob@example.com', 'salt2:key2', NULL, 1)",
+        "INSERT INTO app_password VALUES ('did:plc:aaa', 'phone', 'apsalt:apkey', '2025-01-01T00:00:00.000Z', 1)",
+        "INSERT INTO refresh_token VALUES ('r1', 'did:plc:aaa', '2999-01-01T00:00:00.000Z', 'r2', 'phone')",
+        "INSERT INTO refresh_token VALUES ('r2', 'did:plc:aaa', '2999-01-01T00:00:00.000Z', NULL, 'phone')",
+        "INSERT INTO refresh_token VALUES ('r3', 'did:plc:aaa', '2000-01-01T00:00:00.000Z', NULL, NULL)",
+        "INSERT INTO email_token VALUES ('reset_password', 'did:plc:aaa', 'ABCDE-FGHIJ', '2025-01-01T00:00:00.000Z')",
+        "INSERT INTO invite_code VALUES ('inv-1', 2, 0, 'did:plc:aaa', 'admin', '2025-01-01T00:00:00.000Z')",
+        "INSERT INTO invite_code_use VALUES ('inv-1', 'did:plc:bbb', '2025-01-02T00:00:00.000Z')",
+    ] {
+        sqlx::query(q).execute(&pool).await.unwrap();
+    }
+    pool
+}
+
+#[tokio::test]
+async fn reference_account_import_on_both_backends() {
+    use crate::reference::{AccountImport, Source};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account.sqlite");
+    let holder = reference_account_db(&path).await;
+    // Refused while another process (here, another connection) has it open.
+    match Source::open(&path).await {
+        Err(CoreError::Conflict(m)) => assert!(m.contains("in use"), "{m}"),
+        Err(e) => panic!("wrong refusal: {e}"),
+        Ok(_) => panic!("opened a database in use"),
+    }
+    holder.close().await;
+    for b in backends().await {
+        let src = Source::open(&path).await.unwrap();
+        let hash = |t: &str| format!("h:{t}");
+        let mut tx = b.store.begin().await.unwrap();
+        let report = tx
+            .import_reference_accounts(
+                &src,
+                &AccountImport {
+                    now_ms: 1_800_000_000_000,
+                    token_hash: &hash,
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        src.close().await;
+        let n = |k: &str| report.counts.get(k).copied().unwrap_or(0);
+        assert_eq!(
+            (
+                n("accounts"),
+                n("app passwords"),
+                n("sessions"),
+                n("refresh tokens")
+            ),
+            (2, 1, 1, 2),
+            "{}",
+            b.name
+        );
+        assert_eq!(report.skipped.len(), 1, "the handle-less actor");
+        let ada = b
+            .store
+            .account_by_did("did:plc:aaa")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ada.handle, "ada.example.com");
+        assert_eq!(ada.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(ada.password_hash.as_deref(), Some("scrypt:salt:key"));
+        assert_eq!(ada.created_at, 1_735_689_600_000);
+        let bob = b
+            .store
+            .account_by_did("did:plc:bbb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bob.status, crate::accounts::Status::Takendown);
+        assert_eq!(bob.status_ref.as_deref(), Some("td-1"));
+        assert!(bob.invites_disabled);
+        // The rotated pair is one session, with the app password's scope.
+        let mut tx = b.store.begin().await.unwrap();
+        let r1 = tx.refresh_token_for_update("r1").await.unwrap().unwrap();
+        let r2 = tx.refresh_token_for_update("r2").await.unwrap().unwrap();
+        assert!(tx.refresh_token_for_update("r3").await.unwrap().is_none());
+        tx.rollback().await.unwrap();
+        assert_eq!(r1.session_id, r2.session_id);
+        assert_eq!(r1.next_id.as_deref(), Some("r2"));
+        let s = b.store.session(&r1.session_id).await.unwrap().unwrap();
+        assert_eq!(s.scope, "com.atproto.appPassPrivileged");
+        assert_eq!(s.app_password_name.as_deref(), Some("phone"));
+        // Imported app passwords: found by hash until upgraded.
+        assert!(
+            b.store
+                .has_imported_app_passwords("did:plc:aaa")
+                .await
+                .unwrap()
+        );
+        let ap = b
+            .store
+            .imported_app_password("did:plc:aaa", "scrypt:apsalt:apkey")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ap.privileged);
+        assert!(
+            b.store
+                .upgrade_app_password("did:plc:aaa", "phone", &ap.hash, "lookup", "$argon2id$x")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !b.store
+                .has_imported_app_passwords("did:plc:aaa")
+                .await
+                .unwrap()
+        );
+        assert!(
+            b.store
+                .upgrade_password_hash("did:plc:aaa", "scrypt:salt:key", "$argon2id$y")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !b.store
+                .upgrade_password_hash("did:plc:aaa", "scrypt:salt:key", "$argon2id$z")
+                .await
+                .unwrap()
+        );
+        assert!(b.store.has_accounts().await.unwrap());
+        assert!(b.store.reference_import().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn jobs_pause_and_run_now() {
+    for b in backends().await {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let s2 = starts.clone();
+        let handle = tokio::spawn(run_leased(
+            b.store.clone(),
+            "controlled".into(),
+            "node-a".into(),
+            // Long enough that a slow renewal under load doesn't restart it.
+            Duration::from_secs(3),
+            cancel.clone(),
+            move |_token, job_cancel| {
+                let starts = s2.clone();
+                async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    // A long-running job: it only restarts when asked.
+                    job_cancel.cancelled().await;
+                    Ok(())
+                }
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "{}", b.name);
+        // Run now: restarted within a renew tick.
+        b.store.request_job_run("controlled").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "{}: run now", b.name);
+        assert!(
+            b.store
+                .job_control("controlled")
+                .await
+                .unwrap()
+                .run_requested
+                .is_none()
+        );
+        // Paused: stopped, and not taken up again.
+        b.store
+            .set_job_paused("controlled", true, "op")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        let n = starts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), n, "{}: paused", b.name);
+        let now = b.store.now_ms().await.unwrap();
+        let held = b
+            .store
+            .job_leases()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|(n, _, exp)| n == "controlled" && exp > now);
+        assert!(!held, "{}: released", b.name);
+        // Resumed.
+        b.store
+            .set_job_paused("controlled", false, "op")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), n + 1, "{}: resumed", b.name);
+        cancel.cancel();
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_disagreements_between_live_nodes_are_named() {
+    for b in backends().await {
+        let s = &b.store;
+        let ttl = Duration::from_secs(30);
+        for n in ["node-a", "node-b"] {
+            s.claim_slot(CLOCK_SLOT_FAMILY, 8, n, ttl)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let a = [("role", "Pds"), ("redis_url", "redis://r1")];
+        assert!(
+            s.report_bootstrap("node-a", &a).await.unwrap().is_empty(),
+            "{}",
+            b.name
+        );
+        assert!(
+            s.report_bootstrap("node-b", &a).await.unwrap().is_empty(),
+            "{}: agree",
+            b.name
+        );
+        let other = [("role", "Pds"), ("redis_url", "")];
+        assert_eq!(
+            s.report_bootstrap("node-b", &other).await.unwrap(),
+            vec!["redis_url"],
+            "{}",
+            b.name
+        );
+        // The env report of a node keeps its bootstrap rows.
+        let (v, _) = collect_env(&env_of(&[("PDS_SERVICE_NAME", "X")]));
+        s.report_and_apply_env("node-a", &v).await.unwrap();
+        assert_eq!(
+            s.report_bootstrap("node-b", &other).await.unwrap(),
+            vec!["redis_url"]
+        );
+    }
+}
+
+// ------------------------------------------------- Postgres READ COMMITTED races
+//
+// Two transactions from one pool stand for two nodes. Each test holds the
+// first at the racy point, starts the second in a task, waits for it to
+// block (or finish, which is the bug), then lets the first commit.
+
+async fn postgres() -> Option<Backend> {
+    backends().await.into_iter().find(|b| b.name == "postgres")
+}
+
+async fn racer_account(s: &Store, did: &str) {
+    let mut tx = s.begin().await.unwrap();
+    tx.insert_account(&crate::accounts::NewAccount {
+        did,
+        handle: &format!("{}.test", &did[8..]),
+        email: None,
+        password_hash: None,
+        status: crate::accounts::Status::Active,
+        did_method: "plc",
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Blob state as (state, unreferenced_since is set), or None if gone.
+async fn blob_state(s: &Store, did: &str, cid: &str) -> Option<(String, bool)> {
+    s.blob(did, cid)
+        .await
+        .unwrap()
+        .map(|b| (b.state, b.unreferenced_since.is_some()))
+}
+
+/// An upload of a CID an imported record references, racing the delete
+/// of that last record: whichever commits first, the blob ends a temp row
+/// (temp GC takes it) or permanent with `unreferenced_since` set; never
+/// permanent and unreferenced with it NULL (kept forever).
+#[tokio::test]
+async fn an_upload_racing_the_last_reference_delete_never_leaks() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:uploadrace";
+    racer_account(s, did).await;
+    let cid = "bafkreiuploadrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.replace_record_blobs(did, "app.bsky.feed.post", "r1", &[cid.to_owned()])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // The upload's metadata transaction, held after it saw the record.
+    let mut up = s.begin().await.unwrap();
+    up.lock_repo(did).await.unwrap();
+    up.insert_temp_blob(did, cid, "image/png", 3, "tmp/k1")
+        .await
+        .unwrap();
+    assert!(up.blob_has_records(did, cid).await.unwrap());
+    // The delete of the record, from another node.
+    let s2 = s.clone();
+    let delete = tokio::spawn(async move {
+        let mut tx = s2.begin().await.unwrap();
+        tx.lock_repo(did).await.unwrap();
+        tx.replace_record_blobs(did, "app.bsky.feed.post", "r1", &[])
+            .await
+            .unwrap();
+        tx.orphan_blob_if_unreferenced(did, cid).await.unwrap();
+        tx.commit().await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!delete.is_finished(), "the delete waits for the upload");
+    up.reference_blob(did, cid, "blobs/k1", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    up.commit().await.unwrap();
+    delete.await.unwrap();
+    assert_eq!(
+        blob_state(s, did, cid).await,
+        Some(("permanent".into(), true)),
+        "permanent, and unreferenced since the delete"
+    );
+}
+
+/// A GC batch that starts while a commit references an unreferenced
+/// blob past its grace: the commit's reference wins (the delete re-checks
+/// the row it waited for).
+#[tokio::test]
+async fn blob_gc_never_takes_a_blob_a_commit_is_referencing() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:gcrace";
+    racer_account(s, did).await;
+    let cid = "bafkreigcrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.insert_temp_blob(did, cid, "image/png", 3, "blobs/gc")
+        .await
+        .unwrap();
+    tx.reference_blob(did, cid, "blobs/gc2", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    let Store::Postgres(pool) = s else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE blob SET unreferenced_since = 0, pending_move = NULL WHERE did = $1")
+        .bind(did)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut commit = s.begin().await.unwrap();
+    commit.lock_repo(did).await.unwrap();
+    commit
+        .reference_blob(did, cid, "blobs/gc3", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let s2 = s.clone();
+    let gc = tokio::spawn(async move {
+        let mut tx = s2.begin().await.unwrap();
+        let n = tx.gc_blob_batch(1, 1, 100, 1).await.unwrap();
+        tx.commit().await.unwrap();
+        n
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!gc.is_finished(), "GC waits on the row the commit holds");
+    commit
+        .replace_record_blobs(did, "app.bsky.feed.post", "r1", &[cid.to_owned()])
+        .await
+        .unwrap();
+    commit.commit().await.unwrap();
+    assert_eq!(gc.await.unwrap(), 0, "nothing collected");
+    assert_eq!(
+        blob_state(s, did, cid).await,
+        Some(("permanent".into(), false))
+    );
+}
+
+/// Block GC racing a commit that re-references a zero-count block: the
+/// block survives with its new count.
+#[tokio::test]
+async fn block_gc_never_takes_a_block_a_commit_re_references() {
+    let Some(b) = postgres().await else { return };
+    let s = &b.store;
+    let did = "did:plc:blockrace";
+    let cid = "bafyreiblockrace";
+    let mut tx = s.begin().await.unwrap();
+    tx.put_unreferenced_block(did, cid, "rev1", b"block")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let Store::Postgres(pool) = s else {
+        unreachable!()
+    };
+    sqlx::query("UPDATE repo_block SET zero_since = 0 WHERE did = $1")
+        .bind(did)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut commit = s.begin().await.unwrap();
+    commit
+        .apply_block_deltas(
+            did,
+            "rev2",
+            &[crate::repo::BlockDelta {
+                cid: cid.into(),
+                bytes: Some(b"block".to_vec()),
+                delta: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    let s2 = s.clone();
+    let gc = tokio::spawn(async move { s2.gc_zero_blocks(1, 100).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!gc.is_finished(), "GC waits on the block the commit holds");
+    commit.commit().await.unwrap();
+    assert_eq!(gc.await.unwrap(), 0);
+    assert_eq!(s.repo_block_counts(did).await.unwrap().get(cid), Some(&1));
+}
+
+/// A NUL byte in a lookup is the caller's input error on Postgres (which
+/// can't store it), never a storage failure; SQLite just doesn't find it.
+#[tokio::test]
+async fn text_with_a_nul_byte_is_a_refusal_not_a_failure() {
+    for b in backends().await {
+        let r = b.store.account_by_handle("a\0b.test").await;
+        match b.name {
+            "postgres" => assert!(matches!(r, Err(CoreError::Invalid(_))), "{r:?}"),
+            _ => assert!(matches!(r, Ok(None)), "{}: {r:?}", b.name),
+        }
+    }
+}

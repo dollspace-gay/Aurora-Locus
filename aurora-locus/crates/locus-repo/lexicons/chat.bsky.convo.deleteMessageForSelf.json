@@ -1,0 +1,45 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Marks a message as deleted for the viewer, so they won't see that message in future enumerations.",
+      "errors": [
+        {
+          "name": "InvalidConvo"
+        },
+        {
+          "description": "Indicates that this message cannot be deleted, e.g. because it is a system message.",
+          "name": "MessageDeleteNotAllowed"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "convoId": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "convoId",
+            "messageId"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "chat.bsky.convo.defs#deletedMessageView",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "chat.bsky.convo.deleteMessageForSelf",
+  "lexicon": 1
+}
