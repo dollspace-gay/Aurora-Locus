@@ -1,0 +1,21 @@
+[package]
+name = "locus-web"
+description = "Operator console, account portal, OAuth pages, setup wizard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+askama = "0.12"
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cssparser = "0.34"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[lints]
+workspace = true

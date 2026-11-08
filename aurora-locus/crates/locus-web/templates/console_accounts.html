@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<form class="filters" method="get" action="/admin/accounts" role="search">
+<label for="q" class="muted">Find</label>
+<input type="search" id="q" name="q" value="{{ q }}" placeholder="A handle, email or DID (or its start)">
+<button type="submit" class="secondary">Search</button>
+</form>
+<div class="scroll"><table>
+<thead><tr><th class="name">Handle</th><th class="text">DID</th><th class="text">Email</th><th class="state">Status</th><th class="when">Created</th></tr></thead>
+<tbody>
+{% for a in rows %}<tr><td class="name"><a href="{{ a.href }}">@{{ a.handle }}</a></td><td class="text"><div class="cell-text"><code>{{ a.did }}</code></div></td><td class="text"><div class="cell-text">{{ a.email }}</div></td><td class="state"><span class="pill {{ a.class }}">{{ a.status }}</span></td><td class="when">{{ a.created }}</td></tr>
+{% else %}<tr><td class="text" colspan="5"><div class="cell-text">{% if q.is_empty() %}No accounts yet.{% else %}No account matches.{% endif %}</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% if let Some(m) = more %}<p><a class="button secondary" href="{{ m }}">More</a></p>{% endif %}
+{% if can_create %}
+<details class="advanced"><summary>Create an account</summary>
+<div class="card">
+<form class="stack" method="post" action="/admin/accounts/create">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="handle">Handle</label>
+<input type="text" id="handle" name="handle" spellcheck="false" autocomplete="off" required>
+<div class="hint">Under {{ domains }}.</div>
+<label for="email">Email</label>
+<input type="email" id="email" name="email" required>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<div class="hint">Give it to its owner safely; they can change it in their app.</div>
+<fieldset class="choices column">
+<legend>Identity (DID)</legend>
+<label class="choice"><input type="radio" name="did_method" value="plc" checked> did:plc (recommended)</label>
+<div class="hint">Registered in the public PLC directory. The account can move to another PDS later, and rotation keys can recover it.</div>
+<label class="choice"><input type="radio" name="did_method" value="web"> did:web</label>
+<div class="hint">The identity is the handle's web address (<code>did:web:</code> plus the handle), and this server serves its DID document. Before choosing it:</div>
+<ul class="hint">
+<li>The DID is tied to the handle's hostname forever: the handle can change later, the DID can't.</li>
+<li>There are no rotation keys: whoever controls that hostname controls the identity.</li>
+<li>Moving to another PDS needs the new PDS, or the owner, to serve the DID document at that hostname.</li>
+</ul>
+</fieldset>
+<div class="row"><button type="submit">Create</button></div>
+</form>
+</div>
+</details>
+{% endif %}
+{% endblock %}

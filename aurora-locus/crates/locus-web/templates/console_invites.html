@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<p class="muted">{% if required %}Sign-ups need an invite code.{% else %}Sign-ups are open: codes aren't needed, though they still work.{% endif %} <a href="/admin/settings?q=invite">Invite settings</a></p>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+{% if !new_codes.is_empty() %}<div class="card"><h2>New codes</h2>{% for c in new_codes %}<p><code>{{ c }}</code></p>{% endfor %}</div>{% endif %}
+{% if can_moderate %}
+<div class="card">
+<form class="stack" method="post" action="/admin/invites/create">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="count">How many codes</label>
+<input type="number" id="count" name="count" value="1" min="1" max="100">
+<label for="uses">Uses each</label>
+<input type="number" id="uses" name="uses" value="1" min="1" max="1000">
+<div class="row"><button type="submit">Create codes</button></div>
+</form>
+</div>
+{% endif %}
+<nav class="tabs" aria-label="Order"><a href="/admin/invites"{% if sort == "recent" %} aria-current="page"{% endif %}>Newest</a><a href="/admin/invites?sort=usage"{% if sort == "usage" %} aria-current="page"{% endif %}>Most used</a></nav>
+<div class="scroll"><table>
+<thead><tr><th class="name">Code</th><th class="num">Left</th><th class="num">Used</th><th class="name">For</th><th class="when">Created</th><th class="state">State</th><th class="actions"></th></tr></thead>
+<tbody>
+{% for c in rows %}<tr><td class="name"><code>{{ c.code }}</code></td><td class="num">{{ c.available }}</td><td class="num">{{ c.uses }}</td><td class="name">{{ c.for_account }}</td><td class="when">{{ c.created }}</td><td class="state">{% if c.disabled %}<span class="pill off">disabled</span>{% else if c.available == 0 %}<span class="pill off">used up</span>{% else %}<span class="pill on">usable</span>{% endif %}</td><td class="actions">{% if can_moderate && !c.disabled && c.available > 0 %}<form class="inline" method="post" action="/admin/invites/disable"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ c.code }}"><button type="submit" class="secondary">Disable</button></form>{% endif %}</td></tr>
+{% else %}<tr><td class="text" colspan="7"><div class="cell-text">No invite codes yet.</div></td></tr>
+{% endfor %}</tbody>
+</table></div>
+{% if let Some(m) = more %}<p><a class="button secondary" href="{{ m }}">More</a></p>{% endif %}
+{% endblock %}

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e7d60f4cb1abf63bb2de97e0488a166c6c514fe38af6e74817d787c66ab9d1a3 # shrinks to batches = [[Create { coll: 0, rkey: 0, n: 0 }, Delete { pick: 0 }]]
+cc 099c5faf4d2eaccb1eee5147a50857e298b0b8dd5ee61e651b560d665149fd68 # shrinks to batches = [[Create { coll: 2, rkey: 33, n: 0 }], [Delete { pick: 0 }]]

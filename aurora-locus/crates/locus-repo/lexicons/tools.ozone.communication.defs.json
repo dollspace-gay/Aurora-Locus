@@ -1,0 +1,56 @@
+{
+  "defs": {
+    "templateView": {
+      "properties": {
+        "contentMarkdown": {
+          "description": "Subject of the message, used in emails.",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "lang": {
+          "description": "Message language.",
+          "format": "language",
+          "type": "string"
+        },
+        "lastUpdatedBy": {
+          "description": "DID of the user who last updated the template.",
+          "format": "did",
+          "type": "string"
+        },
+        "name": {
+          "description": "Name of the template.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "Content of the template, can contain markdown and variable placeholders.",
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "contentMarkdown",
+        "disabled",
+        "lastUpdatedBy",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.communication.defs",
+  "lexicon": 1
+}

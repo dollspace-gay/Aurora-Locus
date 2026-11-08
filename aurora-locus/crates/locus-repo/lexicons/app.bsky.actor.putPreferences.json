@@ -1,0 +1,26 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Set the private preferences attached to the account.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "preferences": {
+              "ref": "app.bsky.actor.defs#preferences",
+              "type": "ref"
+            }
+          },
+          "required": [
+            "preferences"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "app.bsky.actor.putPreferences",
+  "lexicon": 1
+}

@@ -1,0 +1,88 @@
+{
+  "defs": {
+    "main": {
+      "description": "List verifications",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "verifications": {
+              "items": {
+                "ref": "tools.ozone.verification.defs#verificationView",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "verifications"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "createdAfter": {
+            "description": "Filter to verifications created after this timestamp",
+            "format": "datetime",
+            "type": "string"
+          },
+          "createdBefore": {
+            "description": "Filter to verifications created before this timestamp",
+            "format": "datetime",
+            "type": "string"
+          },
+          "cursor": {
+            "description": "Pagination cursor",
+            "type": "string"
+          },
+          "isRevoked": {
+            "description": "Filter to verifications that are revoked or not. By default, includes both.",
+            "type": "boolean"
+          },
+          "issuers": {
+            "description": "Filter to verifications from specific issuers",
+            "items": {
+              "format": "did",
+              "type": "string"
+            },
+            "maxLength": 100,
+            "type": "array"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Maximum number of results to return",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "sortDirection": {
+            "default": "desc",
+            "description": "Sort direction for creation date",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "type": "string"
+          },
+          "subjects": {
+            "description": "Filter to specific verified DIDs",
+            "items": {
+              "format": "did",
+              "type": "string"
+            },
+            "maxLength": 100,
+            "type": "array"
+          }
+        },
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.verification.listVerifications",
+  "lexicon": 1
+}

@@ -1,0 +1,30 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Record representing a block relationship against an entire an entire list of accounts (actors).",
+      "key": "tid",
+      "record": {
+        "properties": {
+          "createdAt": {
+            "format": "datetime",
+            "type": "string"
+          },
+          "subject": {
+            "description": "Reference (AT-URI) to the mod list record.",
+            "format": "at-uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "app.bsky.graph.listblock",
+  "lexicon": 1
+}

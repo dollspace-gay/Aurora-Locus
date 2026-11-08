@@ -1,0 +1,466 @@
+{
+  "defs": {
+    "actionView": {
+      "description": "A single moderation action taken against a subject.",
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "expiresAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "id": {
+          "description": "Action ID (moderation event ID).",
+          "type": "integer"
+        },
+        "labels": {
+          "description": "Label values, for labelApplied/labelRemoved.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "policies": {
+          "description": "Policies applied by a takedown action.",
+          "items": {
+            "ref": "#policyView",
+            "type": "ref"
+          },
+          "type": "array"
+        },
+        "reversedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "scope": {
+          "knownValues": [
+            "network",
+            "app",
+            "labelOnly"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "description": "Public action type.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "appealView": {
+      "description": "The state of the viewer's appeal against the actions on a subject.",
+      "properties": {
+        "appealableUntil": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "appealedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "outcome": {
+          "description": "Decision on a resolved appeal.",
+          "knownValues": [
+            "approved",
+            "denied"
+          ],
+          "type": "string"
+        },
+        "resolvedAt": {
+          "description": "When the appeal's report was closed.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "state": {
+          "knownValues": [
+            "none",
+            "pending",
+            "resolved",
+            "superseded",
+            "expired"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "enforcementView": {
+      "description": "The current enforcement state of a subject.",
+      "properties": {
+        "expiresAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "labels": {
+          "description": "Active label values on the subject, excluding negated and expired labels.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "knownValues": [
+            "network",
+            "app",
+            "labelOnly"
+          ],
+          "type": "string"
+        },
+        "state": {
+          "knownValues": [
+            "none",
+            "labeled",
+            "removed",
+            "suspended",
+            "takendown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "notification": {
+      "properties": {
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "isRead": {
+          "type": "boolean"
+        },
+        "reason": {
+          "knownValues": [
+            "reportResolved",
+            "reportReopened",
+            "actionTaken",
+            "actionReversed",
+            "appealResolved",
+            "standingChanged"
+          ],
+          "type": "string"
+        },
+        "target": {
+          "refs": [
+            "#reportRef",
+            "#subjectRef",
+            "#standingRef"
+          ],
+          "type": "union"
+        }
+      },
+      "required": [
+        "id",
+        "reason",
+        "target",
+        "isRead",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "notificationPreferences": {
+      "description": "Push notification preferences by moderation notification category. These preferences do not hide in-app inbox activity. Each category defaults to enabled.",
+      "properties": {
+        "account": {
+          "description": "Notify about moderation actions against the account or its content, action reversals, appeal outcomes, and standing changes. Label application and removal are controlled by labels.",
+          "type": "boolean"
+        },
+        "labels": {
+          "description": "Notify when labels are applied to or removed from the account or its content (labelApplied and labelRemoved actions).",
+          "type": "boolean"
+        },
+        "reports": {
+          "description": "Notify about outcomes of reports filed by the account (reportResolved and reportReopened).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "reports",
+        "account",
+        "labels"
+      ],
+      "type": "object"
+    },
+    "policyView": {
+      "properties": {
+        "displayName": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "link": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "displayName",
+        "link"
+      ],
+      "type": "object"
+    },
+    "reportRef": {
+      "description": "Reference to a report by its report table ID, as used by getReport and Ozone's report detail page.",
+      "properties": {
+        "reportId": {
+          "type": "integer"
+        },
+        "status": {
+          "knownValues": [
+            "pending",
+            "resolved"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef"
+          ],
+          "type": "union"
+        }
+      },
+      "required": [
+        "reportId"
+      ],
+      "type": "object"
+    },
+    "reportsSummary": {
+      "description": "Aggregate view of reports filed against this subject. Deliberately carries no report IDs, no count, and no reporter identities.",
+      "properties": {
+        "firstReportedOn": {
+          "description": "Day of the earliest report, truncated to midnight UTC. Render as a date; the time component is not meaningful.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "lastReportedOn": {
+          "description": "Day of the most recent report, truncated to midnight UTC. Render as a date; the time component is not meaningful.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "reasonTypes": {
+          "description": "Distinct reason types reported, deduplicated and unordered. Excludes reasonAppeal.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "reasonTypes",
+        "firstReportedOn",
+        "lastReportedOn"
+      ],
+      "type": "object"
+    },
+    "standingRef": {
+      "properties": {
+        "previousStanding": {
+          "knownValues": [
+            "good",
+            "warning",
+            "atRisk"
+          ],
+          "type": "string"
+        },
+        "standing": {
+          "knownValues": [
+            "good",
+            "warning",
+            "atRisk"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "standing"
+      ],
+      "type": "object"
+    },
+    "subjectRef": {
+      "properties": {
+        "actionId": {
+          "type": "integer"
+        },
+        "actionType": {
+          "type": "string"
+        },
+        "appealOutcome": {
+          "description": "Decision captured when an appealResolved notification was created. Omitted when the outcome is unknown.",
+          "knownValues": [
+            "approved",
+            "denied"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef"
+          ],
+          "type": "union"
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "type": "object"
+    },
+    "subjectView": {
+      "description": "A subject belonging to the viewer that has moderation actions against it.",
+      "properties": {
+        "actionCount": {
+          "type": "integer"
+        },
+        "appeal": {
+          "ref": "#appealView",
+          "type": "ref"
+        },
+        "availableActions": {
+          "items": {
+            "knownValues": [
+              "appeal"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "enforcement": {
+          "ref": "#enforcementView",
+          "type": "ref"
+        },
+        "isRead": {
+          "type": "boolean"
+        },
+        "latestAction": {
+          "ref": "#actionView",
+          "type": "ref"
+        },
+        "src": {
+          "description": "DID of the moderation service that took the actions.",
+          "format": "did",
+          "type": "string"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef"
+          ],
+          "type": "union"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "src",
+        "subject",
+        "enforcement",
+        "isRead",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "subjectViewDetail": {
+      "description": "A subject with a page of its action history and an aggregate report summary. Follow cursor to retrieve older actions; enforcement and appeal describe the current subject state on every page.",
+      "properties": {
+        "actions": {
+          "description": "A page of action history, most recent first. Reversal timestamps include changes outside this page.",
+          "items": {
+            "ref": "#actionView",
+            "type": "ref"
+          },
+          "maxLength": 100,
+          "type": "array"
+        },
+        "appeal": {
+          "ref": "#appealView",
+          "type": "ref"
+        },
+        "availableActions": {
+          "items": {
+            "knownValues": [
+              "appeal"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "createdAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "cursor": {
+          "description": "Cursor for the next page of action history. Omitted when no older actions remain.",
+          "type": "string"
+        },
+        "enforcement": {
+          "ref": "#enforcementView",
+          "type": "ref"
+        },
+        "isRead": {
+          "type": "boolean"
+        },
+        "record": {
+          "description": "Raw record JSON for the subject, when the subject is a record and the record is available.",
+          "type": "unknown"
+        },
+        "reports": {
+          "description": "Omitted when the subject has never been reported, e.g. proactive enforcement.",
+          "ref": "#reportsSummary",
+          "type": "ref"
+        },
+        "src": {
+          "format": "did",
+          "type": "string"
+        },
+        "subject": {
+          "refs": [
+            "com.atproto.admin.defs#repoRef",
+            "com.atproto.repo.strongRef"
+          ],
+          "type": "union"
+        },
+        "updatedAt": {
+          "format": "datetime",
+          "type": "string"
+        }
+      },
+      "required": [
+        "src",
+        "subject",
+        "enforcement",
+        "isRead",
+        "actions",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.inbox.defs",
+  "lexicon": 1
+}

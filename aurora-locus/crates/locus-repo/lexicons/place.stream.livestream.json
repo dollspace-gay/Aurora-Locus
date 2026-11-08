@@ -1,0 +1,230 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "livestreamView": {
+      "properties": {
+        "author": {
+          "ref": "app.bsky.actor.defs#profileViewBasic",
+          "type": "ref"
+        },
+        "cid": {
+          "format": "cid",
+          "type": "string"
+        },
+        "indexedAt": {
+          "format": "datetime",
+          "type": "string"
+        },
+        "record": {
+          "type": "unknown"
+        },
+        "uri": {
+          "format": "at-uri",
+          "type": "string"
+        },
+        "viewerCount": {
+          "description": "The number of viewers watching this livestream. Use when you can't reasonably use #viewerCount directly.",
+          "ref": "#viewerCount",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "uri",
+        "cid",
+        "author",
+        "record",
+        "indexedAt"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Record announcing a livestream is happening",
+      "key": "tid",
+      "record": {
+        "properties": {
+          "activity": {
+            "description": "The game or activity being streamed.",
+            "refs": [
+              "place.stream.defs#activityGame",
+              "place.stream.defs#activityLabel"
+            ],
+            "type": "union"
+          },
+          "agent": {
+            "description": "The source of the livestream, if available, in a User Agent format: `<product> / <product-version> <comment>` e.g. Streamplace/0.7.5 iOS",
+            "type": "string"
+          },
+          "canonicalUrl": {
+            "description": "The primary URL where this livestream can be viewed, if available.",
+            "format": "uri",
+            "type": "string"
+          },
+          "createdAt": {
+            "description": "Client-declared timestamp when this livestream started.",
+            "format": "datetime",
+            "type": "string"
+          },
+          "endedAt": {
+            "description": "Client-declared timestamp when this livestream ended. Ended livestreams are not supposed to start up again.",
+            "format": "datetime",
+            "type": "string"
+          },
+          "idleTimeoutSeconds": {
+            "description": "Time in seconds after which this livestream should be automatically ended if idle. Zero means no timeout.",
+            "type": "integer"
+          },
+          "lastSeenAt": {
+            "description": "Client-declared timestamp when this livestream was last seen by the Streamplace station.",
+            "format": "datetime",
+            "type": "string"
+          },
+          "notificationSettings": {
+            "ref": "place.stream.livestream#notificationSettings",
+            "type": "ref"
+          },
+          "post": {
+            "description": "The post that announced this livestream.",
+            "ref": "com.atproto.repo.strongRef",
+            "type": "ref"
+          },
+          "tags": {
+            "description": "Freeform tags for this stream. Each tag must be alphanumeric (a-z, A-Z, 0-9) plus colon. Tags with colons indicate a specific tag group (e.g. 'lang:en' indicates the stream's primary language).",
+            "items": {
+              "maxGraphemes": 64,
+              "maxLength": 640,
+              "type": "string"
+            },
+            "maxLength": 10,
+            "type": "array"
+          },
+          "thumb": {
+            "accept": [
+              "image/*"
+            ],
+            "maxSize": 1000000,
+            "type": "blob"
+          },
+          "title": {
+            "description": "The title of the livestream, as it will be announced to followers.",
+            "maxGraphemes": 140,
+            "maxLength": 1400,
+            "type": "string"
+          },
+          "url": {
+            "description": "The URL where this stream can be found. This is primarily a hint for other Streamplace nodes to locate and replicate the stream.",
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "createdAt"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    },
+    "notificationSettings": {
+      "properties": {
+        "pushNotification": {
+          "description": "Whether this livestream should trigger a push notification to followers.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "streamplaceAnything": {
+      "properties": {
+        "livestream": {
+          "refs": [
+            "#livestreamView",
+            "#viewerCount",
+            "#teleportArrival",
+            "#teleportCanceled",
+            "place.stream.defs#blockView",
+            "place.stream.defs#renditions",
+            "place.stream.defs#rendition",
+            "place.stream.chat.defs#messageView",
+            "place.stream.chat.defs#pinnedRecordView"
+          ],
+          "type": "union"
+        }
+      },
+      "required": [
+        "livestream"
+      ],
+      "type": "object"
+    },
+    "teleportArrival": {
+      "properties": {
+        "chatProfile": {
+          "description": "The chat profile of the source streamer",
+          "ref": "place.stream.chat.profile",
+          "type": "ref"
+        },
+        "source": {
+          "description": "The streamer who is teleporting their viewers here",
+          "ref": "app.bsky.actor.defs#profileViewBasic",
+          "type": "ref"
+        },
+        "startsAt": {
+          "description": "When this teleport started",
+          "format": "datetime",
+          "type": "string"
+        },
+        "teleportUri": {
+          "description": "The URI of the teleport record",
+          "format": "at-uri",
+          "type": "string"
+        },
+        "viewerCount": {
+          "description": "How many viewers are arriving from this teleport",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "teleportUri",
+        "source",
+        "viewerCount",
+        "startsAt"
+      ],
+      "type": "object"
+    },
+    "teleportCanceled": {
+      "properties": {
+        "reason": {
+          "description": "Why this teleport was canceled",
+          "enum": [
+            "deleted",
+            "denied",
+            "expired"
+          ],
+          "type": "string"
+        },
+        "teleportUri": {
+          "description": "The URI of the teleport record that was canceled",
+          "format": "at-uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "teleportUri",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "viewerCount": {
+      "properties": {
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "place.stream.livestream",
+  "lexicon": 1
+}

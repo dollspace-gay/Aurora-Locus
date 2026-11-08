@@ -1,0 +1,34 @@
+# Postgres for locus on the same machine, added to the default stack:
+#
+#   docker compose -f compose.yaml -f compose.postgres.yaml up -d
+#
+# Set POSTGRES_PASSWORD in .env, and in locus.env:
+#   LOCUS_DATABASE_URL=postgres://locus:<the same password>@postgres:5432/locus
+#   LOCUS_MASTER_KEY_SOURCE=env
+#   LOCUS_MASTER_KEY=<64 hex characters: openssl rand -hex 32>
+# (a master key file is made automatically only for SQLite). Back the key up.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: locus
+      POSTGRES_DB: locus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      locus: {}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "locus"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  locus:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<p class="muted">Every runtime setting. Each change is checked before it's saved, applies at once on every node, and is recorded in the audit log.{% if !can_edit %} Your role can read these but not change them.{% endif %}</p>
+{% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
+{% endfor %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<form class="filters" method="get" action="/admin/settings" role="search">
+<label for="q" class="muted">Find</label>
+<input type="search" id="q" name="q" value="{{ q }}" placeholder="mail, invite, kryphocron…">
+<button type="submit" class="secondary">Search</button>
+</form>
+{% for g in groups %}
+<h2 id="g-{{ g.key }}">{{ g.label }}</h2>
+<div class="settings-cards">
+{% for f in g.fields %}{% include "setting_field.html" %}
+{% endfor %}</div>
+{% else %}
+<p>No setting matches.</p>
+{% endfor %}
+{% endblock %}

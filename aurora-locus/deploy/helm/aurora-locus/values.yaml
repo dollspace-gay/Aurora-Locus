@@ -1,0 +1,160 @@
+# aurora-locus on Kubernetes. docs/kubernetes.md walks through both
+# profiles; every value is described here.
+
+# The image. Build it from the workspace and push it to a registry your
+# cluster can pull from:
+#   docker build -f deploy/docker/Dockerfile -t <registry>/aurora-locus:<tag> .
+image:
+  repository: ""
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# small: SQLite and blobs on one PersistentVolume, exactly one pod.
+# large: Postgres and S3, any number of pods. Needs secretEnv (for
+#        LOCUS_DATABASE_URL and the master key) and blobs.s3.bucket.
+profile: small
+
+# Pods, large profile only (the small profile always runs one).
+replicaCount: 2
+
+# The PDS hostname (PDS_HOSTNAME). Required.
+hostname: ""
+# Domains handles can be on, each starting with a dot. Empty: handles under
+# the hostname (".<hostname>").
+handleDomains: []
+
+# Where client addresses come from. Locus trusts forwarded headers only from
+# these ranges: set them to your ingress controller's pod range (or the load
+# balancer's addresses). Left empty, locus trusts only loopback and every
+# request appears to come from the ingress, so rate limits would apply to
+# everyone at once.
+trustedProxies: []
+# caddy, cloudflare, other or direct (LOCUS_PROXY_MODE).
+proxyMode: other
+
+# Non-secret environment: any PDS_* or LOCUS_* bootstrap variable, or a
+# runtime setting's initial value (docs/design/operations.md lists them).
+env: {}
+  # PDS_INVITE_REQUIRED: "true"
+  # PDS_BSKY_APP_VIEW_URL: https://api.bsky.app
+  # PDS_BSKY_APP_VIEW_DID: did:web:api.bsky.app
+
+# A Secret whose keys are environment variables, read with envFrom. Put every
+# secret here, never in env:
+#   LOCUS_DATABASE_URL                  large profile: postgres://…
+#   LOCUS_MASTER_KEY                    large profile with masterKeySource env:
+#                                       64 hex characters, the same on every pod
+#   PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY  with S3
+#   LOCUS_REDIS_URL                     optional, when it carries a password
+#   PDS_EMAIL_SMTP_URL                  optional
+#   LOCUS_SETUP_OPERATOR_PASSWORD       with setup.auto
+#   PDS_ADMIN_PASSWORD                  optional
+secretEnv:
+  existingSecret: ""
+
+# The master key that encrypts every stored secret and signing key.
+# small: a key file generated on the volume at first start (back it up:
+#        `aurora-locus keys show`, `keys backup`).
+# large: env (LOCUS_MASTER_KEY in secretEnv) or kms (with
+#        LOCUS_MASTER_KEY_KMS_ID in env and the KMS credentials in secretEnv).
+masterKeySource: env
+
+# Optional Redis for rate limits and replay windows across pods. Without a
+# password it can go here; otherwise put LOCUS_REDIS_URL in secretEnv.
+redisUrl: ""
+
+blobs:
+  # Required for the large profile; optional for the small one (blobs then
+  # stay on the volume). Applies at first start; to move an existing install's
+  # blobs, use `aurora-locus migrate blobs`.
+  s3:
+    bucket: ""
+    region: ""
+    # For S3-compatible services (MinIO, R2, B2, SeaweedFS).
+    endpoint: ""
+    forcePathStyle: false
+    accessKeyId: ""
+    # The secret key goes in secretEnv: PDS_BLOBSTORE_S3_SECRET_ACCESS_KEY.
+    # A separate bucket for gated media (LOCUS_BLOBSTORE_S3_GATED_BUCKET).
+    gatedBucket: ""
+
+# Headless setup: the first start completes setup from env instead of the
+# wizard (docs/design/operations.md, "Headless setup"). Off, open
+# https://<hostname>/setup and enter the setup token from the pod's log.
+setup:
+  auto: false
+  operatorUsername: ""
+  # Must be true for headless setup: you have a copy of the master key or
+  # will make a key backup.
+  keysBackupAcknowledged: false
+  # Subdomains of the handle domain already in use (www, mail, …).
+  existingSubdomains: []
+
+# Small profile: the volume for the database, blobs and the key file.
+persistence:
+  size: 20Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  # Use a claim you made yourself instead of one from this chart.
+  existingClaim: ""
+  # Keep the claim when the release is uninstalled.
+  keep: true
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: false
+  className: ""
+  # Uploads and imports are large and the firehose is a long-lived
+  # WebSocket, so raise the controller's limits. For ingress-nginx:
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  #   cert-manager.io/cluster-issuer: <a DNS-01 issuer, for the wildcard>
+  annotations: {}
+  # The hostname and a wildcard for every handle domain are routed.
+  # A certificate covering them (the wildcard needs DNS-01):
+  tls:
+    secretName: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 2Gi
+
+# Large profile: keep this many pods during voluntary disruptions.
+podDisruptionBudget:
+  minAvailable: 1
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Extra containers, volumes and mounts (a log shipper, an OTLP collector).
+extraContainers: []
+extraVolumes: []
+extraVolumeMounts: []

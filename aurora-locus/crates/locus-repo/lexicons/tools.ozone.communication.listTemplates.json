@@ -1,0 +1,28 @@
+{
+  "defs": {
+    "main": {
+      "description": "Get list of all communication templates.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "communicationTemplates": {
+              "items": {
+                "ref": "tools.ozone.communication.defs#templateView",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "communicationTemplates"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.communication.listTemplates",
+  "lexicon": 1
+}

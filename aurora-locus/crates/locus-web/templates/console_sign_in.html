@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block main_class %} class="narrow"{% endblock %}
+{% block content %}
+<h1>{% if code_stage %}Enter your sign-in code{% else %}Sign in to the console{% endif %}</h1>
+{% if let Some(e) = error %}<div class="banner bad" role="alert">{{ e }}</div>{% endif %}
+{% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
+<div class="card">
+{% if code_stage %}
+<form class="stack" method="post" action="/admin/sign-in/code">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="code">The 6-digit code from your sign-in code app</label>
+<input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" required autofocus>
+<div class="row"><button type="submit">Sign in</button></div>
+</form>
+{% else %}
+<form class="stack" method="post" action="/admin/sign-in">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="username">Operator username</label>
+<input type="text" id="username" name="username" value="{{ username }}" autocomplete="username" spellcheck="false" required autofocus>
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required>
+<div class="hint">The console is for the people who run this PDS. Account holders sign in at their app instead.</div>
+<div class="row"><button type="submit">Continue</button></div>
+</form>
+{% endif %}
+</div>
+{% endblock %}

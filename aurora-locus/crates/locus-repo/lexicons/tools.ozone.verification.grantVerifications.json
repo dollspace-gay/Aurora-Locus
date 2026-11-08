@@ -1,0 +1,104 @@
+{
+  "defs": {
+    "grantError": {
+      "description": "Error object for failed verifications.",
+      "properties": {
+        "error": {
+          "description": "Error message describing the reason for failure.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The did of the subject being verified",
+          "format": "did",
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "subject"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Grant verifications to multiple subjects. Allows batch processing of up to 100 verifications at once.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "verifications": {
+              "description": "Array of verification requests to process",
+              "items": {
+                "ref": "#verificationInput",
+                "type": "ref"
+              },
+              "maxLength": 100,
+              "type": "array"
+            }
+          },
+          "required": [
+            "verifications"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "failedVerifications": {
+              "items": {
+                "ref": "#grantError",
+                "type": "ref"
+              },
+              "type": "array"
+            },
+            "verifications": {
+              "items": {
+                "ref": "tools.ozone.verification.defs#verificationView",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "verifications",
+            "failedVerifications"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    },
+    "verificationInput": {
+      "properties": {
+        "createdAt": {
+          "description": "Timestamp for verification record. Defaults to current time when not specified.",
+          "format": "datetime",
+          "type": "string"
+        },
+        "displayName": {
+          "description": "Display name of the subject the verification applies to at the moment of verifying.",
+          "type": "string"
+        },
+        "handle": {
+          "description": "Handle of the subject the verification applies to at the moment of verifying.",
+          "format": "handle",
+          "type": "string"
+        },
+        "subject": {
+          "description": "The did of the subject being verified",
+          "format": "did",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "handle",
+        "displayName"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "tools.ozone.verification.grantVerifications",
+  "lexicon": 1
+}

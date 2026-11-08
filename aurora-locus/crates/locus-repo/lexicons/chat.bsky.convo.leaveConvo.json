@@ -1,0 +1,56 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Leaves a conversation (direct or group). For group, this effectively removes membership. For direct, membership is never removed, only changed to remove from enumerations by the user who left.",
+      "errors": [
+        {
+          "name": "InvalidConvo"
+        },
+        {
+          "description": "The user has already left the conversation and is not back in (a direct conversation can be restarted by a new message, which allows leaving again).",
+          "name": "AlreadyLeftConvo"
+        },
+        {
+          "description": "The owner of a group conversation cannot leave before locking the group.",
+          "name": "OwnerCannotLeave"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "convoId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "convoId"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "convoId": {
+              "type": "string"
+            },
+            "rev": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "convoId",
+            "rev"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "chat.bsky.convo.leaveConvo",
+  "lexicon": 1
+}

@@ -1,0 +1,61 @@
+[package]
+name = "aurora-locus"
+description = "aurora-locus: an atproto PDS built on proto-blue, with kryphocron built in"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aurora-locus"
+path = "src/main.rs"
+
+[dependencies]
+locus-core.workspace = true
+locus-store.workspace = true
+locus-repo.workspace = true
+locus-identity.workspace = true
+locus-auth.workspace = true
+locus-kryphocron.workspace = true
+locus-blob.workspace = true
+locus-sync.workspace = true
+locus-http.workspace = true
+locus-web.workspace = true
+locus-mail.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true
+arc-swap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+proto-blue-crypto.workspace = true
+proto-blue-lex-data.workspace = true
+proto-blue-lex-cbor.workspace = true
+proto-blue-repo.workspace = true
+hex.workspace = true
+sqlx.workspace = true
+serde_json.workspace = true
+rpassword.workspace = true
+url.workspace = true
+# Optional OTLP trace export (when OTEL_EXPORTER_OTLP_ENDPOINT is set), over
+# plain HTTP to a local collector or agent. No TLS feature: it would bring a
+# second rustls crypto provider, and rustls then can't pick a default.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+axum = "0.8"
+tempfile.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }

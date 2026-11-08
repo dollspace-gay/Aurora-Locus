@@ -1,0 +1,79 @@
+# aurora-locus with Caddy in front. deploy/install.sh writes locus.env and
+# the Caddyfile next to this file and starts it; to do it by hand:
+#
+#   aurora-locus deploy caddyfile --email you@example.com > Caddyfile
+#   docker compose up -d --build
+#
+# Only Caddy publishes public ports. locus publishes 3000 on 127.0.0.1 only
+# (for the CLI over HTTP on this machine; LOCUS_LOCAL_PORT in .env picks
+# another host port); never 0.0.0.0, which would let clients skip Caddy.
+name: aurora-locus
+
+services:
+  locus:
+    image: ${LOCUS_IMAGE:-aurora-locus:latest}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    env_file: [locus.env]
+    volumes:
+      - locus-data:/data
+    ports:
+      - "127.0.0.1:${LOCUS_LOCAL_PORT:-3000}:3000"
+    networks:
+      locus: {}
+    healthcheck:
+      test: ["CMD", "aurora-locus", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  caddy:
+    # caddy:2 for on-demand and Cloudflare certificates; locus-caddy (built
+    # from deploy/docker/caddy) for DNS-01 wildcards.
+    image: ${CADDY_IMAGE:-caddy:2}
+    restart: unless-stopped
+    depends_on: [locus]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # The DNS provider's token, for DNS-01 wildcards.
+      DNS_API_TOKEN: ${DNS_API_TOKEN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      # A fixed address, so locus can trust exactly this one proxy
+      # (LOCUS_TRUSTED_PROXIES=172.30.53.2/32), not the bridge gateway that
+      # Docker's userland proxy connects from.
+      locus:
+        ipv4_address: ${LOCUS_CADDY_IP:-172.30.53.2}
+
+  # Automatic updates, as the reference offers: off by default.
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --cleanup --interval 86400 aurora-locus-locus-1
+
+networks:
+  locus:
+    ipam:
+      config:
+        - subnet: ${LOCUS_SUBNET:-172.30.53.0/24}
+          gateway: ${LOCUS_GATEWAY:-172.30.53.1}
+          # Dynamic addresses only from the upper half, so no container can
+          # take Caddy's .2 by starting first.
+          ip_range: ${LOCUS_IP_RANGE:-172.30.53.128/25}
+
+volumes:
+  locus-data:
+  caddy-data:
+  caddy-config:

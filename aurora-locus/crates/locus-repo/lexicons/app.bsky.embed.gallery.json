@@ -1,0 +1,99 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "image": {
+      "properties": {
+        "alt": {
+          "description": "Alt text description of the image, for accessibility.",
+          "type": "string"
+        },
+        "aspectRatio": {
+          "ref": "app.bsky.embed.defs#aspectRatio",
+          "type": "ref"
+        },
+        "image": {
+          "accept": [
+            "image/*"
+          ],
+          "maxSize": 2000000,
+          "type": "blob"
+        }
+      },
+      "required": [
+        "image",
+        "alt",
+        "aspectRatio"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "properties": {
+        "items": {
+          "description": "The schema-level maxLength of 20 is a future-proof ceiling. Clients should currently enforce a soft limit of 10 items in authoring UIs.",
+          "items": {
+            "description": "The media items in the gallery. Each item may be of a different type, but all types must be supported by the client.",
+            "refs": [
+              "#image"
+            ],
+            "type": "union"
+          },
+          "maxLength": 20,
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "view": {
+      "properties": {
+        "items": {
+          "items": {
+            "refs": [
+              "#viewImage"
+            ],
+            "type": "union"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "viewImage": {
+      "properties": {
+        "alt": {
+          "description": "Alt text description of the image, for accessibility.",
+          "type": "string"
+        },
+        "aspectRatio": {
+          "ref": "app.bsky.embed.defs#aspectRatio",
+          "type": "ref"
+        },
+        "fullsize": {
+          "description": "Fully-qualified URL where a large version of the image can be fetched. May or may not be the exact original blob. For example, CDN location provided by the App View.",
+          "format": "uri",
+          "type": "string"
+        },
+        "thumbnail": {
+          "description": "Fully-qualified URL where a thumbnail of the image can be fetched. For example, CDN location provided by the App View.",
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thumbnail",
+        "fullsize",
+        "alt",
+        "aspectRatio"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "An assortment of media embedded in a Bluesky record (eg, a post).",
+  "id": "app.bsky.embed.gallery",
+  "lexicon": 1
+}

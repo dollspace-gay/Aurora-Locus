@@ -1,0 +1,52 @@
+{
+  "defs": {
+    "main": {
+      "description": "Find repositories based on a search term.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "repos": {
+              "items": {
+                "ref": "tools.ozone.moderation.defs#repoView",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "repos"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "q": {
+            "type": "string"
+          },
+          "term": {
+            "description": "DEPRECATED: use 'q' instead",
+            "type": "string"
+          }
+        },
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.moderation.searchRepos",
+  "lexicon": 1
+}

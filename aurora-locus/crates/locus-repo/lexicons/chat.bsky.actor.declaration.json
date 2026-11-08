@@ -1,0 +1,37 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "A declaration of a Bluesky chat account.",
+      "key": "literal:self",
+      "record": {
+        "properties": {
+          "allowGroupInvites": {
+            "description": "Declaration about group chat invitation preferences for the record owner.",
+            "knownValues": [
+              "all",
+              "none",
+              "following"
+            ],
+            "type": "string"
+          },
+          "allowIncoming": {
+            "knownValues": [
+              "all",
+              "none",
+              "following"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "allowIncoming"
+        ],
+        "type": "object"
+      },
+      "type": "record"
+    }
+  },
+  "id": "chat.bsky.actor.declaration",
+  "lexicon": 1
+}

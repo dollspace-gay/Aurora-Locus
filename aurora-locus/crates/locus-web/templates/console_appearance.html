@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ shell.title }}</h1>
+<p class="muted">How the console looks to you. It's saved with your operator account, so it follows you to any device, and it changes nothing for other operators or for the PDS.</p>
+{% if saved %}<div class="banner ok" role="status">Saved. The console now uses it.</div>{% endif %}
+<div class="card">
+<form method="post" action="/admin/appearance">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<fieldset class="choices">
+<legend>Light or dark</legend>
+{% for m in modes %}<label class="choice"><input type="radio" name="mode" value="{{ m.value }}"{% if m.checked %} checked{% endif %}> {{ m.label }}</label>
+{% endfor %}</fieldset>
+<fieldset class="choices">
+<legend>Colours</legend>
+{% for s in schemes %}<label class="choice"><input type="radio" name="scheme" value="{{ s.value }}"{% if s.checked %} checked{% endif %}><span class="swatch scheme-{{ s.value }}" aria-hidden="true"></span> {{ s.label }}</label>
+{% endfor %}</fieldset>
+<fieldset class="choices">
+<legend>Font</legend>
+{% for f in fonts %}<label class="choice font-sample font-{{ f.value }}"><input type="radio" name="font" value="{{ f.value }}"{% if f.checked %} checked{% endif %}> {{ f.label }}</label>
+{% endfor %}</fieldset>
+<p class="muted">"Same as the device" follows the light or dark setting of the device you use. Each colour scheme has a light and a dark form. Each font is shown in its own face, and is served by this PDS.</p>
+<div class="row"><button type="submit">Save</button></div>
+</form>
+</div>
+{% endblock %}

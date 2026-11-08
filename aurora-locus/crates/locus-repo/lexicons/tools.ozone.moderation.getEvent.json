@@ -1,0 +1,28 @@
+{
+  "defs": {
+    "main": {
+      "description": "Get details about a moderation event.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.moderation.defs#modEventViewDetail",
+          "type": "ref"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "tools.ozone.moderation.getEvent",
+  "lexicon": 1
+}

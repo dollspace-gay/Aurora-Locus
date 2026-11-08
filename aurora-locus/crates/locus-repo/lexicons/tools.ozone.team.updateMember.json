@@ -1,0 +1,50 @@
+{
+  "defs": {
+    "main": {
+      "description": "Update a member in the ozone service. Requires admin role.",
+      "errors": [
+        {
+          "description": "The member being updated does not exist in the team",
+          "name": "MemberNotFound"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "did": {
+              "format": "did",
+              "type": "string"
+            },
+            "disabled": {
+              "type": "boolean"
+            },
+            "role": {
+              "knownValues": [
+                "tools.ozone.team.defs#roleAdmin",
+                "tools.ozone.team.defs#roleModerator",
+                "tools.ozone.team.defs#roleVerifier",
+                "tools.ozone.team.defs#roleTriage"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "did"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.team.defs#member",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.team.updateMember",
+  "lexicon": 1
+}

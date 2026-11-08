@@ -1,0 +1,72 @@
+{
+  "defs": {
+    "main": {
+      "description": "Update an existing URL safety rule",
+      "errors": [
+        {
+          "description": "No active rule found for this URL/domain",
+          "name": "RuleNotFound"
+        },
+        {
+          "description": "A rule for this URL/domain is owned by another source",
+          "name": "RuleSourceConflict"
+        }
+      ],
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "action": {
+              "ref": "tools.ozone.safelink.defs#actionType",
+              "type": "ref"
+            },
+            "comment": {
+              "description": "Optional comment about the update",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Optional DID to credit as the creator. Only respected for admin_token authentication.",
+              "format": "did",
+              "type": "string"
+            },
+            "pattern": {
+              "ref": "tools.ozone.safelink.defs#patternType",
+              "type": "ref"
+            },
+            "reason": {
+              "ref": "tools.ozone.safelink.defs#reasonType",
+              "type": "ref"
+            },
+            "source": {
+              "default": "ozone/default",
+              "description": "Source of the rule to update",
+              "maxLength": 128,
+              "type": "string"
+            },
+            "url": {
+              "description": "The URL or domain to update the rule for",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "pattern",
+            "action",
+            "reason"
+          ],
+          "type": "object"
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "ref": "tools.ozone.safelink.defs#event",
+          "type": "ref"
+        }
+      },
+      "type": "procedure"
+    }
+  },
+  "id": "tools.ozone.safelink.updateRule",
+  "lexicon": 1
+}

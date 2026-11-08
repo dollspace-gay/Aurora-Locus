@@ -1,0 +1,61 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Get a list of posts liked by an actor. Requires auth, actor must be the requesting account.",
+      "errors": [
+        {
+          "name": "BlockedActor"
+        },
+        {
+          "name": "BlockedByActor"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "cursor": {
+              "type": "string"
+            },
+            "feed": {
+              "items": {
+                "ref": "app.bsky.feed.defs#feedViewPost",
+                "type": "ref"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "feed"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "actor": {
+            "format": "at-identifier",
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "actor"
+        ],
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "app.bsky.feed.getActorLikes",
+  "lexicon": 1
+}

@@ -1,0 +1,13 @@
+{{- if and (include "locus.large" .) (gt (int .Values.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "locus.fullname" . }}
+  labels:
+    {{- include "locus.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "locus.selectorLabels" . | nindent 6 }}
+{{- end }}

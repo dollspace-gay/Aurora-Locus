@@ -1,0 +1,13 @@
+//! The OAuth authorization server and resource-server checks (proto-blue's
+//! OAuth is client-only), following the reference's `@atproto/oauth-provider`.
+
+pub mod client;
+pub mod dpop;
+pub mod error;
+#[cfg(test)]
+mod fuzz;
+pub mod jose;
+pub mod metadata;
+pub mod request;
+
+pub use error::OAuthError;

@@ -1,0 +1,23 @@
+{{- if and (not (include "locus.large" .)) (not .Values.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "locus.claimName" . }}
+  labels:
+    {{- include "locus.labels" . | nindent 4 }}
+  {{- if .Values.persistence.keep }}
+  annotations:
+    # The database, blobs and master key live here: uninstalling the release
+    # leaves them.
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

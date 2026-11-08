@@ -1,0 +1,108 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "badgeSelections": {
+      "description": "Selected badges for display in chat, organized by slot.",
+      "properties": {
+        "global": {
+          "description": "Selected globally-issued badge (e.g. event badge).",
+          "ref": "com.atproto.repo.strongRef",
+          "type": "ref"
+        },
+        "streamer": {
+          "description": "Selected streamer-issued badges, one per streamer channel.",
+          "items": {
+            "ref": "#streamerBadgeSelection",
+            "type": "ref"
+          },
+          "maxLength": 20,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "color": {
+      "description": "Customizations for the color of a user's name in chat",
+      "properties": {
+        "blue": {
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "green": {
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "red": {
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "red",
+        "green",
+        "blue"
+      ],
+      "type": "object"
+    },
+    "main": {
+      "description": "Record containing customizations for a user's chat profile.",
+      "key": "literal:self",
+      "record": {
+        "properties": {
+          "badges": {
+            "description": "Badge selections for display in chat.",
+            "ref": "#badgeSelections",
+            "type": "ref"
+          },
+          "color": {
+            "ref": "#color",
+            "type": "ref"
+          },
+          "selfLabels": {
+            "description": "Self-applied labels for this profile, e.g. 'bot'.",
+            "items": {
+              "ref": "#selfLabel",
+              "type": "ref"
+            },
+            "maxLength": 10,
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "type": "record"
+    },
+    "selfLabel": {
+      "description": "Label that a user can apply to their own profile.",
+      "knownValues": [
+        "bot"
+      ],
+      "type": "string"
+    },
+    "streamerBadgeSelection": {
+      "description": "A selected badge for a specific streamer's channel.",
+      "properties": {
+        "badge": {
+          "description": "Strong reference to the selected place.stream.badge.issuance record.",
+          "ref": "com.atproto.repo.strongRef",
+          "type": "ref"
+        },
+        "streamer": {
+          "description": "DID of the streamer whose channel this selection applies to.",
+          "format": "did",
+          "type": "string"
+        }
+      },
+      "required": [
+        "streamer",
+        "badge"
+      ],
+      "type": "object"
+    }
+  },
+  "id": "place.stream.chat.profile",
+  "lexicon": 1
+}

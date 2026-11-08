@@ -1,135 +1,81 @@
-# Aurora-Locus CI (chainlink #94 / Phase 5.1)
-#
-# Two jobs run on every commit:
-#
-# - `sqlite-tests` — cargo build + clippy + lib tests against the
-#   default SQLite backend. Fast (~2 min on a warm cache) and covers
-#   the full 543-test lib suite.
-#
-# - `postgres-tests` — postgres_smoke_test (one round-trip per
-#   manager group) + multi_instance_test (5 leader-election +
-#   LISTEN/NOTIFY scenarios). Both spin up an ephemeral
-#   postgres:16-alpine container per test via testcontainers-rs;
-#   GitHub Actions runners ship with Docker so no extra setup needed.
-#
-# Both jobs must pass for a commit to be considered green. The Postgres
-# job catches placeholder-syntax, bool-decode, bool-literal, and any
-# future Postgres-vs-SQLite drift that the SQLite-only lib suite
-# can't surface.
-#
-# Coverage scope decision (Phase 5.1): smoke + integration tests
-# rather than the full lib suite against Postgres. The 6 smokes
-# exercise every manager group; the 5 multi-instance tests exercise
-# leader election + cache invalidation end-to-end. Promoting to full
-# lib coverage is a future-cycle concern pending post-v0.2 experience
-# showing whether the gap matters.
-
 name: CI
 
 on:
-  # No push branch-filter — runs on every push to the fork (every
-  # skydeval/v0.#-cycle branch, and any future branch). The
-  # previous filter named v0.2-cycle explicitly, which silently
-  # stopped firing once v0.3 / v0.4 / v0.5 work moved to new
-  # branches. Never needs per-cycle editing now.
   push:
-  pull_request:
     branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+  # No debug info in test builds: the workspace's test binaries are large,
+  # and a hosted runner's disk is small.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
-  sqlite-tests:
-    name: SQLite tests + lints
+  test:
+    name: Format, lint and test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aurora-locus
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: locus
+          POSTGRES_PASSWORD: locus
+          POSTGRES_DB: locus
+        ports: ["55491:5432"]
+        options: >-
+          --health-cmd "pg_isready -U locus"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["56379:6379"]
+    env:
+      LOCUS_TEST_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
+      LOCUS_TEST_REDIS_URL: redis://127.0.0.1:56379
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The runner's preinstalled SDKs locus doesn't use, for disk space.
+      - name: Free disk space
+        working-directory: /
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins the version and components.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Install proto-blue-codegen (kryphocron-lexicons build dep)
-        run: cargo install proto-blue-codegen --version "~0.3.1"
-      - name: cargo build --tests
-        # Compile tests, not just lib — surfaces integration-test
-        # compile errors (e.g. struct-literal missing-field gaps)
-        # at the build step rather than letting them slip to the
-        # clippy / test runs.
-        run: cargo build --tests
-      - name: cargo clippy
-        # Match doll's upstream deny gate exactly: --all-targets
-        # so integration tests are linted too, and -- -D warnings
-        # so any warning fails the build. The v0.5 cycle-close
-        # CI fix swept the prior dead_code backlog (runtime route
-        # enumeration forward-substrate, db legacy factories,
-        # is_held trait method, etc.); the gate is clean as of
-        # that sweep.
-        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
-      - name: cargo test --lib
-        run: cargo test --lib
-
-  postgres-tests:
-    name: Postgres tests (testcontainers)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install proto-blue-codegen (kryphocron-lexicons build dep)
-        run: cargo install proto-blue-codegen --version "~0.3.1"
-      # GitHub Actions runners come with Docker pre-installed and the
-      # daemon running, so testcontainers-rs (which shells out to
-      # docker for postgres:16-alpine) works without setup.
-      - name: Verify Docker daemon
-        run: docker version
-      # postgres-client provides pg_dump and psql for the
-      # backup_restore_roundtrip_on_postgres test (chainlink #95 /
-      # Phase 5.2). The test skips silently if these aren't on PATH,
-      # so installing them upgrades the test from skip to actually-run.
-      #
-      # python3-cryptography provides the cryptography package
-      # mock-plc.py imports for ECDSA signature verification
-      # (cryptography.hazmat.primitives.asymmetric.ec / utils). The
-      # v0.5-era doc claim that mock-plc.py was stdlib-only was
-      # incorrect; this install closes that gap so the Launch step
-      # below doesn't fail at first import.
-      - name: Install postgres-client + python3-cryptography
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client python3-cryptography
-      # Launch the mock PLC directory for the postgres_smoke_test
-      # account_manager_round_trip case (chainlink #109 Option A).
-      # The test calls create_account → posts plc_operation → reads
-      # back the DID doc; without a live PLC this short-circuits
-      # via the #[cfg(test)] sentinel in account/manager.rs (which
-      # only fires for cfg(test), NOT integration tests), so the
-      # integration test was #[ignore]'d in v0.5 (Option B). v0.6
-      # ships Option A: stand up mock-plc.py in CI and retarget the
-      # test config at it (see tests/postgres_smoke_test.rs
-      # did_plc_url change in the same chainlink).
-      #
-      # The liveness loop is load-bearing: without it the smoke
-      # test races and intermittently 400s on a not-yet-ready PLC.
-      #
-      # /_health here is mock-plc.py's OWN /_health and works — a
-      # different service from the PDS /_health that 404s (chainlink
-      # #97). Different ports too (mock-PLC on 2582; PDS on the
-      # test's configured port).
-      - name: Launch mock PLC for postgres smoke tests
+        with:
+          workspaces: aurora-locus
+          cache-bin: true
+      - name: proto-blue-codegen
+        run: command -v proto-blue-codegen || cargo install proto-blue-codegen --version 0.3.3 --locked
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --quiet -- -D warnings
+      - name: Test
+        run: cargo test --workspace --quiet
+      # The HTTP suite again on Postgres, as scripts/check.sh runs it.
+      - name: Test the HTTP suite on Postgres
+        env:
+          LOCUS_TEST_HTTP_POSTGRES_URL: postgres://locus:locus@127.0.0.1:55491/locus
         run: |
-          python3 phase-b/mock-plc.py --port 2582 > /tmp/mock-plc.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:2582/_health >/dev/null && break
-            sleep 1
-          done
-          curl -sf http://localhost:2582/_health || {
-            echo "Mock PLC did not start"
-            cat /tmp/mock-plc.log
-            exit 1
-          }
-      # `--test-threads=1` because each test spins up its own Postgres
-      # container; running them in parallel races on port allocation
-      # under some Docker configs. Tests are short individually
-      # (~3-7s each) so the serial cost is small.
-      - name: cargo test --test postgres_smoke_test
-        run: cargo test --test postgres_smoke_test -- --test-threads=1
-      - name: cargo test --test multi_instance_test
-        run: cargo test --test multi_instance_test -- --test-threads=1
+          cargo test -p locus-http --quiet -- --skip tests::blobs:: --skip tests::audiences:: --skip tests::keys::
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: cargo-audit
+        run: cargo install cargo-audit --locked
+      # aurora-locus/.cargo/audit.toml lists the advisories ignored, and why.
+      - name: Audit
+        working-directory: aurora-locus
+        run: cargo audit

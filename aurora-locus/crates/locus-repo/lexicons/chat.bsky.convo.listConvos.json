@@ -1,0 +1,77 @@
+{
+  "$type": "com.atproto.lexicon.schema",
+  "defs": {
+    "main": {
+      "description": "Returns a page of conversations (direct or group) for the user.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "properties": {
+            "convos": {
+              "items": {
+                "ref": "chat.bsky.convo.defs#convoView",
+                "type": "ref"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "convos"
+          ],
+          "type": "object"
+        }
+      },
+      "parameters": {
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "kind": {
+            "description": "Filter by conversation kind.",
+            "knownValues": [
+              "direct",
+              "group"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "lockStatus": {
+            "description": "Filter by conversation lock status. Values follow chat.bsky.convo.defs#convoLockStatus.",
+            "knownValues": [
+              "unlocked",
+              "locked",
+              "locked-permanently"
+            ],
+            "type": "string"
+          },
+          "readState": {
+            "knownValues": [
+              "unread"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "Filter convos by their status. It is discouraged to call with \"request\" and preferred to call chat.bsky.convo.listConvoRequests, which also includes group join requests made by the user.",
+            "knownValues": [
+              "request",
+              "accepted"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "params"
+      },
+      "type": "query"
+    }
+  },
+  "id": "chat.bsky.convo.listConvos",
+  "lexicon": 1
+}

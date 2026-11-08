@@ -1,0 +1,43 @@
+[package]
+name = "locus-auth"
+description = "Sessions, app passwords, service auth, OAuth server, scopes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+locus-core.workspace = true
+locus-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+subtle = "2"
+data-encoding.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+proto-blue-crypto.workspace = true
+proto-blue-syntax.workspace = true
+argon2 = "0.5"
+scrypt = { version = "0.11", default-features = false }
+p256 = { version = "0.14", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
+p521 = { version = "0.14", features = ["ecdsa"] }
+rsa = { version = "0.9", features = ["sha2"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+proptest = "1"
+
+[lints]
+workspace = true
