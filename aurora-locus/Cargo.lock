@@ -3693,7 +3693,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-common"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3720,7 +3720,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-crypto"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -3738,7 +3738,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-identity"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "futures",
  "proto-blue-common",
@@ -3752,7 +3752,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-cbor"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "ciborium",
  "proto-blue-lex-data",
@@ -3763,7 +3763,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-data"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "multibase",
  "serde",
@@ -3775,7 +3775,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-json"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "base64 0.22.1",
  "proto-blue-lex-data",
@@ -3786,7 +3786,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lexicon"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "proto-blue-common",
  "proto-blue-lex-data",
@@ -3799,7 +3799,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-repo"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "futures",
  "proto-blue-common",
@@ -3819,7 +3819,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-syntax"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "chrono",
  "once_cell",
@@ -3831,7 +3831,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-ws"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 dependencies = [
  "async-trait",
  "futures",
@@ -6279,14 +6279,14 @@ dependencies = [
 [[patch.unused]]
 name = "proto-blue-api"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 
 [[patch.unused]]
 name = "proto-blue-oauth"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"
 
 [[patch.unused]]
 name = "proto-blue-xrpc"
 version = "0.3.3"
-source = "git+https://github.com/skydeval/proto-blue?rev=75b6cfba47ed4e34530125c8c70704bcf25447b6#75b6cfba47ed4e34530125c8c70704bcf25447b6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=52d4b2b37fc8fb137efa62040c4d5d085d522fa6#52d4b2b37fc8fb137efa62040c4d5d085d522fa6"

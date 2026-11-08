@@ -1,7 +1,7 @@
 # aurora-locus
 
 An [atproto](https://atproto.com) Personal Data Server (PDS) written in Rust,
-built on [proto-blue](https://github.com/skydeval/proto-blue), with built-in
+built on [proto-blue](https://github.com/dollspace-gay/proto-blue), with built-in
 support for kryphocron private posts.
 
 Locus hosts accounts and their repositories, publishes their changes to
