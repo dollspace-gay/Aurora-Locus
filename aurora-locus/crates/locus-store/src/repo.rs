@@ -383,6 +383,11 @@ impl Tx {
     }
 }
 
+/// How long block GC keeps a block whose count has dropped to 0. A `getRepo`
+/// stream still sends blocks dropped after it started, so this outlasts the
+/// longest `sync.get_repo_timeout_ms` allows (1 hour), with a margin.
+pub const BLOCK_GC_GRACE_MS: i64 = 70 * 60 * 1000;
+
 impl Store {
     /// Deletes blocks whose count has been 0 for longer than `grace_ms`, up
     /// to `limit` of them. The condition is re-checked by the delete itself,
@@ -469,32 +474,40 @@ impl Store {
         did: &str,
         after: Option<&str>,
         since: Option<&str>,
+        live_at_ms: Option<i64>,
         limit: i64,
     ) -> CoreResult<Vec<(String, Vec<u8>)>> {
-        let q = |p: [&str; 4]| {
+        // With `live_at_ms` (database time), a block that has dropped to 0
+        // since then still counts: a commit landing mid-stream must not
+        // punch holes in a CAR rooted at the commit before it. Block GC's
+        // grace keeps such blocks for longer than any stream lasts.
+        let q = |p: [&str; 5]| {
             format!(
-                "SELECT cid, content FROM repo_block WHERE did = {} AND ref_count > 0 \
-                 AND ({} IS NULL OR cid > {}) AND ({} IS NULL OR rev_introduced > {}) \
-                 ORDER BY cid LIMIT {}",
-                p[0], p[1], p[1], p[2], p[2], p[3]
+                "SELECT cid, content FROM repo_block WHERE did = {0} \
+                 AND (ref_count > 0 OR ({4} IS NOT NULL AND zero_since >= {4})) \
+                 AND ({1} IS NULL OR cid > {1}) AND ({2} IS NULL OR rev_introduced > {2}) \
+                 ORDER BY cid LIMIT {3}",
+                p[0], p[1], p[2], p[3], p[4]
             )
         };
         match self {
             Self::Sqlite(p) => {
-                sqlx::query_as(&q(["?1", "?2", "?3", "?4"]))
+                sqlx::query_as(&q(["?1", "?2", "?3", "?4", "?5"]))
                     .bind(did)
                     .bind(after)
                     .bind(since)
                     .bind(limit)
+                    .bind(live_at_ms)
                     .fetch_all(p)
                     .await
             }
             Self::Postgres(p) => {
-                sqlx::query_as(&q(["$1", "$2::text", "$3::text", "$4"]))
+                sqlx::query_as(&q(["$1", "$2::text", "$3::text", "$4", "$5::bigint"]))
                     .bind(did)
                     .bind(after)
                     .bind(since)
                     .bind(limit)
+                    .bind(live_at_ms)
                     .fetch_all(p)
                     .await
             }

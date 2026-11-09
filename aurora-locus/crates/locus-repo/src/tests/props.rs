@@ -130,7 +130,7 @@ pub(super) fn verify_event_opts(body: &LexValue, key: &K256Keypair, opts: ReadCa
 async fn all_blocks(store: &Store, since: Option<&str>) -> BlockMap {
     let mut out = BlockMap::new();
     for (cid, bytes) in store
-        .repo_blocks_page(DID, None, since, 1_000_000)
+        .repo_blocks_page(DID, None, since, None, 1_000_000)
         .await
         .unwrap()
     {

@@ -291,8 +291,11 @@ changes, not on the size of the repo.
 
 - Blocks are reference-counted per repo by locus's own accounting, so two
   records that share a CID are counted twice. A block whose count reaches
-  zero is deleted by a GC job after 10 minutes, not inline; a block
-  re-referenced in the meantime survives.
+  zero is deleted by a GC job after 70 minutes, not inline; a block
+  re-referenced in the meantime survives. The grace outlasts the longest
+  `getRepo` stream: a stream sends every block live when it started, so a
+  commit landing mid-stream can't leave the CAR missing blocks its root
+  needs.
 - Each block records the rev that introduced it, so `getRepo?since=` can
   return only newer blocks.
 - A new `rev` is always greater than the stored one: locus takes the larger
