@@ -385,6 +385,13 @@ pub enum RepairCmd {
     /// The PLC document set back to the handle, this PDS and the held
     /// signing key, then `#identity`.
     Identity { did: String },
+    /// Tombstones the did:plc of an account that's already gone (as
+    /// `accounts.tombstone_plc_on_delete` does at deletion). Permanent.
+    Tombstone {
+        did: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1561,6 +1568,29 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
                 &c.call(&lx("admin.identity.repair"), &[], Some(json!({"did": did})))
                     .await?,
             );
+            Ok(())
+        }
+        AdminCmd::Repair(RepairCmd::Tombstone { did, yes }) => {
+            confirm(
+                &format!(
+                    "This tombstones {did} in the PLC directory: the DID can never be used again"
+                ),
+                yes,
+            )?;
+            let v = c
+                .call(
+                    &lx("admin.identity.tombstone"),
+                    &[],
+                    Some(json!({"did": did})),
+                )
+                .await?;
+            if v["outcome"] == "queued" {
+                println!(
+                    "PLC didn't answer clearly; the tombstone of {did} is queued and retried."
+                );
+            } else {
+                println!("Tombstoned {did}.");
+            }
             Ok(())
         }
         AdminCmd::Shard(ShardCmd::Add {

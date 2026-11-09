@@ -477,6 +477,7 @@ shared advisory lock. `migrate storage` and `import reference-pds` accept
 | `import reference-pds <dir> --env <pds.env>` | [Import a reference installation](#importing-a-reference-pds) |
 | `repo rebuild <did>` | The reference's `rebuild-repo` |
 | `repair repo <did>` / `repair identity <did>` | Rebuild the record index; reset a did:plc document to this PDS |
+| `repair tombstone <did> [--yes]` | Tombstone the did:plc of an account that's already deleted |
 | `sequencer recover [--did] [--since]` | The reference's `sequencer-recovery` |
 | `repair repos --from-sequencer` | The reference's `recovery-repair-repos` |
 | `keys rotate-account <did>… [--file] [--recovery]` | The reference's `rotate-keys` scripts |

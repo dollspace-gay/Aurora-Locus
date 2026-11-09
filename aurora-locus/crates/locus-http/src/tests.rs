@@ -1083,6 +1083,78 @@ async fn deleting_an_account_tombstones_its_did_only_when_chosen() {
     // still running.
     delete(pia.clone()).await;
     assert_eq!(last_type(&pia), "plc_tombstone");
+
+    // On, with the deletion finished before the repair job runs (as it
+    // usually is): the queued tombstone outlives the account's rows.
+    let rho = did_of(
+        h.create_account("rho.pds.example.com", "rho@example.com", "pw")
+            .await,
+    );
+    let job = crate::account::start_deletion(&h.state, &rho)
+        .await
+        .unwrap();
+    h.state.store.run_delete_job(&job, 500).await.unwrap();
+    assert!(h.state.store.account_by_did(&rho).await.unwrap().is_none());
+    crate::identity::run_identity_repairs(&h.state)
+        .await
+        .unwrap();
+    assert_eq!(last_type(&rho), "plc_tombstone");
+}
+
+/// `admin.identity.tombstone`: the did:plc of an account that's already
+/// gone, tombstoned on request; never one an account still holds.
+#[tokio::test]
+async fn an_operator_can_tombstone_a_deleted_accounts_did() {
+    let h = harness(false).await;
+    let ns = |m: &str| format!("/xrpc/{}.{m}", locus_core::LOCUS_NS);
+    let owner = h.owner_with_password("tomb", "tomb-password-123").await;
+    let did = h
+        .create_account("sid.pds.example.com", "sid@example.com", "pw")
+        .await["did"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let last_type = |did: &str| {
+        h.plc.lock().unwrap().last(did).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let tombstone = |did: String| {
+        let (h, owner, ns) = (&h, &owner, &ns);
+        async move {
+            h.admin_call(
+                "POST",
+                &ns("admin.identity.tombstone"),
+                owner,
+                Some(json!({"did": did})),
+            )
+            .await
+        }
+    };
+
+    // Still held by an account: refused.
+    let (st, v) = tombstone(did.clone()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(last_type(&did), "plc_operation");
+
+    // Deleted with the setting off: left alone, then tombstoned on request.
+    let job = crate::account::start_deletion(&h.state, &did)
+        .await
+        .unwrap();
+    h.state.store.run_delete_job(&job, 500).await.unwrap();
+    crate::identity::run_identity_repairs(&h.state)
+        .await
+        .unwrap();
+    assert_eq!(last_type(&did), "plc_operation");
+    let (st, v) = tombstone(did.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["outcome"], "tombstoned");
+    assert_eq!(last_type(&did), "plc_tombstone");
+
+    // Not a did:plc: refused.
+    let (st, v) = tombstone("did:web:gone.pds.example.com".into()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 }
 
 #[tokio::test]

@@ -504,7 +504,8 @@ async fn plc_set_handle(s: &AppState, did: &str, handle: &str) -> Result<(), Plc
     Ok(())
 }
 
-/// Tombstones a DID locus created for an account that was never created.
+/// Tombstones a DID this PDS hosts whose account is gone (deleted, or never
+/// created).
 pub(crate) async fn plc_tombstone(s: &AppState, did: &str) -> Result<(), PlcStep> {
     let (state, prev) = plc_state(s, did).await?;
     let Some(current) = state else {
@@ -579,6 +580,14 @@ pub async fn run_identity_repairs(s: &AppState) -> locus_core::CoreResult<usize>
             }
             Err(PlcStep::Ambiguous(e)) => {
                 let backoff = (30_000_i64 << r.attempts.clamp(0, 7)).min(3_600_000);
+                tracing::warn!(
+                    did = r.did,
+                    kind = r.kind.as_str(),
+                    attempts = r.attempts + 1,
+                    retry_in_s = backoff / 1000,
+                    "identity repair will retry: {}",
+                    e.message
+                );
                 s.store
                     .retry_identity_repair(&r.did, r.kind, &e.message, backoff)
                     .await?;

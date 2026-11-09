@@ -291,7 +291,9 @@ impl Tx {
             "invite_code WHERE for_account",
             "email_token WHERE did",
             "plc_key_listing WHERE did",
-            "identity_repair WHERE did",
+            // A queued tombstone stays: the repair job sends it after the
+            // account is gone.
+            "identity_repair WHERE kind <> 'tombstone' AND did",
             "did_cache WHERE did",
             "account_pref WHERE did",
             "oauth_used_refresh WHERE token_id IN (SELECT id FROM oauth_token WHERE did",
