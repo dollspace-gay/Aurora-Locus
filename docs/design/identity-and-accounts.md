@@ -112,7 +112,9 @@ signs and submits (retrying until PLC answers). It happens only while the
 DID's document still names this PDS and lists one of its rotation keys: a
 DID that moved to another PDS is never tombstoned from here. On a shard the
 entryway decides. Locus also tombstones a DID it created for a sign-up that
-then failed (see [Creation](#creation)).
+then failed (see [Creation](#creation)). For an account deleted while the
+setting was off, `aurora-locus repair tombstone <did>` tombstones its DID
+afterwards, under the same limits; it refuses a DID an account still holds.
 
 ### did:web accounts
 

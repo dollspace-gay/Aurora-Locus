@@ -1110,9 +1110,6 @@ impl Node {
         }
     }
 
-    /// Retries identity changes that didn't finish (handle changes after an
-    /// unclear PLC answer, tombstones of DIDs from failed sign-ups), on one
-    /// node at a time.
     /// Watches the install's key generation; a change (another node, or
     /// this one, changed a key nodes hold in memory) restarts the service.
     fn spawn_key_watch(&mut self, generation: i64) {
@@ -1320,6 +1317,9 @@ impl Node {
             )));
     }
 
+    /// Retries identity changes that didn't finish (handle changes after an
+    /// unclear PLC answer, tombstones of deleted accounts and of DIDs from
+    /// failed sign-ups), on one node at a time.
     fn spawn_identity_repair(&mut self, state: Arc<AppState>) {
         const NAME: &str = "identity-repair";
         const EVERY: Duration = Duration::from_secs(30);

@@ -1,7 +1,8 @@
 //! Operator repair tools: `repo rebuild` (the reference's `rebuild-repo`: a
 //! new tree and commit from the record index), `repair repo` (the record
-//! index from the tree) and `repair identity` (the PLC document back to
-//! what this PDS holds, then `#identity`).
+//! index from the tree), `repair identity` (the PLC document back to what
+//! this PDS holds, then `#identity`) and `repair tombstone` (a gone
+//! account's did:plc tombstoned).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -351,6 +352,58 @@ pub async fn repair_identity(
     Ok(Json(
         json!({"did": did, "plcUpdated": changed, "identityEmitted": true}),
     ))
+}
+
+/// `admin.identity.tombstone`: tombstones the did:plc of an account that's
+/// gone (deleted, or never finished), as `accounts.tombstone_plc_on_delete`
+/// would have at deletion. Same limits as the repair job: only while the
+/// document names this PDS and lists a rotation key it holds. When PLC's
+/// answer is unclear it's queued for the repair job instead.
+pub async fn tombstone_identity(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<DidInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = admin(&s, &headers, locus_nsid!("admin.identity.tombstone")).await?;
+    let did = input.did.as_str();
+    if !did.starts_with("did:plc:") {
+        return Err(XrpcError::invalid_request(
+            "Only a did:plc can be tombstoned",
+        ));
+    }
+    if s.role == locus_core::bootstrap::Role::Shard {
+        return Err(XrpcError::invalid_request(
+            "A shard holds no PLC rotation key; run this on the entryway",
+        ));
+    }
+    if s.store
+        .account_by_did(did)
+        .await?
+        .is_some_and(|a| a.status != locus_store::accounts::Status::Deleted)
+    {
+        return Err(XrpcError::invalid_request(
+            "An account still holds this DID; delete the account first",
+        ));
+    }
+    let outcome = match crate::identity::plc_tombstone(&s, did).await {
+        Ok(()) => "tombstoned",
+        Err(crate::identity::PlcStep::Refused(e)) => return Err(e),
+        Err(crate::identity::PlcStep::Ambiguous(_)) => {
+            s.store
+                .queue_identity_repair(did, locus_store::identity::RepairKind::Tombstone, did)
+                .await?;
+            "queued"
+        }
+    };
+    admin_auth::audit(
+        &s,
+        &who,
+        "identity.tombstone",
+        Some(did),
+        Some(json!({"outcome": outcome})),
+    )
+    .await;
+    Ok(Json(json!({"did": did, "outcome": outcome})))
 }
 
 // ---------------------------------------------------------------- the event log
@@ -739,6 +792,7 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(at!("admin.repo.rebuild"), post(rebuild))
         .route(at!("admin.repo.repair"), post(repair_repo))
         .route(at!("admin.identity.repair"), post(repair_identity))
+        .route(at!("admin.identity.tombstone"), post(tombstone_identity))
         .route(
             at!("admin.repo.recoverFromSequencer"),
             post(recover_from_sequencer),

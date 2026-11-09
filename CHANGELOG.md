@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its lazy-MST and k256 0.14 pull request (`52d4b2b`), the same code as the
   commit pinned before, instead of the fork's branch. The README links to it.
 
+### Added
+
+- `aurora-locus repair tombstone <did>` (`admin.identity.tombstone`):
+  tombstones the did:plc of an account that's already gone, under the same
+  limits as the delete-time tombstone (the document names this PDS and lists
+  a rotation key it holds). Refused while an account holds the DID.
+
+### Fixed
+
+- With `accounts.tombstone_plc_on_delete` on, deleting an account now
+  tombstones its did:plc. The deletion's cleanup removed the queued
+  tombstone along with the account's other rows, usually before the
+  identity repair job reached it, so nothing was sent.
+- The identity repair job logs each retry (the DID, the attempt and the
+  error), not only a dropped repair.
+
 ## [0.1.0] - 2026-11-08
 
 The first release: a production Rust atproto PDS built on proto-blue, with
