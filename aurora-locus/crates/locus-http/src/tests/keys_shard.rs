@@ -427,7 +427,11 @@ async fn an_entryway_key_rotation_waits_for_an_offline_shard_and_keeps_the_old_k
     crate::entryway::deliver_pushes(&e.state).await.unwrap();
     crate::entryway::rotation_step(&e.state).await.unwrap();
     assert_eq!(stored_verify_keys(&s1).await, both);
-    assert_eq!(stored_verify_keys(&s2).await, [old.clone()], "s2 missed it");
+    assert_eq!(
+        stored_verify_keys(&s2).await,
+        std::slice::from_ref(&old),
+        "s2 missed it"
+    );
     let rotation = || async { e.state.store.key_rotation().await.unwrap().unwrap() };
     assert!(
         rotation().await.switched_at.is_none(),
@@ -483,7 +487,7 @@ async fn an_entryway_key_rotation_waits_for_an_offline_shard_and_keeps_the_old_k
     crate::entryway::rotation_step(&e.state).await.unwrap();
     assert!(rotation().await.finished_at.is_some());
     crate::entryway::deliver_pushes(&e.state).await.unwrap();
-    assert_eq!(stored_verify_keys(&s1).await, [new.clone()]);
-    assert_eq!(stored_verify_keys(&s2).await, [new.clone()]);
+    assert_eq!(stored_verify_keys(&s1).await, std::slice::from_ref(&new));
+    assert_eq!(stored_verify_keys(&s2).await, std::slice::from_ref(&new));
     assert!(!entryway_accepts(old_token).await);
 }

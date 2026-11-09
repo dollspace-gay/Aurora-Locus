@@ -14746,7 +14746,7 @@ async fn an_entryway_pushes_revocations_blocks_and_key_changes_to_its_shards() {
         .into_iter()
         .map(|k| k.did_key)
         .collect();
-    assert_eq!(keys, [new.clone()]);
+    assert_eq!(keys, std::slice::from_ref(&new));
     assert!(
         e.state
             .store

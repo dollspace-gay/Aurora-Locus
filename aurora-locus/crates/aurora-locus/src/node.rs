@@ -723,10 +723,10 @@ impl Node {
                             };
                             // OAuth replay windows and expired requests too.
                             let result = match result {
-                                Ok(t) => loop {
+                                Ok(mut t) => loop {
                                     match state.store.prune_oauth(5_000).await {
                                         Ok(0) => break Ok(t),
-                                        Ok(n) => total += n,
+                                        Ok(n) => t += n,
                                         Err(e) => break Err(e),
                                     }
                                 },
