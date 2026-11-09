@@ -605,7 +605,7 @@ blob answers 400 "Blob not found" to every caller.
 A blob response streams for at most `blobs.stream_timeout_ms` (4 minutes by
 default, and never longer than the delete grace of the copy it reads), and a
 `getRepo` CAR for at most `sync.get_repo_timeout_ms` (10 minutes), so a slow
-client can't hold a copy or a database snapshot open indefinitely. A client
+client can't hold a copy or a stream open indefinitely. A client
 cut off resumes a blob with `Range`.
 
 ### Scanning hook

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `getRepo` CAR stays complete when a commit lands while it streams. A
+  stream larger than one page (1,000 blocks) left out blocks the commit
+  dropped, so the CAR failed verification (a missing block): relay backfills
+  and exports of active accounts were hit. A stream now sends every block
+  live when it started (by the database's clock), and block GC keeps dropped
+  blocks for 70 minutes, not 10, to outlast the longest stream
+  `sync.get_repo_timeout_ms` allows. A stored CID that doesn't parse now
+  ends the stream with an error instead of being skipped.
+
 ## [0.1.1] - 2026-11-08
 
 ### Changed

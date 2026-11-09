@@ -237,8 +237,16 @@ fn car_response(body: Body) -> Response {
 }
 
 /// A repository as a CAR, streamed in pages: the commit as root, every
-/// live block (or only those introduced after `since`).
-fn repo_car(s: &AppState, did: String, root: Cid, since: Option<String>) -> Response {
+/// block live at `live_at_ms` (database time, read before the root), or only
+/// those introduced after `since`. Commits landing mid-stream don't remove
+/// blocks the root needs; they may add a few of the newer tree's.
+fn repo_car(
+    s: &AppState,
+    did: String,
+    root: Cid,
+    since: Option<String>,
+    live_at_ms: i64,
+) -> Response {
     let store = s.store.clone();
     let head = futures::stream::once(async move {
         Ok::<_, std::io::Error>(axum::body::Bytes::from(locus_repo::car::header(Some(
@@ -250,15 +258,29 @@ fn repo_car(s: &AppState, did: String, root: Cid, since: Option<String>) -> Resp
         async move {
             let after = after?;
             match store
-                .repo_blocks_page(&did, after.as_deref(), since.as_deref(), BLOCK_PAGE)
+                .repo_blocks_page(
+                    &did,
+                    after.as_deref(),
+                    since.as_deref(),
+                    Some(live_at_ms),
+                    BLOCK_PAGE,
+                )
                 .await
             {
                 Ok(page) if page.is_empty() => None,
                 Ok(page) => {
                     let mut chunk = Vec::new();
                     for (cid, bytes) in &page {
-                        if let Ok(c) = Cid::from_str_multibase(cid) {
-                            chunk.extend(locus_repo::car::block(&c, bytes));
+                        match Cid::from_str_multibase(cid) {
+                            Ok(c) => chunk.extend(locus_repo::car::block(&c, bytes)),
+                            // A stored CID that doesn't parse: end the stream
+                            // with an error, not a CAR missing that block.
+                            Err(e) => {
+                                return Some((
+                                    Err(std::io::Error::other(format!("block {cid}: {e}"))),
+                                    None,
+                                ));
+                            }
                         }
                     }
                     let next = (page.len() as i64 == BLOCK_PAGE)
@@ -297,6 +319,11 @@ pub async fn get_repo(
         ],
     )?;
     available(&s, &headers, &p.did).await?;
+    // Database time, read before the root: every block that root needs was
+    // live then. It's the clock that stamps zero_since, so app nodes' clocks
+    // don't matter; the second's margin covers rounding (an extra block or
+    // two in the CAR is harmless).
+    let live_at_ms = s.store.now_ms().await? - 1000;
     let root = s.store.repo_root_of(&p.did).await?.ok_or_else(|| {
         XrpcError::named(
             "RepoNotFound",
@@ -305,7 +332,7 @@ pub async fn get_repo(
     })?;
     let cid = Cid::from_str_multibase(&root.commit_cid)
         .map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(repo_car(&s, p.did, cid, p.since))
+    Ok(repo_car(&s, p.did, cid, p.since, live_at_ms))
 }
 
 #[derive(Deserialize)]

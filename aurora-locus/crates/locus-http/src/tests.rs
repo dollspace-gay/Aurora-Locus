@@ -6,6 +6,7 @@ mod blobs;
 mod bulk;
 mod conformance;
 mod console_features;
+mod getrepo_race;
 mod identity;
 mod keys;
 mod keys_shard;

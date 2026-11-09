@@ -1356,7 +1356,7 @@ impl Node {
     /// the grace period, on one node at a time.
     fn spawn_block_gc(&mut self) {
         const NAME: &str = "gc-blocks";
-        const GRACE_MS: i64 = 10 * 60 * 1000;
+        const GRACE_MS: i64 = locus_store::repo::BLOCK_GC_GRACE_MS;
         const EVERY: Duration = Duration::from_secs(60);
         const BATCH: i64 = 5_000;
         let store = self.store.clone();

@@ -754,7 +754,7 @@ pub static REGISTRY: &[Def] = &[
         },
         default: "600000",
         env: None,
-        description: "The longest one getRepo CAR may stream, in milliseconds, so a slow reader doesn't hold a database snapshot open.",
+        description: "The longest one getRepo CAR may stream, in milliseconds, so a slow reader can't hold a stream open indefinitely. Block GC keeps dropped blocks longer than the maximum, so a stream's CAR stays complete while commits land.",
     },
     Def {
         key: "sync.retention_hours",
