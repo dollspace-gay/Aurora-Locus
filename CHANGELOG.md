@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-08
+
 ### Changed
 
 - The Docker stack, the installer and the Helm chart use the published image
