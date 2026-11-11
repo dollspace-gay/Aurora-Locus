@@ -25,8 +25,11 @@
 {% for (k, v) in f.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">
 {% endfor %}
 {% for i in f.inputs %}
-<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
-{% if i.kind == "select" %}<select id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
+{% if i.kind == "checkbox" %}<label class="check"><input type="checkbox" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="1"{% if i.value == "1" %} checked{% endif %}> {{ i.label }}</label>
+{% else %}<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
+{% endif %}
+{% if i.kind == "checkbox" %}
+{% else if i.kind == "select" %}<select id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
 {% else if i.kind == "textarea" %}<textarea id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" rows="4" spellcheck="false">{{ i.value }}</textarea>
 {% else %}<input type="{{ i.kind }}" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false"{% if i.kind == "password" %} autocomplete="off"{% endif %}>
 {% endif %}

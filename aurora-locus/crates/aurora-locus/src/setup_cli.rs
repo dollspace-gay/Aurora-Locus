@@ -199,6 +199,43 @@ fn secret(prompt: &str) -> Result<String, String> {
     rpassword::prompt_password(format!("{prompt}: ")).map_err(|e| e.to_string())
 }
 
+/// Asks how email is sent (Resend, an SMTP server's details, or a URL) and
+/// returns the SMTP URL, or (inner) what's wrong with the answers.
+fn smtp_url_prompt() -> Result<Result<String, String>, String> {
+    use locus_mail::provider::SmtpChoice;
+    println!("  Send email through: 1) Resend  2) another SMTP server  3) an SMTP URL");
+    let choice = match ask("  1, 2 or 3", "1")?.as_str() {
+        "1" => SmtpChoice::Resend {
+            api_key: secret("  Resend API key")?.trim().to_owned(),
+            alt_port: confirm(
+                "  Does your server's host block the usual mail ports (25, 465, 587)?",
+                false,
+            )?,
+        },
+        "2" => {
+            let host = ask("  Host", "")?;
+            let starttls = ask("  Security: 1) TLS from the start  2) STARTTLS", "1")? == "2";
+            let port = ask("  Port", if starttls { "587" } else { "465" })?;
+            let username = ask("  Username (empty for none)", "")?;
+            let password = if username.is_empty() {
+                String::new()
+            } else {
+                secret("  Password")?
+            };
+            SmtpChoice::Server {
+                host,
+                port,
+                starttls,
+                username,
+                password,
+            }
+        }
+        "3" => SmtpChoice::Url(secret("  SMTP URL (smtps://user:password@host)")?),
+        _ => return Ok(Err("Pick 1, 2 or 3.".into())),
+    };
+    Ok(choice.smtp_url())
+}
+
 fn say_problems(problems: Vec<rules::Problem>) -> bool {
     for p in &problems {
         println!("  ! {}", p.message);
@@ -308,7 +345,13 @@ async fn interactive(
     println!("\n5. Email");
     if confirm("  Set up email now?", true)? {
         loop {
-            let url = secret("  SMTP URL (smtps://user:password@host)")?;
+            let url = match smtp_url_prompt()? {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("  ! {e}");
+                    continue;
+                }
+            };
             plan.email.from_address = ask("  Send from", &plan.email.from_address)?;
             plan.email.smtp_url = Some(url.clone());
             plan.email.skipped = false;
@@ -321,8 +364,11 @@ async fn interactive(
                 .map_err(|e| e.to_string())?
             {
                 SenderStatus::Failed => {
-                    println!("  ! The SMTP server refused the connection.");
-                    if confirm("  Try another URL?", true)? {
+                    match mailer.blocked_port_hint(Sender::Main).await {
+                        Some(h) => println!("  ! The SMTP server couldn't be reached. {h}"),
+                        None => println!("  ! The SMTP server refused the connection."),
+                    }
+                    if confirm("  Try again?", true)? {
                         continue;
                     }
                 }

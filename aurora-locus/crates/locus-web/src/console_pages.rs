@@ -400,7 +400,8 @@ pub struct Table {
 pub struct Input {
     pub name: String,
     pub label: String,
-    /// text, password, email, number, select or textarea.
+    /// text, password, email, number, select, textarea or checkbox (sent
+    /// as "1" when ticked; `value` "1" ticks it).
     pub kind: &'static str,
     pub value: String,
     pub options: Vec<Choice>,

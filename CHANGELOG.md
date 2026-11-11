@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Email can be set up with Resend by its API key alone, or with an SMTP
+  server's host, port, security, username and password, as well as a whole
+  SMTP URL: in the setup wizard, the console's Email page and
+  `aurora-locus setup`. Each is stored as the SMTP URL, so
+  `PDS_EMAIL_SMTP_URL` works as before. For servers whose host blocks the
+  usual mail ports (25, 465, 587), a box uses Resend's alternate port, and
+  a server that can't be reached on a usual port gets a message suggesting
+  the provider's alternate port.
+
 ## [0.1.2] - 2026-11-11
 
 ### Changed

@@ -882,7 +882,7 @@ async fn email_render(
         ],
     ));
     if op.role >= Role::Admin {
-        let sender = Input {
+        let sender = || Input {
             options: vec![
                 locus_web::setup::Choice {
                     value: "main".into(),
@@ -897,20 +897,67 @@ async fn email_render(
             ],
             ..Input::new("sender", "Sender", "select")
         };
-        p.forms.push(Form {
-            title: "SMTP URL".into(),
-            text: "Saving checks the connection and sign-in at once.".into(),
+        // One form per way of sending; each saves the sender's SMTP URL
+        // and checks the connection and sign-in at once.
+        let smtp_form = |title: &str, text: &str, provider: &str, inputs: Vec<Input>| Form {
+            title: title.into(),
+            text: text.into(),
             action: "/admin/email/smtp".into(),
             get: false,
-            inputs: vec![
-                sender,
-                Input::new("url", "SMTP URL", "password")
-                    .hint("smtps://user:password@smtp.example.com"),
-            ],
-            hidden: Vec::new(),
+            inputs: std::iter::once(sender()).chain(inputs).collect(),
+            hidden: vec![("provider".into(), provider.into())],
             button: "Save and check".into(),
             danger: false,
-        });
+        };
+        p.forms.push(smtp_form(
+            "Resend",
+            "Only the API key is needed.",
+            "resend",
+            vec![
+                Input::new("api_key", "API key", "password"),
+                Input::new(
+                    "alt_port",
+                    "My server's host blocks the usual mail ports",
+                    "checkbox",
+                )
+                .hint("Some hosting providers block outgoing mail on ports 25, 465 and 587; this uses Resend's alternate port (2465)."),
+            ],
+        ));
+        p.forms.push(smtp_form(
+            "Another SMTP server",
+            "If your server's host blocks the usual mail ports (25, 465, 587), use your email provider's alternate port.",
+            "server",
+            vec![
+                Input::new("host", "Host", "text").hint("smtp.example.com"),
+                Input::new("port", "Port", "number").value("465"),
+                Input {
+                    options: vec![
+                        locus_web::setup::Choice {
+                            value: "tls".into(),
+                            label: "TLS from the start (usually 465)".into(),
+                            checked: true,
+                        },
+                        locus_web::setup::Choice {
+                            value: "starttls".into(),
+                            label: "STARTTLS (usually 587)".into(),
+                            checked: false,
+                        },
+                    ],
+                    ..Input::new("security", "Security", "select")
+                },
+                Input::new("username", "Username", "text"),
+                Input::new("password", "Password", "password"),
+            ],
+        ));
+        p.forms.push(smtp_form(
+            "SMTP URL",
+            "The whole connection as one URL, as PDS_EMAIL_SMTP_URL takes it.",
+            "url",
+            vec![
+                Input::new("smtp_url", "SMTP URL", "password")
+                    .hint("smtps://user:password@smtp.example.com"),
+            ],
+        ));
         p.forms.push(Form {
             title: "Send a test email".into(),
             text: "From the main sender. Enter the code it carries below to confirm delivery."
@@ -988,32 +1035,34 @@ pub async fn email_action(
             } else {
                 Sender::Main
             };
-            let url = web::field(&form, "url");
-            if !(url.starts_with("smtp://") || url.starts_with("smtps://")) {
-                return email_render(
-                    &s,
-                    &op,
-                    None,
-                    vec!["An SMTP URL starts with smtp:// or smtps://.".into()],
-                    StatusCode::BAD_REQUEST,
-                )
-                .await;
-            }
-            let status = s.mailer.set_url(sender, url).await;
+            // Resend's key, a server's details or a URL (`url`, the field's
+            // older name, still counts as one).
+            let choice = locus_mail::provider::SmtpChoice::from_form(|k| {
+                let v = web::field(&form, k);
+                if k == "smtp_url" && v.is_empty() {
+                    web::field(&form, "url").to_owned()
+                } else {
+                    v.to_owned()
+                }
+            });
+            let url = match choice.smtp_url() {
+                Ok(u) => u,
+                Err(e) => {
+                    return email_render(&s, &op, None, vec![e], StatusCode::BAD_REQUEST).await;
+                }
+            };
+            let status = s.mailer.set_url(sender, &url).await;
             let _ = s
                 .store
                 .audit(&op.actor(), "email.setSmtp", Some(sender.as_str()), None)
                 .await;
             match status {
                 Ok(SenderStatus::Failed) => {
-                    email_render(
-                        &s,
-                        &op,
-                        None,
-                        vec!["Saved, but the SMTP server refused the connection.".into()],
-                        StatusCode::BAD_REQUEST,
-                    )
-                    .await
+                    let msg = match s.mailer.blocked_port_hint(sender).await {
+                        Some(h) => format!("Saved, but the SMTP server couldn't be reached. {h}"),
+                        None => "Saved, but the SMTP server refused the connection.".into(),
+                    };
+                    email_render(&s, &op, None, vec![msg], StatusCode::BAD_REQUEST).await
                 }
                 Ok(_) => {
                     email_render(

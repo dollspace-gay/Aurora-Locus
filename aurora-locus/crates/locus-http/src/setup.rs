@@ -1270,20 +1270,38 @@ pub async fn save_step(
                 "save" => {
                     plan.email.from_address = f("from_address");
                     plan.email.skipped = false;
-                    let url = f("smtp_url");
+                    // Resend's key, a server's details or a URL; left empty,
+                    // what's saved stays.
+                    let choice = locus_mail::provider::SmtpChoice::from_form(f);
+                    let url = if choice.is_empty() {
+                        if s.mailer.status(Sender::Main).await.ok().flatten().is_none() {
+                            errors.push(
+                                "Enter the Resend API key, the SMTP server's details or an SMTP URL."
+                                    .into(),
+                            );
+                        }
+                        String::new()
+                    } else {
+                        match choice.smtp_url() {
+                            Ok(u) => u,
+                            Err(e) => {
+                                errors.push(e);
+                                String::new()
+                            }
+                        }
+                    };
                     if !url.is_empty() {
                         plan.email.smtp_url = Some(url.clone());
                     }
-                    errors = plan
-                        .email_problems()
-                        .into_iter()
-                        .map(|p| p.message)
-                        .collect();
+                    errors.extend(plan.email_problems().into_iter().map(|p| p.message));
                     plan.email.smtp_url = None;
                     if errors.is_empty() && !url.is_empty() {
                         match s.mailer.set_url(Sender::Main, &url).await {
                             Ok(SenderStatus::Failed) => errors.push(
-                                "Saved, but the SMTP server refused the connection. Check the URL and try again.".into(),
+                                match s.mailer.blocked_port_hint(Sender::Main).await {
+                                    Some(h) => format!("Saved, but the SMTP server couldn't be reached. {h}"),
+                                    None => "Saved, but the SMTP server refused the connection. Check the details and try again.".into(),
+                                },
                             ),
                             Ok(_) => notice = Some("Saved. The SMTP server accepted the connection; now send a test email.".into()),
                             Err(e) => errors.push(e.to_string()),

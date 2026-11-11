@@ -291,8 +291,15 @@ transaction, so they end in the same state.
 6. **First operator**: username and password (at least 12 characters). A
    second sign-in factor (an authenticator app code) is strongly suggested;
    the console's setup for it shows a QR code.
-7. **Email.** An SMTP URL and a from address, then a test email whose code
-   you enter. You can skip email, and the wizard says what won't work
+7. **Email.** How email is sent and a from address, then a test email whose
+   code you enter. How it's sent is one of: Resend, by API key (with a box
+   to tick when the server's host blocks the usual mail ports 25, 465 and
+   587, which uses Resend's alternate port 2465); another SMTP server's
+   host, port, security, username and password; or a whole SMTP URL, as
+   `PDS_EMAIL_SMTP_URL` takes it. Each is stored as the SMTP URL, and the
+   console's Email page offers the same three. When a server can't be
+   reached on one of the usual ports, the message suggests the provider's
+   alternate port. You can skip email, and the wizard says what won't work
    without it (email confirmation, password reset, email sign-in codes).
 8. **Network services.** The AppView (default Bluesky's,
    `https://api.bsky.app`), crawlers (default `https://bsky.network`),
