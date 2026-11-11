@@ -230,7 +230,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aurora-locus"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "locus-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "locus-blob"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "locus-conformance"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "locus-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "locus-http"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "askama",
@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "locus-identity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-sdk-kms",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "locus-kryphocron"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "hmac 0.12.1",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "locus-mail"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "lettre",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "locus-repo"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "locus-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "locus-core",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "locus-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "locus-core",
@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "locus-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "askama",
  "cssparser",
