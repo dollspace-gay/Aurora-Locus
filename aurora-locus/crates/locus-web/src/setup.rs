@@ -189,6 +189,8 @@ pub struct SetupForm {
     pub email_class: &'static str,
     pub email_ready: bool,
     pub smtp_url_set: bool,
+    /// The email provider select and every provider's fields.
+    pub email_inputs: Vec<crate::console_pages::Input>,
     pub from_address: String,
     pub email_skipped: bool,
     pub test_sent_to: String,

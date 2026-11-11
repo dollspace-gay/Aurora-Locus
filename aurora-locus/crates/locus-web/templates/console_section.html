@@ -25,6 +25,7 @@
 {% for (k, v) in f.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">
 {% endfor %}
 {% for i in f.inputs %}
+{% if !i.show_for.is_empty() %}<div class="stack" data-for="{{ i.show_for }}">{% endif %}
 {% if i.kind == "checkbox" %}<label class="check"><input type="checkbox" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="1"{% if i.value == "1" %} checked{% endif %}> {{ i.label }}</label>
 {% else %}<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
 {% endif %}
@@ -34,6 +35,7 @@
 {% else %}<input type="{{ i.kind }}" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false"{% if i.kind == "password" %} autocomplete="off"{% endif %}>
 {% endif %}
 {% if !i.hint.is_empty() %}<div class="hint">{{ i.hint }}</div>{% endif %}
+{% if !i.show_for.is_empty() %}</div>{% endif %}
 {% endfor %}
 <div class="row"><button type="submit"{% if f.danger %} class="danger"{% else %} class="secondary"{% endif %}>{{ f.button }}</button></div>
 </form>

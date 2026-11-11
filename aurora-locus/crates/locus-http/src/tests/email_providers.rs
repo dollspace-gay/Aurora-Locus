@@ -1,5 +1,5 @@
-//! The console's email forms: Resend by API key, an SMTP server's details,
-//! or a URL, each saved as the sender's SMTP URL. Saves point at a closed
+//! The console's email form: a provider and its credentials, another SMTP
+//! server's details, or a URL, each saved as the sender's SMTP URL. Saves point at a closed
 //! local port, so the check fails at once without the network.
 
 use super::*;
@@ -27,13 +27,31 @@ async fn the_console_saves_each_way_of_sending_as_an_smtp_url() {
     let o = Browser::default();
     h.console_sign_in(&o, "own", "an owner password").await;
     let (_, _, page) = o.get(&h, "/admin/email").await;
+    // One form: the provider first, then each provider's fields marked
+    // with the choices they show for.
     assert!(
-        page.contains("<h2>Resend</h2>")
-            && page.contains("<h2>Another SMTP server</h2>")
-            && page.contains("My server&#x27;s host blocks the usual mail ports")
-            && page.contains(r#"type="checkbox""#),
+        page.contains("Who&#x27;s your email provider?")
+            && page.contains(r#"<option value="resend" selected>Resend</option>"#)
+            && page.contains(r#"<option value="other">Other"#)
+            && page.contains(r#"data-for="resend sendgrid mailgun postmark ses brevo""#)
+            && page.contains(r#"data-for="resend""#)
+            && page.contains(r#"name="resend_key""#)
+            && page.contains(r#"name="mailgun_region""#)
+            && page.contains(r#"type="checkbox""#)
+            && page.contains("<h2>How email is sent</h2>")
+            && !page.contains("<h2>Resend</h2>"),
         "{page}"
     );
+    // The stylesheet hides other providers' fields for every choice.
+    let css = include_str!("../../../locus-web/static/locus.css");
+    for (v, _) in locus_mail::provider::provider_options() {
+        assert!(
+            css.contains(&format!(
+                r#"option[value="{v}"]:checked) [data-for]:not([data-for~="{v}"])"#
+            )),
+            "no stylesheet rule for {v}"
+        );
+    }
     let csrf = hidden(&page, "csrf");
     let post = |fields: Vec<(&'static str, String)>| {
         let csrf = csrf.clone();
@@ -50,7 +68,7 @@ async fn the_console_saves_each_way_of_sending_as_an_smtp_url() {
     let port = closed_port();
     let (st, _, page) = post(vec![
         ("sender", "main".into()),
-        ("provider", "server".into()),
+        ("provider", "other".into()),
         ("host", "127.0.0.1".into()),
         ("port", port.to_string()),
         ("security", "starttls".into()),
@@ -72,7 +90,7 @@ async fn the_console_saves_each_way_of_sending_as_an_smtp_url() {
     // On a usual port, an unreachable server gets the hint (naming no host).
     let (st, _, page) = post(vec![
         ("sender", "moderation".into()),
-        ("provider", "server".into()),
+        ("provider", "other".into()),
         ("host", "127.0.0.1".into()),
         ("port", "25".into()),
         ("security", "starttls".into()),
@@ -95,7 +113,7 @@ async fn the_console_saves_each_way_of_sending_as_an_smtp_url() {
         (vec![("provider", "resend")], "Enter the Resend API key."),
         (
             vec![
-                ("provider", "server"),
+                ("provider", "other"),
                 ("host", "smtp.example.com"),
                 ("port", "0"),
             ],

@@ -202,38 +202,56 @@ fn secret(prompt: &str) -> Result<String, String> {
 /// Asks how email is sent (Resend, an SMTP server's details, or a URL) and
 /// returns the SMTP URL, or (inner) what's wrong with the answers.
 fn smtp_url_prompt() -> Result<Result<String, String>, String> {
-    use locus_mail::provider::SmtpChoice;
-    println!("  Send email through: 1) Resend  2) another SMTP server  3) an SMTP URL");
-    let choice = match ask("  1, 2 or 3", "1")?.as_str() {
-        "1" => SmtpChoice::Resend {
-            api_key: secret("  Resend API key")?.trim().to_owned(),
-            alt_port: confirm(
-                "  Does your server's host block the usual mail ports (25, 465, 587)?",
-                false,
-            )?,
-        },
-        "2" => {
-            let host = ask("  Host", "")?;
-            let starttls = ask("  Security: 1) TLS from the start  2) STARTTLS", "1")? == "2";
-            let port = ask("  Port", if starttls { "587" } else { "465" })?;
-            let username = ask("  Username (empty for none)", "")?;
-            let password = if username.is_empty() {
-                String::new()
-            } else {
-                secret("  Password")?
-            };
-            SmtpChoice::Server {
-                host,
-                port,
-                starttls,
-                username,
-                password,
-            }
-        }
-        "3" => SmtpChoice::Url(secret("  SMTP URL (smtps://user:password@host)")?),
-        _ => return Ok(Err("Pick 1, 2 or 3.".into())),
+    use locus_mail::provider::{SmtpChoice, form_fields, provider_options};
+    let options = provider_options();
+    println!("  Who's your email provider?");
+    for (i, (_, label)) in options.iter().enumerate() {
+        println!("    {}) {label}", i + 1);
+    }
+    let pick = ask("  Number", "1")?;
+    let Some((provider, _)) = pick
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| options.get(n))
+    else {
+        return Ok(Err(format!("Pick a number from 1 to {}.", options.len())));
     };
-    Ok(choice.smtp_url())
+    // The chosen provider's fields, asked in the form's order.
+    let mut values =
+        std::collections::HashMap::from([("provider".to_owned(), (*provider).to_owned())]);
+    for f in form_fields()
+        .into_iter()
+        .filter(|f| f.show_for.split(' ').any(|s| s == *provider))
+    {
+        let v = match f.kind {
+            "checkbox" => {
+                if confirm(&format!("  {}?", f.label), false)? {
+                    "1".to_owned()
+                } else {
+                    String::new()
+                }
+            }
+            "password" => secret(&format!("  {}", f.label))?,
+            "select" => {
+                let names: Vec<String> = f
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, l))| format!("{}) {l}", i + 1))
+                    .collect();
+                let n = ask(&format!("  {}: {}", f.label, names.join("  ")), "1")?;
+                n.parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|n| f.options.get(n))
+                    .map_or_else(String::new, |(v, _)| (*v).to_owned())
+            }
+            _ => ask(&format!("  {}", f.label), &f.value)?,
+        };
+        values.insert(f.name, v);
+    }
+    Ok(SmtpChoice::from_form(|k| values.get(k).cloned().unwrap_or_default()).smtp_url())
 }
 
 fn say_problems(problems: Vec<rules::Problem>) -> bool {

@@ -9449,10 +9449,12 @@ async fn setup_mode_serves_only_the_wizard_until_it_finishes() {
         "only a hash is kept: {draft}"
     );
 
-    // The ways of sending, Resend first; then a test email, its code, then on.
+    // The provider choice and its fields; then a test email, its code, then on.
     let (_, _, page) = b.get(&h, "/setup/email").await;
     assert!(
-        page.contains(r#"name="provider" value="resend" checked"#)
+        page.contains("Who&#x27;s your email provider?")
+            && page.contains(r#"<option value="resend" selected>Resend</option>"#)
+            && page.contains(r#"name="resend_key""#)
             && page.contains(r#"name="alt_port""#)
             && page.contains(r#"name="host""#)
             && page.contains(r#"name="smtp_url""#),

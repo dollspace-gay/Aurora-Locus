@@ -406,6 +406,9 @@ pub struct Input {
     pub value: String,
     pub options: Vec<Choice>,
     pub hint: String,
+    /// When set, the values of the form's `provider` select it's shown for
+    /// (space-separated); the stylesheet hides it for the others.
+    pub show_for: String,
 }
 
 impl Input {
@@ -418,6 +421,7 @@ impl Input {
             value: String::new(),
             options: Vec::new(),
             hint: String::new(),
+            show_for: String::new(),
         }
     }
 

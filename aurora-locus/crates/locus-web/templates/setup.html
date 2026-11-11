@@ -109,34 +109,16 @@
 <form class="stack" method="post" action="/setup/email">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="do" value="save">
-<fieldset class="choices column"><legend>Send email through</legend>
-<label class="choice"><input type="radio" name="provider" value="resend" checked> Resend</label>
-<label class="choice"><input type="radio" name="provider" value="server"> Another SMTP server</label>
-<label class="choice"><input type="radio" name="provider" value="url"> An SMTP URL</label>
-</fieldset>
-<fieldset class="stack provider-fields provider-resend"><legend>Resend</legend>
-<label for="api_key">API key</label>
-<input type="password" id="api_key" name="api_key" autocomplete="off" spellcheck="false" placeholder="re_…">
-<label class="check"><input type="checkbox" name="alt_port" value="1"> My server's host blocks the usual mail ports</label>
-<div class="hint">Some hosting providers block outgoing mail on ports 25, 465 and 587; this uses Resend's alternate port (2465).</div>
-</fieldset>
-<fieldset class="stack provider-fields provider-server"><legend>Another SMTP server</legend>
-<label for="host">Host</label>
-<input type="text" id="host" name="host" spellcheck="false" placeholder="smtp.example.com">
-<label for="port">Port</label>
-<input type="number" id="port" name="port" min="1" max="65535" placeholder="465">
-<div class="hint">If your server's host blocks the usual mail ports (25, 465, 587), use your email provider's alternate port.</div>
-<label for="security">Security</label>
-<select id="security" name="security"><option value="tls">TLS from the start (usually 465)</option><option value="starttls">STARTTLS (usually 587)</option></select>
-<label for="username">Username</label>
-<input type="text" id="username" name="username" autocomplete="off" spellcheck="false">
-<label for="smtp_password">Password</label>
-<input type="password" id="smtp_password" name="password" autocomplete="off">
-</fieldset>
-<fieldset class="stack provider-fields provider-url"><legend>An SMTP URL</legend>
-<label for="smtp_url">SMTP URL</label>
-<input type="password" id="smtp_url" name="smtp_url" autocomplete="off" spellcheck="false" placeholder="smtps://user:password@smtp.example.com">
-</fieldset>
+{% for i in f.email_inputs %}
+{% if !i.show_for.is_empty() %}<div class="stack" data-for="{{ i.show_for }}">{% endif %}
+{% if i.kind == "checkbox" %}<label class="check"><input type="checkbox" id="email-{{ i.name }}" name="{{ i.name }}" value="1"{% if i.value == "1" %} checked{% endif %}> {{ i.label }}</label>
+{% else %}<label for="email-{{ i.name }}">{{ i.label }}</label>
+{% if i.kind == "select" %}<select id="email-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
+{% else %}<input type="{{ i.kind }}" id="email-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false" autocomplete="off">
+{% endif %}{% endif %}
+{% if !i.hint.is_empty() %}<div class="hint">{{ i.hint }}</div>{% endif %}
+{% if !i.show_for.is_empty() %}</div>{% endif %}
+{% endfor %}
 <div class="hint">The key or password is stored encrypted and never shown again.{% if f.smtp_url_set %} Email is saved; enter new details to replace them.{% endif %}</div>
 <label for="from_address">Send from</label>
 <input type="text" id="from_address" name="from_address" value="{{ f.from_address }}" placeholder="Example PDS &lt;noreply@example.com&gt;" required>

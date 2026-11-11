@@ -406,19 +406,17 @@ fieldset.choices {
   min-width: 0;
 }
 fieldset.choices legend { font-weight: 600; font-size: 0.92rem; color: var(--fg-strong); padding: 0 0.35rem; }
-/* The setup email step: each provider's fields, and only the chosen
-   provider's shown (all of them where :has isn't supported). */
-fieldset.provider-fields {
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  padding: 0.75rem 1rem 0.9rem;
-  margin: 0 0 1rem;
-  min-width: 0;
-}
-fieldset.provider-fields legend { font-weight: 600; font-size: 0.92rem; color: var(--fg-strong); padding: 0 0.35rem; }
-form:has(input[name="provider"][value="resend"]:checked) .provider-fields:not(.provider-resend),
-form:has(input[name="provider"][value="server"]:checked) .provider-fields:not(.provider-server),
-form:has(input[name="provider"][value="url"]:checked) .provider-fields:not(.provider-url) { display: none; }
+/* The email form (console and setup): only the chosen provider's fields
+   show, with no script (all of them where :has isn't supported). One rule
+   per choice of locus_mail::provider::provider_options(). */
+form:has(select[name="provider"] option[value="resend"]:checked) [data-for]:not([data-for~="resend"]),
+form:has(select[name="provider"] option[value="sendgrid"]:checked) [data-for]:not([data-for~="sendgrid"]),
+form:has(select[name="provider"] option[value="mailgun"]:checked) [data-for]:not([data-for~="mailgun"]),
+form:has(select[name="provider"] option[value="postmark"]:checked) [data-for]:not([data-for~="postmark"]),
+form:has(select[name="provider"] option[value="ses"]:checked) [data-for]:not([data-for~="ses"]),
+form:has(select[name="provider"] option[value="brevo"]:checked) [data-for]:not([data-for~="brevo"]),
+form:has(select[name="provider"] option[value="other"]:checked) [data-for]:not([data-for~="other"]),
+form:has(select[name="provider"] option[value="url"]:checked) [data-for]:not([data-for~="url"]) { display: none; }
 label.choice { display: inline-flex; align-items: center; gap: 0.5rem; font-size: 0.92rem; cursor: pointer; }
 label.choice input { margin: 0; accent-color: var(--accent); }
 .swatch {

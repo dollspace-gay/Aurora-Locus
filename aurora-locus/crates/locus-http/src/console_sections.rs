@@ -897,67 +897,18 @@ async fn email_render(
             ],
             ..Input::new("sender", "Sender", "select")
         };
-        // One form per way of sending; each saves the sender's SMTP URL
-        // and checks the connection and sign-in at once.
-        let smtp_form = |title: &str, text: &str, provider: &str, inputs: Vec<Input>| Form {
-            title: title.into(),
-            text: text.into(),
+        // One form: the provider, then only its fields. Saving stores the
+        // sender's SMTP URL and checks the connection and sign-in at once.
+        p.forms.push(Form {
+            title: "How email is sent".into(),
+            text: "Pick your email provider and enter what it gives you. For any other provider, pick Other and enter its SMTP server's details.".into(),
             action: "/admin/email/smtp".into(),
             get: false,
-            inputs: std::iter::once(sender()).chain(inputs).collect(),
-            hidden: vec![("provider".into(), provider.into())],
+            inputs: std::iter::once(sender()).chain(email_inputs()).collect(),
+            hidden: Vec::new(),
             button: "Save and check".into(),
             danger: false,
-        };
-        p.forms.push(smtp_form(
-            "Resend",
-            "Only the API key is needed.",
-            "resend",
-            vec![
-                Input::new("api_key", "API key", "password"),
-                Input::new(
-                    "alt_port",
-                    "My server's host blocks the usual mail ports",
-                    "checkbox",
-                )
-                .hint("Some hosting providers block outgoing mail on ports 25, 465 and 587; this uses Resend's alternate port (2465)."),
-            ],
-        ));
-        p.forms.push(smtp_form(
-            "Another SMTP server",
-            "If your server's host blocks the usual mail ports (25, 465, 587), use your email provider's alternate port.",
-            "server",
-            vec![
-                Input::new("host", "Host", "text").hint("smtp.example.com"),
-                Input::new("port", "Port", "number").value("465"),
-                Input {
-                    options: vec![
-                        locus_web::setup::Choice {
-                            value: "tls".into(),
-                            label: "TLS from the start (usually 465)".into(),
-                            checked: true,
-                        },
-                        locus_web::setup::Choice {
-                            value: "starttls".into(),
-                            label: "STARTTLS (usually 587)".into(),
-                            checked: false,
-                        },
-                    ],
-                    ..Input::new("security", "Security", "select")
-                },
-                Input::new("username", "Username", "text"),
-                Input::new("password", "Password", "password"),
-            ],
-        ));
-        p.forms.push(smtp_form(
-            "SMTP URL",
-            "The whole connection as one URL, as PDS_EMAIL_SMTP_URL takes it.",
-            "url",
-            vec![
-                Input::new("smtp_url", "SMTP URL", "password")
-                    .hint("smtps://user:password@smtp.example.com"),
-            ],
-        ));
+        });
         p.forms.push(Form {
             title: "Send a test email".into(),
             text: "From the main sender. Enter the code it carries below to confirm delivery."
@@ -999,6 +950,38 @@ async fn email_render(
     });
     p.fields = fields_under(s, "email", &[]);
     web::render(&p, status)
+}
+
+/// The email form's inputs: "Who's your email provider?", then every
+/// provider's fields, each shown only for its choice (the console's Email
+/// page and the setup wizard).
+#[must_use]
+pub fn email_inputs() -> Vec<Input> {
+    use locus_mail::provider::{form_fields, provider_options};
+    let choices = |opts: &[(&str, &str)]| {
+        opts.iter()
+            .enumerate()
+            .map(|(i, (v, l))| locus_web::setup::Choice {
+                value: (*v).into(),
+                label: (*l).into(),
+                checked: i == 0,
+            })
+            .collect()
+    };
+    std::iter::once(Input {
+        options: choices(&provider_options()),
+        ..Input::new("provider", "Who's your email provider?", "select")
+    })
+    .chain(form_fields().into_iter().map(|f| Input {
+        name: f.name,
+        label: f.label,
+        kind: f.kind,
+        value: f.value,
+        options: choices(&f.options),
+        hint: f.hint,
+        show_for: f.show_for,
+    }))
+    .collect()
 }
 
 fn code_hash(code: &str) -> String {

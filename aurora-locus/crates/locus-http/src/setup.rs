@@ -1606,6 +1606,7 @@ async fn form_for(
         Step::Email => {
             let status = s.mailer.status(Sender::Main).await.ok().flatten();
             f.smtp_url_set = status.is_some();
+            f.email_inputs = crate::console_sections::email_inputs();
             (f.email_status, f.email_class) = match status {
                 Some(SenderStatus::Verified) => ("working: a test email arrived".into(), "ok"),
                 Some(SenderStatus::Unverified) => (
