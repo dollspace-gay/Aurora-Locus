@@ -183,7 +183,7 @@ mod tests {
                 proptest::prop_assert_eq!(&n, &n.to_ascii_lowercase());
                 proptest::prop_assert_eq!(normalize_and_validate(&n), Ok(n.clone()));
             }
-            let _ = ensure_service_constraints(&s, &domains(), LabelLimits { min, max }, &[s.clone()], false);
+            let _ = ensure_service_constraints(&s, &domains(), LabelLimits { min, max }, std::slice::from_ref(&s), false);
             let _ = has_explicit_slur(&s);
             let _ = is_reserved(&s);
         }

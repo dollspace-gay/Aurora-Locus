@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The pinned toolchain and minimum Rust version are now 1.94.1
+  (`rust-toolchain.toml`, `rust-version`, the Dockerfile's build image), so
+  the AWS SDK can move to current releases.
+
+### Security
+
+- The AWS SDK (S3 and KMS) is updated, which takes `aws-smithy-json` to
+  0.65.1 (unbounded recursion while skipping unknown JSON keys) and `lru` to
+  0.18.5 (`IterMut` invalidating an internal pointer). Locus only uses the SDK
+  as a client of the operator's own S3 and KMS endpoints, so neither was
+  reachable by other users.
+
 ### Fixed
 
 - A `getRepo` CAR stays complete when a commit lands while it streams. A
@@ -23,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accounts. Before numbering its first event, a fresh install now asks each
   crawler for its last seq from the hostname (`getHostStatus`) and starts
   above it plus `sync.restore_seq_margin`, as a restore does.
+- The prune job's total counts the OAuth rows it removes (they were added to
+  a count nothing read).
 
 ## [0.1.1] - 2026-11-08
 

@@ -164,7 +164,7 @@ its own authentication and authorization.
 
 ### Build requirements
 
-- Rust edition 2024, toolchain 1.88 (pinned in `rust-toolchain.toml`).
+- Rust edition 2024, toolchain 1.94.1 (pinned in `rust-toolchain.toml`).
 - `proto-blue-codegen` on `PATH` at build time; `kryphocron-lexicons` runs
   it from its build script, so a fresh `cargo build` fails without it.
   Install it with `cargo install proto-blue-codegen --version 0.3.3 --locked`.

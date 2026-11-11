@@ -138,10 +138,10 @@ proptest! {
         m.extend(overlay);
         if let Ok(p) = Parameters::parse(&m) {
             let _ = p.scopes();
-            if let Ok(p) = validate(&client(), p) {
-                if let Ok(p) = narrow(p, approved.as_deref()) {
-                    let _ = check_code_grant(&p, "https://app.example.com/cb", verifier.as_deref());
-                }
+            if let Ok(p) = validate(&client(), p)
+                && let Ok(p) = narrow(p, approved.as_deref())
+            {
+                let _ = check_code_grant(&p, "https://app.example.com/cb", verifier.as_deref());
             }
         }
         if let Some(v) = &verifier {

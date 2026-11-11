@@ -4,7 +4,7 @@
 #
 #   docker build -f deploy/docker/Dockerfile -t aurora-locus .
 
-FROM rust:1.88-bookworm AS build
+FROM rust:1.94.1-bookworm AS build
 # kryphocron-lexicons generates its code at build time with this.
 RUN cargo install proto-blue-codegen --version 0.3.3 --locked
 WORKDIR /src
