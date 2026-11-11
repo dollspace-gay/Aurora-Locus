@@ -7,4 +7,11 @@ ignore = [
     # signing timing. Locus only verifies OAuth clients' RSA signatures with
     # their public keys; it holds no RSA private key.
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys (bundled SQLite before 3.54.0): opening a database with
+    # a crafted -wal file can return uninitialized memory. Locus opens only
+    # its own database, and with `import reference-pds` the operator's own
+    # reference install; no user can hand it SQLite files. The fix
+    # (libsqlite3-sys 0.39) is outside every sqlx release's range so far
+    # (sqlx-sqlite 0.9.0: < 0.38); drop this once sqlx allows it.
+    "RUSTSEC-2026-0459",
 ]
