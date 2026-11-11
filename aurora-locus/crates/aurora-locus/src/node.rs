@@ -666,6 +666,14 @@ impl Node {
                 move |lease, cancel| {
                     let state = Arc::clone(&st);
                     async move {
+                        // A fresh log starts above relays' cursors for this
+                        // hostname, before the first event is numbered.
+                        crate::restore::fresh_log_floor(
+                            &state.store,
+                            &state.snapshot(),
+                            &state.hostname,
+                        )
+                        .await?;
                         loop {
                             let days = state
                                 .snapshot()

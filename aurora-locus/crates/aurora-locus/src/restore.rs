@@ -178,17 +178,7 @@ async fn resolve_floor(
         floor.value = g;
         floor.source = "--seq-floor".into();
     }
-    for crawler in snap.list("sync.crawlers") {
-        let url = format!(
-            "{}/xrpc/com.atproto.sync.getHostStatus?hostname={hostname}",
-            crawler.trim_end_matches('/')
-        );
-        let seq = match http().get(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                r.json::<Value>().await.ok().and_then(|v| v["seq"].as_i64())
-            }
-            _ => None,
-        };
+    for (crawler, seq) in crawler_seqs(snap, hostname).await {
         match seq {
             Some(seq) => {
                 floor.answered = true;
@@ -203,6 +193,61 @@ async fn resolve_floor(
         }
     }
     Ok(floor)
+}
+
+/// Each crawler's last seq from `hostname` (`getHostStatus`), or None where
+/// it didn't give one (unreachable, an error, or a host it doesn't know).
+async fn crawler_seqs(snap: &Snapshot, hostname: &str) -> Vec<(String, Option<i64>)> {
+    let mut out = Vec::new();
+    for crawler in snap.list("sync.crawlers") {
+        let url = format!(
+            "{}/xrpc/com.atproto.sync.getHostStatus?hostname={hostname}",
+            crawler.trim_end_matches('/')
+        );
+        let seq = match http().get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                r.json::<Value>().await.ok().and_then(|v| v["seq"].as_i64())
+            }
+            _ => None,
+        };
+        out.push((crawler.to_owned(), seq));
+    }
+    out
+}
+
+/// A fresh install's event log starts above what relays already saw from
+/// this hostname (an earlier install there), as a restore's does: a relay
+/// resumes from its cursor, so events numbered from 1 again would never
+/// reach it. Runs only while the log has never had an event, before the
+/// sequencer numbers the first one; a crawler that doesn't answer leaves the
+/// log as it is.
+pub(crate) async fn fresh_log_floor(
+    store: &Store,
+    snap: &Snapshot,
+    hostname: &str,
+) -> locus_core::CoreResult<()> {
+    if store.seq_state().await?.last_seq != 0 {
+        return Ok(());
+    }
+    let seen = crawler_seqs(snap, hostname).await;
+    let Some((crawler, seq)) = seen
+        .iter()
+        .filter_map(|(c, s)| s.filter(|s| *s > 0).map(|s| (c, s)))
+        .max_by_key(|(_, s)| *s)
+    else {
+        return Ok(());
+    };
+    let margin = snap.int("sync.restore_seq_margin");
+    let mut tx = store.begin().await?;
+    let last = tx.raise_seq_floor(seq.saturating_add(margin)).await?;
+    tx.commit().await?;
+    tracing::info!(
+        %crawler,
+        relay_seq = seq,
+        next_seq = last + 1,
+        "{hostname} was known to a relay already: the event log starts above its cursor"
+    );
+    Ok(())
 }
 
 /// The atproto signing key an account's live DID document lists.

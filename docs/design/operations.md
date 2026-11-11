@@ -909,6 +909,12 @@ Relays may have seen events newer than the backup, so restore:
   signing key. Fix them with `keys import` of a later key backup, then
   `identity publish` or `repair identity`.
 
+A fresh install does the first of these on its own: before numbering its
+first event, it asks each crawler for this host's last seq and starts above
+it plus `sync.restore_seq_margin`. A new PDS at a hostname relays already
+follow (one replacing another there) then reaches them; at a hostname they
+don't know, the log starts at 1.
+
 **Large profile (Postgres and S3).** Use Postgres point-in-time recovery
 and versioning on every bucket, keeping noncurrent versions at least as
 long as the recovery window plus `blobs.delete_grace_ms`. Make key backups
