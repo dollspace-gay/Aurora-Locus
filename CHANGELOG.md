@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks for 70 minutes, not 10, to outlast the longest stream
   `sync.get_repo_timeout_ms` allows. A stored CID that doesn't parse now
   ends the stream with an error instead of being skipped.
+- A fresh install at a hostname relays already follow (replacing an
+  earlier PDS there) now reaches them. Its events were numbered from 1
+  again, below the cursor relays resume from, so they never saw the new
+  accounts. Before numbering its first event, a fresh install now asks each
+  crawler for its last seq from the hostname (`getHostStatus`) and starts
+  above it plus `sync.restore_seq_margin`, as a restore does.
 
 ## [0.1.1] - 2026-11-08
 

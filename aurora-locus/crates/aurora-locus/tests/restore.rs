@@ -759,3 +759,60 @@ async fn post_restore_checks_objects_ends_migrations_and_raises_the_floor() {
             .await;
     }
 }
+
+/// A fresh install at a hostname a relay already follows (an earlier
+/// install there): its first event is numbered above the relay's cursor
+/// plus the margin, so the relay sees it. With no relay answering, the log
+/// starts at 1 as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_install_starts_above_a_relays_cursor_for_its_hostname() {
+    let root = tempfile::tempdir().unwrap();
+    let (plc_url, _) = plc().await;
+    let (relay_url, relay_seq) = relay().await;
+    let env = Env {
+        plc: plc_url,
+        relay: relay_url,
+        extra: Vec::new(),
+    };
+    // The relay knows this hostname at seq 7000.
+    relay_seq.store(7000, Ordering::SeqCst);
+    let known = root.path().join("known");
+    std::fs::create_dir_all(&known).unwrap();
+    assert_eq!(first_seq(&env, &known).await, 7000 + 1_000_000 + 1);
+
+    // No relay answering: from 1.
+    relay_seq.store(-1, Ordering::SeqCst);
+    let unknown = root.path().join("unknown");
+    std::fs::create_dir_all(&unknown).unwrap();
+    assert_eq!(first_seq(&env, &unknown).await, 1);
+}
+
+/// Starts a fresh node in `dir`, creates an account, and returns the seq of
+/// the first event it sequenced.
+async fn first_seq(env: &Env, dir: &Path) -> i64 {
+    let node = start(env, dir).await;
+    let (st, v) = xrpc(
+        &node.url,
+        "POST",
+        "com.atproto.server.createAccount",
+        None,
+        Some(json!({"handle": "fresh.test", "email": "fresh@example.com", "password": "pw-123456789"})),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    let pool = db(dir).await;
+    let mut seq = None;
+    for _ in 0..80 {
+        seq = sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(seq) FROM seq_event")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if seq.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    pool.close().await;
+    drop(node);
+    seq.expect("the account's events were sequenced")
+}

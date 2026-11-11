@@ -1074,7 +1074,7 @@ pub static REGISTRY: &[Def] = &[
         },
         default: "1000000",
         env: None,
-        description: "After a restore, how far above the seq relays report the next event's seq starts, so a relay whose cursor is ahead of what it reports still gets the new events.",
+        description: "After a restore, or on a fresh install at a hostname relays already follow, how far above the seq relays report the next event's seq starts, so a relay whose cursor is ahead of what it reports still gets the new events.",
     },
     Def {
         key: "deploy.proxy_mode",
