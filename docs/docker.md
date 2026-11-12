@@ -74,7 +74,7 @@ LOCUS_SUBNET=172.31.99.0/24            # if 172.30.53.0/24 clashes with another 
 LOCUS_GATEWAY=172.31.99.1
 LOCUS_IP_RANGE=172.31.99.128/25        # the upper half: containers' dynamic addresses
 LOCUS_CADDY_IP=172.31.99.2             # Caddy's address; LOCUS_TRUSTED_PROXIES must match
-LOCUS_IMAGE=ghcr.io/dollspace-gay/aurora-locus:0.1.2   # pin an exact version
+LOCUS_IMAGE=ghcr.io/dollspace-gay/aurora-locus:0.1.3   # pin an exact version
 COMPOSE_FILE=compose.yaml:compose.build.yaml           # build from source (step 3)
 CADDY_IMAGE=locus-caddy                # DNS-01 wildcards (see below)
 DNS_API_TOKEN=…                        # the DNS provider's token, for DNS-01
@@ -91,7 +91,7 @@ docker compose pull locus
 
 This pulls `ghcr.io/dollspace-gay/aurora-locus:0.1`, the published image.
 `0.1` follows the 0.1.x patch releases; set `LOCUS_IMAGE` in `.env` to pin
-an exact version (`ghcr.io/dollspace-gay/aurora-locus:0.1.2`) or to use
+an exact version (`ghcr.io/dollspace-gay/aurora-locus:0.1.3`) or to use
 another registry.
 
 **To build it from the source instead**, add `compose.build.yaml` to the

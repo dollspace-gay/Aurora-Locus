@@ -16,7 +16,7 @@ name: aurora-locus
 
 services:
   locus:
-    # 0.1 follows the 0.1.x patch releases; pin 0.1.2 for no updates.
+    # 0.1 follows the 0.1.x patch releases; pin 0.1.3 for no updates.
     image: ${LOCUS_IMAGE:-ghcr.io/dollspace-gay/aurora-locus:0.1}
     restart: unless-stopped
     env_file: [locus.env]
