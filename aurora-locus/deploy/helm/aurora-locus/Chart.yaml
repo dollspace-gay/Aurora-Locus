@@ -2,6 +2,6 @@ apiVersion: v2
 name: aurora-locus
 description: aurora-locus, an atproto PDS, on Kubernetes (SQLite on one pod, or Postgres and S3 on several)
 type: application
-version: 0.1.2
-appVersion: "0.1.2"
+version: 0.1.3
+appVersion: "0.1.3"
 keywords: [atproto, pds, bluesky]

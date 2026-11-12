@@ -22,10 +22,10 @@ within seconds.
   private registry), push it and set `image.repository`:
 
   ```sh
-  docker build -f deploy/docker/Dockerfile -t registry.example.com/aurora-locus:0.1.2 \
+  docker build -f deploy/docker/Dockerfile -t registry.example.com/aurora-locus:0.1.3 \
     --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
     --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 .
-  docker push registry.example.com/aurora-locus:0.1.2
+  docker push registry.example.com/aurora-locus:0.1.3
   ```
 
 - An ingress controller (the examples use ingress-nginx) and a certificate
