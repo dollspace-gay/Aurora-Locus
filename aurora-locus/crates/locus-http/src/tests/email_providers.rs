@@ -42,6 +42,17 @@ async fn the_console_saves_each_way_of_sending_as_an_smtp_url() {
             && !page.contains("<h2>Resend</h2>"),
         "{page}"
     );
+    // Sending a test email and confirming it share one card.
+    let test_card = page
+        .split_once("<h2>Send a test email</h2>")
+        .map(|(_, rest)| rest.split(r#"<div class="card">"#).next().unwrap_or(rest))
+        .expect("the test email card");
+    assert!(
+        test_card.contains(r#"action="/admin/email/test""#)
+            && test_card.contains(r#"action="/admin/email/verify""#)
+            && !page.contains("<h2>Confirm delivery</h2>"),
+        "{page}"
+    );
     // The stylesheet hides other providers' fields for every choice.
     let css = include_str!("../../../locus-web/static/locus.css");
     for (v, _) in locus_mail::provider::provider_options() {

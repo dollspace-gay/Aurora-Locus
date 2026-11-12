@@ -911,7 +911,7 @@ async fn email_render(
         });
         p.forms.push(Form {
             title: "Send a test email".into(),
-            text: "From the main sender. Enter the code it carries below to confirm delivery."
+            text: "From the main sender. It carries a code: enter it below to confirm delivery."
                 .into(),
             action: "/admin/email/test".into(),
             get: false,
@@ -920,8 +920,9 @@ async fn email_render(
             button: "Send".into(),
             danger: false,
         });
+        // No title: it shares the test email's card.
         p.forms.push(Form {
-            title: "Confirm delivery".into(),
+            title: String::new(),
             text: String::new(),
             action: "/admin/email/verify".into(),
             get: false,
