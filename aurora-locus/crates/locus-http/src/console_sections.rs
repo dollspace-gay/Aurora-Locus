@@ -882,7 +882,7 @@ async fn email_render(
         ],
     ));
     if op.role >= Role::Admin {
-        let sender = Input {
+        let sender = || Input {
             options: vec![
                 locus_web::setup::Choice {
                     value: "main".into(),
@@ -897,23 +897,21 @@ async fn email_render(
             ],
             ..Input::new("sender", "Sender", "select")
         };
+        // One form: the provider, then only its fields. Saving stores the
+        // sender's SMTP URL and checks the connection and sign-in at once.
         p.forms.push(Form {
-            title: "SMTP URL".into(),
-            text: "Saving checks the connection and sign-in at once.".into(),
+            title: "How email is sent".into(),
+            text: "Pick your email provider and enter what it gives you. For any other provider, pick Other and enter its SMTP server's details.".into(),
             action: "/admin/email/smtp".into(),
             get: false,
-            inputs: vec![
-                sender,
-                Input::new("url", "SMTP URL", "password")
-                    .hint("smtps://user:password@smtp.example.com"),
-            ],
+            inputs: std::iter::once(sender()).chain(email_inputs()).collect(),
             hidden: Vec::new(),
             button: "Save and check".into(),
             danger: false,
         });
         p.forms.push(Form {
             title: "Send a test email".into(),
-            text: "From the main sender. Enter the code it carries below to confirm delivery."
+            text: "From the main sender. It carries a code: enter it below to confirm delivery."
                 .into(),
             action: "/admin/email/test".into(),
             get: false,
@@ -922,8 +920,9 @@ async fn email_render(
             button: "Send".into(),
             danger: false,
         });
+        // No title: it shares the test email's card.
         p.forms.push(Form {
-            title: "Confirm delivery".into(),
+            title: String::new(),
             text: String::new(),
             action: "/admin/email/verify".into(),
             get: false,
@@ -952,6 +951,38 @@ async fn email_render(
     });
     p.fields = fields_under(s, "email", &[]);
     web::render(&p, status)
+}
+
+/// The email form's inputs: "Who's your email provider?", then every
+/// provider's fields, each shown only for its choice (the console's Email
+/// page and the setup wizard).
+#[must_use]
+pub fn email_inputs() -> Vec<Input> {
+    use locus_mail::provider::{form_fields, provider_options};
+    let choices = |opts: &[(&str, &str)]| {
+        opts.iter()
+            .enumerate()
+            .map(|(i, (v, l))| locus_web::setup::Choice {
+                value: (*v).into(),
+                label: (*l).into(),
+                checked: i == 0,
+            })
+            .collect()
+    };
+    std::iter::once(Input {
+        options: choices(&provider_options()),
+        ..Input::new("provider", "Who's your email provider?", "select")
+    })
+    .chain(form_fields().into_iter().map(|f| Input {
+        name: f.name,
+        label: f.label,
+        kind: f.kind,
+        value: f.value,
+        options: choices(&f.options),
+        hint: f.hint,
+        show_for: f.show_for,
+    }))
+    .collect()
 }
 
 fn code_hash(code: &str) -> String {
@@ -988,32 +1019,34 @@ pub async fn email_action(
             } else {
                 Sender::Main
             };
-            let url = web::field(&form, "url");
-            if !(url.starts_with("smtp://") || url.starts_with("smtps://")) {
-                return email_render(
-                    &s,
-                    &op,
-                    None,
-                    vec!["An SMTP URL starts with smtp:// or smtps://.".into()],
-                    StatusCode::BAD_REQUEST,
-                )
-                .await;
-            }
-            let status = s.mailer.set_url(sender, url).await;
+            // Resend's key, a server's details or a URL (`url`, the field's
+            // older name, still counts as one).
+            let choice = locus_mail::provider::SmtpChoice::from_form(|k| {
+                let v = web::field(&form, k);
+                if k == "smtp_url" && v.is_empty() {
+                    web::field(&form, "url").to_owned()
+                } else {
+                    v.to_owned()
+                }
+            });
+            let url = match choice.smtp_url() {
+                Ok(u) => u,
+                Err(e) => {
+                    return email_render(&s, &op, None, vec![e], StatusCode::BAD_REQUEST).await;
+                }
+            };
+            let status = s.mailer.set_url(sender, &url).await;
             let _ = s
                 .store
                 .audit(&op.actor(), "email.setSmtp", Some(sender.as_str()), None)
                 .await;
             match status {
                 Ok(SenderStatus::Failed) => {
-                    email_render(
-                        &s,
-                        &op,
-                        None,
-                        vec!["Saved, but the SMTP server refused the connection.".into()],
-                        StatusCode::BAD_REQUEST,
-                    )
-                    .await
+                    let msg = match s.mailer.blocked_port_hint(sender).await {
+                        Some(h) => format!("Saved, but the SMTP server couldn't be reached. {h}"),
+                        None => "Saved, but the SMTP server refused the connection.".into(),
+                    };
+                    email_render(&s, &op, None, vec![msg], StatusCode::BAD_REQUEST).await
                 }
                 Ok(_) => {
                     email_render(

@@ -199,6 +199,61 @@ fn secret(prompt: &str) -> Result<String, String> {
     rpassword::prompt_password(format!("{prompt}: ")).map_err(|e| e.to_string())
 }
 
+/// Asks how email is sent (Resend, an SMTP server's details, or a URL) and
+/// returns the SMTP URL, or (inner) what's wrong with the answers.
+fn smtp_url_prompt() -> Result<Result<String, String>, String> {
+    use locus_mail::provider::{SmtpChoice, form_fields, provider_options};
+    let options = provider_options();
+    println!("  Who's your email provider?");
+    for (i, (_, label)) in options.iter().enumerate() {
+        println!("    {}) {label}", i + 1);
+    }
+    let pick = ask("  Number", "1")?;
+    let Some((provider, _)) = pick
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| options.get(n))
+    else {
+        return Ok(Err(format!("Pick a number from 1 to {}.", options.len())));
+    };
+    // The chosen provider's fields, asked in the form's order.
+    let mut values =
+        std::collections::HashMap::from([("provider".to_owned(), (*provider).to_owned())]);
+    for f in form_fields()
+        .into_iter()
+        .filter(|f| f.show_for.split(' ').any(|s| s == *provider))
+    {
+        let v = match f.kind {
+            "checkbox" => {
+                if confirm(&format!("  {}?", f.label), false)? {
+                    "1".to_owned()
+                } else {
+                    String::new()
+                }
+            }
+            "password" => secret(&format!("  {}", f.label))?,
+            "select" => {
+                let names: Vec<String> = f
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, l))| format!("{}) {l}", i + 1))
+                    .collect();
+                let n = ask(&format!("  {}: {}", f.label, names.join("  ")), "1")?;
+                n.parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|n| f.options.get(n))
+                    .map_or_else(String::new, |(v, _)| (*v).to_owned())
+            }
+            _ => ask(&format!("  {}", f.label), &f.value)?,
+        };
+        values.insert(f.name, v);
+    }
+    Ok(SmtpChoice::from_form(|k| values.get(k).cloned().unwrap_or_default()).smtp_url())
+}
+
 fn say_problems(problems: Vec<rules::Problem>) -> bool {
     for p in &problems {
         println!("  ! {}", p.message);
@@ -308,7 +363,13 @@ async fn interactive(
     println!("\n5. Email");
     if confirm("  Set up email now?", true)? {
         loop {
-            let url = secret("  SMTP URL (smtps://user:password@host)")?;
+            let url = match smtp_url_prompt()? {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("  ! {e}");
+                    continue;
+                }
+            };
             plan.email.from_address = ask("  Send from", &plan.email.from_address)?;
             plan.email.smtp_url = Some(url.clone());
             plan.email.skipped = false;
@@ -321,8 +382,11 @@ async fn interactive(
                 .map_err(|e| e.to_string())?
             {
                 SenderStatus::Failed => {
-                    println!("  ! The SMTP server refused the connection.");
-                    if confirm("  Try another URL?", true)? {
+                    match mailer.blocked_port_hint(Sender::Main).await {
+                        Some(h) => println!("  ! The SMTP server couldn't be reached. {h}"),
+                        None => println!("  ! The SMTP server refused the connection."),
+                    }
+                    if confirm("  Try again?", true)? {
                         continue;
                     }
                 }

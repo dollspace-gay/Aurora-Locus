@@ -5,6 +5,7 @@
 //! check (or a test email arrived); otherwise features that need email
 //! report it unavailable instead of pretending to send.
 
+pub mod provider;
 pub mod templates;
 
 use std::collections::HashMap;
@@ -184,6 +185,14 @@ impl Mailer {
             .set_sender_state(sender, status, &hash, result.err().as_deref())
             .await?;
         Ok(status)
+    }
+
+    /// After a failed check: the blocked-port hint, when the sender's last
+    /// failure was a connection on one of the usual mail ports.
+    pub async fn blocked_port_hint(&self, sender: Sender) -> Option<&'static str> {
+        let url = self.url(sender).await.ok()??;
+        let error = self.store.sender_state(sender).await.ok()??.last_error?;
+        provider::blocked_port_hint(&url, &error)
     }
 
     /// Records that a test email sent with the current URL arrived.

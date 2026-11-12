@@ -17,24 +17,29 @@
 {% endif %}
 {% if !forms.is_empty() %}
 <div class="settings-cards">
-{% for f in forms %}<div class="card">
-<h2>{{ f.title }}</h2>
+{% for f in forms %}{% if !f.title.is_empty() || loop.first %}<div class="card">{% endif %}
+{% if !f.title.is_empty() %}<h2>{{ f.title }}</h2>{% endif %}
 {% if !f.text.is_empty() %}<p>{{ f.text }}</p>{% endif %}
 <form class="stack" method="{% if f.get %}get{% else %}post{% endif %}" action="{{ f.action }}"{% if f.has_file() %} enctype="multipart/form-data"{% endif %}>
 {% if !f.get %}<input type="hidden" name="csrf" value="{{ csrf }}">{% endif %}
 {% for (k, v) in f.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">
 {% endfor %}
 {% for i in f.inputs %}
-<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
-{% if i.kind == "select" %}<select id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
+{% if !i.show_for.is_empty() %}<div class="stack" data-for="{{ i.show_for }}">{% endif %}
+{% if i.kind == "checkbox" %}<label class="check"><input type="checkbox" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="1"{% if i.value == "1" %} checked{% endif %}> {{ i.label }}</label>
+{% else %}<label for="{{ f.action }}-{{ i.name }}">{{ i.label }}</label>
+{% endif %}
+{% if i.kind == "checkbox" %}
+{% else if i.kind == "select" %}<select id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
 {% else if i.kind == "textarea" %}<textarea id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" rows="4" spellcheck="false">{{ i.value }}</textarea>
 {% else %}<input type="{{ i.kind }}" id="{{ f.action }}-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false"{% if i.kind == "password" %} autocomplete="off"{% endif %}>
 {% endif %}
 {% if !i.hint.is_empty() %}<div class="hint">{{ i.hint }}</div>{% endif %}
+{% if !i.show_for.is_empty() %}</div>{% endif %}
 {% endfor %}
 <div class="row"><button type="submit"{% if f.danger %} class="danger"{% else %} class="secondary"{% endif %}>{{ f.button }}</button></div>
 </form>
-</div>
+{% if self.card_ends_after(loop.index0) %}</div>{% endif %}
 {% endfor %}
 </div>
 {% endif %}

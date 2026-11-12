@@ -400,11 +400,15 @@ pub struct Table {
 pub struct Input {
     pub name: String,
     pub label: String,
-    /// text, password, email, number, select or textarea.
+    /// text, password, email, number, select, textarea or checkbox (sent
+    /// as "1" when ticked; `value` "1" ticks it).
     pub kind: &'static str,
     pub value: String,
     pub options: Vec<Choice>,
     pub hint: String,
+    /// When set, the values of the form's `provider` select it's shown for
+    /// (space-separated); the stylesheet hides it for the others.
+    pub show_for: String,
 }
 
 impl Input {
@@ -417,6 +421,7 @@ impl Input {
             value: String::new(),
             options: Vec::new(),
             hint: String::new(),
+            show_for: String::new(),
         }
     }
 
@@ -433,7 +438,8 @@ impl Input {
     }
 }
 
-/// A form on a section page.
+/// A form on a section page. A form with no title is drawn in the card of
+/// the form before it (a step that follows on from it).
 #[derive(Debug, Clone)]
 pub struct Form {
     pub title: String,
@@ -484,4 +490,13 @@ pub struct SectionPage {
     pub frames: Vec<Frame>,
     pub can_edit: bool,
     pub back: String,
+}
+
+impl SectionPage {
+    /// Whether the card form `i` is in ends after it: the next form, if
+    /// any, has a title of its own.
+    #[must_use]
+    pub fn card_ends_after(&self, i: &usize) -> bool {
+        self.forms.get(i + 1).is_none_or(|n| !n.title.is_empty())
+    }
 }

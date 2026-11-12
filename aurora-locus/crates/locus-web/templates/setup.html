@@ -109,9 +109,17 @@
 <form class="stack" method="post" action="/setup/email">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="do" value="save">
-<label for="smtp_url">SMTP URL</label>
-<input type="password" id="smtp_url" name="smtp_url" autocomplete="off" spellcheck="false" placeholder="smtps://user:password@smtp.example.com"{% if !f.smtp_url_set %} required{% endif %}>
-<div class="hint">It carries the password, so it's stored encrypted and never shown again.{% if f.smtp_url_set %} One is saved; enter a new one to replace it.{% endif %}</div>
+{% for i in f.email_inputs %}
+{% if !i.show_for.is_empty() %}<div class="stack" data-for="{{ i.show_for }}">{% endif %}
+{% if i.kind == "checkbox" %}<label class="check"><input type="checkbox" id="email-{{ i.name }}" name="{{ i.name }}" value="1"{% if i.value == "1" %} checked{% endif %}> {{ i.label }}</label>
+{% else %}<label for="email-{{ i.name }}">{{ i.label }}</label>
+{% if i.kind == "select" %}<select id="email-{{ i.name }}" name="{{ i.name }}">{% for o in i.options %}<option value="{{ o.value }}"{% if o.checked %} selected{% endif %}>{{ o.label }}</option>{% endfor %}</select>
+{% else %}<input type="{{ i.kind }}" id="email-{{ i.name }}" name="{{ i.name }}" value="{{ i.value }}" spellcheck="false" autocomplete="off">
+{% endif %}{% endif %}
+{% if !i.hint.is_empty() %}<div class="hint">{{ i.hint }}</div>{% endif %}
+{% if !i.show_for.is_empty() %}</div>{% endif %}
+{% endfor %}
+<div class="hint">The key or password is stored encrypted and never shown again.{% if f.smtp_url_set %} Email is saved; enter new details to replace them.{% endif %}</div>
 <label for="from_address">Send from</label>
 <input type="text" id="from_address" name="from_address" value="{{ f.from_address }}" placeholder="Example PDS &lt;noreply@example.com&gt;" required>
 <div class="row"><button type="submit" class="secondary">Save and test the connection</button></div>
